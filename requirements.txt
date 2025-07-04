@@ -1,5 +1,6 @@
 flask
-mediapipe
+flask_cors
 opencv-python
-requests
+mediapipe
 numpy
+requests
