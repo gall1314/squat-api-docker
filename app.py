@@ -88,3 +88,8 @@ def analyze():
         "reps": counter,
         "feedback": list(set(form_flags))
     })
+
+# ✅ חשוב! הפעלת Flask כמו ש-Render מצפה
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
+
