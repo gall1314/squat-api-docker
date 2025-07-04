@@ -1,0 +1,5 @@
+flask
+mediapipe
+opencv-python
+requests
+numpy
