@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 import tempfile
-import requests
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -13,20 +12,20 @@ def calculate_angle(a, b, c):
     b = np.array(b)
     c = np.array(c)
     radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
-    angle = np.abs(radians*180.0/np.pi)
+    angle = np.abs(radians * 180.0 / np.pi)
     if angle > 180.0:
         angle = 360 - angle
     return angle
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    data = request.get_json()
-    video_url = data.get('video_url')
+    video_file = request.files.get('video')
 
-    response = requests.get(video_url)
+    if video_file is None:
+        return jsonify({"error": "No video uploaded"}), 400
+
     temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    temp_video.write(response.content)
-    temp_video.close()
+    video_file.save(temp_video.name)
 
     cap = cv2.VideoCapture(temp_video.name)
     mp_pose = mp.solutions.pose
@@ -89,7 +88,7 @@ def analyze():
         "feedback": list(set(form_flags))
     })
 
-# ✅ חשוב! הפעלת Flask כמו ש-Render מצפה
+# וודא שהשרת פועל ביציאה ל־Render
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
 
