@@ -17,6 +17,9 @@ def calculate_angle(a, b, c):
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
+    print("🔥 request.files:", request.files)  # ✅ הדפסה חדשה
+    print("🔥 request.form:", request.form)    # ✅ הדפסה חדשה
+
     video_file = request.files.get('video')
     if not video_file:
         return jsonify({"error": "No video uploaded"}), 400
@@ -24,7 +27,7 @@ def analyze():
     temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     video_file.save(temp_video.name)
     
-    print("✅ Video saved at:", temp_video.name)  # שורת ההדפסה שהוספת
+    print("✅ Video saved at:", temp_video.name)  # ✅ לוודא שהקובץ נשמר
 
     mp_pose = mp.solutions.pose
     counter = 0
