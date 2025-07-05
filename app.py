@@ -1,10 +1,12 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # ✅ הוספה חשובה!
 import tempfile
 import cv2
 import mediapipe as mp
 import numpy as np
 
 app = Flask(__name__)
+CORS(app)  # ✅ שורת הקסם שמאפשרת בקשות מהאפליקציה
 
 def calculate_angle(a, b, c):
     a = np.array(a)
@@ -87,3 +89,4 @@ def analyze():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
