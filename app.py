@@ -37,6 +37,7 @@ def run_analysis(video_path):
 
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
+
             if not results.pose_landmarks:
                 continue
 
@@ -49,59 +50,54 @@ def run_analysis(video_path):
                 heel = [lm[mp_pose.PoseLandmark.RIGHT_HEEL.value].x, lm[mp_pose.PoseLandmark.RIGHT_HEEL.value].y]
                 foot_index = [lm[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value].x, lm[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value].y]
 
-                knee_angle = calculate_angle(hip, knee, ankle)
                 back_angle = calculate_angle(shoulder, hip, knee)
 
                 feedback = set()
                 depth_penalty = 0
-                back_penalty = 0
-                heel_penalty = 0
 
-                # Depth penalty (based on knee angle only)
-                if knee_angle <= 85:
+                # ✅ NEW: Depth check based on hip vs knee height
+                hip_y = hip[1]
+                knee_y = knee[1]
+
+                if hip_y > knee_y + 0.04:
                     depth_penalty = 0
-                elif 86 <= knee_angle <= 90:
+                elif knee_y < hip_y <= knee_y + 0.04:
                     depth_penalty = 0.5
-                elif 91 <= knee_angle <= 100:
+                elif hip_y <= knee_y:
                     depth_penalty = 1.5
                     feedback.add("Try to squat deeper")
                 else:
                     depth_penalty = 3
                     feedback.add("The squat is too shallow – go deeper")
 
-                # Stage detection for squat
-                if knee_angle < 90:
-                    stage = "down"
-                if knee_angle > 160 and stage == "down":
-                    stage = "up"
+                # ✅ Heel lifting
+                heel_penalty = 0
+                if heel[1] < foot_index[1] - 0.02:
+                    feedback.add("Keep your heels firmly on the ground")
+                    heel_penalty = 2
 
-                    # Back penalty by stage
-                    if back_angle >= 130:
-                        pass  # perfect
-                    elif 110 <= back_angle < 130:
-                        back_penalty = 1.5
+                # ✅ Back posture depending on stage
+                if stage == "up":
+                    if back_angle < 150:
                         feedback.add("Try to stand up straighter at the top")
-                    else:
-                        back_penalty = 3
-                        feedback.add("Your back is too rounded – try to keep it straighter")
+                elif stage == "down":
+                    if back_angle < 110:
+                        feedback.add("Your back is too rounded – try to stay more upright")
 
-                    # Heel lift
-                    if heel[1] < foot_index[1] - 0.02:
-                        heel_penalty = 2
-                        feedback.add("Keep your heels firmly on the ground")
-
-                    # Final scoring
-                    total_penalty = depth_penalty + back_penalty + heel_penalty
-                    score = round(max(4.0, 10.0 - total_penalty), 1)
-
+                # ✅ Rep detection (same logic as before)
+                if hip_y < knee_y:
+                    stage = "down"
+                elif hip_y > knee_y + 0.08 and stage == "down":
+                    stage = "up"
                     counter += 1
+                    total_penalty = depth_penalty + heel_penalty
+                    score = max(4, 10 - total_penalty)
                     all_scores.append(score)
                     reps_feedback.append({
                         "rep": counter,
                         "score": score,
                         "issues": list(feedback)
                     })
-
                     if feedback:
                         bad_reps += 1
                     else:
@@ -143,3 +139,4 @@ def analyze():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
