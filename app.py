@@ -11,15 +11,19 @@ CORS(app)
 
 def calculate_angle(a, b, c):
     a, b, c = map(np.array, [a, b, c])
-    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
+    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
 def run_analysis(video_path):
-    mp_pose = mp.solutions.pose
+    print(f"📂 Attempting to open video: {video_path}")
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return {"error": "Could not open video"}
+        print("❌ Failed to open video file with OpenCV.")
+        return {"error": "Could not open video file."}
+
+    print("✅ Video opened successfully.")
+    mp_pose = mp.solutions.pose
 
     counter = 0
     good_reps = 0
@@ -27,13 +31,14 @@ def run_analysis(video_path):
     all_scores = []
     reps_feedback = []
     stage = None
-    start_time = time.time()
     frame_index = 0
+    start_time = time.time()
 
     with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
+                print(f"⚠️ Failed to read frame at index {frame_index}")
                 break
 
             frame_index += 1
@@ -112,7 +117,7 @@ def run_analysis(video_path):
                     print(f"✅ Rep {counter} - Score: {score}, Feedback: {feedback}")
 
             except Exception as e:
-                print(f"❌ Exception on frame {frame_index}: {e}")
+                print(f"❌ Exception at frame {frame_index}: {e}")
                 continue
 
     cap.release()
@@ -144,9 +149,11 @@ def analyze():
 
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     video_file.save(temp.name)
+    print(f"📥 Video saved to: {temp.name}")
     result = run_analysis(temp.name)
 
     if "error" in result:
+        print(f"❌ Analysis error: {result['error']}")
         return jsonify(result), 400
     return jsonify(result)
 
