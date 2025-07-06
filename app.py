@@ -38,7 +38,6 @@ def run_analysis(video_path):
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
-                print(f"⚠️ Failed to read frame at index {frame_index}")
                 break
 
             frame_index += 1
@@ -50,7 +49,6 @@ def run_analysis(video_path):
             results = pose.process(image)
 
             if not results.pose_landmarks:
-                print(f"[Frame {frame_index}] ❌ No landmarks detected")
                 continue
 
             try:
@@ -64,8 +62,6 @@ def run_analysis(video_path):
 
                 knee_angle = calculate_angle(hip, knee, ankle)
                 back_angle = calculate_angle(shoulder, hip, knee)
-
-                print(f"[Frame {frame_index}] Knee Angle: {knee_angle:.2f}, Back Angle: {back_angle:.2f}, Stage: {stage}")
 
                 feedback = []
                 depth_penalty = 0
@@ -114,8 +110,6 @@ def run_analysis(video_path):
                     else:
                         good_reps += 1
 
-                    print(f"✅ Rep {counter} - Score: {score}, Feedback: {feedback}")
-
             except Exception as e:
                 print(f"❌ Exception at frame {frame_index}: {e}")
                 continue
@@ -124,7 +118,6 @@ def run_analysis(video_path):
     elapsed_time = time.time() - start_time
 
     if counter == 0:
-        print("⚠️ No squats detected")
         return {
             "error": "No clear squat movement detected",
             "duration_seconds": round(elapsed_time)
@@ -143,8 +136,11 @@ def run_analysis(video_path):
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
+    print("📥 Files received:", request.files)
+
     video_file = request.files.get('video')
     if not video_file:
+        print("❌ No video file found in request.")
         return jsonify({"error": "No video uploaded"}), 400
 
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
