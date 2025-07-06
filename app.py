@@ -51,56 +51,57 @@ def run_analysis(video_path):
 
                 knee_angle = calculate_angle(hip, knee, ankle)
                 back_angle = calculate_angle(shoulder, hip, knee)
-                hip_y = lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y
-                knee_y = lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y
-                depth_ratio = hip_y / knee_y
 
-                feedback = []
-                total_penalty = 0
+                feedback = set()
+                depth_penalty = 0
+                back_penalty = 0
+                heel_penalty = 0
 
-                # 💡 Depth feedback (based on knee angle)
+                # Depth penalty (based on knee angle only)
                 if knee_angle <= 85:
-                    pass
+                    depth_penalty = 0
                 elif 86 <= knee_angle <= 90:
-                    total_penalty += 0.5
+                    depth_penalty = 0.5
                 elif 91 <= knee_angle <= 100:
-                    feedback.append("Try to squat deeper")
-                    total_penalty += 2
+                    depth_penalty = 1.5
+                    feedback.add("Try to squat deeper")
                 else:
-                    feedback.append("The squat is too shallow – go deeper")
-                    total_penalty += 4
+                    depth_penalty = 3
+                    feedback.add("The squat is too shallow – go deeper")
 
-                # ✅ Add bonus check using depth ratio (optional)
-                if depth_ratio < 0.95:
-                    feedback.append("The squat doesn't reach full depth (based on hip position)")
-                    total_penalty += 1.5
-
-                # 💡 Back feedback
-                if stage == "up" and back_angle < 130:
-                    feedback.append("Try to stand up straighter at the top")
-                    total_penalty += 1
-                elif stage == "down" and back_angle < 110:
-                    feedback.append("Your back is too rounded – try to stay more upright")
-                    total_penalty += 2
-
-                # 💡 Heel lift
-                if heel[1] < foot_index[1] - 0.02:
-                    feedback.append("Keep your heels firmly on the ground")
-                    total_penalty += 2
-
-                # ✅ Rep detection (only angle-based)
+                # Stage detection for squat
                 if knee_angle < 90:
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
+
+                    # Back penalty by stage
+                    if back_angle >= 130:
+                        pass  # perfect
+                    elif 110 <= back_angle < 130:
+                        back_penalty = 1.5
+                        feedback.add("Try to stand up straighter at the top")
+                    else:
+                        back_penalty = 3
+                        feedback.add("Your back is too rounded – try to keep it straighter")
+
+                    # Heel lift
+                    if heel[1] < foot_index[1] - 0.02:
+                        heel_penalty = 2
+                        feedback.add("Keep your heels firmly on the ground")
+
+                    # Final scoring
+                    total_penalty = depth_penalty + back_penalty + heel_penalty
+                    score = round(max(4.0, 10.0 - total_penalty), 1)
+
                     counter += 1
-                    score = max(4, round(10 - total_penalty, 1))
                     all_scores.append(score)
                     reps_feedback.append({
                         "rep": counter,
                         "score": score,
-                        "issues": feedback
+                        "issues": list(feedback)
                     })
+
                     if feedback:
                         bad_reps += 1
                     else:
@@ -111,10 +112,12 @@ def run_analysis(video_path):
 
     cap.release()
     elapsed_time = time.time() - start_time
+
     if counter == 0:
         return {"error": "No clear squat movement detected", "duration_seconds": round(elapsed_time)}
 
     technique_score = round(np.mean(all_scores), 1)
+
     return {
         "squat_count": counter,
         "duration_seconds": round(elapsed_time),
