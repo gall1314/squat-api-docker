@@ -5,7 +5,7 @@ import mediapipe as mp
 import numpy as np
 import tempfile
 import time
-import requests  # חובה
+import requests  # ← חובה כדי לעבוד עם video_url
 
 app = Flask(__name__)
 CORS(app)
@@ -17,6 +17,8 @@ def calculate_angle(a, b, c):
     return 360 - angle if angle > 180 else angle
 
 def run_analysis(video_path):
+    print("🔥 analyzing video file:", video_path)
+
     mp_pose = mp.solutions.pose
     counter = 0
     stage = None
@@ -73,6 +75,7 @@ def run_analysis(video_path):
                 continue
 
     cap.release()
+
     elapsed_time = time.time() - start_time
     rpm = counter / (elapsed_time / 60) if elapsed_time > 0 else 0
 
@@ -83,39 +86,18 @@ def run_analysis(video_path):
         "feedback": list(set(feedback_log))
     }
 
-@app.route('/analyze', methods=['POST'])
-def analyze():
-    print("🔥 /analyze called")
-    print("request.files:", request.files)
-    video_file = request.files.get('video')
-    if not video_file:
-        return jsonify({"error": "No video uploaded"}), 400
-
-    temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    video_file.save(temp_video.name)
-    print("✅ Saved file to:", temp_video.name)
-
-    try:
-        result = run_analysis(temp_video.name)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 @app.route('/analyze_url', methods=['POST'])
 def analyze_url():
-    print("🔥 /analyze_url called")
     try:
+        print("🔥 /analyze_url called")
         data = request.get_json()
-        print("📦 JSON Data:", data)
-    except Exception as e:
-        print("❌ Failed to parse JSON:", str(e))
-        return jsonify({"error": "Invalid JSON"}), 400
+        print("📥 request data:", data)
 
-    video_url = data.get('video_url')
-    if not video_url:
-        return jsonify({"error": "Missing video_url"}), 400
+        video_url = data.get('video_url')
+        if not video_url:
+            return jsonify({"error": "Missing video_url"}), 400
 
-    try:
+        print("🌐 Downloading video from:", video_url)
         response = requests.get(video_url)
         if response.status_code != 200:
             return jsonify({"error": "Failed to download video"}), 400
@@ -123,12 +105,12 @@ def analyze_url():
         temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         temp_video.write(response.content)
         temp_video.close()
-        print("✅ Downloaded and saved video from URL")
 
         result = run_analysis(temp_video.name)
         return jsonify(result)
+
     except Exception as e:
-        print("❌ Exception:", str(e))
+        print("💥 Error:", str(e))
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
