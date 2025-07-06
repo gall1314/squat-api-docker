@@ -5,20 +5,18 @@ import mediapipe as mp
 import numpy as np
 import tempfile
 import time
-import requests  # ← חובה כדי לעבוד עם video_url
+import requests
 
 app = Flask(__name__)
 CORS(app)
 
 def calculate_angle(a, b, c):
     a, b, c = map(np.array, [a, b, c])
-    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
+    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
 def run_analysis(video_path):
-    print("🔥 analyzing video file:", video_path)
-
     mp_pose = mp.solutions.pose
     counter = 0
     stage = None
@@ -26,13 +24,24 @@ def run_analysis(video_path):
     feedback_log = []
 
     cap = cv2.VideoCapture(video_path)
+    frame_count = 0
 
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    with mp_pose.Pose(
+        static_image_mode=True,
+        model_complexity=1,
+        enable_segmentation=False,
+        min_detection_confidence=0.5
+    ) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
+            frame_count += 1
+            if frame_count % 3 != 0:
+                continue
+
+            frame = cv2.resize(frame, (640, 480))
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
 
@@ -71,7 +80,7 @@ def run_analysis(video_path):
                 if frame_feedback:
                     feedback_log.extend(frame_feedback)
 
-            except Exception as e:
+            except Exception:
                 continue
 
     cap.release()
@@ -89,15 +98,11 @@ def run_analysis(video_path):
 @app.route('/analyze_url', methods=['POST'])
 def analyze_url():
     try:
-        print("🔥 /analyze_url called")
         data = request.get_json()
-        print("📥 request data:", data)
-
         video_url = data.get('video_url')
         if not video_url:
             return jsonify({"error": "Missing video_url"}), 400
 
-        print("🌐 Downloading video from:", video_url)
         response = requests.get(video_url)
         if response.status_code != 200:
             return jsonify({"error": "Failed to download video"}), 400
@@ -110,8 +115,8 @@ def analyze_url():
         return jsonify(result)
 
     except Exception as e:
-        print("💥 Error:", str(e))
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
