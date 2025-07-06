@@ -5,6 +5,7 @@ import mediapipe as mp
 import numpy as np
 import tempfile
 import time
+import requests
 
 app = Flask(__name__)
 CORS(app)
@@ -15,27 +16,14 @@ def calculate_angle(a, b, c):
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
-@app.route('/analyze', methods=['POST'])
-def analyze():
-    print("🔥 request.files:", request.files)  # ✅ הדפסה חדשה
-    print("🔥 request.form:", request.form)    # ✅ הדפסה חדשה
-
-    video_file = request.files.get('video')
-    if not video_file:
-        return jsonify({"error": "No video uploaded"}), 400
-
-    temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    video_file.save(temp_video.name)
-    
-    print("✅ Video saved at:", temp_video.name)  # ✅ לוודא שהקובץ נשמר
-
+def run_analysis(video_path):
     mp_pose = mp.solutions.pose
     counter = 0
     stage = None
-    start_time = time.time()
     feedback_log = []
+    start_time = time.time()
 
-    cap = cv2.VideoCapture(temp_video.name)
+    cap = cv2.VideoCapture(video_path)
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
@@ -81,20 +69,44 @@ def analyze():
                 if frame_feedback:
                     feedback_log.extend(frame_feedback)
 
-            except Exception as e:
+            except:
                 continue
 
     cap.release()
-
     elapsed_time = time.time() - start_time
     rpm = counter / (elapsed_time / 60) if elapsed_time > 0 else 0
 
-    return jsonify({
+    return {
         "squat_count": counter,
         "duration_seconds": round(elapsed_time),
         "rpm": round(rpm, 1),
         "feedback": list(set(feedback_log))
-    })
+    }
+
+@app.route('/analyze_url', methods=['POST'])
+def analyze_url():
+    data = request.get_json()
+    video_url = data.get('video_url')
+
+    if not video_url:
+        return jsonify({"error": "Missing video_url"}), 400
+
+    try:
+        response = requests.get(video_url)
+        if response.status_code != 200:
+            return jsonify({"error": "Failed to download video"}), 400
+
+        temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        temp_video.write(response.content)
+        temp_video.close()
+
+        result = run_analysis(temp_video.name)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Keep your existing /analyze endpoint as-is
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
