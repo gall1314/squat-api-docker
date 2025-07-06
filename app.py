@@ -83,30 +83,52 @@ def run_analysis(video_path):
         "feedback": list(set(feedback_log))
     }
 
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    print("🔥 request.files:", request.files)
+    print("🔥 request.form:", request.form)
+
+    video_file = request.files.get('video')
+    if not video_file:
+        return jsonify({"error": "No video uploaded"}), 400
+
+    temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    video_file.save(temp_video.name)
+
+    print("✅ Video saved at:", temp_video.name)
+
+    result = run_analysis(temp_video.name)
+    return jsonify(result)
+
 @app.route('/analyze_url', methods=['POST'])
 def analyze_url():
-    data = request.get_json()
-    video_url = data.get('video_url')
-
-    if not video_url:
-        return jsonify({"error": "Missing video_url"}), 400
-
     try:
+        data = request.get_json()
+        print("📥 Received data:", data)
+
+        video_url = data.get('video_url')
+        if not video_url:
+            return jsonify({"error": "Missing video_url"}), 400
+
+        print("🌐 Downloading from:", video_url)
         response = requests.get(video_url)
+        print("📥 Response status:", response.status_code)
+
         if response.status_code != 200:
             return jsonify({"error": "Failed to download video"}), 400
 
         temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         temp_video.write(response.content)
         temp_video.close()
+        print("✅ Saved video to:", temp_video.name)
 
         result = run_analysis(temp_video.name)
+        print("🎉 Analysis done:", result)
         return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
-# Keep your existing /analyze endpoint as-is
+    except Exception as e:
+        print("❌ Error:", str(e))
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
