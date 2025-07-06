@@ -17,13 +17,16 @@ def calculate_angle(a, b, c):
 
 def run_analysis(video_path):
     mp_pose = mp.solutions.pose
-    counter = 0
-    stage = None
-    feedback_log = []
-    bad_reps = 0
-
     cap = cv2.VideoCapture(video_path)
+    
     frame_index = 0
+    stage = None
+    counter = 0
+    good_reps = 0
+    bad_reps = 0
+    all_rep_scores = []
+    reps_feedback = []
+    
     start_time = time.time()
 
     with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
@@ -58,46 +61,46 @@ def run_analysis(video_path):
                 knee_angle = calculate_angle(hip, knee, ankle)
                 back_angle = calculate_angle(shoulder, hip, knee)
 
-                frame_feedback = []
-                bad_form = False
+                rep_feedback = set()
 
-                if back_angle < 140:
-                    frame_feedback.append("Keep your back straighter during descent")
-                    bad_form = True
-                if knee_angle > 100:
-                    frame_feedback.append("Go lower into the squat")
-                    bad_form = True
-                if heel[1] < foot_index[1] - 0.02:
-                    frame_feedback.append("Keep your heels down")
-                    bad_form = True
+                # תנאים פחות נוקשים
+                if stage == "down":
+                    if back_angle < 130:
+                        rep_feedback.add("Keep your back straighter during descent")
+                    if knee_angle > 105:
+                        rep_feedback.add("Go lower into the squat")
+                    if heel[1] < foot_index[1] - 0.02:
+                        rep_feedback.add("Keep your heels down")
 
                 if knee_angle < 90:
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
                     counter += 1
-                    if bad_form:
-                        bad_reps += 1
 
-                if frame_feedback:
-                    for fb in frame_feedback:
-                        feedback_log.append({"issue": fb})
+                    if rep_feedback:
+                        bad_reps += 1
+                    else:
+                        good_reps += 1
+
+                    score = max(0, 10 - len(rep_feedback) * 2)
+                    all_rep_scores.append(score)
+                    reps_feedback.append({"rep": counter, "issues": list(rep_feedback)})
 
             except:
                 continue
 
     cap.release()
     elapsed_time = time.time() - start_time
-    score = max(0, round((1 - bad_reps / counter) * 10)) if counter > 0 else 0
-    good_reps = max(counter - bad_reps, 0)
+    technique_score = round(np.mean(all_rep_scores), 1) if all_rep_scores else 0
 
     return {
         "squat_count": counter,
-        "bad_reps": bad_reps,
-        "good_reps": good_reps,
         "duration_seconds": round(elapsed_time),
-        "technique_score": score,
-        "feedback": feedback_log
+        "technique_score": technique_score,
+        "good_reps": good_reps,
+        "bad_reps": bad_reps,
+        "feedback": reps_feedback
     }
 
 @app.route('/analyze', methods=['POST'])
@@ -114,4 +117,5 @@ def analyze():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
