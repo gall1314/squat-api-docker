@@ -11,7 +11,7 @@ CORS(app)
 
 def calculate_angle(a, b, c):
     a, b, c = map(np.array, [a, b, c])
-    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
+    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
@@ -50,54 +50,50 @@ def run_analysis(video_path):
                 heel = [lm[mp_pose.PoseLandmark.RIGHT_HEEL.value].x, lm[mp_pose.PoseLandmark.RIGHT_HEEL.value].y]
                 foot_index = [lm[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value].x, lm[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value].y]
 
+                knee_angle = calculate_angle(hip, knee, ankle)
                 back_angle = calculate_angle(shoulder, hip, knee)
 
-                feedback = set()
-                depth_penalty = 0
+                feedback = []
+                penalties = 0
 
-                # ✅ NEW: Depth check based on hip vs knee height
-                hip_y = hip[1]
-                knee_y = knee[1]
-
-                if hip_y > knee_y + 0.04:
-                    depth_penalty = 0
-                elif knee_y < hip_y <= knee_y + 0.04:
-                    depth_penalty = 0.5
-                elif hip_y <= knee_y:
-                    depth_penalty = 1.5
-                    feedback.add("Try to squat deeper")
+                # עומק סקוואט לפי גובה ירך מול ברך
+                thigh_drop = knee[1] - hip[1]
+                if thigh_drop > 0.12:
+                    pass  # מעולה, לא מוסיפים כלום
+                elif 0.09 <= thigh_drop <= 0.12:
+                    feedback.append("Almost deep enough – try just a bit lower")
+                    penalties += 0.5
+                elif 0.06 <= thigh_drop < 0.09:
+                    feedback.append("Try to squat deeper")
+                    penalties += 1.5
                 else:
-                    depth_penalty = 3
-                    feedback.add("The squat is too shallow – go deeper")
+                    feedback.append("The squat is too shallow – go deeper")
+                    penalties += 3
 
-                # ✅ Heel lifting
-                heel_penalty = 0
-                if heel[1] < foot_index[1] - 0.02:
-                    feedback.add("Keep your heels firmly on the ground")
-                    heel_penalty = 2
-
-                # ✅ Back posture depending on stage
-                if stage == "up":
-                    if back_angle < 150:
-                        feedback.add("Try to stand up straighter at the top")
-                elif stage == "down":
-                    if back_angle < 110:
-                        feedback.add("Your back is too rounded – try to stay more upright")
-
-                # ✅ Rep detection (same logic as before)
-                if hip_y < knee_y:
+                # שמירת שלב התנועה לפי זווית ברך
+                if knee_angle < 90:
                     stage = "down"
-                elif hip_y > knee_y + 0.08 and stage == "down":
+                if knee_angle > 160 and stage == "down":
                     stage = "up"
+
+                    # תנוחת גב לפי שלב
+                    if back_angle < 150:
+                        if thigh_drop > 0.12 and back_angle < 130:
+                            feedback.append("Try to stand up straighter at the top")
+                            penalties += 1
+                        elif thigh_drop <= 0.12 and back_angle < 110:
+                            feedback.append("Your back is too rounded – try to stay more upright")
+                            penalties += 1
+
+                    # עקבים
+                    if heel[1] < foot_index[1] - 0.02:
+                        feedback.append("Keep your heels firmly on the ground")
+                        penalties += 1.5
+
                     counter += 1
-                    total_penalty = depth_penalty + heel_penalty
-                    score = max(4, 10 - total_penalty)
+                    score = max(4, round(10 - penalties, 1))
                     all_scores.append(score)
-                    reps_feedback.append({
-                        "rep": counter,
-                        "score": score,
-                        "issues": list(feedback)
-                    })
+                    reps_feedback.append({"rep": counter, "score": score, "issues": feedback})
                     if feedback:
                         bad_reps += 1
                     else:
