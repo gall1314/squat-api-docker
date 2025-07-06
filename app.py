@@ -96,7 +96,14 @@ def run_analysis(video_path):
 
     cap.release()
     elapsed_time = time.time() - start_time
-    technique_score = round(np.mean(all_rep_scores), 1) if all_rep_scores else 0
+
+    if counter == 0:
+        return {
+            "error": "No clear squat movement detected",
+            "duration_seconds": round(elapsed_time)
+        }
+
+    technique_score = round(np.mean(all_rep_scores), 1)
 
     return {
         "squat_count": counter,
@@ -117,8 +124,10 @@ def analyze():
     video_file.save(temp_video.name)
 
     result = run_analysis(temp_video.name)
+
+    if "error" in result:
+        return jsonify(result), 400
     return jsonify(result)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
