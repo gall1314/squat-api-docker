@@ -11,7 +11,7 @@ CORS(app)
 
 def calculate_angle(a, b, c):
     a, b, c = map(np.array, [a, b, c])
-    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
+    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
@@ -34,6 +34,9 @@ def run_analysis(video_path):
             ret, frame = cap.read()
             if not ret:
                 break
+
+            # ✅ הקטנת רזולוציה
+            frame = cv2.resize(frame, (640, 480))
 
             if frame_index % 5 != 0:
                 frame_index += 1
@@ -63,16 +66,16 @@ def run_analysis(video_path):
 
                 rep_feedback = set()
 
-                # Only during descent
+                # ✅ הערות טכניקה בזמן הירידה בלבד
                 if stage == "down":
                     if back_angle < 130:
                         rep_feedback.add("Try to keep your back a bit straighter as you go down")
                     if knee_angle > 105:
-                        rep_feedback.add("It would be even better if you squat a little deeper")
+                        rep_feedback.add("It would be better if you squat a little deeper")
                     if heel[1] < foot_index[1] - 0.02:
-                        rep_feedback.add("Try to keep your heels firmly on the ground")
+                        rep_feedback.add("Keep your heels firmly on the ground")
 
-                # Repetition logic
+                # ✅ ניתוח חזרות
                 if knee_angle < 90:
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
@@ -131,3 +134,4 @@ def analyze():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
