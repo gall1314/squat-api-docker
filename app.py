@@ -5,7 +5,6 @@ import mediapipe as mp
 import numpy as np
 import tempfile
 import time
-import subprocess
 
 app = Flask(__name__)
 CORS(app)
@@ -29,13 +28,19 @@ def run_analysis(video_path):
     reps_feedback = []
     stage = None
     start_time = time.time()
+    frame_index = 0
 
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
+            frame_index += 1
+            if frame_index % 4 != 0:  # skip every 3 frames
+                continue
+
+            frame = cv2.resize(frame, (480, 360))  # reduce resolution for speed
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
 
@@ -56,7 +61,6 @@ def run_analysis(video_path):
 
                 feedback = []
 
-                # Technique feedback
                 if back_angle < 150:
                     feedback.append("Try to keep your back straighter")
                 if knee_angle > 100:
@@ -64,7 +68,6 @@ def run_analysis(video_path):
                 if heel[1] < foot_index[1] - 0.02:
                     feedback.append("Keep your heels firmly on the ground")
 
-                # Rep detection
                 if knee_angle < 90:
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
@@ -104,7 +107,7 @@ def analyze():
     if not video_file:
         return jsonify({"error": "No video uploaded"}), 400
 
-    temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     video_file.save(temp.name)
     result = run_analysis(temp.name)
 
@@ -114,4 +117,3 @@ def analyze():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
