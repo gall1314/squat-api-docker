@@ -1,31 +1,42 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import cv2
+import mediapipe as mp
+import numpy as np
+import tempfile
+import time
+import subprocess
+
+app = Flask(__name__)
+CORS(app)
+
+def calculate_angle(a, b, c):
+    a, b, c = map(np.array, [a, b, c])
+    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
+    angle = np.abs(radians * 180.0 / np.pi)
+    return 360 - angle if angle > 180 else angle
+
+def convert_video_to_h264(input_path):
+    temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+    output_path = temp_output.name
+    temp_output.close()
+    try:
+        subprocess.run([
+            'ffmpeg', '-y', '-i', input_path,
+            '-c:v', 'libx264', '-crf', '23', '-preset', 'fast',
+            output_path
+        ], check=True)
+        print("✅ Converted video to H.264:", output_path)
+        return output_path
+    except subprocess.CalledProcessError:
+        print("❌ ffmpeg conversion failed.")
+        return None
+
 def run_analysis(video_path):
-    import cv2
-    import mediapipe as mp
-    import numpy as np
-    import time
-    import subprocess
-    import tempfile
-
     print("⚠️ Trying to open video:", video_path)
-
-    def convert_video_to_h264(input_path):
-        temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-        output_path = temp_output.name
-        temp_output.close()
-        try:
-            subprocess.run([
-                'ffmpeg', '-y', '-i', input_path,
-                '-c:v', 'libx264', '-crf', '23', '-preset', 'fast',
-                output_path
-            ], check=True)
-            print("✅ Converted video to H.264:", output_path)
-            return output_path
-        except subprocess.CalledProcessError:
-            print("❌ ffmpeg conversion failed.")
-            return None
-
     mp_pose = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
+
     if not cap.isOpened():
         print("⚠️ Initial open failed, trying conversion...")
         converted_path = convert_video_to_h264(video_path)
@@ -84,7 +95,7 @@ def run_analysis(video_path):
                 back_penalty = 0
                 heel_penalty = 0
 
-                # ✅ Depth check
+                # Depth check
                 depth_ratio = hip_y / knee_y
                 if depth_ratio > 1.05:
                     pass
@@ -95,7 +106,7 @@ def run_analysis(video_path):
                     rep_feedback.add("The squat is too shallow – try going lower")
                     depth_penalty = 3
 
-                # ✅ Back angle check
+                # Back angle check
                 back_angle = calculate_angle(shoulder, hip, knee)
                 if back_angle > 130:
                     pass
@@ -106,12 +117,12 @@ def run_analysis(video_path):
                     rep_feedback.add("Your back is too rounded – try to keep it straighter")
                     back_penalty = 3
 
-                # ✅ Heels
+                # Heels
                 if heel_y < foot_index_y - 0.02:
                     rep_feedback.add("Keep your heels firmly on the ground")
                     heel_penalty = 2
 
-                # ✅ Stage detection
+                # Stage detection
                 if stage != "down" and depth_ratio > 1.05:
                     stage = "down"
 
@@ -156,5 +167,24 @@ def run_analysis(video_path):
         "bad_reps": bad_reps,
         "feedback": reps_feedback
     }
+
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    video_file = request.files.get('video')
+    if not video_file:
+        print("❌ No file received")
+        return jsonify({"error": "No video uploaded"}), 400
+
+    temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    video_file.save(temp_video.name)
+
+    result = run_analysis(temp_video.name)
+
+    if "error" in result:
+        return jsonify(result), 400
+    return jsonify(result)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
 
 
