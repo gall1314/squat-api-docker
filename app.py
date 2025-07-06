@@ -1,43 +1,38 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import cv2
-import mediapipe as mp
-import numpy as np
-import tempfile
-import time
-import subprocess
-
-app = Flask(__name__)
-CORS(app)
-
-def calculate_angle(a, b, c):
-    a, b, c = map(np.array, [a, b, c])
-    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
-    angle = np.abs(radians * 180.0 / np.pi)
-    return 360 - angle if angle > 180 else angle
-
-def convert_video_to_h264(input_path):
-    temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-    output_path = temp_output.name
-    temp_output.close()
-    try:
-        subprocess.run([
-            'ffmpeg', '-y', '-i', input_path,
-            '-c:v', 'libx264', '-crf', '23', '-preset', 'fast',
-            output_path
-        ], check=True)
-        return output_path
-    except subprocess.CalledProcessError:
-        return None
-
 def run_analysis(video_path):
+    import cv2
+    import mediapipe as mp
+    import numpy as np
+    import time
+    import subprocess
+    import tempfile
+
+    print("⚠️ Trying to open video:", video_path)
+
+    def convert_video_to_h264(input_path):
+        temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        output_path = temp_output.name
+        temp_output.close()
+        try:
+            subprocess.run([
+                'ffmpeg', '-y', '-i', input_path,
+                '-c:v', 'libx264', '-crf', '23', '-preset', 'fast',
+                output_path
+            ], check=True)
+            print("✅ Converted video to H.264:", output_path)
+            return output_path
+        except subprocess.CalledProcessError:
+            print("❌ ffmpeg conversion failed.")
+            return None
+
     mp_pose = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
+        print("⚠️ Initial open failed, trying conversion...")
         converted_path = convert_video_to_h264(video_path)
         if converted_path:
             cap = cv2.VideoCapture(converted_path)
         if not cap.isOpened():
+            print("❌ Failed to open video even after conversion.")
             return {"error": "Video could not be opened even after conversion."}
 
     frame_index = 0
@@ -65,6 +60,10 @@ def run_analysis(video_path):
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
 
+            if not results.pose_landmarks:
+                print(f"❌ No pose landmarks detected at frame {frame_index}")
+                continue
+
             try:
                 lm = results.pose_landmarks.landmark
                 hip_y = lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y
@@ -85,38 +84,37 @@ def run_analysis(video_path):
                 back_penalty = 0
                 heel_penalty = 0
 
-                # ✅ עומק לפי יחס ירך/ברך
+                # ✅ Depth check
                 depth_ratio = hip_y / knee_y
                 if depth_ratio > 1.05:
                     pass
                 elif 1.00 <= depth_ratio <= 1.05:
-                    rep_feedback.add("אפשר לרדת טיפה יותר עמוק")
+                    rep_feedback.add("Try to squat slightly deeper")
                     depth_penalty = 1
                 else:
-                    rep_feedback.add("הירידה לא מספיקה – נסה לרדת עד שהירך מתחת לברך")
+                    rep_feedback.add("The squat is too shallow – try going lower")
                     depth_penalty = 3
 
-                # ✅ גב
+                # ✅ Back angle check
                 back_angle = calculate_angle(shoulder, hip, knee)
                 if back_angle > 130:
                     pass
                 elif 110 <= back_angle <= 130:
-                    rep_feedback.add("נסה ליישר מעט את הגב בעלייה")
+                    rep_feedback.add("Try to keep your back a bit straighter")
                     back_penalty = 1.5
                 else:
-                    rep_feedback.add("הגב עקום מדי – שמור על גב ישר לאורך התנועה")
+                    rep_feedback.add("Your back is too rounded – try to keep it straighter")
                     back_penalty = 3
 
-                # ✅ עקבים
+                # ✅ Heels
                 if heel_y < foot_index_y - 0.02:
-                    rep_feedback.add("שמור על עקבים צמודים לקרקע")
+                    rep_feedback.add("Keep your heels firmly on the ground")
                     heel_penalty = 2
 
-                # זיהוי שלב ירידה
+                # ✅ Stage detection
                 if stage != "down" and depth_ratio > 1.05:
                     stage = "down"
 
-                # זיהוי עלייה וסיום חזרה
                 if depth_ratio < 0.95 and stage == "down":
                     stage = "up"
                     counter += 1
@@ -134,13 +132,15 @@ def run_analysis(video_path):
                         "issues": list(rep_feedback)
                     })
 
-            except Exception:
+            except Exception as e:
+                print(f"❌ Exception at frame {frame_index}: {e}")
                 continue
 
     cap.release()
     elapsed_time = time.time() - start_time
 
     if counter == 0:
+        print("❌ No squats detected in entire video")
         return {
             "error": "No clear squat movement detected",
             "duration_seconds": round(elapsed_time)
@@ -157,21 +157,4 @@ def run_analysis(video_path):
         "feedback": reps_feedback
     }
 
-@app.route('/analyze', methods=['POST'])
-def analyze():
-    video_file = request.files.get('video')
-    if not video_file:
-        return jsonify({"error": "No video uploaded"}), 400
-
-    temp_video = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    video_file.save(temp_video.name)
-
-    result = run_analysis(temp_video.name)
-
-    if "error" in result:
-        return jsonify(result), 400
-    return jsonify(result)
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
 
