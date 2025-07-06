@@ -18,7 +18,7 @@ def calculate_angle(a, b, c):
 def run_analysis(video_path):
     mp_pose = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
-    
+
     frame_index = 0
     stage = None
     counter = 0
@@ -26,7 +26,7 @@ def run_analysis(video_path):
     bad_reps = 0
     all_rep_scores = []
     reps_feedback = []
-    
+
     start_time = time.time()
 
     with mp_pose.Pose(static_image_mode=True, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
@@ -63,15 +63,16 @@ def run_analysis(video_path):
 
                 rep_feedback = set()
 
-                # תנאים פחות נוקשים
+                # Only during descent
                 if stage == "down":
                     if back_angle < 130:
-                        rep_feedback.add("Keep your back straighter during descent")
+                        rep_feedback.add("Try to keep your back a bit straighter as you go down")
                     if knee_angle > 105:
-                        rep_feedback.add("Go lower into the squat")
+                        rep_feedback.add("It would be even better if you squat a little deeper")
                     if heel[1] < foot_index[1] - 0.02:
-                        rep_feedback.add("Keep your heels down")
+                        rep_feedback.add("Try to keep your heels firmly on the ground")
 
+                # Repetition logic
                 if knee_angle < 90:
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
@@ -85,9 +86,12 @@ def run_analysis(video_path):
 
                     score = max(0, 10 - len(rep_feedback) * 2)
                     all_rep_scores.append(score)
-                    reps_feedback.append({"rep": counter, "issues": list(rep_feedback)})
+                    reps_feedback.append({
+                        "rep": counter,
+                        "issues": list(rep_feedback)
+                    })
 
-            except:
+            except Exception:
                 continue
 
     cap.release()
@@ -117,5 +121,4 @@ def analyze():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
 
