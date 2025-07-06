@@ -18,9 +18,9 @@ def calculate_angle(a, b, c):
 def run_analysis(video_path):
     mp_pose = mp.solutions.pose
     counter = 0
-    bad_reps = 0
     stage = None
     feedback_log = []
+    bad_reps = 0
 
     cap = cv2.VideoCapture(video_path)
     frame_index = 0
@@ -32,7 +32,6 @@ def run_analysis(video_path):
             if not ret:
                 break
 
-            # דילוג על חלק מהפריימים (שיפור ביצועים)
             if frame_index % 5 != 0:
                 frame_index += 1
                 continue
@@ -60,43 +59,42 @@ def run_analysis(video_path):
                 back_angle = calculate_angle(shoulder, hip, knee)
 
                 frame_feedback = []
+                bad_form = False
 
-                # תנאי משופר לזיהוי גב בירידה
-                if stage == "down" and back_angle < 120:
+                if back_angle < 140:
                     frame_feedback.append("Keep your back straighter during descent")
-                elif back_angle < 150:
-                    frame_feedback.append("Keep your back straight")
-
+                    bad_form = True
                 if knee_angle > 100:
                     frame_feedback.append("Go lower into the squat")
+                    bad_form = True
                 if heel[1] < foot_index[1] - 0.02:
                     frame_feedback.append("Keep your heels down")
+                    bad_form = True
 
                 if knee_angle < 90:
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
                     counter += 1
-                    if frame_feedback:
+                    if bad_form:
                         bad_reps += 1
 
-                # שמירת פידבקים לפריים
-                for issue in frame_feedback:
-                    feedback_log.append({"issue": issue})
+                if frame_feedback:
+                    for fb in frame_feedback:
+                        feedback_log.append({"issue": fb})
 
-            except Exception:
+            except:
                 continue
 
     cap.release()
     elapsed_time = time.time() - start_time
-
-    # ניקוד טכניקה בין 1 ל־10
+    score = max(0, round((1 - bad_reps / counter) * 10)) if counter > 0 else 0
     good_reps = max(counter - bad_reps, 0)
-    score = int((good_reps / counter) * 10) if counter > 0 else 1
 
     return {
         "squat_count": counter,
         "bad_reps": bad_reps,
+        "good_reps": good_reps,
         "duration_seconds": round(elapsed_time),
         "technique_score": score,
         "feedback": feedback_log
