@@ -37,10 +37,10 @@ def run_analysis(video_path):
                 break
 
             frame_index += 1
-            if frame_index % 4 != 0:  # skip every 3 frames
+            if frame_index % 4 != 0:
                 continue
 
-            frame = cv2.resize(frame, (480, 360))  # reduce resolution for speed
+            frame = cv2.resize(frame, (480, 360))
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
 
@@ -60,22 +60,52 @@ def run_analysis(video_path):
                 back_angle = calculate_angle(shoulder, hip, knee)
 
                 feedback = []
+                depth_penalty = 0
 
-                if back_angle < 150:
-                    feedback.append("Try to keep your back straighter")
-                if knee_angle > 100:
+                # Depth scoring based on knee angle
+                if knee_angle <= 85:
+                    depth_penalty = 0
+                elif 86 <= knee_angle <= 90:
+                    depth_penalty = 0.5
+                elif 91 <= knee_angle <= 100:
                     feedback.append("Try to squat deeper")
-                if heel[1] < foot_index[1] - 0.02:
-                    feedback.append("Keep your heels firmly on the ground")
+                    depth_penalty = 2
+                else:
+                    feedback.append("The squat is too shallow – go deeper")
+                    depth_penalty = 4
 
+                # Determine stage
                 if knee_angle < 90:
                     stage = "down"
+                elif knee_angle > 160 and stage == "down":
+                    stage = "up"
+
+                # Back posture check (by stage)
+                if stage == "up":
+                    if back_angle < 130:
+                        feedback.append("Try to stand up straighter at the top")
+                elif stage == "down":
+                    if back_angle < 110:
+                        feedback.append("Your back is too rounded – try to stay more upright")
+
+                # Heel check
+                heel_penalty = 0
+                if heel[1] < foot_index[1] - 0.02:
+                    feedback.append("Keep your heels firmly on the ground")
+                    heel_penalty = 2
+
+                # Finalize rep
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
                     counter += 1
-                    score = max(4, 10 - len(feedback) * 2)
+                    total_penalty = depth_penalty + heel_penalty
+                    score = max(4, round(10 - total_penalty, 1))
                     all_scores.append(score)
-                    reps_feedback.append({"rep": counter, "score": score, "issues": feedback})
+                    reps_feedback.append({
+                        "rep": counter,
+                        "score": score,
+                        "issues": feedback
+                    })
                     if feedback:
                         bad_reps += 1
                     else:
@@ -117,3 +147,4 @@ def analyze():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
