@@ -5,6 +5,8 @@ import mediapipe as mp
 import numpy as np
 import tempfile
 import time
+import subprocess
+import os
 
 app = Flask(__name__)
 CORS(app)
@@ -15,9 +17,29 @@ def calculate_angle(a, b, c):
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
+def convert_video_to_h264(input_path):
+    temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+    output_path = temp_output.name
+    temp_output.close()
+    try:
+        subprocess.run([
+            'ffmpeg', '-y', '-i', input_path,
+            '-c:v', 'libx264', '-crf', '23', '-preset', 'fast',
+            output_path
+        ], check=True)
+        return output_path
+    except subprocess.CalledProcessError:
+        return None
+
 def run_analysis(video_path):
     mp_pose = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        converted_path = convert_video_to_h264(video_path)
+        if converted_path:
+            cap = cv2.VideoCapture(converted_path)
+        if not cap.isOpened():
+            return {"error": "Video could not be opened even after conversion."}
 
     frame_index = 0
     stage = None
@@ -35,7 +57,6 @@ def run_analysis(video_path):
             if not ret:
                 break
 
-            # ✅ הקטנת רזולוציה
             frame = cv2.resize(frame, (640, 480))
 
             if frame_index % 5 != 0:
@@ -47,47 +68,67 @@ def run_analysis(video_path):
             results = pose.process(image)
 
             try:
-                landmarks = results.pose_landmarks.landmark
-                hip = [landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
-                       landmarks[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
-                knee = [landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
-                        landmarks[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
-                ankle = [landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
-                         landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
-                shoulder = [landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
-                            landmarks[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
-                heel = [landmarks[mp_pose.PoseLandmark.RIGHT_HEEL.value].x,
-                        landmarks[mp_pose.PoseLandmark.RIGHT_HEEL.value].y]
-                foot_index = [landmarks[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value].x,
-                              landmarks[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value].y]
-
-                knee_angle = calculate_angle(hip, knee, ankle)
-                back_angle = calculate_angle(shoulder, hip, knee)
+                lm = results.pose_landmarks.landmark
+                hip_y = lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y
+                knee_y = lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y
+                ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
+                         lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
+                shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
+                            lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
+                hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
+                       lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
+                knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
+                        lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
+                heel_y = lm[mp_pose.PoseLandmark.RIGHT_HEEL.value].y
+                foot_index_y = lm[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value].y
 
                 rep_feedback = set()
 
-                # ✅ הערות טכניקה בזמן הירידה בלבד
-                if stage == "down":
-                    if back_angle < 130:
-                        rep_feedback.add("Try to keep your back a bit straighter as you go down")
-                    if knee_angle > 105:
-                        rep_feedback.add("It would be better if you squat a little deeper")
-                    if heel[1] < foot_index[1] - 0.02:
-                        rep_feedback.add("Keep your heels firmly on the ground")
+                # ✅ עומק לפי יחס ירך/ברך
+                depth_ratio = hip_y / knee_y
+                if depth_ratio > 1.05:
+                    depth_penalty = 0
+                elif 1.00 <= depth_ratio <= 1.05:
+                    rep_feedback.add("אפשר לרדת טיפה יותר עמוק")
+                    depth_penalty = 1
+                else:
+                    rep_feedback.add("הירידה לא מספיקה – נסה לרדת עד שהירך מתחת לברך")
+                    depth_penalty = 3
 
-                # ✅ ניתוח חזרות
-                if knee_angle < 90:
+                # ✅ גב
+                back_angle = calculate_angle(shoulder, hip, knee)
+                if back_angle > 130:
+                    back_penalty = 0
+                elif 110 <= back_angle <= 130:
+                    rep_feedback.add("נסה ליישר מעט את הגב בעלייה")
+                    back_penalty = 1.5
+                else:
+                    rep_feedback.add("הגב עקום מדי – שמור על גב ישר לאורך התנועה")
+                    back_penalty = 3
+
+                # ✅ עקבים
+                if heel_y >= foot_index_y - 0.02:
+                    heel_penalty = 0
+                else:
+                    rep_feedback.add("שמור על עקבים צמודים לקרקע")
+                    heel_penalty = 2
+
+                # זיהוי שלב ירידה
+                if stage != "down" and depth_ratio > 1.05:
                     stage = "down"
-                if knee_angle > 160 and stage == "down":
+
+                # זיהוי עלייה וסיום חזרה
+                if depth_ratio < 0.95 and stage == "down":
                     stage = "up"
                     counter += 1
+                    total_penalty = depth_penalty + back_penalty + heel_penalty
 
                     if rep_feedback:
                         bad_reps += 1
                     else:
                         good_reps += 1
 
-                    score = max(0, 10 - len(rep_feedback) * 2)
+                    score = max(4, round(10 - total_penalty, 1))
                     all_rep_scores.append(score)
                     reps_feedback.append({
                         "rep": counter,
@@ -134,4 +175,3 @@ def analyze():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
-
