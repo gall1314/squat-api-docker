@@ -6,7 +6,6 @@ import numpy as np
 import tempfile
 import time
 import subprocess
-import os
 
 app = Flask(__name__)
 CORS(app)
@@ -58,7 +57,6 @@ def run_analysis(video_path):
                 break
 
             frame = cv2.resize(frame, (640, 480))
-
             if frame_index % 5 != 0:
                 frame_index += 1
                 continue
@@ -83,11 +81,14 @@ def run_analysis(video_path):
                 foot_index_y = lm[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value].y
 
                 rep_feedback = set()
+                depth_penalty = 0
+                back_penalty = 0
+                heel_penalty = 0
 
                 # ✅ עומק לפי יחס ירך/ברך
                 depth_ratio = hip_y / knee_y
                 if depth_ratio > 1.05:
-                    depth_penalty = 0
+                    pass
                 elif 1.00 <= depth_ratio <= 1.05:
                     rep_feedback.add("אפשר לרדת טיפה יותר עמוק")
                     depth_penalty = 1
@@ -98,7 +99,7 @@ def run_analysis(video_path):
                 # ✅ גב
                 back_angle = calculate_angle(shoulder, hip, knee)
                 if back_angle > 130:
-                    back_penalty = 0
+                    pass
                 elif 110 <= back_angle <= 130:
                     rep_feedback.add("נסה ליישר מעט את הגב בעלייה")
                     back_penalty = 1.5
@@ -107,9 +108,7 @@ def run_analysis(video_path):
                     back_penalty = 3
 
                 # ✅ עקבים
-                if heel_y >= foot_index_y - 0.02:
-                    heel_penalty = 0
-                else:
+                if heel_y < foot_index_y - 0.02:
                     rep_feedback.add("שמור על עקבים צמודים לקרקע")
                     heel_penalty = 2
 
@@ -175,3 +174,4 @@ def analyze():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
