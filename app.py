@@ -11,7 +11,7 @@ CORS(app)
 
 def calculate_angle(a, b, c):
     a, b, c = map(np.array, [a, b, c])
-    radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
+    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
@@ -35,40 +35,11 @@ def compress_video(input_path, scale=0.4):
     out.release()
     return temp.name
 
-def detect_motion_frames(video_path, frame_skip=3, scale=0.4, threshold=2.0):
-    cap = cv2.VideoCapture(video_path)
-    prev_gray = None
-    motion_frames = []
-    index = -1
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        index += 1
-        if index % frame_skip != 0:
-            continue
-        if scale != 1.0:
-            frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if prev_gray is not None:
-            diff = cv2.absdiff(gray, prev_gray)
-            if np.mean(diff) > threshold:
-                motion_frames.append(index)
-        prev_gray = gray
-    cap.release()
-    return motion_frames
-
 def run_analysis(video_path, frame_skip=3, scale=0.4):
     mp_pose = mp.solutions.pose
-    motion_frames = detect_motion_frames(video_path, frame_skip, scale)
-    if not motion_frames:
-        return {"error": "No squat motion detected"}
-
-    start_frame = max(0, min(motion_frames) - 6)
-    end_frame = max(motion_frames) + 6
-
     cap = cv2.VideoCapture(video_path)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    if not cap.isOpened():
+        return {"error": "Could not open video"}
 
     counter = 0
     good_reps = 0
@@ -77,18 +48,20 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
     reps_feedback = []
     problem_reps = []
     stage = None
+    prev_knee_angle = None
+    prev_stage = None
+    angle_idle = 0
     rep_min_angle = 180
     rep_max_depth = 0
-    prev_stage = None
-    prev_knee_angle = None
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+        frame_idx = 0
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-            current_frame = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-            if current_frame % frame_skip != 0:
+            frame_idx += 1
+            if frame_idx % frame_skip != 0:
                 continue
             if scale != 1.0:
                 frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
@@ -96,77 +69,104 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
             results = pose.process(image)
             if not results.pose_landmarks:
                 continue
+            try:
+                lm = results.pose_landmarks.landmark
+                hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
+                knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
+                ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
+                shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
+                heel_y = lm[mp_pose.PoseLandmark.RIGHT_HEEL.value].y
+                foot_y = lm[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value].y
 
-            lm = results.pose_landmarks.landmark
-            hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
-            knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
-            ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
-            shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
-            heel_y = lm[mp_pose.PoseLandmark.RIGHT_HEEL.value].y
-            foot_y = lm[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value].y
+                knee_angle = calculate_angle(hip, knee, ankle)
+                back_angle = calculate_angle(shoulder, hip, knee)
 
-            knee_angle = calculate_angle(hip, knee, ankle)
-            back_angle = calculate_angle(shoulder, hip, knee)
-
-            hip_to_knee = abs(hip[1] - knee[1])
-            knee_to_ankle = abs(knee[1] - ankle[1])
-            depth_ratio = hip_to_knee / knee_to_ankle if knee_to_ankle != 0 else 0
-            rep_max_depth = max(rep_max_depth, round(min(depth_ratio, 1.0) * 10, 1))
-
-            old_stage = stage
-            if knee_angle < 90:
-                stage = "down"
-            if knee_angle > 160 and stage == "down":
-                stage = "up"
-
-                # Penalties
-                feedback = []
-                angle_pen = 3 if rep_min_angle > 110 else 1.5 if rep_min_angle > 100 else 0.5 if rep_min_angle > 95 else 0
-                if angle_pen == 3: feedback.append("Very shallow")
-                elif angle_pen == 1.5: feedback.append("Try deeper")
-                elif angle_pen == 0.5: feedback.append("Almost deep enough")
-
-                depth_pen = 4 if rep_max_depth < 6.5 else 3 if rep_max_depth < 7.5 else 1.5 if rep_max_depth < 8.5 else 0.5 if rep_max_depth < 9.5 else 0
-                if depth_pen >= 3: feedback.append("Too shallow")
-                elif depth_pen == 1.5: feedback.append("Try deeper")
-                elif depth_pen == 0.5: feedback.append("Almost deep enough")
-
-                back_pen = 1.5 if back_angle < 35 else 0
-                if back_pen > 0: feedback.append("Keep your back straighter")
-
-                heel_pen = 1.5 if heel_y < foot_y - 0.03 else 0
-                if heel_pen > 0: feedback.append("Keep your heels down")
-
-                total_pen = max(angle_pen, depth_pen) + back_pen + heel_pen
-                total_pen = min(total_pen, 6)
-                score = round(max(4, 10 - total_pen) * 2) / 2
-                counter += 1
-                all_scores.append(score)
-                reps_feedback.append("; ".join(set(feedback)) if feedback else "Perfect form")
-                if score >= 9.5:
-                    good_reps += 1
-                else:
-                    bad_reps += 1
-                    problem_reps.append(counter)
-                rep_min_angle = 180
-                rep_max_depth = 0
-
-            if stage == "down" and old_stage != "down":
-                rep_min_angle = knee_angle
-            if stage == "down":
-                rep_min_angle = min(rep_min_angle, knee_angle)
+                hip_to_knee = abs(hip[1] - knee[1])
+                knee_to_ankle = abs(knee[1] - ankle[1])
+                depth_ratio = hip_to_knee / knee_to_ankle if knee_to_ankle != 0 else 0
                 rep_max_depth = max(rep_max_depth, round(min(depth_ratio, 1.0) * 10, 1))
+
+                old_stage = stage
+                if knee_angle < 90:
+                    stage = "down"
+                if knee_angle > 160 and stage == "down":
+                    stage = "up"
+
+                    feedback_msgs = []
+
+                    # Penalty for knee angle
+                    angle_penalty = 0
+                    if rep_min_angle > 105:
+                        angle_penalty = 3
+                        feedback_msgs.append("Knee angle too shallow")
+                    elif rep_min_angle > 95:
+                        angle_penalty = 1.5
+                        feedback_msgs.append("Try to go deeper (angle)")
+                    elif rep_min_angle > 90:
+                        angle_penalty = 0.5
+                        feedback_msgs.append("Almost deep enough (angle)")
+
+                    # Penalty for depth
+                    depth_penalty = 0
+                    if rep_max_depth < 6.5:
+                        depth_penalty = 3
+                        feedback_msgs.append("Depth too shallow")
+                    elif rep_max_depth < 7.5:
+                        depth_penalty = 1.5
+                        feedback_msgs.append("Try to go deeper (depth)")
+                    elif rep_max_depth < 8.5:
+                        depth_penalty = 0.5
+                        feedback_msgs.append("Almost deep enough (depth)")
+
+                    # Back angle penalty
+                    back_penalty = 0
+                    if back_angle < 35:
+                        back_penalty = 1.5
+                        feedback_msgs.append("Keep your back straighter")
+
+                    # Heel penalty
+                    heel_penalty = 0
+                    if heel_y < foot_y - 0.03:
+                        heel_penalty = 1.5
+                        feedback_msgs.append("Keep your heels down")
+
+                    # Total penalty capped at 6
+                    total_penalty = min(6, angle_penalty + depth_penalty + back_penalty + heel_penalty)
+
+                    score = round(max(4, 10 - total_penalty) * 2) / 2
+                    feedback = "; ".join(feedback_msgs) if feedback_msgs else "Perfect form"
+
+                    counter += 1
+                    if score >= 9.5:
+                        good_reps += 1
+                    else:
+                        bad_reps += 1
+                        problem_reps.append(counter)
+                    all_scores.append(score)
+                    reps_feedback.append(feedback)
+                    rep_min_angle = 180
+                    rep_max_depth = 0
+
+                if stage == "down" and old_stage != "down":
+                    rep_min_angle = knee_angle
+                    rep_max_depth = round(min(depth_ratio, 1.0) * 10, 1)
+                if stage == "down":
+                    rep_min_angle = min(rep_min_angle, knee_angle)
+                    rep_max_depth = max(rep_max_depth, round(min(depth_ratio, 1.0) * 10, 1))
+
+            except Exception:
+                continue
 
     cap.release()
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
 
     return {
-        "squat_count": counter,
         "technique_score": technique_score,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
         "feedback": reps_feedback,
-        "problem_reps": problem_reps
+        "problem_reps": problem_reps,
+        "squat_count": counter
     }
 
 @app.route('/analyze', methods=['POST'])
@@ -182,11 +182,11 @@ def analyze():
     except OSError:
         pass
     result = run_analysis(compressed_path, frame_skip=3, scale=0.4)
+    if "error" in result:
+        return jsonify(result), 400
     return jsonify(result)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
 
-
-    
 
