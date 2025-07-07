@@ -36,34 +36,6 @@ def compress_video(input_path, scale=0.4):
     out.release()
     return temp.name
 
-def estimate_squat_depth(landmarks):
-    mp_pose = mp.solutions.pose
-    sides = [
-        (mp_pose.PoseLandmark.LEFT_HIP.value,
-         mp_pose.PoseLandmark.LEFT_KNEE.value,
-         mp_pose.PoseLandmark.LEFT_ANKLE.value),
-        (mp_pose.PoseLandmark.RIGHT_HIP.value,
-         mp_pose.PoseLandmark.RIGHT_KNEE.value,
-         mp_pose.PoseLandmark.RIGHT_ANKLE.value),
-    ]
-    ratios = []
-    for hip_idx, knee_idx, ankle_idx in sides:
-        hip = landmarks[hip_idx]
-        knee = landmarks[knee_idx]
-        ankle = landmarks[ankle_idx]
-        if hip.visibility < 0.5 or knee.visibility < 0.5 or ankle.visibility < 0.5:
-            continue
-        hip_to_knee = abs(hip.y - knee.y)
-        knee_to_ankle = abs(knee.y - ankle.y)
-        if knee_to_ankle == 0:
-            continue
-        ratios.append(hip_to_knee / knee_to_ankle)
-    if not ratios:
-        return 0.0
-    depth_ratio = np.mean(ratios)
-    depth_ratio = max(0.0, min(depth_ratio, 1.0))
-    return round(depth_ratio * 10, 1)
-
 def _detect_motion_indices(cap, frame_skip, scale, threshold):
     indices = []
     prev_gray = None
@@ -110,7 +82,6 @@ def run_analysis(video_path, frame_skip=2, scale=0.4, motion_threshold=2.0, angl
     prev_knee_angle = prev_stage = None
     angle_idle = 0
     rep_min_angle = 180
-    rep_max_depth = 0
     feedback_msgs = []
     start_time = time.time()
 
@@ -136,41 +107,26 @@ def run_analysis(video_path, frame_skip=2, scale=0.4, motion_threshold=2.0, angl
                 hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
                 knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
                 ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
-                shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
                 knee_angle = calculate_angle(hip, knee, ankle)
                 old_stage = stage
                 if knee_angle < 90:
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
-                    angle_penalty = ratio_penalty = 0
-                    if rep_min_angle <= 85:
-                        angle_penalty = 0
-                    elif rep_min_angle <= 92:
-                        angle_penalty = 0.5
-                        feedback_msgs.append("Almost deep enough")
-                    elif rep_min_angle <= 98:
-                        angle_penalty = 1.5
-                        feedback_msgs.append("Try deeper")
-                    else:
-                        angle_penalty = 3
-                        feedback_msgs.append("Too shallow")
-                    if rep_max_depth >= 9.5:
-                        ratio_penalty = 0
-                    elif rep_max_depth >= 8.5:
-                        ratio_penalty = 0.5
-                        feedback_msgs.append("Almost deep enough")
-                    elif rep_max_depth >= 7.5:
-                        ratio_penalty = 1.5
-                        feedback_msgs.append("Try deeper")
-                    else:
-                        ratio_penalty = 3
-                        feedback_msgs.append("Too shallow")
-                    total_penalty = angle_penalty + ratio_penalty
+
+                    # Knee-angle-only based penalty
                     if rep_min_angle > 100:
+                        total_penalty = 3
                         feedback_msgs.append("Too shallow (angle > 100°)")
-                        total_penalty += 3
-                    total_penalty = min(total_penalty, 6)
+                    elif rep_min_angle > 92:
+                        total_penalty = 1.5
+                        feedback_msgs.append("Try deeper")
+                    elif rep_min_angle > 85:
+                        total_penalty = 0.5
+                        feedback_msgs.append("Almost deep enough")
+                    else:
+                        total_penalty = 0
+
                     score = max(4, round((10 - total_penalty) * 2) / 2)
                     counter += 1
                     if score >= 9.5:
@@ -181,14 +137,12 @@ def run_analysis(video_path, frame_skip=2, scale=0.4, motion_threshold=2.0, angl
                     reps_feedback.append("; ".join(set(feedback_msgs)) if feedback_msgs else "Good depth")
                     all_scores.append(score)
                     rep_min_angle = 180
-                    rep_max_depth = 0
                     feedback_msgs = []
+
                 if stage == "down" and old_stage != "down":
                     rep_min_angle = knee_angle
-                    rep_max_depth = estimate_squat_depth(lm)
                 if stage == "down":
                     rep_min_angle = min(rep_min_angle, knee_angle)
-                    rep_max_depth = max(rep_max_depth, estimate_squat_depth(lm))
                 if prev_knee_angle is not None:
                     if abs(knee_angle - prev_knee_angle) < angle_epsilon and stage == prev_stage:
                         angle_idle += 1
@@ -240,4 +194,3 @@ def analyze():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
