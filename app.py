@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cv2
@@ -84,6 +85,7 @@ def run_analysis(video_path, frame_skip=2, scale=0.4, motion_threshold=2.0, angl
     rep_min_angle = 180
     feedback_msgs = []
     start_time = time.time()
+    missed_depth_flag = False
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         frame_index = start_frame - 1
@@ -113,21 +115,7 @@ def run_analysis(video_path, frame_skip=2, scale=0.4, motion_threshold=2.0, angl
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
-
-                    print(f'rep_min_angle: {rep_min_angle}')
-
-                    if rep_min_angle > 100:
-                        total_penalty = 3
-                        feedback_msgs.append("Too shallow (angle > 100°)")
-                    elif rep_min_angle > 92:
-                        total_penalty = 1.5
-                        feedback_msgs.append("Try deeper")
-                    elif rep_min_angle > 85:
-                        total_penalty = 0.5
-                        feedback_msgs.append("Almost deep enough")
-                    else:
-                        total_penalty = 0
-
+                    total_penalty = 3 if missed_depth_flag else 0
                     score = max(4, round((10 - total_penalty) * 2) / 2)
                     counter += 1
                     if score >= 9.5:
@@ -135,15 +123,18 @@ def run_analysis(video_path, frame_skip=2, scale=0.4, motion_threshold=2.0, angl
                     else:
                         bad_reps += 1
                         problem_reps.append(counter)
-                    reps_feedback.append("; ".join(set(feedback_msgs)) if feedback_msgs else "Good depth")
+                    reps_feedback.append("Too shallow (knee > 100°)" if missed_depth_flag else "Good depth")
                     all_scores.append(score)
                     rep_min_angle = 180
+                    missed_depth_flag = False
                     feedback_msgs = []
-
                 if stage == "down" and old_stage != "down":
                     rep_min_angle = knee_angle
+                    missed_depth_flag = False
                 if stage == "down":
                     rep_min_angle = min(rep_min_angle, knee_angle)
+                    if knee_angle > 100:
+                        missed_depth_flag = True
                 if prev_knee_angle is not None:
                     if abs(knee_angle - prev_knee_angle) < angle_epsilon and stage == prev_stage:
                         angle_idle += 1
