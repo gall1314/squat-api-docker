@@ -227,6 +227,6 @@ def analyze():
     return jsonify(result)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0:8080", port=10000)
 
 
