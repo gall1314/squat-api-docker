@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cv2
@@ -6,7 +5,6 @@ import mediapipe as mp
 import numpy as np
 import tempfile
 import os
-import time
 
 app = Flask(__name__)
 CORS(app)
@@ -55,13 +53,16 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
     angle_idle = 0
     rep_min_angle = 180
     rep_max_depth = 0
-    start_time = time.time()
+    frame_idx = 0
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
+            frame_idx += 1
+            if frame_idx % frame_skip != 0:
+                continue
             if scale != 1.0:
                 frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -83,7 +84,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                 hip_to_knee = abs(hip[1] - knee[1])
                 knee_to_ankle = abs(knee[1] - ankle[1])
                 depth_ratio = hip_to_knee / knee_to_ankle if knee_to_ankle != 0 else 0
-                rep_max_depth = round(min(depth_ratio, 1.0) * 10, 1)
+                rep_max_depth = max(rep_max_depth, round(min(depth_ratio, 1.0) * 10, 1))
 
                 old_stage = stage
                 if knee_angle < 90:
@@ -93,45 +94,46 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
 
                     feedbacks = []
 
-                    # Penalties
+                    # Angle penalties
                     angle_pen = 0
-                    if rep_min_angle > 100:
+                    if rep_min_angle > 110:
                         angle_pen = 3
                         feedbacks.append("Very shallow")
-                    elif rep_min_angle > 90:
+                    elif rep_min_angle > 100:
                         angle_pen = 1.5
                         feedbacks.append("Try deeper")
-                    elif rep_min_angle > 85:
+                    elif rep_min_angle > 95:
                         angle_pen = 0.5
                         feedbacks.append("Almost deep enough")
 
+                    # Depth penalties
                     depth_pen = 0
-                    if rep_max_depth < 7.5:
+                    if rep_max_depth < 6.5:
+                        depth_pen = 4
+                        feedbacks.append("Too shallow")
+                    elif rep_max_depth < 7.5:
                         depth_pen = 3
-                        if "Very shallow" not in feedbacks:
-                            feedbacks.append("Too shallow")
+                        feedbacks.append("Too shallow")
                     elif rep_max_depth < 8.5:
                         depth_pen = 1.5
-                        if "Try deeper" not in feedbacks:
-                            feedbacks.append("Try deeper")
+                        feedbacks.append("Try deeper")
                     elif rep_max_depth < 9.5:
                         depth_pen = 0.5
-                        if "Almost deep enough" not in feedbacks:
-                            feedbacks.append("Almost deep enough")
+                        feedbacks.append("Almost deep enough")
 
-                    back_pen = 0
-                    if back_angle < 30:
-                        back_pen = 1.5
+                    # Back posture
+                    back_pen = 1.5 if back_angle < 35 else 0
+                    if back_pen:
                         feedbacks.append("Keep your back straighter")
 
-                    heel_pen = 0
-                    if heel[0] < foot_index[0] - 0.03:
-                        heel_pen = 1.5
+                    # Heels down
+                    heel_pen = 1.5 if heel[0] < foot_index[0] - 0.03 else 0
+                    if heel_pen:
                         feedbacks.append("Keep your heels down")
 
-                    top_lock_pen = 0
-                    if knee_angle < 165:
-                        top_lock_pen = 1
+                    # Lockout
+                    top_lock_pen = 1 if knee_angle < 165 else 0
+                    if top_lock_pen:
                         feedbacks.append("Incomplete lockout")
 
                     total_penalty = max(angle_pen, depth_pen) + back_pen + heel_pen + top_lock_pen
@@ -139,6 +141,9 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
 
                     score = round(max(4, 10 - total_penalty) * 2) / 2
                     feedback = "; ".join(feedbacks) if feedbacks else "Perfect form"
+
+                    # Debug print – optional
+                    print(f"Rep #{counter+1}: score={score} | feedback: {feedback}")
 
                     counter += 1
                     if score >= 9.5:
@@ -153,19 +158,18 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
 
                 if stage == "down" and old_stage != "down":
                     rep_min_angle = knee_angle
+                    rep_max_depth = round(min(depth_ratio, 1.0) * 10, 1)
                 if stage == "down":
                     rep_min_angle = min(rep_min_angle, knee_angle)
+                    rep_max_depth = max(rep_max_depth, round(min(depth_ratio, 1.0) * 10, 1))
 
             except Exception:
                 continue
 
     cap.release()
-    elapsed_time = time.time() - start_time
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
 
     return {
-        "squat_count": counter,
-        "duration_seconds": round(elapsed_time),
         "technique_score": technique_score,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
@@ -192,4 +196,7 @@ def analyze():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
+
+    
 
