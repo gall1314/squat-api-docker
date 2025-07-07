@@ -10,8 +10,8 @@ import uuid
 app = Flask(__name__)
 CORS(app)
 
-ANNOTATED_DIR = "/tmp/annotated_videos"
-os.makedirs(ANNOTATED_DIR, exist_ok=True)
+MEDIA_DIR = "media"
+os.makedirs(MEDIA_DIR, exist_ok=True)
 
 def calculate_angle(a, b, c):
     a, b, c = map(np.array, [a, b, c])
@@ -39,30 +39,30 @@ def compress_video(input_path, scale=0.4):
     out.release()
     return temp.name
 
-def run_analysis_with_output(video_path, frame_skip=3, scale=0.4):
+def run_analysis(video_path, frame_skip=3, scale=0.4):
     mp_pose = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {"error": "Could not open video"}
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
-    output_path = os.path.join(ANNOTATED_DIR, f"squat_{uuid.uuid4().hex}.mp4")
-    out = cv2.VideoWriter(output_path, fourcc, fps // frame_skip, (width, height))
 
-    counter = 0
-    good_reps = 0
-    bad_reps = 0
+    video_id = str(uuid.uuid4().hex[:8])
+    output_filename = f"squat_{video_id}.mp4"
+    output_path = os.path.join(MEDIA_DIR, output_filename)
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps / frame_skip, (width, height))
+
+    counter = good_reps = bad_reps = 0
     all_scores = []
     reps_feedback = []
+    problem_reps = []
     stage = None
+    rep_min_angle = 180
     prev_knee_angle = None
     prev_stage = None
-    angle_idle = 0
-    rep_min_angle = 180
-    rep_max_depth = 0
+    feedback = "Waiting"
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         frame_idx = 0
@@ -76,105 +76,77 @@ def run_analysis_with_output(video_path, frame_skip=3, scale=0.4):
             frame = cv2.resize(frame, (width, height))
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
-            feedbacks = []
-            score = 10
+            annotated = frame.copy()
 
             if results.pose_landmarks:
-                lm = results.pose_landmarks.landmark
-                hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
-                knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
-                ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
-                shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
-                heel_y = lm[mp_pose.PoseLandmark.RIGHT_HEEL.value].y
-                foot_y = lm[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value].y
+                try:
+                    lm = results.pose_landmarks.landmark
+                    hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
+                    knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
+                    ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
+                    shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
 
-                knee_angle = calculate_angle(hip, knee, ankle)
-                back_angle = calculate_angle(shoulder, hip, knee)
+                    knee_angle = calculate_angle(hip, knee, ankle)
+                    back_angle = calculate_angle(shoulder, hip, knee)
 
-                hip_to_knee = abs(hip[1] - knee[1])
-                knee_to_ankle = abs(knee[1] - ankle[1])
-                depth_ratio = hip_to_knee / knee_to_ankle if knee_to_ankle else 0
-                rep_max_depth = round(min(depth_ratio, 1.0) * 10, 1)
+                    old_stage = stage
+                    if knee_angle < 90:
+                        stage = "down"
+                    if knee_angle > 160 and stage == "down":
+                        stage = "up"
+                        feedback = ""
+                        penalty = 0
 
-                old_stage = stage
-                if knee_angle < 90:
-                    stage = "down"
-                if knee_angle > 160 and stage == "down":
-                    stage = "up"
-                    angle_pen = 0
-                    if rep_min_angle > 110:
-                        angle_pen = 3
-                        feedbacks.append("Very shallow")
-                    elif rep_min_angle > 100:
-                        angle_pen = 1.5
-                        feedbacks.append("Try deeper")
-                    elif rep_min_angle > 95:
-                        angle_pen = 0.5
-                        feedbacks.append("Almost deep enough")
+                        if rep_min_angle > 110:
+                            penalty += 3
+                            feedback = "Very shallow"
+                        elif rep_min_angle > 100:
+                            penalty += 1.5
+                            feedback = "Try deeper"
+                        elif rep_min_angle > 95:
+                            penalty += 0.5
+                            feedback = "Almost deep enough"
+                        else:
+                            feedback = "Good depth"
 
-                    depth_pen = 0
-                    if rep_max_depth < 6.5:
-                        depth_pen = 4
-                        feedbacks.append("Too shallow")
-                    elif rep_max_depth < 7.5:
-                        depth_pen = 3
-                        if "Too shallow" not in feedbacks:
-                            feedbacks.append("Too shallow")
-                    elif rep_max_depth < 8.5:
-                        depth_pen = 1.5
-                        feedbacks.append("Try deeper")
-                    elif rep_max_depth < 9.5:
-                        depth_pen = 0.5
-                        feedbacks.append("Almost deep enough")
+                        score = round(max(4, 10 - penalty) * 2) / 2
+                        counter += 1
+                        if score >= 9.5:
+                            good_reps += 1
+                        else:
+                            bad_reps += 1
+                            problem_reps.append(counter)
+                        reps_feedback.append(feedback)
+                        all_scores.append(score)
+                        rep_min_angle = 180
 
-                    back_pen = 0
-                    if back_angle < 35:
-                        back_pen = 1.5
-                        feedbacks.append("Keep your back straighter")
+                    if stage == "down" and old_stage != "down":
+                        rep_min_angle = knee_angle
+                    if stage == "down":
+                        rep_min_angle = min(rep_min_angle, knee_angle)
 
-                    heel_pen = 0
-                    if heel_y < foot_y - 0.03:
-                        heel_pen = 1.5
-                        feedbacks.append("Keep your heels down")
+                    # Draw feedback on frame
+                    cv2.putText(annotated, f"Stage: {stage or '-'}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+                    cv2.putText(annotated, f"Angle: {int(knee_angle)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
+                    cv2.putText(annotated, f"Feedback: {feedback}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
+                except Exception:
+                    pass
 
-                    total_penalty = max(angle_pen, depth_pen) + back_pen + heel_pen
-                    score = round(max(4, 10 - total_penalty) * 2) / 2
-
-                    counter += 1
-                    if score >= 9.5:
-                        good_reps += 1
-                    else:
-                        bad_reps += 1
-                    all_scores.append(score)
-                    reps_feedback.append("; ".join(feedbacks))
-                    rep_min_angle = 180
-                    rep_max_depth = 0
-
-                if stage == "down" and old_stage != "down":
-                    rep_min_angle = knee_angle
-                if stage == "down":
-                    rep_min_angle = min(rep_min_angle, knee_angle)
-
-                cv2.putText(frame, f"Score: {score:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                for msg_idx, msg in enumerate(feedbacks):
-                    cv2.putText(frame, msg, (10, 60 + 30 * msg_idx), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
-            out.write(frame)
+            out.write(annotated)
 
     cap.release()
     out.release()
+
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
     return {
         "technique_score": technique_score,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
+        "squat_count": counter,
         "feedback": reps_feedback,
-        "video_url": f"/media/{os.path.basename(output_path)}"
+        "problem_reps": problem_reps,
+        "video_url": f"/media/{output_filename}"
     }
-
-@app.route('/media/<path:filename>')
-def media(filename):
-    return send_from_directory(ANNOTATED_DIR, filename)
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
@@ -188,12 +160,10 @@ def analyze():
         os.remove(temp.name)
     except OSError:
         pass
-    result = run_analysis_with_output(compressed_path)
-    if "error" in result:
-        return jsonify(result), 400
+    result = run_analysis(compressed_path, frame_skip=3, scale=0.4)
     return jsonify(result)
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
-
+@app.route("/media/<path:filename>")
+def serve_video(filename):
+    return send_from_directory(MEDIA_DIR, filename)
 
