@@ -40,6 +40,37 @@ def compress_video(input_path, scale=0.4):
     out.release()
     return temp.name
 
+def estimate_squat_depth(landmarks):
+    mp_pose = mp.solutions.pose
+    sides = [
+        (mp_pose.PoseLandmark.LEFT_HIP.value,
+         mp_pose.PoseLandmark.LEFT_KNEE.value,
+         mp_pose.PoseLandmark.LEFT_ANKLE.value),
+        (mp_pose.PoseLandmark.RIGHT_HIP.value,
+         mp_pose.PoseLandmark.RIGHT_KNEE.value,
+         mp_pose.PoseLandmark.RIGHT_ANKLE.value),
+    ]
+
+    ratios = []
+    for hip_idx, knee_idx, ankle_idx in sides:
+        hip = landmarks[hip_idx]
+        knee = landmarks[knee_idx]
+        ankle = landmarks[ankle_idx]
+        if hip.visibility < 0.5 or knee.visibility < 0.5 or ankle.visibility < 0.5:
+            continue
+        hip_to_knee = abs(hip.y - knee.y)
+        knee_to_ankle = abs(knee.y - ankle.y)
+        if knee_to_ankle == 0:
+            continue
+        ratios.append(hip_to_knee / knee_to_ankle)
+
+    if not ratios:
+        return 0.0
+
+    depth_ratio = np.mean(ratios)
+    depth_ratio = max(0.0, min(depth_ratio, 1.0))
+    return round(depth_ratio * 10, 1)
+
 def _detect_motion_indices(cap, frame_skip, scale, threshold):
     indices = []
     prev_gray = None
@@ -98,19 +129,18 @@ def run_analysis(
     all_scores = []
     reps_feedback = []
     problem_reps = []
-
-    frame_index = start_frame - 1
-    last_processed_idx = start_frame - frame_skip
-
     stage = None
     prev_knee_angle = None
     prev_stage = None
     angle_idle = 0
     rep_min_angle = 180
     rep_max_depth = 0
+    feedback_msgs = []
     start_time = time.time()
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+        frame_index = start_frame - 1
+        last_processed_idx = start_frame - frame_skip
         while cap.isOpened() and frame_index < end_frame:
             ret, frame = cap.read()
             if not ret:
@@ -137,30 +167,42 @@ def run_analysis(
 
                 knee_angle = calculate_angle(hip, knee, ankle)
 
-                feedback = []
-                penalties = 0
-
-                thigh_drop = knee[1] - hip[1]
-                if thigh_drop > 0.12:
-                    pass
-                elif 0.09 <= thigh_drop <= 0.12:
-                    feedback.append("Almost deep enough")
-                    penalties += 0.5
-                elif 0.06 <= thigh_drop < 0.09:
-                    feedback.append("Try to squat deeper")
-                    penalties += 1.5
-                else:
-                    feedback.append("Too shallow")
-                    penalties += 3
-
                 old_stage = stage
                 if knee_angle < 90:
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
 
-                    score = round(10 - penalties, 1)
-                    score = max(4, score)
+                    angle_penalty = 0
+                    ratio_penalty = 0
+
+                    if rep_min_angle <= 85:
+                        angle_penalty = 0
+                    elif rep_min_angle <= 92:
+                        angle_penalty = 0.5
+                        feedback_msgs.append("Almost deep enough")
+                    elif rep_min_angle <= 98:
+                        angle_penalty = 1.5
+                        feedback_msgs.append("Try deeper")
+                    else:
+                        angle_penalty = 3
+                        feedback_msgs.append("Too shallow")
+
+                    if rep_max_depth >= 9.5:
+                        ratio_penalty = 0
+                    elif rep_max_depth >= 8.5:
+                        ratio_penalty = 0.5
+                        feedback_msgs.append("Almost deep enough")
+                    elif rep_max_depth >= 7.5:
+                        ratio_penalty = 1.5
+                        feedback_msgs.append("Try deeper")
+                    else:
+                        ratio_penalty = 3
+                        feedback_msgs.append("Too shallow")
+
+                    total_penalty = min(angle_penalty + ratio_penalty, 6)
+                    score = 10 - total_penalty
+                    score = max(4, round(score * 2) / 2)
 
                     counter += 1
                     if score >= 9.5:
@@ -169,11 +211,19 @@ def run_analysis(
                         bad_reps += 1
                         problem_reps.append(counter)
 
+                    reps_feedback.append("; ".join(set(feedback_msgs)) if feedback_msgs else "Good depth")
                     all_scores.append(score)
-                    reps_feedback.append(" ".join(feedback) if feedback else "")
-
                     rep_min_angle = 180
                     rep_max_depth = 0
+                    feedback_msgs = []
+
+                if stage == "down" and old_stage != "down":
+                    rep_min_angle = knee_angle
+                    rep_max_depth = estimate_squat_depth(lm)
+
+                if stage == "down":
+                    rep_min_angle = min(rep_min_angle, knee_angle)
+                    rep_max_depth = max(rep_max_depth, estimate_squat_depth(lm))
 
                 if prev_knee_angle is not None:
                     if abs(knee_angle - prev_knee_angle) < angle_epsilon and stage == prev_stage:
@@ -187,17 +237,14 @@ def run_analysis(
 
                 prev_knee_angle = knee_angle
                 prev_stage = stage
+                angle_idle = 0
 
             except Exception:
                 continue
 
     cap.release()
     elapsed_time = time.time() - start_time
-
-    if counter == 0:
-        return {"error": "No clear squat movement detected", "duration_seconds": round(elapsed_time)}
-
-    technique_score = round(np.mean(all_scores), 1)
+    technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
 
     return {
         "squat_count": counter,
@@ -224,9 +271,8 @@ def analyze():
     except OSError:
         pass
 
-    frame_skip = request.args.get('frame_skip', '2')
     try:
-        frame_skip = max(1, int(frame_skip))
+        frame_skip = max(1, int(request.args.get('frame_skip', '2')))
     except ValueError:
         frame_skip = 2
 
