@@ -20,22 +20,18 @@ def compress_video(input_path, scale=0.4):
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         return input_path
-
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
-
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     out = cv2.VideoWriter(temp.name, fourcc, fps, (width, height))
-
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         frame = cv2.resize(frame, (width, height))
         out.write(frame)
-
     cap.release()
     out.release()
     return temp.name
@@ -50,7 +46,6 @@ def estimate_squat_depth(landmarks):
          mp_pose.PoseLandmark.RIGHT_KNEE.value,
          mp_pose.PoseLandmark.RIGHT_ANKLE.value),
     ]
-
     ratios = []
     for hip_idx, knee_idx, ankle_idx in sides:
         hip = landmarks[hip_idx]
@@ -63,10 +58,8 @@ def estimate_squat_depth(landmarks):
         if knee_to_ankle == 0:
             continue
         ratios.append(hip_to_knee / knee_to_ankle)
-
     if not ratios:
         return 0.0
-
     depth_ratio = np.mean(ratios)
     depth_ratio = max(0.0, min(depth_ratio, 1.0))
     return round(depth_ratio * 10, 1)
@@ -92,46 +85,29 @@ def _detect_motion_indices(cap, frame_skip, scale, threshold):
         prev_gray = gray
     return indices
 
-def run_analysis(
-    video_path,
-    frame_skip=2,
-    scale=0.4,
-    motion_threshold=2.0,
-    angle_epsilon=1.0,
-    max_angle_idle=5,
-    context_frames=6,
-):
+def run_analysis(video_path, frame_skip=2, scale=0.4, motion_threshold=2.0, angle_epsilon=1.0, max_angle_idle=5, context_frames=6):
     frame_skip = max(1, int(frame_skip))
-    if scale <= 0 or scale > 1:
-        scale = 1.0
-
+    scale = min(max(scale, 0.1), 1.0)
     mp_pose = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {"error": "Could not open video"}
-
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     motion_frames = _detect_motion_indices(cap, frame_skip, scale, motion_threshold)
     cap.release()
-
     if not motion_frames:
         return {"error": "No clear motion detected"}
-
     start_frame = max(0, min(motion_frames) - context_frames)
     end_frame = min(frame_count - 1, max(motion_frames) + context_frames)
-
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-    counter = 0
-    good_reps = 0
-    bad_reps = 0
+    counter = good_reps = bad_reps = 0
     all_scores = []
     reps_feedback = []
     problem_reps = []
     stage = None
-    prev_knee_angle = None
-    prev_stage = None
+    prev_knee_angle = prev_stage = None
     angle_idle = 0
     rep_min_angle = 180
     rep_max_depth = 0
@@ -149,33 +125,25 @@ def run_analysis(
             if frame_index - last_processed_idx < frame_skip:
                 continue
             last_processed_idx = frame_index
-
             if scale != 1.0:
                 frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
-
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
             if not results.pose_landmarks:
                 continue
-
             try:
                 lm = results.pose_landmarks.landmark
                 hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
                 knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
                 ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
                 shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
-
                 knee_angle = calculate_angle(hip, knee, ankle)
-
                 old_stage = stage
                 if knee_angle < 90:
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
-
-                    angle_penalty = 0
-                    ratio_penalty = 0
-
+                    angle_penalty = ratio_penalty = 0
                     if rep_min_angle <= 85:
                         angle_penalty = 0
                     elif rep_min_angle <= 92:
@@ -187,7 +155,6 @@ def run_analysis(
                     else:
                         angle_penalty = 3
                         feedback_msgs.append("Too shallow")
-
                     if rep_max_depth >= 9.5:
                         ratio_penalty = 0
                     elif rep_max_depth >= 8.5:
@@ -199,32 +166,29 @@ def run_analysis(
                     else:
                         ratio_penalty = 3
                         feedback_msgs.append("Too shallow")
-
-                    total_penalty = min(angle_penalty + ratio_penalty, 6)
-                    score = 10 - total_penalty
-                    score = max(4, round(score * 2) / 2)
-
+                    total_penalty = angle_penalty + ratio_penalty
+                    if rep_min_angle > 100:
+                        feedback_msgs.append("Too shallow (angle > 100°)")
+                        total_penalty += 3
+                    total_penalty = min(total_penalty, 6)
+                    score = max(4, round((10 - total_penalty) * 2) / 2)
                     counter += 1
                     if score >= 9.5:
                         good_reps += 1
                     else:
                         bad_reps += 1
                         problem_reps.append(counter)
-
                     reps_feedback.append("; ".join(set(feedback_msgs)) if feedback_msgs else "Good depth")
                     all_scores.append(score)
                     rep_min_angle = 180
                     rep_max_depth = 0
                     feedback_msgs = []
-
                 if stage == "down" and old_stage != "down":
                     rep_min_angle = knee_angle
                     rep_max_depth = estimate_squat_depth(lm)
-
                 if stage == "down":
                     rep_min_angle = min(rep_min_angle, knee_angle)
                     rep_max_depth = max(rep_max_depth, estimate_squat_depth(lm))
-
                 if prev_knee_angle is not None:
                     if abs(knee_angle - prev_knee_angle) < angle_epsilon and stage == prev_stage:
                         angle_idle += 1
@@ -234,18 +198,15 @@ def run_analysis(
                             continue
                     else:
                         angle_idle = 0
-
                 prev_knee_angle = knee_angle
                 prev_stage = stage
                 angle_idle = 0
-
             except Exception:
                 continue
 
     cap.release()
     elapsed_time = time.time() - start_time
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
-
     return {
         "squat_count": counter,
         "duration_seconds": round(elapsed_time),
@@ -261,23 +222,18 @@ def analyze():
     video_file = request.files.get('video')
     if not video_file:
         return jsonify({"error": "No video uploaded"}), 400
-
     temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     video_file.save(temp.name)
-
     compressed_path = compress_video(temp.name, scale=0.4)
     try:
         os.remove(temp.name)
     except OSError:
         pass
-
     try:
         frame_skip = max(1, int(request.args.get('frame_skip', '2')))
     except ValueError:
         frame_skip = 2
-
     result = run_analysis(compressed_path, frame_skip=frame_skip, scale=0.4)
-
     if "error" in result:
         return jsonify(result), 400
     return jsonify(result)
