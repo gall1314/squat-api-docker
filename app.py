@@ -14,49 +14,28 @@ def calculate_angle(a, b, c):
     radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import cv2
-import mediapipe as mp
-import numpy as np
-import tempfile
-import time
 
-app = Flask(__name__)
-CORS(app)
-
-def calculate_angle(a, b, c):
-    a, b, c = map(np.array, [a, b, c])
-    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
-    angle = np.abs(radians * 180.0 / np.pi)
-    return 360 - angle if angle > 180 else angle
-
-def _frame_generator(cap, frame_skip, scale, motion_threshold, idle_frames=5):
-    frame_index = 0
+def _detect_motion_indices(cap, frame_skip, scale, threshold):
+    """Return frame indices with motion based on absdiff."""
+    indices = []
     prev_gray = None
-    idle = 0
+    index = -1
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
-        frame_index += 1
-        if frame_index % frame_skip != 0:
+        index += 1
+        if index % frame_skip != 0:
             continue
         if scale != 1.0:
             frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
-
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if prev_gray is not None:
             diff = cv2.absdiff(gray, prev_gray)
-            if np.mean(diff) < motion_threshold:
-                idle += 1
-                if idle < idle_frames:
-                    prev_gray = gray
-                    continue
-            else:
-                idle = 0
+            if np.mean(diff) > threshold:
+                indices.append(index)
         prev_gray = gray
-        yield frame
+    return indices
 
 def run_analysis(
     video_path,
@@ -65,7 +44,7 @@ def run_analysis(
     motion_threshold=2.0,
     angle_epsilon=1.0,
     max_angle_idle=5,
-    idle_frames=5,
+    context_frames=10,
 ):
     frame_skip = max(1, int(frame_skip))
     if scale <= 0 or scale > 1:
@@ -76,6 +55,21 @@ def run_analysis(
     if not cap.isOpened():
         return {"error": "Could not open video"}
 
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    motion_frames = _detect_motion_indices(cap, frame_skip, scale, motion_threshold)
+    cap.release()
+
+    if not motion_frames:
+        return {"error": "No clear motion detected"}
+
+    indices_to_process = set()
+    for idx in motion_frames:
+        start = max(0, idx - context_frames)
+        end = min(frame_count - 1, idx + context_frames)
+        indices_to_process.update(range(start, end + 1))
+
+    cap = cv2.VideoCapture(video_path)
+
     counter = 0
     good_reps = 0
     bad_reps = 0
@@ -84,12 +78,21 @@ def run_analysis(
     stage = None
     start_time = time.time()
 
+    frame_index = -1
     prev_knee_angle = None
     prev_stage = None
     angle_idle = 0
-
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-        for frame in _frame_generator(cap, frame_skip, scale, motion_threshold, idle_frames):
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_index += 1
+            if frame_index % frame_skip != 0 or frame_index not in indices_to_process:
+                continue
+            if scale != 1.0:
+                frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
 
@@ -128,7 +131,7 @@ def run_analysis(
                 if knee_angle < 90:
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
-                    stage = "up"  # ← תוקן ה־if
+                    stage = "up"
 
                 if prev_knee_angle is not None:
                     if (
@@ -194,3 +197,4 @@ def analyze():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
