@@ -4,6 +4,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import tempfile
+import os
 import time
 
 app = Flask(__name__)
@@ -15,8 +16,31 @@ def calculate_angle(a, b, c):
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
+def compress_video(input_path, scale=0.5):
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        return input_path
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
+
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    out = cv2.VideoWriter(temp.name, fourcc, fps, (width, height))
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame = cv2.resize(frame, (width, height))
+        out.write(frame)
+
+    cap.release()
+    out.release()
+    return temp.name
+
 def _detect_motion_indices(cap, frame_skip, scale, threshold):
-    """Return frame indices with motion based on absdiff."""
     indices = []
     prev_gray = None
     index = -1
@@ -62,11 +86,13 @@ def run_analysis(
     if not motion_frames:
         return {"error": "No clear motion detected"}
 
-    indices_to_process = set()
+    indices_set = set()
     for idx in motion_frames:
         start = max(0, idx - context_frames)
         end = min(frame_count - 1, idx + context_frames)
-        indices_to_process.update(range(start, end + 1))
+        indices_set.update(range(start, end + 1))
+
+    indices_to_process = sorted(indices_set)
 
     cap = cv2.VideoCapture(video_path)
 
@@ -82,14 +108,31 @@ def run_analysis(
     prev_knee_angle = None
     prev_stage = None
     angle_idle = 0
+    process_ptr = 0
+    last_processed_idx = -frame_skip
+
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-        while cap.isOpened():
+        while cap.isOpened() and process_ptr < len(indices_to_process):
             ret, frame = cap.read()
             if not ret:
                 break
             frame_index += 1
-            if frame_index % frame_skip != 0 or frame_index not in indices_to_process:
+            if frame_index % frame_skip != 0:
                 continue
+            if frame_index < indices_to_process[process_ptr]:
+                continue
+            while process_ptr < len(indices_to_process) and frame_index > indices_to_process[process_ptr]:
+                process_ptr += 1
+            if process_ptr >= len(indices_to_process):
+                break
+            if frame_index != indices_to_process[process_ptr]:
+                continue
+            if frame_index - last_processed_idx < frame_skip:
+                process_ptr += 1
+                continue
+            last_processed_idx = frame_index
+            process_ptr += 1
+
             if scale != 1.0:
                 frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
 
@@ -189,7 +232,26 @@ def analyze():
     temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     video_file.save(temp.name)
 
-    result = run_analysis(temp.name)
+    compressed_path = compress_video(temp.name, scale=0.5)
+    try:
+        os.remove(temp.name)
+    except OSError:
+        pass
+
+    frame_skip = request.args.get('frame_skip', '2')
+    scale = request.args.get('scale', '0.5')
+    try:
+        frame_skip = max(1, int(frame_skip))
+    except ValueError:
+        frame_skip = 2
+    try:
+        scale = float(scale)
+        if scale <= 0 or scale > 1:
+            scale = 0.5
+    except ValueError:
+        scale = 0.5
+
+    result = run_analysis(compressed_path, frame_skip=frame_skip, scale=scale)
 
     if "error" in result:
         return jsonify(result), 400
