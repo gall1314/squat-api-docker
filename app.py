@@ -1,3 +1,6 @@
++35
+-2
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cv2
@@ -16,6 +19,21 @@ def calculate_angle(a, b, c):
     return 360 - angle if angle > 180 else angle
 
 def run_analysis(video_path):
+def run_analysis(video_path, frame_skip=2, scale=0.5):
+    """Analyze squat technique in a video.
+
+    Args:
+        video_path (str): Path to the video file.
+        frame_skip (int, optional): Process every Nth frame. Defaults to 2.
+            Values below 1 are treated as 1.
+        scale (float, optional): Resize factor for frames (0 < scale <= 1).
+            Smaller values speed up processing. Defaults to 0.5.
+    Returns:
+        dict: Analysis results or an error message.
+    """
+    frame_skip = max(1, int(frame_skip))
+    if scale <= 0 or scale > 1:
+        scale = 1.0
     mp_pose = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -29,11 +47,17 @@ def run_analysis(video_path):
     stage = None
     start_time = time.time()
 
+    frame_index = 0
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
+            frame_index += 1
+            if frame_index % frame_skip != 0:
+                continue
+            if scale != 1.0:
+                frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
 
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
@@ -59,49 +83,7 @@ def run_analysis(video_path):
                 # עומק סקוואט לפי גובה ירך מול ברך
                 thigh_drop = knee[1] - hip[1]
                 if thigh_drop > 0.12:
-                    pass  # מעולה, לא מוסיפים כלום
-                elif 0.09 <= thigh_drop <= 0.12:
-                    feedback.append("Almost deep enough – try just a bit lower")
-                    penalties += 0.5
-                elif 0.06 <= thigh_drop < 0.09:
-                    feedback.append("Try to squat deeper")
-                    penalties += 1.5
-                else:
-                    feedback.append("The squat is too shallow – go deeper")
-                    penalties += 3
-
-                # שמירת שלב התנועה לפי זווית ברך
-                if knee_angle < 90:
-                    stage = "down"
-                if knee_angle > 160 and stage == "down":
-                    stage = "up"
-
-                    # תנוחת גב לפי שלב
-                    if back_angle < 150:
-                        if thigh_drop > 0.12 and back_angle < 130:
-                            feedback.append("Try to stand up straighter at the top")
-                            penalties += 1
-                        elif thigh_drop <= 0.12 and back_angle < 110:
-                            feedback.append("Your back is too rounded – try to stay more upright")
-                            penalties += 1
-
-                    # עקבים
-                    if heel[1] < foot_index[1] - 0.02:
-                        feedback.append("Keep your heels firmly on the ground")
-                        penalties += 1.5
-
-                    counter += 1
-                    score = max(4, round(10 - penalties, 1))
-                    all_scores.append(score)
-                    reps_feedback.append({"rep": counter, "score": score, "issues": feedback})
-                    if feedback:
-                        bad_reps += 1
-                    else:
-                        good_reps += 1
-
-            except Exception:
-                continue
-
+@@ -105,33 +125,46 @@ def run_analysis(video_path):
     cap.release()
     elapsed_time = time.time() - start_time
 
@@ -128,6 +110,20 @@ def analyze():
     temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     video_file.save(temp.name)
     result = run_analysis(temp.name)
+    frame_skip = request.args.get('frame_skip', '2')
+    scale = request.args.get('scale', '0.5')
+    try:
+        frame_skip = max(1, int(frame_skip))
+    except ValueError:
+        frame_skip = 2
+    try:
+        scale = float(scale)
+        if scale <= 0 or scale > 1:
+            scale = 0.5
+    except ValueError:
+        scale = 0.5
+
+    result = run_analysis(temp.name, frame_skip=frame_skip, scale=scale)
 
     if "error" in result:
         return jsonify(result), 400
