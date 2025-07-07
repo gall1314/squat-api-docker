@@ -237,6 +237,8 @@ def analyze():
         return jsonify(result), 400
     return jsonify(result)
 
+# ✅ הפעלת השרת על הפורט והכתובת ש־Fly מצפה להם
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=8080)
+
 
