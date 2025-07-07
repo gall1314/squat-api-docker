@@ -1,6 +1,3 @@
-+109
--10
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cv2
@@ -19,7 +16,6 @@ def calculate_angle(a, b, c):
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
-def run_analysis(video_path, frame_skip=2, scale=0.5):
 def compress_video(input_path, scale=0.4):
     """Return path to a compressed copy of the input video."""
     cap = cv2.VideoCapture(input_path)
@@ -46,7 +42,6 @@ def compress_video(input_path, scale=0.4):
     return temp.name
 
 def _detect_motion_indices(cap, frame_skip, scale, threshold):
-    """Return frame indices with motion based on absdiff."""
     indices = []
     prev_gray = None
     index = -1
@@ -76,7 +71,6 @@ def run_analysis(
     max_angle_idle=5,
     context_frames=6,
 ):
-    """Analyze squat technique in a video."""
     frame_skip = max(1, int(frame_skip))
     if scale <= 0 or scale > 1:
         scale = 1.0
@@ -107,20 +101,20 @@ def run_analysis(
     stage = None
     start_time = time.time()
 
-    frame_index = 0
+    frame_index = start_frame - 1
     prev_knee_angle = None
     prev_stage = None
     angle_idle = 0
+    last_processed_idx = start_frame - frame_skip
+
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-        while cap.isOpened():
-        frame_index = start_frame - 1
-        last_processed_idx = start_frame - frame_skip
         while cap.isOpened() and frame_index < end_frame:
             ret, frame = cap.read()
             if not ret:
                 break
             frame_index += 1
             if frame_index % frame_skip != 0:
+                continue
             if frame_index - last_processed_idx < frame_skip:
                 continue
             last_processed_idx = frame_index
@@ -139,8 +133,6 @@ def run_analysis(
                 knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
                 ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
                 shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
-                heel = [lm[mp_pose.PoseLandmark.RIGHT_HEEL.value].x, lm[mp_pose.PoseLandmark.RIGHT_HEEL.value].y]
-                foot_index = [lm[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value].x, lm[mp_pose.PoseLandmark.RIGHT_FOOT_INDEX.value].y]
 
                 knee_angle = calculate_angle(hip, knee, ankle)
                 back_angle = calculate_angle(shoulder, hip, knee)
@@ -155,4 +147,96 @@ def run_analysis(
                     feedback.append("Almost deep enough")
                     penalties += 0.5
                 elif 0.06 <= thigh_drop < 0.09:
-   
+                    feedback.append("Try deeper")
+                    penalties += 1.5
+                else:
+                    feedback.append("Too shallow")
+                    penalties += 3
+
+                old_stage = stage
+                if knee_angle < 90:
+                    stage = "down"
+                elif knee_angle > 160 and stage == "down":
+                    stage = "up"
+
+                if prev_knee_angle is not None:
+                    if abs(knee_angle - prev_knee_angle) < angle_epsilon and stage == prev_stage:
+                        angle_idle += 1
+                        if angle_idle < max_angle_idle:
+                            prev_knee_angle = knee_angle
+                            prev_stage = stage
+                            continue
+                    else:
+                        angle_idle = 0
+
+                if stage == "up" and old_stage == "down":
+                    score = max(4, round(10 - penalties, 1))
+                    counter += 1
+                    if score >= 7:
+                        good_reps += 1
+                    else:
+                        bad_reps += 1
+                    all_scores.append(score)
+                    reps_feedback.append(feedback)
+
+                prev_knee_angle = knee_angle
+                prev_stage = stage
+                angle_idle = 0
+
+            except Exception:
+                continue
+
+    cap.release()
+    elapsed_time = time.time() - start_time
+
+    if counter == 0:
+        return {"error": "No clear squat movement detected", "duration_seconds": round(elapsed_time)}
+
+    technique_score = round(np.mean(all_scores), 1)
+
+    return {
+        "squat_count": counter,
+        "duration_seconds": round(elapsed_time),
+        "technique_score": technique_score,
+        "good_reps": good_reps,
+        "bad_reps": bad_reps,
+        "feedback": reps_feedback
+    }
+
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    video_file = request.files.get('video')
+    if not video_file:
+        return jsonify({"error": "No video uploaded"}), 400
+
+    temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+    video_file.save(temp.name)
+
+    compressed_path = compress_video(temp.name, scale=0.4)
+    try:
+        os.remove(temp.name)
+    except OSError:
+        pass
+
+    frame_skip = request.args.get('frame_skip', '2')
+    scale = request.args.get('scale', '0.4')
+    try:
+        frame_skip = max(1, int(frame_skip))
+    except ValueError:
+        frame_skip = 2
+    try:
+        scale = float(scale)
+        if scale <= 0 or scale > 1:
+            scale = 0.4
+    except ValueError:
+        scale = 0.4
+
+    result = run_analysis(compressed_path, frame_skip=frame_skip, scale=scale)
+
+    if "error" in result:
+        return jsonify(result), 400
+    return jsonify(result)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
+
