@@ -17,7 +17,6 @@ def calculate_angle(a, b, c):
     return 360 - angle if angle > 180 else angle
 
 def compress_video(input_path, scale=0.4):
-    """Return path to a compressed copy of the input video."""
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         return input_path
@@ -62,15 +61,7 @@ def _detect_motion_indices(cap, frame_skip, scale, threshold):
         prev_gray = gray
     return indices
 
-def run_analysis(
-    video_path,
-    frame_skip=2,
-    scale=0.4,
-    motion_threshold=2.0,
-    angle_epsilon=1.0,
-    max_angle_idle=5,
-    context_frames=6,
-):
+def run_analysis(video_path, frame_skip=2, scale=0.4, motion_threshold=2.0, angle_epsilon=1.0, max_angle_idle=5, context_frames=6):
     frame_skip = max(1, int(frame_skip))
     if scale <= 0 or scale > 1:
         scale = 1.0
@@ -102,10 +93,11 @@ def run_analysis(
     start_time = time.time()
 
     frame_index = start_frame - 1
+    last_processed_idx = start_frame - frame_skip
     prev_knee_angle = None
     prev_stage = None
     angle_idle = 0
-    last_processed_idx = start_frame - frame_skip
+    rep_min_angle = 180
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened() and frame_index < end_frame:
@@ -118,6 +110,7 @@ def run_analysis(
             if frame_index - last_processed_idx < frame_skip:
                 continue
             last_processed_idx = frame_index
+
             if scale != 1.0:
                 frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
 
@@ -135,29 +128,17 @@ def run_analysis(
                 shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
 
                 knee_angle = calculate_angle(hip, knee, ankle)
-                back_angle = calculate_angle(shoulder, hip, knee)
 
                 feedback = []
-                penalties = 0
-
-                thigh_drop = knee[1] - hip[1]
-                if thigh_drop > 0.12:
-                    pass
-                elif 0.09 <= thigh_drop <= 0.12:
-                    feedback.append("Almost deep enough")
-                    penalties += 0.5
-                elif 0.06 <= thigh_drop < 0.09:
-                    feedback.append("Try deeper")
-                    penalties += 1.5
-                else:
-                    feedback.append("Too shallow")
-                    penalties += 3
 
                 old_stage = stage
                 if knee_angle < 90:
                     stage = "down"
                 elif knee_angle > 160 and stage == "down":
                     stage = "up"
+
+                if stage == "down":
+                    rep_min_angle = min(rep_min_angle, knee_angle)
 
                 if prev_knee_angle is not None:
                     if abs(knee_angle - prev_knee_angle) < angle_epsilon and stage == prev_stage:
@@ -170,7 +151,18 @@ def run_analysis(
                         angle_idle = 0
 
                 if stage == "up" and old_stage == "down":
-                    score = max(4, round(10 - penalties, 1))
+                    if rep_min_angle <= 85:
+                        score = 10
+                    elif rep_min_angle <= 92:
+                        score = 9.5
+                        feedback.append("Almost deep enough")
+                    elif rep_min_angle <= 98:
+                        score = 8.5
+                        feedback.append("Try deeper")
+                    else:
+                        score = 7
+                        feedback.append("Too shallow")
+
                     counter += 1
                     if score >= 7:
                         good_reps += 1
@@ -178,6 +170,7 @@ def run_analysis(
                         bad_reps += 1
                     all_scores.append(score)
                     reps_feedback.append(feedback)
+                    rep_min_angle = 180
 
                 prev_knee_angle = knee_angle
                 prev_stage = stage
@@ -218,17 +211,13 @@ def analyze():
     except OSError:
         pass
 
-    frame_skip = request.args.get('frame_skip', '2')
-    scale = request.args.get('scale', '0.4')
     try:
-        frame_skip = max(1, int(frame_skip))
-    except ValueError:
-        frame_skip = 2
-    try:
-        scale = float(scale)
+        frame_skip = max(1, int(request.args.get('frame_skip', '2')))
+        scale = float(request.args.get('scale', '0.4'))
         if scale <= 0 or scale > 1:
             scale = 0.4
     except ValueError:
+        frame_skip = 2
         scale = 0.4
 
     result = run_analysis(compressed_path, frame_skip=frame_skip, scale=scale)
@@ -237,8 +226,7 @@ def analyze():
         return jsonify(result), 400
     return jsonify(result)
 
-# ✅ הפעלת השרת על הפורט והכתובת ש־Fly מצפה להם
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    app.run(host="0.0.0.0", port=10000)
 
 
