@@ -15,7 +15,30 @@ def calculate_angle(a, b, c):
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
-def run_analysis(video_path, frame_skip=2, scale=0.5):
+def _frame_generator(cap, frame_skip, scale, motion_threshold):
+    """Yield frames that contain meaningful motion."""
+    frame_index = 0
+    prev_gray = None
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_index += 1
+        if frame_index % frame_skip != 0:
+            continue
+        if scale != 1.0:
+            frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if prev_gray is not None:
+            diff = cv2.absdiff(gray, prev_gray)
+            if np.mean(diff) < motion_threshold:
+                prev_gray = gray
+                continue
+        prev_gray = gray
+        yield frame
+
+def run_analysis(video_path, frame_skip=2, scale=0.5, motion_threshold=2.0, angle_threshold=2.0):
     """Analyze squat technique in a video."""
     frame_skip = max(1, int(frame_skip))
     if scale <= 0 or scale > 1:
@@ -34,18 +57,10 @@ def run_analysis(video_path, frame_skip=2, scale=0.5):
     stage = None
     start_time = time.time()
 
-    frame_index = 0
+    prev_knee_angle = None
+    prev_stage = None
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_index += 1
-            if frame_index % frame_skip != 0:
-                continue
-            if scale != 1.0:
-                frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
-
+        for frame in _frame_generator(cap, frame_skip, scale, motion_threshold):
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
 
@@ -80,10 +95,23 @@ def run_analysis(video_path, frame_skip=2, scale=0.5):
                     feedback.append("Too shallow")
                     penalties += 3
 
+                old_stage = stage
                 if knee_angle < 90:
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
+
+                # דילוג אם אין שינוי בזווית או מצב
+                if (
+                    prev_knee_angle is not None
+                    and abs(knee_angle - prev_knee_angle) < angle_threshold
+                    and stage == prev_stage
+                ):
+                    prev_knee_angle = knee_angle
+                    prev_stage = stage
+                    continue
+
+                if stage == "up" and old_stage == "down":
                     score = max(4, round(10 - penalties, 1))
                     counter += 1
                     if score >= 7:
@@ -92,6 +120,9 @@ def run_analysis(video_path, frame_skip=2, scale=0.5):
                         bad_reps += 1
                     all_scores.append(score)
                     reps_feedback.append(feedback)
+
+                prev_knee_angle = knee_angle
+                prev_stage = stage
 
             except Exception:
                 continue
