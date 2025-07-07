@@ -1,6 +1,3 @@
-+35
--2
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cv2
@@ -18,22 +15,12 @@ def calculate_angle(a, b, c):
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
-def run_analysis(video_path):
 def run_analysis(video_path, frame_skip=2, scale=0.5):
-    """Analyze squat technique in a video.
-
-    Args:
-        video_path (str): Path to the video file.
-        frame_skip (int, optional): Process every Nth frame. Defaults to 2.
-            Values below 1 are treated as 1.
-        scale (float, optional): Resize factor for frames (0 < scale <= 1).
-            Smaller values speed up processing. Defaults to 0.5.
-    Returns:
-        dict: Analysis results or an error message.
-    """
+    """Analyze squat technique in a video."""
     frame_skip = max(1, int(frame_skip))
     if scale <= 0 or scale > 1:
         scale = 1.0
+
     mp_pose = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -80,10 +67,35 @@ def run_analysis(video_path, frame_skip=2, scale=0.5):
                 feedback = []
                 penalties = 0
 
-                # עומק סקוואט לפי גובה ירך מול ברך
                 thigh_drop = knee[1] - hip[1]
                 if thigh_drop > 0.12:
-@@ -105,33 +125,46 @@ def run_analysis(video_path):
+                    pass
+                elif 0.09 <= thigh_drop <= 0.12:
+                    feedback.append("Almost deep enough")
+                    penalties += 0.5
+                elif 0.06 <= thigh_drop < 0.09:
+                    feedback.append("Try deeper")
+                    penalties += 1.5
+                else:
+                    feedback.append("Too shallow")
+                    penalties += 3
+
+                if knee_angle < 90:
+                    stage = "down"
+                if knee_angle > 160 and stage == "down":
+                    stage = "up"
+                    score = max(4, round(10 - penalties, 1))
+                    counter += 1
+                    if score >= 7:
+                        good_reps += 1
+                    else:
+                        bad_reps += 1
+                    all_scores.append(score)
+                    reps_feedback.append(feedback)
+
+            except Exception:
+                continue
+
     cap.release()
     elapsed_time = time.time() - start_time
 
@@ -109,7 +121,7 @@ def analyze():
 
     temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
     video_file.save(temp.name)
-    result = run_analysis(temp.name)
+
     frame_skip = request.args.get('frame_skip', '2')
     scale = request.args.get('scale', '0.5')
     try:
