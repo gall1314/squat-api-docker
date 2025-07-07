@@ -82,9 +82,9 @@ def run_analysis(video_path, frame_skip=2, scale=0.4, motion_threshold=2.0, angl
     prev_knee_angle = prev_stage = None
     angle_idle = 0
     rep_min_angle = 180
+    angle_violations = []
     feedback_msgs = []
     start_time = time.time()
-    worst_depth_penalty = 0
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         frame_index = start_frame - 1
@@ -114,29 +114,53 @@ def run_analysis(video_path, frame_skip=2, scale=0.4, motion_threshold=2.0, angl
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
-                    score = max(4, round((10 - worst_depth_penalty) * 2) / 2)
+
+                    # Analyze violations
+                    counts = {3: 0, 1.5: 0, 0.5: 0}
+                    for angle in angle_violations:
+                        if angle > 103:
+                            counts[3] += 1
+                        elif angle > 96:
+                            counts[1.5] += 1
+                        elif angle > 90:
+                            counts[0.5] += 1
+
+                    total = sum(counts.values())
+                    if total == 0:
+                        penalty = 0
+                        feedback = "Good depth"
+                    else:
+                        # Allow small number of soft violations
+                        if counts[3] > 0:
+                            penalty = 3
+                            feedback = "Too shallow (angle > 103°)"
+                        elif counts[1.5] > 1:
+                            penalty = 1.5
+                            feedback = "Try deeper"
+                        elif counts[0.5] > 2:
+                            penalty = 0.5
+                            feedback = "Almost deep enough"
+                        else:
+                            penalty = 0
+                            feedback = "Good depth"
+
+                    score = max(4, round((10 - penalty) * 2) / 2)
                     counter += 1
                     if score >= 9.5:
                         good_reps += 1
                     else:
                         bad_reps += 1
                         problem_reps.append(counter)
-                    reps_feedback.append("Depth issue" if worst_depth_penalty > 0 else "Good depth")
+                    reps_feedback.append(feedback)
                     all_scores.append(score)
+                    angle_violations = []
                     rep_min_angle = 180
-                    worst_depth_penalty = 0
-                    feedback_msgs = []
                 if stage == "down" and old_stage != "down":
+                    angle_violations = []
                     rep_min_angle = knee_angle
-                    worst_depth_penalty = 0
                 if stage == "down":
                     rep_min_angle = min(rep_min_angle, knee_angle)
-                    if knee_angle > 100:
-                        worst_depth_penalty = max(worst_depth_penalty, 3)
-                    elif knee_angle > 92:
-                        worst_depth_penalty = max(worst_depth_penalty, 1.5)
-                    elif knee_angle > 85:
-                        worst_depth_penalty = max(worst_depth_penalty, 0.5)
+                    angle_violations.append(knee_angle)
                 if prev_knee_angle is not None:
                     if abs(knee_angle - prev_knee_angle) < angle_epsilon and stage == prev_stage:
                         angle_idle += 1
@@ -189,3 +213,4 @@ def analyze():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
