@@ -1,3 +1,6 @@
++109
+-10
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cv2
@@ -16,7 +19,9 @@ def calculate_angle(a, b, c):
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
-def compress_video(input_path, scale=0.5):
+def run_analysis(video_path, frame_skip=2, scale=0.5):
+def compress_video(input_path, scale=0.4):
+    """Return path to a compressed copy of the input video."""
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
         return input_path
@@ -41,6 +46,7 @@ def compress_video(input_path, scale=0.5):
     return temp.name
 
 def _detect_motion_indices(cap, frame_skip, scale, threshold):
+    """Return frame indices with motion based on absdiff."""
     indices = []
     prev_gray = None
     index = -1
@@ -64,12 +70,13 @@ def _detect_motion_indices(cap, frame_skip, scale, threshold):
 def run_analysis(
     video_path,
     frame_skip=2,
-    scale=0.5,
+    scale=0.4,
     motion_threshold=2.0,
     angle_epsilon=1.0,
     max_angle_idle=5,
-    context_frames=10,
+    context_frames=6,
 ):
+    """Analyze squat technique in a video."""
     frame_skip = max(1, int(frame_skip))
     if scale <= 0 or scale > 1:
         scale = 1.0
@@ -86,15 +93,11 @@ def run_analysis(
     if not motion_frames:
         return {"error": "No clear motion detected"}
 
-    indices_set = set()
-    for idx in motion_frames:
-        start = max(0, idx - context_frames)
-        end = min(frame_count - 1, idx + context_frames)
-        indices_set.update(range(start, end + 1))
-
-    indices_to_process = sorted(indices_set)
+    start_frame = max(0, min(motion_frames) - context_frames)
+    end_frame = min(frame_count - 1, max(motion_frames) + context_frames)
 
     cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
     counter = 0
     good_reps = 0
@@ -104,35 +107,23 @@ def run_analysis(
     stage = None
     start_time = time.time()
 
-    frame_index = -1
+    frame_index = 0
     prev_knee_angle = None
     prev_stage = None
     angle_idle = 0
-    process_ptr = 0
-    last_processed_idx = -frame_skip
-
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-        while cap.isOpened() and process_ptr < len(indices_to_process):
+        while cap.isOpened():
+        frame_index = start_frame - 1
+        last_processed_idx = start_frame - frame_skip
+        while cap.isOpened() and frame_index < end_frame:
             ret, frame = cap.read()
             if not ret:
                 break
             frame_index += 1
             if frame_index % frame_skip != 0:
-                continue
-            if frame_index < indices_to_process[process_ptr]:
-                continue
-            while process_ptr < len(indices_to_process) and frame_index > indices_to_process[process_ptr]:
-                process_ptr += 1
-            if process_ptr >= len(indices_to_process):
-                break
-            if frame_index != indices_to_process[process_ptr]:
-                continue
             if frame_index - last_processed_idx < frame_skip:
-                process_ptr += 1
                 continue
             last_processed_idx = frame_index
-            process_ptr += 1
-
             if scale != 1.0:
                 frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
 
@@ -164,99 +155,4 @@ def run_analysis(
                     feedback.append("Almost deep enough")
                     penalties += 0.5
                 elif 0.06 <= thigh_drop < 0.09:
-                    feedback.append("Try deeper")
-                    penalties += 1.5
-                else:
-                    feedback.append("Too shallow")
-                    penalties += 3
-
-                old_stage = stage
-                if knee_angle < 90:
-                    stage = "down"
-                if knee_angle > 160 and stage == "down":
-                    stage = "up"
-
-                if prev_knee_angle is not None:
-                    if (
-                        abs(knee_angle - prev_knee_angle) < angle_epsilon
-                        and stage == prev_stage
-                    ):
-                        angle_idle += 1
-                        if angle_idle < max_angle_idle:
-                            prev_knee_angle = knee_angle
-                            prev_stage = stage
-                            continue
-                    else:
-                        angle_idle = 0
-
-                if stage == "up" and old_stage == "down":
-                    score = max(4, round(10 - penalties, 1))
-                    counter += 1
-                    if score >= 7:
-                        good_reps += 1
-                    else:
-                        bad_reps += 1
-                    all_scores.append(score)
-                    reps_feedback.append(feedback)
-
-                prev_knee_angle = knee_angle
-                prev_stage = stage
-                angle_idle = 0
-
-            except Exception:
-                continue
-
-    cap.release()
-    elapsed_time = time.time() - start_time
-
-    if counter == 0:
-        return {"error": "No clear squat movement detected", "duration_seconds": round(elapsed_time)}
-
-    technique_score = round(np.mean(all_scores), 1)
-
-    return {
-        "squat_count": counter,
-        "duration_seconds": round(elapsed_time),
-        "technique_score": technique_score,
-        "good_reps": good_reps,
-        "bad_reps": bad_reps,
-        "feedback": reps_feedback
-    }
-
-@app.route('/analyze', methods=['POST'])
-def analyze():
-    video_file = request.files.get('video')
-    if not video_file:
-        return jsonify({"error": "No video uploaded"}), 400
-
-    temp = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-    video_file.save(temp.name)
-
-    compressed_path = compress_video(temp.name, scale=0.5)
-    try:
-        os.remove(temp.name)
-    except OSError:
-        pass
-
-    frame_skip = request.args.get('frame_skip', '2')
-    scale = request.args.get('scale', '0.5')
-    try:
-        frame_skip = max(1, int(frame_skip))
-    except ValueError:
-        frame_skip = 2
-    try:
-        scale = float(scale)
-        if scale <= 0 or scale > 1:
-            scale = 0.5
-    except ValueError:
-        scale = 0.5
-
-    result = run_analysis(compressed_path, frame_skip=frame_skip, scale=scale)
-
-    if "error" in result:
-        return jsonify(result), 400
-    return jsonify(result)
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
-
+   
