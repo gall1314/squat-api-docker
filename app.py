@@ -114,9 +114,9 @@ def run_analysis(video_path, frame_skip=2, scale=0.4, motion_threshold=2.0, angl
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
 
-                    # Knee-angle-only based penalty
                     print(f'rep_min_angle: {rep_min_angle}')
-        if rep_min_angle > 100:
+
+                    if rep_min_angle > 100:
                         total_penalty = 3
                         feedback_msgs.append("Too shallow (angle > 100°)")
                     elif rep_min_angle > 92:
@@ -194,4 +194,5 @@ def analyze():
     return jsonify(result)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
