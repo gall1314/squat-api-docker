@@ -1,13 +1,17 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import cv2
 import mediapipe as mp
 import numpy as np
 import tempfile
 import os
+import uuid
 
 app = Flask(__name__)
 CORS(app)
+
+ANNOTATED_DIR = "/tmp/annotated_videos"
+os.makedirs(ANNOTATED_DIR, exist_ok=True)
 
 def calculate_angle(a, b, c):
     a, b, c = map(np.array, [a, b, c])
@@ -35,18 +39,24 @@ def compress_video(input_path, scale=0.4):
     out.release()
     return temp.name
 
-def run_analysis(video_path, frame_skip=3, scale=0.4):
+def run_analysis_with_output(video_path, frame_skip=3, scale=0.4):
     mp_pose = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {"error": "Could not open video"}
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
+    output_path = os.path.join(ANNOTATED_DIR, f"squat_{uuid.uuid4().hex}.mp4")
+    out = cv2.VideoWriter(output_path, fourcc, fps // frame_skip, (width, height))
 
     counter = 0
     good_reps = 0
     bad_reps = 0
     all_scores = []
     reps_feedback = []
-    problem_reps = []
     stage = None
     prev_knee_angle = None
     prev_stage = None
@@ -63,13 +73,13 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
             frame_idx += 1
             if frame_idx % frame_skip != 0:
                 continue
-            if scale != 1.0:
-                frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+            frame = cv2.resize(frame, (width, height))
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
-            if not results.pose_landmarks:
-                continue
-            try:
+            feedbacks = []
+            score = 10
+
+            if results.pose_landmarks:
                 lm = results.pose_landmarks.landmark
                 hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
                 knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
@@ -83,91 +93,88 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
 
                 hip_to_knee = abs(hip[1] - knee[1])
                 knee_to_ankle = abs(knee[1] - ankle[1])
-                depth_ratio = hip_to_knee / knee_to_ankle if knee_to_ankle != 0 else 0
-                rep_max_depth = max(rep_max_depth, round(min(depth_ratio, 1.0) * 10, 1))
+                depth_ratio = hip_to_knee / knee_to_ankle if knee_to_ankle else 0
+                rep_max_depth = round(min(depth_ratio, 1.0) * 10, 1)
 
                 old_stage = stage
                 if knee_angle < 90:
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
-
-                    feedback_msgs = []
-
-                    # Penalty for knee angle
-                    angle_penalty = 0
-                    if rep_min_angle > 105:
-                        angle_penalty = 3
-                        feedback_msgs.append("Knee angle too shallow")
+                    angle_pen = 0
+                    if rep_min_angle > 110:
+                        angle_pen = 3
+                        feedbacks.append("Very shallow")
+                    elif rep_min_angle > 100:
+                        angle_pen = 1.5
+                        feedbacks.append("Try deeper")
                     elif rep_min_angle > 95:
-                        angle_penalty = 1.5
-                        feedback_msgs.append("Try to go deeper (angle)")
-                    elif rep_min_angle > 90:
-                        angle_penalty = 0.5
-                        feedback_msgs.append("Almost deep enough (angle)")
+                        angle_pen = 0.5
+                        feedbacks.append("Almost deep enough")
 
-                    # Penalty for depth
-                    depth_penalty = 0
+                    depth_pen = 0
                     if rep_max_depth < 6.5:
-                        depth_penalty = 3
-                        feedback_msgs.append("Depth too shallow")
+                        depth_pen = 4
+                        feedbacks.append("Too shallow")
                     elif rep_max_depth < 7.5:
-                        depth_penalty = 1.5
-                        feedback_msgs.append("Try to go deeper (depth)")
+                        depth_pen = 3
+                        if "Too shallow" not in feedbacks:
+                            feedbacks.append("Too shallow")
                     elif rep_max_depth < 8.5:
-                        depth_penalty = 0.5
-                        feedback_msgs.append("Almost deep enough (depth)")
+                        depth_pen = 1.5
+                        feedbacks.append("Try deeper")
+                    elif rep_max_depth < 9.5:
+                        depth_pen = 0.5
+                        feedbacks.append("Almost deep enough")
 
-                    # Back angle penalty
-                    back_penalty = 0
+                    back_pen = 0
                     if back_angle < 35:
-                        back_penalty = 1.5
-                        feedback_msgs.append("Keep your back straighter")
+                        back_pen = 1.5
+                        feedbacks.append("Keep your back straighter")
 
-                    # Heel penalty
-                    heel_penalty = 0
+                    heel_pen = 0
                     if heel_y < foot_y - 0.03:
-                        heel_penalty = 1.5
-                        feedback_msgs.append("Keep your heels down")
+                        heel_pen = 1.5
+                        feedbacks.append("Keep your heels down")
 
-                    # Total penalty capped at 6
-                    total_penalty = min(6, angle_penalty + depth_penalty + back_penalty + heel_penalty)
-
+                    total_penalty = max(angle_pen, depth_pen) + back_pen + heel_pen
                     score = round(max(4, 10 - total_penalty) * 2) / 2
-                    feedback = "; ".join(feedback_msgs) if feedback_msgs else "Perfect form"
 
                     counter += 1
                     if score >= 9.5:
                         good_reps += 1
                     else:
                         bad_reps += 1
-                        problem_reps.append(counter)
                     all_scores.append(score)
-                    reps_feedback.append(feedback)
+                    reps_feedback.append("; ".join(feedbacks))
                     rep_min_angle = 180
                     rep_max_depth = 0
 
                 if stage == "down" and old_stage != "down":
                     rep_min_angle = knee_angle
-                    rep_max_depth = round(min(depth_ratio, 1.0) * 10, 1)
                 if stage == "down":
                     rep_min_angle = min(rep_min_angle, knee_angle)
-                    rep_max_depth = max(rep_max_depth, round(min(depth_ratio, 1.0) * 10, 1))
 
-            except Exception:
-                continue
+                cv2.putText(frame, f"Score: {score:.1f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                for msg_idx, msg in enumerate(feedbacks):
+                    cv2.putText(frame, msg, (10, 60 + 30 * msg_idx), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+            out.write(frame)
 
     cap.release()
+    out.release()
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
-
     return {
         "technique_score": technique_score,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
         "feedback": reps_feedback,
-        "problem_reps": problem_reps,
-        "squat_count": counter
+        "video_url": f"/media/{os.path.basename(output_path)}"
     }
+
+@app.route('/media/<path:filename>')
+def media(filename):
+    return send_from_directory(ANNOTATED_DIR, filename)
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
@@ -181,7 +188,7 @@ def analyze():
         os.remove(temp.name)
     except OSError:
         pass
-    result = run_analysis(compressed_path, frame_skip=3, scale=0.4)
+    result = run_analysis_with_output(compressed_path)
     if "error" in result:
         return jsonify(result), 400
     return jsonify(result)
