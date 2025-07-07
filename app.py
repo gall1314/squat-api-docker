@@ -115,7 +115,8 @@ def run_analysis(video_path, frame_skip=2, scale=0.4, motion_threshold=2.0, angl
                     stage = "up"
 
                     # Knee-angle-only based penalty
-                    if rep_min_angle > 100:
+                    print(f'rep_min_angle: {rep_min_angle}')
+        if rep_min_angle > 100:
                         total_penalty = 3
                         feedback_msgs.append("Too shallow (angle > 100°)")
                     elif rep_min_angle > 92:
