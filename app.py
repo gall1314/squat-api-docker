@@ -53,17 +53,18 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
     if not cap.isOpened():
         return {"error": "Could not open video"}
 
-    counter = good_reps = bad_reps = 0
+    counter = 0
+    good_reps = 0
+    bad_reps = 0
     all_scores = []
-    overall_feedback = []
     problem_reps = []
+    overall_feedback = []
+
     stage = None
     rep_min_angle = 180
     rep_max_depth = 0
     max_lean_down = 0
-    top_knee_angle = 0
     top_back_angle = 0
-    heel_lifted = False
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         frame_idx = 0
@@ -80,7 +81,6 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
             results = pose.process(image)
             if not results.pose_landmarks:
                 continue
-
             try:
                 lm = results.pose_landmarks.landmark
                 hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
@@ -93,6 +93,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                 knee_angle = calculate_angle(hip, knee, ankle)
                 back_angle = calculate_angle(shoulder, hip, knee)
                 body_angle = calculate_body_angle(shoulder, hip)
+                heel_lifted = foot_y - heel_y > 0.03
 
                 hip_to_knee = abs(hip[1] - knee[1])
                 knee_to_ankle = abs(knee[1] - ankle[1])
@@ -105,77 +106,42 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
 
-                heel_lifted = heel_lifted or (foot_y - heel_y > 0.03)
-
-                if stage == 'up' and knee_angle < 90:
                     feedbacks = []
 
-                    # עומק וזווית
-                    angle_pen = 0
-                    if rep_min_angle > 115:
-                        angle_pen = 3
-                        feedbacks.append("Very shallow")
-                        feedbacks.append("Try to go deeper")
-                    elif rep_min_angle > 110:
-                        angle_pen = 2
-                        feedbacks.append("Try to go deeper")
-                    elif rep_min_angle > 100:
-                        angle_pen = 1.5
-                        feedbacks.append("Try deeper")
-                    elif rep_min_angle > 95:
-                        angle_pen = 1
-                        feedbacks.append("Almost deep enough")
-
-                    ratio_pen = 0
-                    if rep_max_depth < 6.5:
-                        ratio_pen = 3
-                        feedbacks.append("Too shallow")
-                    elif rep_max_depth < 7.5:
-                        ratio_pen = 2
-                        feedbacks.append("Try to go deeper")
-                    elif rep_max_depth < 8.5:
-                        ratio_pen = 1
-                        feedbacks.append("Try deeper")
-                    elif rep_max_depth < 9.5:
-                        ratio_pen = 0.5
-                        feedbacks.append("Almost deep enough")
-
-                    depth_pen = angle_pen + ratio_pen
-                    if angle_pen > 0 and ratio_pen > 0:
-                        depth_pen += 1
+                    # עומק וזווית – מוחמר
+                    if rep_min_angle > 100 or rep_max_depth < 8.0:
+                        if rep_min_angle > 115 or rep_max_depth < 6.5:
+                            feedbacks.append("Too shallow")
+                            penalty = 3
+                        elif rep_min_angle > 110 or rep_max_depth < 7.0:
+                            feedbacks.append("Try to go deeper")
+                            penalty = 1.5
+                        else:
+                            feedbacks.append("Almost deep enough")
+                            penalty = 0.5
+                    else:
+                        penalty = 0
 
                     # גב
-                    back_pen = 0
-                    if back_angle < 35:
-                        back_pen = 1.5
+                    if back_angle < 35 or max_lean_down > 45 or top_back_angle > 20:
                         feedbacks.append("Keep your back straighter")
-                    if max_lean_down > 40:
-                        back_pen += 0.5
-                        feedbacks.append("Back not straight enough")
-                    if top_back_angle > 20:
-                        back_pen += 0.5
-                        feedbacks.append("Back not straight enough")
+                        penalty += 1.5
 
                     # עקבים
-                    heel_pen = 0
                     if heel_lifted:
-                        heel_pen = 1
                         feedbacks.append("Keep your heels down")
+                        penalty += 1
 
-                    # נעילת ברכיים
-                    lock_pen = 0
-                    if top_knee_angle < 165:
-                        lock_pen = 0.5
+                    # סגירה עליונה
+                    if knee_angle < 165:
                         feedbacks.append("Incomplete lockout")
+                        penalty += 1
 
-                    total_penalty = min(depth_pen + back_pen + heel_pen + lock_pen, 6)
-                    score = round(max(4, 10 - total_penalty) * 2) / 2
+                    penalty = min(penalty, 6)
+                    score = round(max(4, 10 - penalty) * 2) / 2
 
-                    # ניקוי כפילויות
-                    seen = set()
                     for f in feedbacks:
-                        if f not in seen:
-                            seen.add(f)
+                        if f not in overall_feedback:
                             overall_feedback.append(f)
 
                     counter += 1
@@ -184,7 +150,6 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     else:
                         bad_reps += 1
                         problem_reps.append(counter)
-
                     all_scores.append(score)
                     rep_min_angle = 180
                     rep_max_depth = 0
@@ -198,7 +163,6 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     rep_max_depth = max(rep_max_depth, round(min(depth_ratio, 1.0) * 10, 1))
                     max_lean_down = max(max_lean_down, body_angle)
                 if stage == "up":
-                    top_knee_angle = max(top_knee_angle, knee_angle)
                     top_back_angle = max(top_back_angle, body_angle)
 
             except Exception:
@@ -212,8 +176,8 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
         "squat_count": counter,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
+        "feedback": overall_feedback,
         "problem_reps": problem_reps,
-        "feedback": overall_feedback
     }
 
 @app.route('/analyze', methods=['POST'])
