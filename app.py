@@ -106,21 +106,13 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # עומק: קרבת האגן לעקב + זווית מינימלית
+                    # ✅ עומק לפי קרבת האגן לעקב בלבד
                     hip_to_heel_dist = abs(hip[1] - heel_y)
-                    hip_heel_score = max(0, min(1, (0.25 - hip_to_heel_dist) / 0.15))
 
-                    if rep_min_knee_angle < 130:
-                        angle_score = max(0, min(1, (130 - rep_min_knee_angle) / 40))
-                    else:
-                        angle_score = 0
-
-                    depth_score = 0.6 * hip_heel_score + 0.4 * angle_score
-
-                    if depth_score < 0.4:
+                    if hip_to_heel_dist > 0.25:
                         feedbacks.append("Too shallow")
                         depth_penalty = 3
-                    elif depth_score < 0.7:
+                    elif hip_to_heel_dist > 0.18:
                         feedbacks.append("Try to go deeper")
                         depth_penalty = 1
                     else:
@@ -128,6 +120,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
 
                     penalty += depth_penalty
 
+                    # פידבקים נוספים
                     if back_angle < 150:
                         feedbacks.append("Keep your back straighter")
                         penalty += 1
@@ -155,7 +148,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                         problem_reps.append(counter)
                     all_scores.append(score)
 
-                    # reset
+                    # Reset
                     rep_min_knee_angle = 180
                     max_lean_down = 0
 
