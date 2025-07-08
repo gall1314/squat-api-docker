@@ -58,6 +58,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
     problem_reps = []
     overall_feedback = []
     depth_distances = []
+    depth_feedback_given = False
 
     stage = None
     rep_min_knee_angle = 180
@@ -93,7 +94,6 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                 body_angle = calculate_body_angle(shoulder, hip)
                 heel_lifted = foot_y - heel_y > 0.03
 
-                old_stage = stage
                 if knee_angle < 90:
                     stage = "down"
                 if stage == "down":
@@ -107,25 +107,30 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # עומק לפי קרבת האגן לעקב
                     hip_to_heel_dist = abs(hip[1] - heel_y)
                     depth_distances.append(hip_to_heel_dist)
 
                     if hip_to_heel_dist > 0.48:
-                        feedbacks.append("Too shallow — squat lower")
+                        if not depth_feedback_given:
+                            feedbacks.append("Too shallow — squat lower")
+                            depth_feedback_given = True
                         depth_penalty = 3
                     elif hip_to_heel_dist > 0.45:
-                        feedbacks.append("Could go a bit deeper")
+                        if not depth_feedback_given:
+                            feedbacks.append("Almost there — go a bit lower")
+                            depth_feedback_given = True
                         depth_penalty = 1.5
                     elif hip_to_heel_dist > 0.43:
-                        feedbacks.append("Just a bit more depth")
+                        if not depth_feedback_given:
+                            feedbacks.append("Looking good — just a bit more depth")
+                            depth_feedback_given = True
                         depth_penalty = 0.5
                     else:
                         depth_penalty = 0
 
                     penalty += depth_penalty
 
-                    if stage == "up" and back_angle < 135:
+                    if stage == "up" and back_angle < 140:
                         feedbacks.append("Try to straighten your back more at the top")
                         penalty += 1
 
@@ -161,15 +166,14 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
     cap.release()
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
 
-    # פידבק עומק כללי לפי ממוצע
-    if depth_distances:
+    if depth_distances and not depth_feedback_given:
         avg_depth = np.mean(depth_distances)
         if avg_depth > 0.48:
             overall_feedback.append("Try squatting lower")
         elif avg_depth > 0.45:
-            overall_feedback.append("Could go a bit deeper")
+            overall_feedback.append("Almost there — go a bit lower")
         elif avg_depth > 0.43:
-            overall_feedback.append("Just a bit more depth")
+            overall_feedback.append("Looking good — just a bit more depth")
 
     if not overall_feedback:
         overall_feedback.append("Great form! Keep it up 💪")
