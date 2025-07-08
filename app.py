@@ -53,16 +53,13 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
     if not cap.isOpened():
         return {"error": "Could not open video"}
 
-    counter = 0
-    good_reps = 0
-    bad_reps = 0
+    counter = good_reps = bad_reps = 0
     all_scores = []
     problem_reps = []
     overall_feedback = []
 
     stage = None
     rep_min_angle = 180
-    rep_max_depth = 0
     max_lean_down = 0
     top_back_angle = 0
 
@@ -95,44 +92,33 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                 body_angle = calculate_body_angle(shoulder, hip)
                 heel_lifted = foot_y - heel_y > 0.03
 
-                hip_to_knee = abs(hip[1] - knee[1])
-                knee_to_ankle = abs(knee[1] - ankle[1])
-                depth_ratio = hip_to_knee / knee_to_ankle if knee_to_ankle != 0 else 0
-                rep_max_depth = max(rep_max_depth, round(min(depth_ratio, 1.0) * 10, 1))
+                # עומק לפי המפתח
+                is_deep_enough = knee[1] < hip[1] - 0.02
 
                 old_stage = stage
                 if knee_angle < 90:
                     stage = "down"
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
-
                     feedbacks = []
+                    penalty = 0
 
-                    # עומק וזווית – מוחמר
-                    if rep_min_angle > 100 or rep_max_depth < 8.0:
-                        if rep_min_angle > 115 or rep_max_depth < 6.5:
-                            feedbacks.append("Too shallow")
-                            penalty = 3
-                        elif rep_min_angle > 110 or rep_max_depth < 7.0:
-                            feedbacks.append("Try to go deeper")
-                            penalty = 1.5
-                        else:
-                            feedbacks.append("Almost deep enough")
-                            penalty = 0.5
-                    else:
-                        penalty = 0
+                    # עומק מוחמר אך מדויק יותר
+                    if not is_deep_enough:
+                        feedbacks.append("Too shallow")
+                        penalty += 3
 
-                    # גב
-                    if back_angle < 35 or max_lean_down > 45 or top_back_angle > 20:
+                    # גב - חמרה דינמית
+                    if back_angle < 35 or max_lean_down > 50 or top_back_angle > 30:
                         feedbacks.append("Keep your back straighter")
-                        penalty += 1.5
+                        penalty += 1.0
 
                     # עקבים
                     if heel_lifted:
                         feedbacks.append("Keep your heels down")
                         penalty += 1
 
-                    # סגירה עליונה
+                    # נעילה עליונה
                     if knee_angle < 165:
                         feedbacks.append("Incomplete lockout")
                         penalty += 1
@@ -151,16 +137,14 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                         bad_reps += 1
                         problem_reps.append(counter)
                     all_scores.append(score)
+
                     rep_min_angle = 180
-                    rep_max_depth = 0
                     max_lean_down = 0
 
                 if stage == "down" and old_stage != "down":
                     rep_min_angle = knee_angle
-                    rep_max_depth = round(min(depth_ratio, 1.0) * 10, 1)
                 if stage == "down":
                     rep_min_angle = min(rep_min_angle, knee_angle)
-                    rep_max_depth = max(rep_max_depth, round(min(depth_ratio, 1.0) * 10, 1))
                     max_lean_down = max(max_lean_down, body_angle)
                 if stage == "up":
                     top_back_angle = max(top_back_angle, body_angle)
@@ -185,23 +169,17 @@ def analyze():
     video_file = request.files.get('video')
     if not video_file:
         return jsonify({"error": "No video uploaded"}), 400
-
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     video_file.save(temp.name)
-
     unique_id = str(uuid.uuid4())[:8]
     output_filename = f"squat_{unique_id}.mp4"
     output_path = os.path.join(MEDIA_DIR, output_filename)
-
     success = compress_video(temp.name, output_path, scale=0.4)
     os.remove(temp.name)
-
     if not success:
         return jsonify({"error": "Video compression failed"}), 500
-
     result = run_analysis(output_path, frame_skip=3, scale=0.4)
     result["video_url"] = f"/media/{output_filename}"
-
     return jsonify(result)
 
 @app.route('/media/<filename>')
