@@ -60,6 +60,8 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
 
     stage = None
     rep_min_knee_angle = 180
+    rep_min_hip_y = 1.0
+    rep_min_knee_y = 1.0
     max_lean_down = 0
     top_back_angle = 0
 
@@ -97,28 +99,41 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     stage = "down"
                 if stage == "down":
                     rep_min_knee_angle = min(rep_min_knee_angle, knee_angle)
+                    rep_min_hip_y = min(rep_min_hip_y, hip[1])
+                    rep_min_knee_y = min(rep_min_knee_y, knee[1])
+                    max_lean_down = max(max_lean_down, body_angle)
+                if stage == "up":
+                    top_back_angle = max(top_back_angle, body_angle)
 
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
                     feedbacks = []
                     penalty = 0
 
-                    # עומק מבוסס נקודת שפל
+                    hip_knee_diff = rep_min_knee_y - rep_min_hip_y
+                    print("rep_min_knee_angle:", round(rep_min_knee_angle, 1), 
+                          "| hip_knee_diff:", round(hip_knee_diff, 3))
+
+                    # עומק משולב: גם זווית וגם מיקום יחסי
                     depth_penalty = 0
-                    if rep_min_knee_angle < 90:
+                    if rep_min_knee_angle >= 120 and hip_knee_diff < 0.02:
+                        feedbacks.append("Too shallow")
+                        depth_penalty = 3
+                    elif rep_min_knee_angle < 90:
                         pass
-                    elif rep_min_knee_angle < 100:
+                    elif rep_min_knee_angle < 98:
                         feedbacks.append("Try to go a bit deeper")
                         depth_penalty = 0.5
-                    elif rep_min_knee_angle < 110:
+                    elif rep_min_knee_angle < 106:
                         feedbacks.append("Go deeper into the squat")
                         depth_penalty = 1
-                    elif rep_min_knee_angle < 120:
+                    elif rep_min_knee_angle < 115:
                         feedbacks.append("Your squat is quite shallow")
                         depth_penalty = 1.5
                     else:
                         feedbacks.append("Too shallow")
                         depth_penalty = 3
+
                     penalty += depth_penalty
 
                     if back_angle < 150:
@@ -148,7 +163,10 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                         problem_reps.append(counter)
                     all_scores.append(score)
 
+                    # איפוס משתנים
                     rep_min_knee_angle = 180
+                    rep_min_hip_y = 1.0
+                    rep_min_knee_y = 1.0
                     max_lean_down = 0
 
             except Exception:
