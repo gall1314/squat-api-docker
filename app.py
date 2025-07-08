@@ -106,20 +106,28 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # עומק לפי מדרגות פשוטות (כמו המקורי, אבל מדורג)
-                    depth_penalty = 0
-                    if rep_min_knee_angle > 120:
-                        feedbacks.append("Too shallow")
+                    # עומק לפי קו אנכי מהברך
+                    lateral_offset = abs(hip[0] - knee[0])
+                    vertical_offset = hip[1] - knee[1]
+
+                    if vertical_offset < 0 and lateral_offset < 0.05:
+                        feedbacks.append("Too shallow (hip stayed above knee)")
                         depth_penalty = 3
-                    elif rep_min_knee_angle > 110:
-                        feedbacks.append("Your squat is quite shallow")
-                        depth_penalty = 1.5
-                    elif rep_min_knee_angle > 100:
-                        feedbacks.append("Go deeper into the squat")
-                        depth_penalty = 1
-                    elif rep_min_knee_angle > 95:
-                        feedbacks.append("Try to go a bit deeper")
-                        depth_penalty = 0.5
+                    else:
+                        # מדרגות עומק רגילות לפי זווית
+                        depth_penalty = 0
+                        if rep_min_knee_angle > 120:
+                            feedbacks.append("Too shallow")
+                            depth_penalty = 3
+                        elif rep_min_knee_angle > 110:
+                            feedbacks.append("Your squat is quite shallow")
+                            depth_penalty = 1.5
+                        elif rep_min_knee_angle > 100:
+                            feedbacks.append("Go deeper into the squat")
+                            depth_penalty = 1
+                        elif rep_min_knee_angle > 95:
+                            feedbacks.append("Try to go a bit deeper")
+                            depth_penalty = 0.5
 
                     penalty += depth_penalty
 
@@ -151,7 +159,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                         problem_reps.append(counter)
                     all_scores.append(score)
 
-                    # איפוס עומק
+                    # reset
                     rep_min_knee_angle = 180
                     max_lean_down = 0
 
