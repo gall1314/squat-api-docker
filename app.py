@@ -109,14 +109,18 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     # ✅ עומק לפי קרבת האגן לעקב בלבד (הגרסה המרוככת)
                     hip_to_heel_dist = abs(hip[1] - heel_y)
 
-                    if hip_to_heel_dist > 0.46:
-                        feedbacks.append("Too shallow")
-                        depth_penalty = 3
-                    elif hip_to_heel_dist > 0.40:
-                        feedbacks.append("Try to go deeper")
-                        depth_penalty = 1
-                    else:
-                        depth_penalty = 0
+                   if hip_to_heel_dist > 0.48:
+    feedbacks.append("Too shallow")
+    depth_penalty = 3
+elif hip_to_heel_dist > 0.43:
+    feedbacks.append("Try to go deeper")
+    depth_penalty = 1
+elif hip_to_heel_dist > 0.40:
+    feedbacks.append("Almost deep enough")
+    depth_penalty = 0.5
+else:
+    depth_penalty = 0
+
 
                     penalty += depth_penalty
 
