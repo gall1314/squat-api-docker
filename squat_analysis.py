@@ -1,5 +1,7 @@
 import cv2
 import mediapipe as mp
+
+from utils import calculate_angle, calculate_body_angle
 import numpy as np
 from .helpers import calculate_angle, calculate_body_angle  # אם תוציא אותם החוצה בהמשך
 
