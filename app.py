@@ -107,24 +107,33 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # עומק - נשמר לכל ריפ
                     hip_to_heel_dist = abs(hip[1] - heel_y)
                     depth_distances.append(hip_to_heel_dist)
 
-                    # תנאי גב רך יותר לפי שלב
-                    if stage == "up" and back_angle < 155:
+                    if hip_to_heel_dist > 0.48:
+                        feedbacks.append("Too shallow — squat lower")
+                        depth_penalty = 3
+                    elif hip_to_heel_dist > 0.45:
+                        feedbacks.append("Almost there — go a bit lower")
+                        depth_penalty = 1.5
+                    elif hip_to_heel_dist > 0.43:
+                        feedbacks.append("Looking good — just a bit more depth")
+                        depth_penalty = 0.5
+                    else:
+                        depth_penalty = 0
+
+                    penalty += depth_penalty
+
+                    if stage == "up" and back_angle < 140:
                         feedbacks.append("Try to straighten your back more at the top")
-                        penalty += 1
-                    elif stage == "down" and back_angle < 130:
-                        feedbacks.append("Keep your back a bit more upright as you descend")
                         penalty += 1
 
                     if heel_lifted:
-                        feedbacks.append("Try to keep your heels firmly on the ground")
+                        feedbacks.append("Keep your heels down")
                         penalty += 1
 
                     if knee_angle < 160:
-                        feedbacks.append("Make sure to fully extend your knees at the top")
+                        feedbacks.append("Incomplete lockout")
                         penalty += 1
 
                     penalty = min(penalty, 6)
@@ -156,10 +165,11 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
         avg_depth = np.mean(depth_distances)
         if avg_depth > 0.48:
             overall_feedback.append("Try squatting lower")
+        elif avg_depth > 0.45:
+            overall_feedback.append("Almost there — go a bit lower")
         elif avg_depth > 0.43:
             overall_feedback.append("Looking good — just a bit more depth")
 
-    # פידבק חיובי אם אין כלל הערות
     if not overall_feedback:
         overall_feedback.append("Great form! Keep it up 💪")
 
