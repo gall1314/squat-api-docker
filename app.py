@@ -4,6 +4,7 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import tempfile
+import os
 import uuid
 
 app = Flask(__name__)
@@ -105,12 +106,13 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
+                    # ✅ עומק לפי קרבת האגן לעקב בלבד (הגרסה המרוככת)
                     hip_to_heel_dist = abs(hip[1] - heel_y)
 
-                    if hip_to_heel_dist > 0.44:
+                    if hip_to_heel_dist > 0.42:
                         feedbacks.append("Too shallow")
                         depth_penalty = 3
-                    elif hip_to_heel_dist > 0.38:
+                    elif hip_to_heel_dist > 0.35:
                         feedbacks.append("Try to go deeper")
                         depth_penalty = 1
                     else:
@@ -145,6 +147,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                         problem_reps.append(counter)
                     all_scores.append(score)
 
+                    # Reset
                     rep_min_knee_angle = 180
                     max_lean_down = 0
 
@@ -184,6 +187,10 @@ def analyze():
 @app.route('/media/<filename>')
 def media(filename):
     return send_from_directory(MEDIA_DIR, filename)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
