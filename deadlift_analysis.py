@@ -21,15 +21,6 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     shoulder_rise_frame = None
     frame_index = 0
 
-    def calculate_body_angle(shoulder, hip):
-        vector = np.array(shoulder) - np.array(hip)
-        vertical = np.array([0, -1])
-        norm = np.linalg.norm(vector)
-        if norm == 0:
-            return 0
-        cos_angle = np.dot(vector, vertical) / norm
-        return np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
-
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
@@ -133,3 +124,4 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
     }
+
