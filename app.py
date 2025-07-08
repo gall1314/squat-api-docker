@@ -106,21 +106,20 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # ✅ עומק לפי קרבת האגן לעקב בלבד (הגרסה המרוככת)
+                    # ✅ עומק לפי קרבת האגן לעקב בלבד (3 שלבים)
                     hip_to_heel_dist = abs(hip[1] - heel_y)
 
-                   if hip_to_heel_dist > 0.48:
-    feedbacks.append("Too shallow")
-    depth_penalty = 3
-elif hip_to_heel_dist > 0.43:
-    feedbacks.append("Try to go deeper")
-    depth_penalty = 1
-elif hip_to_heel_dist > 0.40:
-    feedbacks.append("Almost deep enough")
-    depth_penalty = 0.5
-else:
-    depth_penalty = 0
-
+                    if hip_to_heel_dist > 0.48:
+                        feedbacks.append("Too shallow")
+                        depth_penalty = 3
+                    elif hip_to_heel_dist > 0.43:
+                        feedbacks.append("Try to go deeper")
+                        depth_penalty = 1
+                    elif hip_to_heel_dist > 0.40:
+                        feedbacks.append("Almost deep enough")
+                        depth_penalty = 0.5
+                    else:
+                        depth_penalty = 0
 
                     penalty += depth_penalty
 
@@ -151,7 +150,7 @@ else:
                         problem_reps.append(counter)
                     all_scores.append(score)
 
-                    # Reset
+                    # Reset for next rep
                     rep_min_knee_angle = 180
                     max_lean_down = 0
 
@@ -194,6 +193,3 @@ def media(filename):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
-
-
