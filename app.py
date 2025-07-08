@@ -106,33 +106,37 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # ✅ עומק לפי קרבת האגן לעקב בלבד (3 שלבים)
+                    # עומק לפי קרבת האגן לעקב
                     hip_to_heel_dist = abs(hip[1] - heel_y)
 
-                    if hip_to_heel_dist > 0.48:
-                        feedbacks.append("Too shallow")
+                    if hip_to_heel_dist > 0.50:
+                        feedbacks.append("Try to squat lower – this one wasn't deep enough")
                         depth_penalty = 3
-                    elif hip_to_heel_dist > 0.43:
-                        feedbacks.append("Try to go deeper")
+                    elif hip_to_heel_dist > 0.45:
+                        feedbacks.append("Try going deeper next time")
                         depth_penalty = 1
-                    elif hip_to_heel_dist > 0.40:
-                        feedbacks.append("Almost deep enough")
+                    elif hip_to_heel_dist > 0.41:
+                        feedbacks.append("Almost there – just a bit deeper would be perfect")
                         depth_penalty = 0.5
                     else:
                         depth_penalty = 0
 
                     penalty += depth_penalty
 
-                    if back_angle < 150:
-                        feedbacks.append("Keep your back straighter")
+                    # תנאי דינמי לגב לפי שלב
+                    if stage == "up" and back_angle < 150:
+                        feedbacks.append("Try to straighten your back more at the top")
+                        penalty += 1
+                    elif stage == "down" and back_angle < 130:
+                        feedbacks.append("Keep your back a bit more upright as you descend")
                         penalty += 1
 
                     if heel_lifted:
-                        feedbacks.append("Keep your heels down")
+                        feedbacks.append("Try to keep your heels firmly on the ground")
                         penalty += 1
 
                     if knee_angle < 160:
-                        feedbacks.append("Incomplete lockout")
+                        feedbacks.append("Make sure to fully extend your knees at the top")
                         penalty += 1
 
                     penalty = min(penalty, 6)
@@ -150,7 +154,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                         problem_reps.append(counter)
                     all_scores.append(score)
 
-                    # Reset for next rep
+                    # Reset
                     rep_min_knee_angle = 180
                     max_lean_down = 0
 
@@ -159,6 +163,9 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
 
     cap.release()
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
+
+    if not overall_feedback:
+        overall_feedback.append("Great form! Keep it up 💪")
 
     return {
         "technique_score": technique_score,
