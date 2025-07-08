@@ -92,9 +92,6 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                 body_angle = calculate_body_angle(shoulder, hip)
                 heel_lifted = foot_y - heel_y > 0.03
 
-                # עומק לפי המפתח
-                is_deep_enough = knee[1] < hip[1] - 0.02
-
                 old_stage = stage
                 if knee_angle < 90:
                     stage = "down"
@@ -103,15 +100,28 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # עומק מוחמר אך מדויק יותר
-                    if not is_deep_enough:
+                    # עומק מדורג לפי זווית ברך
+                    depth_penalty = 0
+                    if knee_angle < 90:
+                        pass
+                    elif knee_angle < 100:
+                        feedbacks.append("Try to go a bit deeper")
+                        depth_penalty = 0.5
+                    elif knee_angle < 110:
+                        feedbacks.append("Go deeper into the squat")
+                        depth_penalty = 1
+                    elif knee_angle < 120:
+                        feedbacks.append("Your squat is quite shallow")
+                        depth_penalty = 1.5
+                    else:
                         feedbacks.append("Too shallow")
-                        penalty += 3
+                        depth_penalty = 3
+                    penalty += depth_penalty
 
-                    # גב - חמרה דינמית
-                    if back_angle < 35 or max_lean_down > 50 or top_back_angle > 30:
+                    # גב
+                    if back_angle < 150:
                         feedbacks.append("Keep your back straighter")
-                        penalty += 1.0
+                        penalty += 1
 
                     # עקבים
                     if heel_lifted:
@@ -119,7 +129,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                         penalty += 1
 
                     # נעילה עליונה
-                    if knee_angle < 165:
+                    if knee_angle < 160:
                         feedbacks.append("Incomplete lockout")
                         penalty += 1
 
@@ -188,3 +198,4 @@ def media(filename):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
