@@ -59,7 +59,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
     overall_feedback = []
 
     stage = None
-    rep_min_angle = 180
+    rep_min_knee_angle = 180
     max_lean_down = 0
     top_back_angle = 0
 
@@ -95,22 +95,25 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                 old_stage = stage
                 if knee_angle < 90:
                     stage = "down"
+                if stage == "down":
+                    rep_min_knee_angle = min(rep_min_knee_angle, knee_angle)
+
                 if knee_angle > 160 and stage == "down":
                     stage = "up"
                     feedbacks = []
                     penalty = 0
 
-                    # עומק מדורג לפי זווית ברך
+                    # עומק מבוסס נקודת שפל
                     depth_penalty = 0
-                    if knee_angle < 90:
+                    if rep_min_knee_angle < 90:
                         pass
-                    elif knee_angle < 100:
+                    elif rep_min_knee_angle < 100:
                         feedbacks.append("Try to go a bit deeper")
                         depth_penalty = 0.5
-                    elif knee_angle < 110:
+                    elif rep_min_knee_angle < 110:
                         feedbacks.append("Go deeper into the squat")
                         depth_penalty = 1
-                    elif knee_angle < 120:
+                    elif rep_min_knee_angle < 120:
                         feedbacks.append("Your squat is quite shallow")
                         depth_penalty = 1.5
                     else:
@@ -118,17 +121,14 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                         depth_penalty = 3
                     penalty += depth_penalty
 
-                    # גב
                     if back_angle < 150:
                         feedbacks.append("Keep your back straighter")
                         penalty += 1
 
-                    # עקבים
                     if heel_lifted:
                         feedbacks.append("Keep your heels down")
                         penalty += 1
 
-                    # נעילה עליונה
                     if knee_angle < 160:
                         feedbacks.append("Incomplete lockout")
                         penalty += 1
@@ -148,16 +148,8 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                         problem_reps.append(counter)
                     all_scores.append(score)
 
-                    rep_min_angle = 180
+                    rep_min_knee_angle = 180
                     max_lean_down = 0
-
-                if stage == "down" and old_stage != "down":
-                    rep_min_angle = knee_angle
-                if stage == "down":
-                    rep_min_angle = min(rep_min_angle, knee_angle)
-                    max_lean_down = max(max_lean_down, body_angle)
-                if stage == "up":
-                    top_back_angle = max(top_back_angle, body_angle)
 
             except Exception:
                 continue
@@ -198,4 +190,3 @@ def media(filename):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
