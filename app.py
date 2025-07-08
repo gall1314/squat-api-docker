@@ -106,15 +106,16 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # תנאי עומק פשוט: האם האגן ירד מתחת לגובה הברך
-                    if hip[1] < knee[1]:
+                    # ✅ עומק לפי ציר Y (תיקון כיוון!)
+                    if hip[1] > knee[1]:
+                        depth_penalty = 0
+                    else:
                         feedbacks.append("Too shallow")
                         depth_penalty = 3
-                    else:
-                        depth_penalty = 0
 
                     penalty += depth_penalty
 
+                    # פידבק נוסף
                     if back_angle < 150:
                         feedbacks.append("Keep your back straighter")
                         penalty += 1
