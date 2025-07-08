@@ -1,9 +1,7 @@
 import cv2
 import mediapipe as mp
-
-from utils import calculate_angle, calculate_body_angle
 import numpy as np
-from .helpers import calculate_angle, calculate_body_angle  # אם תוציא אותם החוצה בהמשך
+from utils import calculate_angle, calculate_body_angle
 
 def run_analysis(video_path, frame_skip=3, scale=0.4):
     mp_pose = mp.solutions.pose
