@@ -106,15 +106,16 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # ✅ עומק לפי y_diff = hip.y - knee.y
-                    depth_penalty = 0
+                    # ✅ עומק לפי y_diff – רך יותר
                     y_diff = hip[1] - knee[1]
-                    if y_diff < -0.02:
+                    if y_diff < -0.04:
                         feedbacks.append("Too shallow")
                         depth_penalty = 3
-                    elif y_diff < 0.00:
+                    elif y_diff < -0.01:
                         feedbacks.append("Try to go deeper")
                         depth_penalty = 1
+                    else:
+                        depth_penalty = 0
 
                     penalty += depth_penalty
 
