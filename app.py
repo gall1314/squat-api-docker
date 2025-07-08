@@ -1,13 +1,17 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import cv2
 import mediapipe as mp
 import numpy as np
 import tempfile
 import os
+import uuid
 
 app = Flask(__name__)
 CORS(app)
+
+MEDIA_DIR = "media"
+os.makedirs(MEDIA_DIR, exist_ok=True)
 
 def calculate_angle(a, b, c):
     a, b, c = map(np.array, [a, b, c])
@@ -106,7 +110,6 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                 if stage == 'up' and knee_angle < 90:
                     feedbacks = []
 
-                    # עומק וזווית
                     if rep_min_angle > 110 or rep_max_depth < 6.5:
                         feedbacks.append("Too shallow")
                         penalty = 3
@@ -119,17 +122,14 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     else:
                         penalty = 0
 
-                    # גב
                     if back_angle < 35 or max_lean_down > 45 or top_back_angle > 20:
                         feedbacks.append("Keep your back straighter")
                         penalty += 1.5
 
-                    # עקבים
                     if heel_lifted:
                         feedbacks.append("Keep your heels down")
                         penalty += 1
 
-                    # נעילת ברכיים
                     if top_knee_angle < 165:
                         feedbacks.append("Incomplete lockout")
                         penalty += 1
@@ -182,14 +182,29 @@ def analyze():
     video_file = request.files.get("video")
     if not video_file:
         return jsonify({"error": "No video uploaded"}), 400
+
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     video_file.save(temp.name)
-    result = run_analysis(temp.name)
-    try:
-        os.remove(temp.name)
-    except:
-        pass
+
+    unique_id = str(uuid.uuid4())[:8]
+    output_filename = f"squat_{unique_id}.mp4"
+    output_path = os.path.join(MEDIA_DIR, output_filename)
+
+    success = compress_video(temp.name, output_path, scale=0.4)
+    os.remove(temp.name)
+
+    if not success:
+        return jsonify({"error": "Video compression failed"}), 500
+
+    result = run_analysis(output_path, frame_skip=3, scale=0.4)
+    result["video_url"] = f"/media/{output_filename}"
+
     return jsonify(result)
+
+@app.route('/media/<filename>')
+def media(filename):
+    return send_from_directory(MEDIA_DIR, filename)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
