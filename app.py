@@ -106,16 +106,18 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # ✅ עומק לפי ציר Y (תיקון כיוון!)
-                    if hip[1] > knee[1]:
-                        depth_penalty = 0
-                    else:
+                    # ✅ עומק לפי y_diff = hip.y - knee.y
+                    depth_penalty = 0
+                    y_diff = hip[1] - knee[1]
+                    if y_diff < -0.02:
                         feedbacks.append("Too shallow")
                         depth_penalty = 3
+                    elif y_diff < 0.00:
+                        feedbacks.append("Try to go deeper")
+                        depth_penalty = 1
 
                     penalty += depth_penalty
 
-                    # פידבק נוסף
                     if back_angle < 150:
                         feedbacks.append("Keep your back straighter")
                         penalty += 1
