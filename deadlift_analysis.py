@@ -1,6 +1,7 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+from utils import calculate_angle, calculate_body_angle
 
 def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     mp_pose = mp.solutions.pose
