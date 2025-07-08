@@ -40,24 +40,25 @@ def analyze():
     if not video_file:
         return jsonify({"error": "No video uploaded"}), 400
 
-    # סוג התרגיל (squat, deadlift וכו׳)
-    exercise_type = request.form.get('exercise_type', 'squat')
+    # סוג התרגיל (squat, deadlift וכו׳), נמוך לאותיות קטנות
+    exercise_type = request.form.get('exercise_type', 'squat').lower()
 
-    # שמירה זמנית
+    # שמירה זמנית של הקובץ
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     video_file.save(temp.name)
 
-    # יצירת שם קובץ ייחודי
+    # יצירת שם קובץ פלט
     unique_id = str(uuid.uuid4())[:8]
     output_filename = f"{exercise_type}_{unique_id}.mp4"
     output_path = os.path.join(MEDIA_DIR, output_filename)
 
+    # דחיסת הווידאו
     success = compress_video(temp.name, output_path, scale=0.4)
     os.remove(temp.name)
     if not success:
         return jsonify({"error": "Video compression failed"}), 500
 
-    # ניתוב לפונקציה הנכונה
+    # ניתוח לפי סוג התרגיל
     if exercise_type == 'squat':
         result = run_analysis(output_path, frame_skip=3, scale=0.4)
     elif exercise_type == 'deadlift':
@@ -65,6 +66,7 @@ def analyze():
     else:
         return jsonify({"error": "Unsupported exercise type"}), 400
 
+    # הוספת קישור לסרטון
     result["video_url"] = f"/media/{output_filename}"
     return jsonify(result)
 
