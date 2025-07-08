@@ -106,12 +106,21 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # ✅ עומק לפי y_diff – רך יותר
-                    y_diff = hip[1] - knee[1]
-                    if y_diff < -0.04:
+                    # עומק: קרבת האגן לעקב + זווית מינימלית
+                    hip_to_heel_dist = abs(hip[1] - heel_y)
+                    hip_heel_score = max(0, min(1, (0.25 - hip_to_heel_dist) / 0.15))
+
+                    if rep_min_knee_angle < 130:
+                        angle_score = max(0, min(1, (130 - rep_min_knee_angle) / 40))
+                    else:
+                        angle_score = 0
+
+                    depth_score = 0.6 * hip_heel_score + 0.4 * angle_score
+
+                    if depth_score < 0.4:
                         feedbacks.append("Too shallow")
                         depth_penalty = 3
-                    elif y_diff < -0.01:
+                    elif depth_score < 0.7:
                         feedbacks.append("Try to go deeper")
                         depth_penalty = 1
                     else:
@@ -189,4 +198,3 @@ def media(filename):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
