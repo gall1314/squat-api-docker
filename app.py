@@ -106,32 +106,15 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # עומק לפי קו אנכי מהברך
-                    lateral_offset = abs(hip[0] - knee[0])
-                    vertical_offset = hip[1] - knee[1]
-
-                    if vertical_offset < 0 and lateral_offset < 0.05:
-                        feedbacks.append("Too shallow (hip stayed above knee)")
+                    # תנאי עומק פשוט: האם האגן ירד מתחת לגובה הברך
+                    if hip[1] < knee[1]:
+                        feedbacks.append("Too shallow")
                         depth_penalty = 3
                     else:
-                        # מדרגות עומק רגילות לפי זווית
                         depth_penalty = 0
-                        if rep_min_knee_angle > 120:
-                            feedbacks.append("Too shallow")
-                            depth_penalty = 3
-                        elif rep_min_knee_angle > 110:
-                            feedbacks.append("Your squat is quite shallow")
-                            depth_penalty = 1.5
-                        elif rep_min_knee_angle > 100:
-                            feedbacks.append("Go deeper into the squat")
-                            depth_penalty = 1
-                        elif rep_min_knee_angle > 95:
-                            feedbacks.append("Try to go a bit deeper")
-                            depth_penalty = 0.5
 
                     penalty += depth_penalty
 
-                    # גב
                     if back_angle < 150:
                         feedbacks.append("Keep your back straighter")
                         penalty += 1
@@ -202,3 +185,4 @@ def media(filename):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
