@@ -106,13 +106,13 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # ✅ עומק לפי קרבת האגן לעקב בלבד
+                    # ✅ עומק לפי קרבת האגן לעקב בלבד – תנאי מרוכך
                     hip_to_heel_dist = abs(hip[1] - heel_y)
 
-                    if hip_to_heel_dist > 0.25:
+                    if hip_to_heel_dist > 0.35:
                         feedbacks.append("Too shallow")
                         depth_penalty = 3
-                    elif hip_to_heel_dist > 0.18:
+                    elif hip_to_heel_dist > 0.28:
                         feedbacks.append("Try to go deeper")
                         depth_penalty = 1
                     else:
@@ -120,7 +120,6 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
 
                     penalty += depth_penalty
 
-                    # פידבקים נוספים
                     if back_angle < 150:
                         feedbacks.append("Keep your back straighter")
                         penalty += 1
@@ -191,3 +190,4 @@ def media(filename):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
