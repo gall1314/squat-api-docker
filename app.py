@@ -57,6 +57,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
     all_scores = []
     problem_reps = []
     overall_feedback = []
+    depth_distances = []
 
     stage = None
     rep_min_knee_angle = 180
@@ -106,25 +107,12 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     feedbacks = []
                     penalty = 0
 
-                    # עומק לפי קרבת האגן לעקב
+                    # עומק - נשמר לכל ריפ
                     hip_to_heel_dist = abs(hip[1] - heel_y)
+                    depth_distances.append(hip_to_heel_dist)
 
-                    if hip_to_heel_dist > 0.50:
-                        feedbacks.append("Try to squat lower – this one wasn't deep enough")
-                        depth_penalty = 3
-                    elif hip_to_heel_dist > 0.45:
-                        feedbacks.append("Try going deeper next time")
-                        depth_penalty = 1
-                    elif hip_to_heel_dist > 0.41:
-                        feedbacks.append("Almost there – just a bit deeper would be perfect")
-                        depth_penalty = 0.5
-                    else:
-                        depth_penalty = 0
-
-                    penalty += depth_penalty
-
-                    # תנאי דינמי לגב לפי שלב
-                    if stage == "up" and back_angle < 150:
+                    # תנאי גב רך יותר לפי שלב
+                    if stage == "up" and back_angle < 155:
                         feedbacks.append("Try to straighten your back more at the top")
                         penalty += 1
                     elif stage == "down" and back_angle < 130:
@@ -154,7 +142,6 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                         problem_reps.append(counter)
                     all_scores.append(score)
 
-                    # Reset
                     rep_min_knee_angle = 180
                     max_lean_down = 0
 
@@ -164,6 +151,15 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
     cap.release()
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
 
+    # פידבק עומק כללי לפי ממוצע
+    if depth_distances:
+        avg_depth = np.mean(depth_distances)
+        if avg_depth > 0.48:
+            overall_feedback.append("Try squatting lower")
+        elif avg_depth > 0.43:
+            overall_feedback.append("Looking good — just a bit more depth")
+
+    # פידבק חיובי אם אין כלל הערות
     if not overall_feedback:
         overall_feedback.append("Great form! Keep it up 💪")
 
