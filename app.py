@@ -34,9 +34,10 @@ def compress_video(input_path, output_path, scale=0.4):
     out.release()
     return True
 
-# מיפוי שמות תרגילים לקוד ניתוח מתאים
+# מיפוי שמות תרגילים לשמות קוד
 EXERCISE_MAP = {
     "barbell squat": "squat",
+    "barbell back squat": "squat",
     "squat": "squat",
     "deadlift": "deadlift"
 }
@@ -74,7 +75,7 @@ def analyze():
     if not success:
         return jsonify({"error": "Video compression failed"}), 500
 
-    # הרצת הניתוח
+    # הרצת ניתוח לפי סוג התרגיל
     if resolved_type == 'squat':
         result = run_analysis(output_path, frame_skip=3, scale=0.4)
     elif resolved_type == 'deadlift':
