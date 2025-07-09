@@ -58,7 +58,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                     lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y
                 ])
 
-                # בחר את האוזן הכי יציבה
+                # אוזן ימין או שמאל – מה שזמין
                 ear_r = lm[mp_pose.PoseLandmark.RIGHT_EAR.value]
                 ear_l = lm[mp_pose.PoseLandmark.LEFT_EAR.value]
 
@@ -67,12 +67,12 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                 elif ear_l.visibility > 0.5:
                     head_point = np.array([ear_l.x, ear_l.y])
                 else:
-                    continue  # אין נקודת ראש אמינה
+                    continue  # אין ראש ברור
 
                 delta_x = abs(hip[0] - shoulder[0])
                 knee_angle = calculate_angle(hip, knee, ankle)
 
-                # חישוב סטייה של הראש מקו כתף־ירך
+                # curvature = סטיית הראש מקו כתף–ירך
                 v = shoulder - hip
                 v_norm = v / np.linalg.norm(v)
                 v_head = head_point - hip
@@ -112,14 +112,14 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                                 feedbacks.append("Try to lift your chest and hips together")
                                 penalty += 1
 
-                            # 🌡 מדרוג גב עגול לפי סטייה מהקו
-                            if 0.09 < max_curvature <= 0.11:
+                            # 🌡 מדרוג גב עגול לפי curvature
+                            if 0.105 < max_curvature <= 0.11:
                                 feedbacks.append("Try to keep your back a bit straighter")
                                 penalty += 1.5
-                            elif 0.11 < max_curvature <= 0.14:
+                            elif 0.11 < max_curvature <= 0.13:
                                 feedbacks.append("Your back is rounding too much – focus on spinal alignment")
                                 penalty += 2.5
-                            elif max_curvature > 0.14:
+                            elif max_curvature > 0.13:
                                 feedbacks.append("Dangerous back rounding – stop and fix your form!")
                                 penalty += 3.5
 
