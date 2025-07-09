@@ -19,6 +19,9 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     last_rep_frame = -999
     MIN_FRAMES_BETWEEN_REPS = 10
 
+    min_body_angle = 999
+    min_knee_angle = 999
+
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
@@ -39,7 +42,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
             try:
                 lm = results.pose_landmarks.landmark
 
-                # נקודות חיוניות
+                # נקודות
                 shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
                             lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
                 hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
@@ -49,46 +52,58 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                 ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
                          lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
 
-                # בדיקת נראות הברך
                 if lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].visibility < 0.5:
                     continue
 
                 body_angle = calculate_body_angle(shoulder, hip)
                 knee_angle = calculate_angle(hip, knee, ankle)
 
-                # התחלת חזרה – גב כפוף יחסית + ברך מכופפת
-                if not rep_in_progress and body_angle < 140 and knee_angle < 160:
-                    rep_in_progress = True
+                # מעקב אחרי שיאי הזווית במהלך החזרה
+                if rep_in_progress:
+                    min_body_angle = min(min_body_angle, body_angle)
+                    min_knee_angle = min(min_knee_angle, knee_angle)
 
-                # סיום חזרה – עמידה זקופה
+                # התחלת חזרה – תנוחה נראית נמוכה
+                if not rep_in_progress:
+                    if body_angle < 150 and knee_angle < 165:
+                        rep_in_progress = True
+                        min_body_angle = body_angle
+                        min_knee_angle = knee_angle
+
+                # סיום חזרה – הגוף חוזר לעמידה זקופה
                 elif rep_in_progress and body_angle > 165:
                     if frame_index - last_rep_frame > MIN_FRAMES_BETWEEN_REPS:
-                        feedbacks = []
-                        penalty = 0
+                        # בדיקה האם היה שינוי אמיתי לאורך החזרה
+                        body_delta = body_angle - min_body_angle
+                        if body_delta > 20 and min_knee_angle < 160:
+                            # נחשבת חזרה
+                            feedbacks = []
+                            penalty = 0
 
-                        # הערכת טכניקה
-                        if body_angle < 118:
-                            feedbacks.append("Try to keep your back straighter")
-                            penalty += 1.5
-                        if body_angle < 155:
-                            feedbacks.append("Try to finish more upright")
-                            penalty += 1
+                            if min_body_angle < 118:
+                                feedbacks.append("Try to keep your back straighter")
+                                penalty += 1.5
+                            if body_angle < 155:
+                                feedbacks.append("Try to finish more upright")
+                                penalty += 1
 
-                        score = round(max(4, 10 - penalty) * 2) / 2
-                        for f in feedbacks:
-                            if f not in overall_feedback:
-                                overall_feedback.append(f)
+                            score = round(max(4, 10 - penalty) * 2) / 2
+                            for f in feedbacks:
+                                if f not in overall_feedback:
+                                    overall_feedback.append(f)
 
-                        counter += 1
-                        last_rep_frame = frame_index
-                        if score >= 9.5:
-                            good_reps += 1
-                        else:
-                            bad_reps += 1
-                            problem_reps.append(counter)
-                        all_scores.append(score)
+                            counter += 1
+                            last_rep_frame = frame_index
+                            if score >= 9.5:
+                                good_reps += 1
+                            else:
+                                bad_reps += 1
+                                problem_reps.append(counter)
+                            all_scores.append(score)
 
                     rep_in_progress = False
+                    min_body_angle = 999
+                    min_knee_angle = 999
 
             except Exception:
                 continue
