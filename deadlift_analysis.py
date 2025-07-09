@@ -18,7 +18,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     frame_index = 0
     last_rep_frame = -999
     MIN_FRAMES_BETWEEN_REPS = 10
-    min_delta_y = 0
+    max_delta_x = 0
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
@@ -40,44 +40,43 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
             try:
                 lm = results.pose_landmarks.landmark
 
-                # כתף וירך ימין
-                shoulder_y = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y
-                hip_y = lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y
+                # נקודות רלוונטיות
+                shoulder_x = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x
+                hip_x = lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x
+                hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
+                       lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
                 knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
                         lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
                 ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
                          lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
-                hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
-                       lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
 
-                # זווית ברך לזיהוי אם הייתה ירידה ממשית
                 knee_angle = calculate_angle(hip, knee, ankle)
 
-                delta_y = shoulder_y - hip_y
+                delta_x = abs(hip_x - shoulder_x)
 
                 if rep_in_progress:
-                    min_delta_y = max(min_delta_y, delta_y)
+                    max_delta_x = max(max_delta_x, delta_x)
 
-                # התחלת חזרה – ירידה אמיתית בזווית גוף
+                # התחלת חזרה – כשהכתפיים זזות קדימה ביחס לאגן
                 if not rep_in_progress:
-                    if delta_y > 0.18:  # התחלה של תנועה כלפי מטה
+                    if delta_x > 0.08:
                         rep_in_progress = True
-                        min_delta_y = delta_y
+                        max_delta_x = delta_x
                         min_knee_angle = knee_angle
 
-                # סיום חזרה – כתף חזרה למעלה
-                elif rep_in_progress and delta_y < 0.08:
+                # סיום חזרה – כתפיים חוזרות לקו עם האגן
+                elif rep_in_progress and delta_x < 0.035:
                     if frame_index - last_rep_frame > MIN_FRAMES_BETWEEN_REPS:
-                        delta_drop = min_delta_y - delta_y
+                        delta_range = max_delta_x - delta_x
 
-                        if delta_drop > 0.12 and min_knee_angle < 160:
+                        if delta_range > 0.05 and min_knee_angle < 160:
                             feedbacks = []
                             penalty = 0
 
-                            if min_delta_y > 0.35:
+                            if max_delta_x > 0.2:
                                 feedbacks.append("Try not to lean too far forward")
                                 penalty += 1.5
-                            if delta_y > 0.1:
+                            if delta_x > 0.05:
                                 feedbacks.append("Try to finish more upright")
                                 penalty += 1
 
@@ -96,7 +95,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                             all_scores.append(score)
 
                     rep_in_progress = False
-                    min_delta_y = 0
+                    max_delta_x = 0
 
             except Exception:
                 continue
@@ -115,5 +114,6 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
     }
+
 
 
