@@ -1,7 +1,7 @@
+
 import cv2
 import mediapipe as mp
 import numpy as np
-
 from utils import calculate_angle, calculate_body_angle
 
 def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
@@ -15,11 +15,8 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     problem_reps = []
     overall_feedback = []
 
-    stage = None
-    rep_min_body_angle = 180
-    rep_min_knee_angle = 180
-    top_body_angle = 0
     frame_index = 0
+    rep_cooldown = 0  # מניעת ספירה כפולה
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
@@ -41,30 +38,24 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
             try:
                 lm = results.pose_landmarks.landmark
                 hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
-                knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
-                ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
                 shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
+                knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
 
                 body_angle = calculate_body_angle(shoulder, hip)
-                knee_angle = calculate_angle(hip, knee, ankle)
+                knee_angle = calculate_angle(hip, knee, [knee[0], knee[1] + 0.1])
 
-                if stage is None and body_angle < 145 and knee_angle < 150:
-                    stage = "down"
-                    rep_min_body_angle = body_angle
-                    rep_min_knee_angle = knee_angle
-
-                # ספירת חזרה: אם יש עלייה והגוף נעול
-                if (stage == "down" or stage is None) and body_angle > 160 and knee_angle > 160:
+                # תנאי לעלייה בלבד
+                if rep_cooldown == 0 and body_angle > 157 and knee_angle > 157:
                     feedbacks = []
                     penalty = 0
 
-                    if rep_min_body_angle < 130:
-                        feedbacks.append("Try to keep your back straighter")
-                        penalty += 2
-
                     if body_angle < 165:
-                        feedbacks.append("Finish your rep with a full lockout")
-                        penalty += 1.5
+                        feedbacks.append("Stand taller at the top")
+                        penalty += 1
+
+                    if knee_angle < 165:
+                        feedbacks.append("Lock your knees fully")
+                        penalty += 1
 
                     penalty = min(penalty, 6)
                     score = round(max(4, 10 - penalty) * 2) / 2
@@ -81,10 +72,10 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                         problem_reps.append(counter)
                     all_scores.append(score)
 
-                    # איפוס לחזרה הבאה
-                    stage = None
-                    rep_min_body_angle = 180
-                    rep_min_knee_angle = 180
+                    rep_cooldown = 20  # המתנה לפני שמותר לספור שוב
+
+                else:
+                    rep_cooldown = max(0, rep_cooldown - 1)
 
             except Exception:
                 continue
