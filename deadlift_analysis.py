@@ -22,9 +22,6 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     max_curvature = 0
     min_knee_angle = 999
 
-    curvatures = []
-    shoulder_ys = []
-
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
@@ -62,6 +59,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                     lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y
                 ])
 
+                # נקודת ראש (אוזן)
                 ear_r = lm[mp_pose.PoseLandmark.RIGHT_EAR.value]
                 ear_l = lm[mp_pose.PoseLandmark.LEFT_EAR.value]
 
@@ -75,7 +73,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                 delta_x = abs(hip[0] - shoulder[0])
                 knee_angle = calculate_angle(hip, knee, ankle)
 
-                # curvature
+                # חישוב curvature
                 v = shoulder - hip
                 v_norm = v / np.linalg.norm(v)
                 v_head = head_point - hip
@@ -83,15 +81,10 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                 perp = v_head - proj
                 curvature = np.linalg.norm(perp)
 
-                shoulder_y = shoulder[1]
-                hip_y = hip[1]
-
                 if rep_in_progress:
                     max_delta_x = max(max_delta_x, delta_x)
                     min_knee_angle = min(min_knee_angle, knee_angle)
                     max_curvature = max(max_curvature, curvature)
-                    curvatures.append(curvature)
-                    shoulder_ys.append(shoulder_y)
 
                 if not rep_in_progress:
                     if delta_x > 0.08:
@@ -99,8 +92,6 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                         max_delta_x = delta_x
                         min_knee_angle = knee_angle
                         max_curvature = curvature
-                        curvatures = [curvature]
-                        shoulder_ys = [shoulder_y]
 
                 elif rep_in_progress and delta_x < 0.035:
                     if frame_index - last_rep_frame > MIN_FRAMES_BETWEEN_REPS:
@@ -122,17 +113,15 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                                 feedbacks.append("Try to lift your chest and hips together")
                                 penalty += 1
 
-                            # 🌡 מדרוג curvature – קל ובינוני
-                            if 0.105 < max_curvature <= 0.11:
+                            # 🌡 מדרוג curvature בלבד
+                            if 0.11 < max_curvature <= 0.115:
                                 feedbacks.append("Try to keep your back a bit straighter")
                                 penalty += 1.5
-                            elif 0.11 < max_curvature <= 0.125:
+                            elif 0.115 < max_curvature <= 0.13:
                                 feedbacks.append("Your back is rounding too much – focus on spinal alignment")
                                 penalty += 2.5
-
-                            # 🔴 תנאי חמור: אם לפחות אחד מהפריימים עובר את הסף
-                            if any(c > 0.125 for c in curvatures) or any(s >= hip_y - 0.015 for s in shoulder_ys):
-                                feedbacks.append("Severe back rounding – keep your spine neutral")
+                            elif max_curvature > 0.13:
+                                feedbacks.append("Dangerous back rounding – stop and fix your form!")
                                 penalty += 3.5
 
                             score = round(max(4, 10 - penalty) * 2) / 2
@@ -152,8 +141,6 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                     rep_in_progress = False
                     max_delta_x = 0
                     max_curvature = 0
-                    curvatures = []
-                    shoulder_ys = []
                     min_knee_angle = 999
 
             except Exception:
@@ -173,5 +160,4 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
     }
-
 
