@@ -34,6 +34,13 @@ def compress_video(input_path, output_path, scale=0.4):
     out.release()
     return True
 
+# מיפוי שמות תרגילים לקוד ניתוח מתאים
+EXERCISE_MAP = {
+    "barbell squat": "squat",
+    "squat": "squat",
+    "deadlift": "deadlift"
+}
+
 @app.route('/analyze', methods=['POST'])
 def analyze():
     print("==== POST RECEIVED ====")
@@ -48,14 +55,18 @@ def analyze():
     exercise_type = request.form.get('exercise_type')
     if not exercise_type:
         return jsonify({"error": "Missing exercise_type"}), 400
-    exercise_type = exercise_type.lower()
+    exercise_type = exercise_type.lower().strip()
+    resolved_type = EXERCISE_MAP.get(exercise_type)
+
+    if not resolved_type:
+        return jsonify({"error": f"Unsupported exercise type: {exercise_type}"}), 400
 
     # שמירה זמנית של הסרטון
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     video_file.save(temp.name)
 
     unique_id = str(uuid.uuid4())[:8]
-    output_filename = f"{exercise_type}_{unique_id}.mp4"
+    output_filename = f"{resolved_type}_{unique_id}.mp4"
     output_path = os.path.join(MEDIA_DIR, output_filename)
 
     success = compress_video(temp.name, output_path, scale=0.4)
@@ -63,13 +74,11 @@ def analyze():
     if not success:
         return jsonify({"error": "Video compression failed"}), 500
 
-    # הרצת הניתוח לפי סוג התרגיל
-    if exercise_type == 'squat':
+    # הרצת הניתוח
+    if resolved_type == 'squat':
         result = run_analysis(output_path, frame_skip=3, scale=0.4)
-    elif exercise_type == 'deadlift':
+    elif resolved_type == 'deadlift':
         result = run_deadlift_analysis(output_path, frame_skip=3, scale=0.4)
-    else:
-        return jsonify({"error": f"Unsupported exercise type: {exercise_type}"}), 400
 
     result["video_url"] = f"/media/{output_filename}"
     return jsonify(result)
