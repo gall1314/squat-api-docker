@@ -15,13 +15,10 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     overall_feedback = []
 
     stage = None
-    min_body_angle = 180
-    top_body_angle = 0
-    hip_rise_frame = None
-    shoulder_rise_frame = None
-    frame_index = 0
+    min_knee_angle = 180
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+        frame_index = 0
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -41,50 +38,41 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
             try:
                 lm = results.pose_landmarks.landmark
                 hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
+                knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
+                ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
                 shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
 
-                hip_y = hip[1]
-                shoulder_y = shoulder[1]
-
+                knee_angle = calculate_angle(hip, knee, ankle)
                 body_angle = calculate_body_angle(shoulder, hip)
 
-                if stage is None and body_angle < 140:
+                if stage is None and knee_angle < 150:
                     stage = "down"
-                    min_body_angle = body_angle
-                    hip_rise_frame = None
-                    shoulder_rise_frame = None
+                    min_knee_angle = knee_angle
 
-                elif stage == "down" and body_angle > 145:
+                elif stage == "down" and knee_angle > 165:
                     stage = "up"
-                    top_body_angle = body_angle
 
                 if stage == "down":
-                    min_body_angle = min(min_body_angle, body_angle)
+                    min_knee_angle = min(min_knee_angle, knee_angle)
 
                 if stage == "up":
-                    top_body_angle = max(top_body_angle, body_angle)
-
-                    if hip_rise_frame is None and hip_y < lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y:
-                        hip_rise_frame = frame_index
-                    if shoulder_rise_frame is None and shoulder_y < lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y:
-                        shoulder_rise_frame = frame_index
-
-                if stage == "up" and body_angle > 165:
                     feedbacks = []
                     penalty = 0
 
-                    if min_body_angle < 130:
+                    # חזרה שטחית מידי לא נחשבת
+                    if min_knee_angle > 110:
+                        feedbacks.append("Didn't go deep enough — not counted")
+                        stage = None
+                        continue
+
+                    # ניקוד לפי זווית גב ונעילה
+                    if min_knee_angle < 120:
                         feedbacks.append("Try to keep your back straighter")
                         penalty += 2
 
-                    if top_body_angle < 165:
+                    if knee_angle < 170:
                         feedbacks.append("Finish your rep with a full lockout")
                         penalty += 1.5
-
-                    if (hip_rise_frame is not None and shoulder_rise_frame is not None and 
-                        hip_rise_frame < shoulder_rise_frame - 2):
-                        feedbacks.append("Lift your chest together with your hips")
-                        penalty += 1
 
                     penalty = min(penalty, 6)
                     score = round(max(4, 10 - penalty) * 2) / 2
@@ -102,10 +90,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                     all_scores.append(score)
 
                     stage = None
-                    min_body_angle = 180
-                    top_body_angle = 0
-                    hip_rise_frame = None
-                    shoulder_rise_frame = None
+                    min_knee_angle = 180
 
             except Exception:
                 continue
