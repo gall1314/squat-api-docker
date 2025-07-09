@@ -9,7 +9,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     if not cap.isOpened():
         return {"error": "Could not open video"}
 
-    squat_count = good_reps = bad_reps = 0
+    counter = good_reps = bad_reps = 0
     all_scores = []
     problem_reps = []
     overall_feedback = []
@@ -54,10 +54,23 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                     hip_rise_frame = None
                     shoulder_rise_frame = None
 
-                elif stage == "down" and body_angle > 165:
+                elif stage == "down" and body_angle > 140:
                     stage = "up"
                     top_body_angle = body_angle
 
+                if stage == "down":
+                    min_body_angle = min(min_body_angle, body_angle)
+
+                if stage == "up":
+                    top_body_angle = max(top_body_angle, body_angle)
+
+                    if hip_rise_frame is None and hip_y < lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y:
+                        hip_rise_frame = frame_index
+                    if shoulder_rise_frame is None and shoulder_y < lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y:
+                        shoulder_rise_frame = frame_index
+
+                # ספירת חזרה רק כשמסיימים עלייה מעל 150
+                if stage == "up" and body_angle > 150:
                     feedbacks = []
                     penalty = 0
 
@@ -81,29 +94,20 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                         if f not in overall_feedback:
                             overall_feedback.append(f)
 
-                    squat_count += 1
+                    counter += 1
                     if score >= 9.5:
                         good_reps += 1
                     else:
                         bad_reps += 1
-                        problem_reps.append(squat_count)
+                        problem_reps.append(counter)
                     all_scores.append(score)
 
+                    # איפוס לניתוח החזרה הבאה
                     stage = None
                     min_body_angle = 180
                     top_body_angle = 0
                     hip_rise_frame = None
                     shoulder_rise_frame = None
-
-                if stage == "down":
-                    min_body_angle = min(min_body_angle, body_angle)
-
-                if stage == "up":
-                    top_body_angle = max(top_body_angle, body_angle)
-                    if hip_rise_frame is None and hip_y < lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y:
-                        hip_rise_frame = frame_index
-                    if shoulder_rise_frame is None and shoulder_y < lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y:
-                        shoulder_rise_frame = frame_index
 
             except Exception:
                 continue
@@ -116,10 +120,9 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
 
     return {
         "technique_score": technique_score,
-        "squat_count": squat_count,
+        "squat_count": counter,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
     }
-
