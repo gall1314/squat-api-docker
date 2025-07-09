@@ -40,31 +40,35 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
             try:
                 lm = results.pose_landmarks.landmark
 
-                # נקודות רלוונטיות
+                # נקודות
                 shoulder_x = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x
                 hip_x = lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x
-                hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
-                       lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
+                shoulder = [shoulder_x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
+                hip = [hip_x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
                 knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
                         lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
                 ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
                          lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
 
                 knee_angle = calculate_angle(hip, knee, ankle)
+                body_angle = calculate_angle(shoulder, hip, knee)
 
                 delta_x = abs(hip_x - shoulder_x)
 
                 if rep_in_progress:
                     max_delta_x = max(max_delta_x, delta_x)
+                    min_knee_angle = min(min_knee_angle, knee_angle)
+                    min_body_angle = min(min_body_angle, body_angle)
 
-                # התחלת חזרה – כשהכתפיים זזות קדימה ביחס לאגן
+                # התחלת חזרה
                 if not rep_in_progress:
                     if delta_x > 0.08:
                         rep_in_progress = True
                         max_delta_x = delta_x
                         min_knee_angle = knee_angle
+                        min_body_angle = body_angle
 
-                # סיום חזרה – כתפיים חוזרות לקו עם האגן
+                # סיום חזרה
                 elif rep_in_progress and delta_x < 0.035:
                     if frame_index - last_rep_frame > MIN_FRAMES_BETWEEN_REPS:
                         delta_range = max_delta_x - delta_x
@@ -73,12 +77,30 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                             feedbacks = []
                             penalty = 0
 
+                            # תנאי 1: כפיפה מוגזמת
                             if max_delta_x > 0.2:
                                 feedbacks.append("Try not to lean too far forward")
                                 penalty += 1.5
+
+                            # תנאי 2: לא עמד זקוף מספיק
                             if delta_x > 0.05:
                                 feedbacks.append("Try to finish more upright")
                                 penalty += 1
+
+                            # תנאי 3: כתפיים זזו קדימה בלי כיפוף ברך
+                            if max_delta_x > 0.18 and min_knee_angle > 170:
+                                feedbacks.append("Try to bend your knees as you lean forward")
+                                penalty += 1
+
+                            # תנאי 4: האגן עלה לפני הגב
+                            if min_knee_angle > 165 and max_delta_x > 0.2:
+                                feedbacks.append("Try to lift your chest and hips together")
+                                penalty += 1
+
+                            # תנאי 5: גב עגול
+                            if min_body_angle < 115:
+                                feedbacks.append("Try to keep your back straighter")
+                                penalty += 1.5
 
                             score = round(max(4, 10 - penalty) * 2) / 2
                             for f in feedbacks:
@@ -114,6 +136,3 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
     }
-
-
-
