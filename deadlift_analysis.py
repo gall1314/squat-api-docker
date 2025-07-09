@@ -1,3 +1,4 @@
+
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -17,11 +18,9 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     stage = None
     min_body_angle = 180
     top_body_angle = 0
-    hip_rise_frame = None
-    shoulder_rise_frame = None
     frame_index = 0
 
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    with mp_pose.Pose(min_detection_confidence=0.4, min_tracking_confidence=0.4) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -41,51 +40,31 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
             try:
                 lm = results.pose_landmarks.landmark
                 hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
+                knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
+                ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
                 shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
 
-                hip_y = hip[1]
-                shoulder_y = shoulder[1]
-
                 body_angle = calculate_body_angle(shoulder, hip)
+                knee_angle = calculate_angle(hip, knee, ankle)
 
-                if stage is None and body_angle < 140:
+                if stage is None and knee_angle < 130:
                     stage = "down"
                     min_body_angle = body_angle
-                    hip_rise_frame = None
-                    shoulder_rise_frame = None
+                    top_body_angle = 0
 
-                elif stage == "down" and body_angle > 140:
+                elif stage == "down" and knee_angle > 158:
                     stage = "up"
-                    top_body_angle = body_angle
 
-                if stage == "down":
-                    min_body_angle = min(min_body_angle, body_angle)
-
-                if stage == "up":
-                    top_body_angle = max(top_body_angle, body_angle)
-
-                    if hip_rise_frame is None and hip_y < lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y:
-                        hip_rise_frame = frame_index
-                    if shoulder_rise_frame is None and shoulder_y < lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y:
-                        shoulder_rise_frame = frame_index
-
-                # ספירת חזרה רק כשמסיימים עלייה מעל 150
-                if stage == "up" and body_angle > 150:
                     feedbacks = []
                     penalty = 0
 
-                    if min_body_angle < 130:
+                    if min_body_angle < 125:
                         feedbacks.append("Try to keep your back straighter")
-                        penalty += 2
-
-                    if top_body_angle < 165:
-                        feedbacks.append("Finish your rep with a full lockout")
                         penalty += 1.5
 
-                    if (hip_rise_frame is not None and shoulder_rise_frame is not None and 
-                        hip_rise_frame < shoulder_rise_frame - 2):
-                        feedbacks.append("Lift your chest together with your hips")
-                        penalty += 1
+                    if body_angle < 160:
+                        feedbacks.append("Finish with a full lockout")
+                        penalty += 1.5
 
                     penalty = min(penalty, 6)
                     score = round(max(4, 10 - penalty) * 2) / 2
@@ -102,12 +81,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                         problem_reps.append(counter)
                     all_scores.append(score)
 
-                    # איפוס לניתוח החזרה הבאה
                     stage = None
-                    min_body_angle = 180
-                    top_body_angle = 0
-                    hip_rise_frame = None
-                    shoulder_rise_frame = None
 
             except Exception:
                 continue
@@ -126,3 +100,4 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
     }
+
