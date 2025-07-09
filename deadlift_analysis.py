@@ -40,25 +40,31 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
             try:
                 lm = results.pose_landmarks.landmark
 
-                # נקודות
+                # נקודות רלוונטיות
                 shoulder_x = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x
+                shoulder_y = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y
                 hip_x = lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x
-                shoulder = [shoulder_x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
-                hip = [hip_x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
+                hip_y = lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y
+
+                shoulder = [shoulder_x, shoulder_y]
+                hip = [hip_x, hip_y]
+
                 knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
                         lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
                 ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
                          lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
 
                 knee_angle = calculate_angle(hip, knee, ankle)
-                body_angle = calculate_angle(shoulder, hip, knee)
-
                 delta_x = abs(hip_x - shoulder_x)
+
+                # יצירת נקודת אמצע גב וחשב זווית גב
+                mid_back = [(shoulder_x + hip_x) / 2, (shoulder_y + hip_y) / 2]
+                back_angle = calculate_angle(shoulder, mid_back, hip)
 
                 if rep_in_progress:
                     max_delta_x = max(max_delta_x, delta_x)
                     min_knee_angle = min(min_knee_angle, knee_angle)
-                    min_body_angle = min(min_body_angle, body_angle)
+                    min_back_angle = min(min_back_angle, back_angle)
 
                 # התחלת חזרה
                 if not rep_in_progress:
@@ -66,7 +72,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                         rep_in_progress = True
                         max_delta_x = delta_x
                         min_knee_angle = knee_angle
-                        min_body_angle = body_angle
+                        min_back_angle = back_angle
 
                 # סיום חזרה
                 elif rep_in_progress and delta_x < 0.035:
@@ -77,28 +83,23 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                             feedbacks = []
                             penalty = 0
 
-                            # תנאי 1: כפיפה מוגזמת
-                            if max_delta_x > 0.2:
-                                feedbacks.append("Try not to lean too far forward")
-                                penalty += 1.5
-
-                            # תנאי 2: לא עמד זקוף מספיק
+                            # תנאי 1: לא נעמד מספיק זקוף
                             if delta_x > 0.05:
                                 feedbacks.append("Try to finish more upright")
                                 penalty += 1
 
-                            # תנאי 3: כתפיים זזו קדימה בלי כיפוף ברך
+                            # תנאי 2: כתפיים זזו לפני הברך
                             if max_delta_x > 0.18 and min_knee_angle > 170:
                                 feedbacks.append("Try to bend your knees as you lean forward")
                                 penalty += 1
 
-                            # תנאי 4: האגן עלה לפני הגב
+                            # תנאי 3: האגן עולה לפני החזה
                             if min_knee_angle > 165 and max_delta_x > 0.2:
                                 feedbacks.append("Try to lift your chest and hips together")
                                 penalty += 1
 
-                            # תנאי 5: גב עגול
-                            if min_body_angle < 115:
+                            # תנאי 4: גב עגול לפי זווית גב מדויקת
+                            if min_back_angle < 150:
                                 feedbacks.append("Try to keep your back straighter")
                                 penalty += 1.5
 
@@ -136,3 +137,4 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
     }
+
