@@ -158,3 +158,4 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
     }
+
