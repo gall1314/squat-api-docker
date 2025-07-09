@@ -14,11 +14,12 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     problem_reps = []
     overall_feedback = []
 
-    stage = None
-    min_body_angle = 180
+    rep_in_progress = False
     frame_index = 0
+    last_rep_frame = -999
+    MIN_FRAMES_BETWEEN_REPS = 10
 
-    with mp_pose.Pose(min_detection_confidence=0.4, min_tracking_confidence=0.4) as pose:
+    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -37,52 +38,56 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
 
             try:
                 lm = results.pose_landmarks.landmark
-                hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
-                knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
-                ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
-                shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
+
+                shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
+                            lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
+                hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
+                       lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
+                knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
+                        lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
+
+                # Skip if knee is not visible
+                if lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].visibility < 0.5:
+                    continue
 
                 body_angle = calculate_body_angle(shoulder, hip)
-                knee_angle = calculate_angle(hip, knee, ankle)
 
-                # התחלת ירידה
-                if stage is None and knee_angle < 130:
-                    stage = "down"
-                    min_body_angle = body_angle
+                # Detect start of rep (going down)
+                if not rep_in_progress and body_angle < 130:
+                    rep_in_progress = True
 
-                # סיום חזרה בעלייה
-                elif stage == "down" and knee_angle > 158:
-                    stage = "up"
-                    feedbacks = []
-                    penalty = 0
+                # Detect top of rep (going up)
+                if rep_in_progress and body_angle > 165:
+                    if frame_index - last_rep_frame > MIN_FRAMES_BETWEEN_REPS:
+                        # === Start evaluation ===
+                        feedbacks = []
+                        penalty = 0
 
-                    # גב קעור מדי
-                    if min_body_angle < 122:
-                        feedbacks.append("Try to keep your back straighter")
-                        penalty += 1.5
+                        # 1. Back too rounded (during lowest point)
+                        if body_angle < 118:
+                            feedbacks.append("Try to keep your back straighter")
+                            penalty += 1.5
 
-                    # סוף חזרה לא נעול לגמרי
-                    if body_angle < 158:
-                        feedbacks.append("Try to finish more upright")
-                        penalty += 1
+                        # 2. Not locking out fully
+                        if body_angle < 155:
+                            feedbacks.append("Try to finish more upright")
+                            penalty += 1
 
-                    # ניקוד
-                    penalty = min(penalty, 6)
-                    score = round(max(4, 10 - penalty) * 2) / 2
+                        score = round(max(4, 10 - penalty) * 2) / 2
+                        for f in feedbacks:
+                            if f not in overall_feedback:
+                                overall_feedback.append(f)
 
-                    for f in feedbacks:
-                        if f not in overall_feedback:
-                            overall_feedback.append(f)
+                        counter += 1
+                        last_rep_frame = frame_index
+                        if score >= 9.5:
+                            good_reps += 1
+                        else:
+                            bad_reps += 1
+                            problem_reps.append(counter)
+                        all_scores.append(score)
 
-                    counter += 1
-                    if score >= 9.5:
-                        good_reps += 1
-                    else:
-                        bad_reps += 1
-                        problem_reps.append(counter)
-                    all_scores.append(score)
-
-                    stage = None  # איפוס
+                    rep_in_progress = False
 
             except Exception:
                 continue
@@ -95,10 +100,11 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
 
     return {
         "technique_score": technique_score,
-        "squat_count": counter,  # לשם אחידות
+        "squat_count": counter,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
     }
+
 
