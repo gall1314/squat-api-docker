@@ -15,9 +15,10 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     overall_feedback = []
 
     stage = None
+    min_body_angle = 180
     frame_index = 0
 
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    with mp_pose.Pose(min_detection_confidence=0.4, min_tracking_confidence=0.4) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -37,31 +38,36 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
             try:
                 lm = results.pose_landmarks.landmark
                 hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
+                knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x, lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
+                ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x, lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
                 shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x, lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
 
                 body_angle = calculate_body_angle(shoulder, hip)
+                knee_angle = calculate_angle(hip, knee, ankle)
 
-                # התחלה של ירידה
-                if stage is None and body_angle < 140:
+                # התחלת ירידה
+                if stage is None and knee_angle < 130:
                     stage = "down"
+                    min_body_angle = body_angle
 
-                # תחילת עלייה
-                elif stage == "down" and body_angle > 145:
+                # סיום חזרה בעלייה
+                elif stage == "down" and knee_angle > 158:
                     stage = "up"
 
-                # ספירה וניתוח מתבצע רק אם הגוף כמעט ישר
-                if stage == "up" and body_angle > 165:
                     feedbacks = []
                     penalty = 0
 
-                    if body_angle < 155:
+                    # גב קעור מדי
+                    if min_body_angle < 122:
                         feedbacks.append("Try to keep your back straighter")
-                        penalty += 1.0
+                        penalty += 1.5
 
-                    if body_angle < 150:
-                        feedbacks.append("Finish with a full lockout")
-                        penalty += 0.5
+                    # סוף חזרה לא נעול לגמרי
+                    if body_angle < 158:
+                        feedbacks.append("Try to finish more upright")
+                        penalty += 1
 
+                    # ניקוד
                     penalty = min(penalty, 6)
                     score = round(max(4, 10 - penalty) * 2) / 2
 
@@ -77,8 +83,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                         problem_reps.append(counter)
                     all_scores.append(score)
 
-                    # איפוס
-                    stage = None
+                    stage = None  # איפוס למעקב הבא
 
             except Exception:
                 continue
@@ -91,9 +96,10 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
 
     return {
         "technique_score": technique_score,
-        "squat_count": counter,  # נשאר כך לפי בקשתך
+        "squat_count": counter,  # נשאר ככה לשם אחידות
         "good_reps": good_reps,
         "bad_reps": bad_reps,
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
     }
+
