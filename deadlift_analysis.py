@@ -1,7 +1,7 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-from utils import calculate_angle, calculate_body_angle
+from utils import calculate_angle
 
 def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     mp_pose = mp.solutions.pose
@@ -18,9 +18,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     frame_index = 0
     last_rep_frame = -999
     MIN_FRAMES_BETWEEN_REPS = 10
-
-    min_body_angle = 999
-    min_knee_angle = 999
+    min_delta_y = 0
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
@@ -42,48 +40,44 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
             try:
                 lm = results.pose_landmarks.landmark
 
-                # נקודות
-                shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
-                            lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
-                hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
-                       lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
+                # כתף וירך ימין
+                shoulder_y = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y
+                hip_y = lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y
                 knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
                         lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
                 ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
                          lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
+                hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
+                       lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
 
-                if lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].visibility < 0.5:
-                    continue
-
-                body_angle = calculate_body_angle(shoulder, hip)
+                # זווית ברך לזיהוי אם הייתה ירידה ממשית
                 knee_angle = calculate_angle(hip, knee, ankle)
 
-                # מעקב אחרי שיאי הזווית במהלך החזרה
-                if rep_in_progress:
-                    min_body_angle = min(min_body_angle, body_angle)
-                    min_knee_angle = min(min_knee_angle, knee_angle)
+                delta_y = shoulder_y - hip_y
 
-                # התחלת חזרה – תנוחה נראית נמוכה
+                if rep_in_progress:
+                    min_delta_y = max(min_delta_y, delta_y)
+
+                # התחלת חזרה – ירידה אמיתית בזווית גוף
                 if not rep_in_progress:
-                    if body_angle < 150 and knee_angle < 165:
+                    if delta_y > 0.18:  # התחלה של תנועה כלפי מטה
                         rep_in_progress = True
-                        min_body_angle = body_angle
+                        min_delta_y = delta_y
                         min_knee_angle = knee_angle
 
-                # סיום חזרה – הגוף חוזר לעמידה זקופה
-                elif rep_in_progress and body_angle > 165:
+                # סיום חזרה – כתף חזרה למעלה
+                elif rep_in_progress and delta_y < 0.08:
                     if frame_index - last_rep_frame > MIN_FRAMES_BETWEEN_REPS:
-                        # בדיקה האם היה שינוי אמיתי לאורך החזרה
-                        body_delta = body_angle - min_body_angle
-                        if body_delta > 20 and min_knee_angle < 160:
-                            # נחשבת חזרה
+                        delta_drop = min_delta_y - delta_y
+
+                        if delta_drop > 0.12 and min_knee_angle < 160:
                             feedbacks = []
                             penalty = 0
 
-                            if min_body_angle < 118:
-                                feedbacks.append("Try to keep your back straighter")
+                            if min_delta_y > 0.35:
+                                feedbacks.append("Try not to lean too far forward")
                                 penalty += 1.5
-                            if body_angle < 155:
+                            if delta_y > 0.1:
                                 feedbacks.append("Try to finish more upright")
                                 penalty += 1
 
@@ -102,8 +96,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                             all_scores.append(score)
 
                     rep_in_progress = False
-                    min_body_angle = 999
-                    min_knee_angle = 999
+                    min_delta_y = 0
 
             except Exception:
                 continue
