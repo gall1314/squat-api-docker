@@ -39,36 +39,37 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
             try:
                 lm = results.pose_landmarks.landmark
 
+                # נקודות חיוניות
                 shoulder = [lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
                             lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y]
                 hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
                        lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
                 knee = [lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
                         lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y]
+                ankle = [lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
+                         lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y]
 
-                # Skip if knee is not visible
+                # בדיקת נראות הברך
                 if lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].visibility < 0.5:
                     continue
 
                 body_angle = calculate_body_angle(shoulder, hip)
+                knee_angle = calculate_angle(hip, knee, ankle)
 
-                # Detect start of rep (going down)
-                if not rep_in_progress and body_angle < 130:
+                # התחלת חזרה – גב כפוף יחסית + ברך מכופפת
+                if not rep_in_progress and body_angle < 140 and knee_angle < 160:
                     rep_in_progress = True
 
-                # Detect top of rep (going up)
-                if rep_in_progress and body_angle > 165:
+                # סיום חזרה – עמידה זקופה
+                elif rep_in_progress and body_angle > 165:
                     if frame_index - last_rep_frame > MIN_FRAMES_BETWEEN_REPS:
-                        # === Start evaluation ===
                         feedbacks = []
                         penalty = 0
 
-                        # 1. Back too rounded (during lowest point)
+                        # הערכת טכניקה
                         if body_angle < 118:
                             feedbacks.append("Try to keep your back straighter")
                             penalty += 1.5
-
-                        # 2. Not locking out fully
                         if body_angle < 155:
                             feedbacks.append("Try to finish more upright")
                             penalty += 1
