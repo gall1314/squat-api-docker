@@ -41,7 +41,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
             try:
                 lm = results.pose_landmarks.landmark
 
-                # נקודות בסיס
+                # כתף, ירך, ברך, קרסול
                 shoulder = np.array([
                     lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
                     lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y
@@ -58,21 +58,28 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                     lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
                     lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y
                 ])
-                nose = np.array([
-                    lm[mp_pose.PoseLandmark.NOSE.value].x,
-                    lm[mp_pose.PoseLandmark.NOSE.value].y
-                ])
+
+                # בחר את האוזן עם visibility הכי טוב
+                ear_r = lm[mp_pose.PoseLandmark.RIGHT_EAR.value]
+                ear_l = lm[mp_pose.PoseLandmark.LEFT_EAR.value]
+
+                if ear_r.visibility > 0.5:
+                    head_point = np.array([ear_r.x, ear_r.y])
+                elif ear_l.visibility > 0.5:
+                    head_point = np.array([ear_l.x, ear_l.y])
+                else:
+                    continue  # אין נקודת ראש טובה – דלג
 
                 # חישובים
                 delta_x = abs(hip[0] - shoulder[0])
                 knee_angle = calculate_angle(hip, knee, ankle)
 
-                # חישוב curvature – סטייה של הראש מהקו כתף־ירך
+                # חישוב curvature של הראש מהקו כתף–ירך
                 v = shoulder - hip
                 v_norm = v / np.linalg.norm(v)
-                v_nose = nose - hip
-                projection = np.dot(v_nose, v_norm) * v_norm
-                perp = v_nose - projection
+                v_head = head_point - hip
+                proj = np.dot(v_head, v_norm) * v_norm
+                perp = v_head - proj
                 curvature = np.linalg.norm(perp)
 
                 if rep_in_progress:
@@ -97,23 +104,19 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                             feedbacks = []
                             penalty = 0
 
-                            # לא נעמד זקוף מספיק
                             if delta_x > 0.05:
                                 feedbacks.append("Try to finish more upright")
                                 penalty += 1
 
-                            # כתפיים לפני ברכיים
                             if max_delta_x > 0.18 and min_knee_angle > 170:
                                 feedbacks.append("Try to bend your knees as you lean forward")
                                 penalty += 1
 
-                            # אגן עולה לפני גב
                             if min_knee_angle > 165 and max_delta_x > 0.2:
                                 feedbacks.append("Try to lift your chest and hips together")
                                 penalty += 1
 
-                            # גב עגול – לפי סטייה מהקו
-                            if max_curvature > 0.08:
+                            if max_curvature > 0.07:
                                 feedbacks.append("Try to keep your back straighter")
                                 penalty += 1.5
 
