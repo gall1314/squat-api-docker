@@ -127,15 +127,25 @@ def run_bulgarian_analysis(video_path, frame_skip=3, scale=0.4):
     cap.release()
     cv2.destroyAllWindows()
 
+        # חישוב ציון כולל וחזרות טובות/לא טובות
     technique_score = round(np.mean([r['score'] for r in rep_reports]), 2) if rep_reports else 0
     good_reps = sum(1 for r in rep_reports if r['score'] == 10)
     bad_reps = sum(1 for r in rep_reports if r['score'] != 10)
+
+    # פידבק כללי מאוחד (סט)
+    all_feedback = []
+    seen = set()
+    for rep in rep_reports:
+        for fb in rep["feedback"]:
+            if fb not in seen:
+                all_feedback.append(fb)
+                seen.add(fb)
 
     return {
         "squat_count": len(rep_reports),
         "technique_score": technique_score,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
+        "feedback": all_feedback,
         "reps": rep_reports
     }
-
