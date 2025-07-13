@@ -1,3 +1,4 @@
+
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -20,32 +21,32 @@ def get_feedback_and_score(knee_angle, back_angle, heel_y, foot_index_y, knee_x,
     feedback = []
     score = 10
 
-    if knee_angle > 100:
-        feedback.append("⚠️ Go deeper; front knee isn't bent enough.")
-        score -= 2
-
-    if back_angle < 150:
-        feedback.append("⚠️ Keep your torso more upright.")
+    if knee_angle > 115:
+        feedback.append("⚠️ Try to go a bit deeper – front knee isn't bent enough.")
         score -= 1
 
-    if heel_y > foot_index_y + 5:
-        feedback.append("⚠️ Front heel is lifting. Keep it grounded.")
+    if back_angle < 135:
+        feedback.append("⚠️ Try to keep your torso slightly more upright.")
         score -= 1
 
-    if knee_x > foot_x + 20:
-        feedback.append("⚠️ Front knee is moving too far past the foot.")
+    if heel_y > foot_index_y + 10:
+        feedback.append("⚠️ Keep your front heel grounded.")
         score -= 1
 
-    if abs(shoulder_x - hip_x) > 30:
+    if knee_x > foot_x + 40:
+        feedback.append("⚠️ Front knee is going too far past the toes.")
+        score -= 1
+
+    if abs(shoulder_x - hip_x) > 60:
         feedback.append("⚠️ Avoid leaning sideways during the rep.")
         score -= 1
 
-    if front_hip_y < front_knee_y - 20:
-        feedback.append("⚠️ Hip too high — lower for proper depth.")
+    if front_hip_y < front_knee_y - 10:
+        feedback.append("⚠️ Try lowering your hip a bit more for proper depth.")
         score -= 1
 
-    if back_knee_y > front_knee_y + 30:
-        feedback.append("⚠️ Back knee might be touching the ground.")
+    if back_knee_y > front_knee_y + 50:
+        feedback.append("⚠️ Be careful – your back knee is hitting the floor.")
         score -= 1
 
     return feedback, max(1, score)
@@ -127,12 +128,10 @@ def run_bulgarian_analysis(video_path, frame_skip=3, scale=0.4):
     cap.release()
     cv2.destroyAllWindows()
 
-        # חישוב ציון כולל וחזרות טובות/לא טובות
     technique_score = round(np.mean([r['score'] for r in rep_reports]), 2) if rep_reports else 0
     good_reps = sum(1 for r in rep_reports if r['score'] == 10)
     bad_reps = sum(1 for r in rep_reports if r['score'] != 10)
 
-    # פידבק כללי מאוחד (סט)
     all_feedback = []
     seen = set()
     for rep in rep_reports:
