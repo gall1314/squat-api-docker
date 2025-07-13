@@ -7,6 +7,7 @@ import uuid
 # ייבוא פונקציות ניתוח
 from squat_analysis import run_analysis
 from deadlift_analysis import run_deadlift_analysis
+from bulgarian_split_squat_analysis import run_bulgarian_analysis  # חדש
 
 app = Flask(__name__)
 CORS(app)
@@ -39,7 +40,9 @@ EXERCISE_MAP = {
     "barbell squat": "squat",
     "barbell back squat": "squat",
     "squat": "squat",
-    "deadlift": "deadlift"
+    "deadlift": "deadlift",
+    "bulgarian split squat": "bulgarian",
+    "split squat": "bulgarian"
 }
 
 @app.route('/analyze', methods=['POST'])
@@ -80,6 +83,8 @@ def analyze():
         result = run_analysis(output_path, frame_skip=3, scale=0.4)
     elif resolved_type == 'deadlift':
         result = run_deadlift_analysis(output_path, frame_skip=3, scale=0.4)
+    elif resolved_type == 'bulgarian':
+        result = run_bulgarian_analysis(output_path, frame_skip=3, scale=0.4)
 
     result["video_url"] = f"/media/{output_filename}"
     return jsonify(result)
@@ -90,3 +95,4 @@ def media(filename):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
