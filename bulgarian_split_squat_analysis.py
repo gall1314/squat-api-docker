@@ -1,4 +1,5 @@
 
+
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -21,7 +22,7 @@ def get_feedback_and_score(knee_angle, back_angle, heel_y, foot_index_y, knee_x,
     feedback = []
     score = 10
 
-    if knee_angle > 115:
+    if knee_angle > 120:
         feedback.append("⚠️ Try to go a bit deeper – front knee isn't bent enough.")
         score -= 1
 
@@ -41,7 +42,7 @@ def get_feedback_and_score(knee_angle, back_angle, heel_y, foot_index_y, knee_x,
         feedback.append("⚠️ Avoid leaning sideways during the rep.")
         score -= 1
 
-    if front_hip_y < front_knee_y - 10:
+    if front_hip_y < front_knee_y - 20:
         feedback.append("⚠️ Try lowering your hip a bit more for proper depth.")
         score -= 1
 
@@ -148,3 +149,4 @@ def run_bulgarian_analysis(video_path, frame_skip=3, scale=0.4):
         "feedback": all_feedback,
         "reps": rep_reports
     }
+
