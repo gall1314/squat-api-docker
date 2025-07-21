@@ -10,9 +10,11 @@ def calculate_angle(a, b, c):
     cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
     return np.degrees(np.arccos(cosine_angle))
 
-def generate_back_rounding_feedback(min_back_angle, max_curvature, head_z, hip_z):
+def generate_back_rounding_feedback(min_back_angle, max_curvature, head_z, hip_z, back_slope, existing_feedbacks):
     feedback = None
     penalty = 0
+    if any("back" in f.lower() for f in existing_feedbacks):
+        return None, 0
     if min_back_angle < 150:
         feedback = "Dangerous back rounding – stop and fix your form!"
         penalty = 3.5
@@ -22,7 +24,7 @@ def generate_back_rounding_feedback(min_back_angle, max_curvature, head_z, hip_z
     elif min_back_angle < 170:
         feedback = "Try to keep your back a bit straighter"
         penalty = 1.5
-    elif max_curvature > 0.08 and head_z > hip_z - 0.02:
+    elif max_curvature > 0.08 and head_z > hip_z - 0.02 and back_slope > -0.2:
         feedback = "Your upper back is rounding too far backward"
         penalty = 2
     return feedback, penalty
@@ -76,8 +78,15 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                                  lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y])
                 ankle = np.array([lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
                                   lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y])
+
                 shoulder_z = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].z
                 hip_z = lm[mp_pose.PoseLandmark.RIGHT_HIP.value].z
+                shoulder_y = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y
+                hip_y = lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y
+
+                delta_z = shoulder_z - hip_z
+                delta_y = shoulder_y - hip_y
+                back_slope = delta_z / delta_y if abs(delta_y) > 1e-5 else 0
 
                 head_candidates = [
                     lm[mp_pose.PoseLandmark.RIGHT_EAR.value],
@@ -137,7 +146,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                                 penalty += 1
 
                             back_feedback, back_penalty = generate_back_rounding_feedback(
-                                min_back_angle, max_curvature, head_z, hip_z
+                                min_back_angle, max_curvature, head_z, hip_z, back_slope, feedbacks
                             )
                             if back_feedback:
                                 feedbacks.append(back_feedback)
@@ -169,7 +178,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     cap.release()
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
     if not overall_feedback:
-        overall_feedback.append("Great form! Keep it up! 💪")
+        overall_feedback.append("Great form! Your back stayed straight throughout the movement. Keep it up! 💪")
 
     return {
         "technique_score": technique_score,
@@ -179,4 +188,3 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
     }
-
