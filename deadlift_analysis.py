@@ -27,7 +27,7 @@ def generate_back_rounding_feedback(min_back_angle, max_curvature, head_z, hip_z
         penalty = 2
     return feedback, penalty
 
-def run_deadlift_analysis_blazepose(video_path, frame_skip=3, scale=0.4):
+def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     mp_pose = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -179,5 +179,4 @@ def run_deadlift_analysis_blazepose(video_path, frame_skip=3, scale=0.4):
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
     }
-
 
