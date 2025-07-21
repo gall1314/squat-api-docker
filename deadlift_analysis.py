@@ -30,7 +30,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     min_knee_angle = 999
     min_back_angle = 180
 
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5, model_complexity=2) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -67,7 +67,6 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                     lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y
                 ])
 
-                # Head landmark: prefer visible ear, fallback to nose
                 head_candidates = [
                     lm[mp_pose.PoseLandmark.RIGHT_EAR.value],
                     lm[mp_pose.PoseLandmark.LEFT_EAR.value],
@@ -83,12 +82,21 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
 
                 delta_x = abs(hip[0] - shoulder[0])
                 knee_angle = calculate_angle(hip, knee, ankle)
+
+                # חישוב קימור גב – סטייה אנכית מראש מהקו בין כתף לאגן
+                line_vec = hip - shoulder
+                line_unit = line_vec / np.linalg.norm(line_vec)
+                proj_len = np.dot(head_point - shoulder, line_unit)
+                proj_point = shoulder + proj_len * line_unit
+                perpendicular_vec = head_point - proj_point
+                curvature_score = np.linalg.norm(perpendicular_vec)
+
                 back_angle = calculate_angle(head_point, shoulder, hip)
 
                 if rep_in_progress:
                     max_delta_x = max(max_delta_x, delta_x)
                     min_knee_angle = min(min_knee_angle, knee_angle)
-                    max_curvature = max(max_curvature, 1.0 - back_angle / 180.0)
+                    max_curvature = max(max_curvature, curvature_score)
                     min_back_angle = min(min_back_angle, back_angle)
 
                 if not rep_in_progress:
@@ -96,7 +104,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                         rep_in_progress = True
                         max_delta_x = delta_x
                         min_knee_angle = knee_angle
-                        max_curvature = 1.0 - back_angle / 180.0
+                        max_curvature = curvature_score
                         min_back_angle = back_angle
 
                 elif rep_in_progress and delta_x < 0.035:
@@ -119,7 +127,6 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                                 feedbacks.append("Try to lift your chest and hips together")
                                 penalty += 1
 
-                            # Back angle logic
                             if min_back_angle < 170 and min_back_angle >= 160:
                                 feedbacks.append("Try to keep your back a bit straighter")
                                 penalty += 1.5
@@ -129,6 +136,10 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                             elif min_back_angle < 150:
                                 feedbacks.append("Dangerous back rounding – stop and fix your form!")
                                 penalty += 3.5
+
+                            if max_curvature > 0.08:
+                                feedbacks.append("Your upper back is rounding too far forward")
+                                penalty += 2
 
                             score = round(max(4, 10 - penalty) * 2) / 2
                             for f in feedbacks:
@@ -167,4 +178,5 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
     }
+
 
