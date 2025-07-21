@@ -10,7 +10,24 @@ def calculate_angle(a, b, c):
     cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
     return np.degrees(np.arccos(cosine_angle))
 
-def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
+def generate_back_rounding_feedback(min_back_angle, max_curvature, head_z, hip_z):
+    feedback = None
+    penalty = 0
+    if min_back_angle < 150:
+        feedback = "Dangerous back rounding – stop and fix your form!"
+        penalty = 3.5
+    elif min_back_angle < 160:
+        feedback = "Your back is rounding too much – focus on spinal alignment"
+        penalty = 2.5
+    elif min_back_angle < 170:
+        feedback = "Try to keep your back a bit straighter"
+        penalty = 1.5
+    elif max_curvature > 0.08 and head_z > hip_z - 0.02:
+        feedback = "Your upper back is rounding too far backward"
+        penalty = 2
+    return feedback, penalty
+
+def run_deadlift_analysis_blazepose(video_path, frame_skip=3, scale=0.4):
     mp_pose = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -29,6 +46,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
     max_curvature = 0
     min_knee_angle = 999
     min_back_angle = 180
+    head_z = hip_z = 0
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5, model_complexity=2) as pose:
         while cap.isOpened():
@@ -50,22 +68,16 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
             try:
                 lm = results.pose_landmarks.landmark
 
-                shoulder = np.array([
-                    lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
-                    lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y
-                ])
-                hip = np.array([
-                    lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
-                    lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y
-                ])
-                knee = np.array([
-                    lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
-                    lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y
-                ])
-                ankle = np.array([
-                    lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
-                    lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y
-                ])
+                shoulder = np.array([lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x,
+                                     lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y])
+                hip = np.array([lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x,
+                                lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y])
+                knee = np.array([lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].x,
+                                 lm[mp_pose.PoseLandmark.RIGHT_KNEE.value].y])
+                ankle = np.array([lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x,
+                                  lm[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y])
+                shoulder_z = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].z
+                hip_z = lm[mp_pose.PoseLandmark.RIGHT_HIP.value].z
 
                 head_candidates = [
                     lm[mp_pose.PoseLandmark.RIGHT_EAR.value],
@@ -76,6 +88,7 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                 for candidate in head_candidates:
                     if candidate.visibility > 0.5:
                         head_point = np.array([candidate.x, candidate.y])
+                        head_z = candidate.z
                         break
                 if head_point is None:
                     continue
@@ -83,7 +96,6 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                 delta_x = abs(hip[0] - shoulder[0])
                 knee_angle = calculate_angle(hip, knee, ankle)
 
-                # חישוב קימור גב – סטייה אנכית מראש מהקו בין כתף לאגן
                 line_vec = hip - shoulder
                 line_unit = line_vec / np.linalg.norm(line_vec)
                 proj_len = np.dot(head_point - shoulder, line_unit)
@@ -110,7 +122,6 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                 elif rep_in_progress and delta_x < 0.035:
                     if frame_index - last_rep_frame > MIN_FRAMES_BETWEEN_REPS:
                         delta_range = max_delta_x - delta_x
-
                         if delta_range > 0.05 and min_knee_angle < 160:
                             feedbacks = []
                             penalty = 0
@@ -118,28 +129,19 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
                             if delta_x > 0.05:
                                 feedbacks.append("Try to finish more upright")
                                 penalty += 1
-
                             if max_delta_x > 0.18 and min_knee_angle > 170:
                                 feedbacks.append("Try to bend your knees as you lean forward")
                                 penalty += 1
-
                             if min_knee_angle > 165 and max_delta_x > 0.2:
                                 feedbacks.append("Try to lift your chest and hips together")
                                 penalty += 1
 
-                            if min_back_angle < 170 and min_back_angle >= 160:
-                                feedbacks.append("Try to keep your back a bit straighter")
-                                penalty += 1.5
-                            elif min_back_angle < 160 and min_back_angle >= 150:
-                                feedbacks.append("Your back is rounding too much – focus on spinal alignment")
-                                penalty += 2.5
-                            elif min_back_angle < 150:
-                                feedbacks.append("Dangerous back rounding – stop and fix your form!")
-                                penalty += 3.5
-
-                            if max_curvature > 0.08:
-                                feedbacks.append("Your upper back is rounding too far forward")
-                                penalty += 2
+                            back_feedback, back_penalty = generate_back_rounding_feedback(
+                                min_back_angle, max_curvature, head_z, hip_z
+                            )
+                            if back_feedback:
+                                feedbacks.append(back_feedback)
+                                penalty += back_penalty
 
                             score = round(max(4, 10 - penalty) * 2) / 2
                             for f in feedbacks:
@@ -166,9 +168,8 @@ def run_deadlift_analysis(video_path, frame_skip=3, scale=0.4):
 
     cap.release()
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
-
     if not overall_feedback:
-        overall_feedback.append("Great form! Your back stayed straight throughout the movement. Keep it up! 💪")
+        overall_feedback.append("Great form! Keep it up! 💪")
 
     return {
         "technique_score": technique_score,
