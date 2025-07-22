@@ -24,9 +24,13 @@ class PullUpAnalyzer:
                 all_feedback.extend(result["errors"])
 
         if rep_reports:
-            technique_score = round(np.mean([r["technique_score"] for r in rep_reports]), 2)
+            avg_score = np.mean([r["technique_score"] for r in rep_reports])
+            technique_score = round(avg_score * 2) / 2  # round to .0 or .5
         else:
             technique_score = 0.0
+
+        if technique_score < 10 and not all_feedback:
+            all_feedback.append("General technique could be improved")
 
         return {
             "squat_count": len(rep_reports),
@@ -47,12 +51,7 @@ class PullUpAnalyzer:
         if self.has_excessive_momentum(rep_frames):
             errors.append("Used excessive leg momentum (kipping)")
 
-        score_map = {
-            0: 10,
-            1: 8,
-            2: 6,
-            3: 5
-        }
+        score_map = {0: 10, 1: 8, 2: 6, 3: 5}
         technique_score = score_map.get(len(errors), 4)
 
         return {
@@ -79,11 +78,9 @@ class PullUpAnalyzer:
         max_angles = []
         for f in frames:
             if all(k in f for k in ["LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"]):
-                ang = angle(f["LEFT_SHOULDER"], f["LEFT_ELBOW"], f["LEFT_WRIST"])
-                max_angles.append(ang)
+                max_angles.append(angle(f["LEFT_SHOULDER"], f["LEFT_ELBOW"], f["LEFT_WRIST"]))
             if all(k in f for k in ["RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"]):
-                ang = angle(f["RIGHT_SHOULDER"], f["RIGHT_ELBOW"], f["RIGHT_WRIST"])
-                max_angles.append(ang)
+                max_angles.append(angle(f["RIGHT_SHOULDER"], f["RIGHT_ELBOW"], f["RIGHT_WRIST"]))
 
         return any(a > 170 for a in max_angles)
 
@@ -91,9 +88,7 @@ class PullUpAnalyzer:
         def knee_angle(f, side="LEFT"):
             keys = [f"{side}_HIP", f"{side}_KNEE", f"{side}_ANKLE"]
             if all(k in f for k in keys):
-                a = f[keys[0]]
-                b = f[keys[1]]
-                c = f[keys[2]]
+                a, b, c = f[keys[0]], f[keys[1]], f[keys[2]]
                 ba = np.array(a) - np.array(b)
                 bc = np.array(c) - np.array(b)
                 cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
@@ -113,24 +108,20 @@ class PullUpAnalyzer:
             return False
 
         diffs = [abs(knee_angles[i+1] - knee_angles[i]) for i in range(len(knee_angles)-1)]
-        peak_movement = max(diffs) if diffs else 0
-        return peak_movement > 30
+        return max(diffs) > 30 if diffs else False
 
-    def segment_reps(self, frames, min_separation=3):
-        """Detect reps by identifying upward pull (elbow flex + nose rise)"""
+    def segment_reps(self, frames, min_separation=2):
         def elbow_angle(f, side="LEFT"):
             keys = [f"{side}_SHOULDER", f"{side}_ELBOW", f"{side}_WRIST"]
             if all(k in f for k in keys):
                 a, b, c = f[keys[0]], f[keys[1]], f[keys[2]]
                 ba = np.array(a) - np.array(b)
                 bc = np.array(c) - np.array(b)
-                cos = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-                return np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
+                cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+                return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
             return None
 
-        elbow_angles = []
-        noses = []
-
+        elbow_angles, noses = [], []
         for f in frames:
             l = elbow_angle(f, "LEFT")
             r = elbow_angle(f, "RIGHT")
@@ -140,7 +131,6 @@ class PullUpAnalyzer:
 
         reps = []
         last_rep_frame = -min_separation
-
         for i in range(1, len(frames)):
             if i - last_rep_frame < min_separation:
                 continue
@@ -152,12 +142,12 @@ class PullUpAnalyzer:
             if angle is None or prev_nose is None or curr_nose is None:
                 continue
 
-            upward_motion = curr_nose < prev_nose - 0.002
+            upward_motion = curr_nose < prev_nose - 0.001
             elbow_flexed = angle < 105
 
             if upward_motion and elbow_flexed:
                 start = max(0, i - 3)
-                end = min(len(frames), i + 5)
+                end = min(len(frames), i + 10)
                 reps.append((start, end))
                 last_rep_frame = i
 
