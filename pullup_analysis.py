@@ -61,17 +61,15 @@ class PullUpAnalyzer:
         }
 
     def full_range(self, frames):
-        """Check if nose reaches wrist height"""
         for f in frames:
             if all(k in f for k in ["NOSE", "LEFT_WRIST", "RIGHT_WRIST"]):
                 nose_y = f["NOSE"][1]
                 avg_wrist_y = (f["LEFT_WRIST"][1] + f["RIGHT_WRIST"][1]) / 2
-                if nose_y < avg_wrist_y:  # chin above wrist level
+                if nose_y < avg_wrist_y:
                     return True
         return False
 
     def full_extension(self, frames):
-        """Check if elbow gets near full extension (>170°) at bottom"""
         def angle(a, b, c):
             ba = np.array(a) - np.array(b)
             bc = np.array(c) - np.array(b)
@@ -90,7 +88,6 @@ class PullUpAnalyzer:
         return any(a > 170 for a in max_angles)
 
     def has_excessive_momentum(self, frames):
-        """Detect fast knee bend & extend = kipping"""
         def knee_angle(f, side="LEFT"):
             keys = [f"{side}_HIP", f"{side}_KNEE", f"{side}_ANKLE"]
             if all(k in f for k in keys):
@@ -117,10 +114,9 @@ class PullUpAnalyzer:
 
         diffs = [abs(knee_angles[i+1] - knee_angles[i]) for i in range(len(knee_angles)-1)]
         peak_movement = max(diffs) if diffs else 0
-        return peak_movement > 30  # large swing in knee angle = kick
+        return peak_movement > 30
 
-    def segment_reps(self, frames, min_gap=8):
-        """Detect reps by combining elbow angle and head rise"""
+    def segment_reps(self, frames, min_gap=5):
         def elbow_angle(f, side="LEFT"):
             keys = [f"{side}_SHOULDER", f"{side}_ELBOW", f"{side}_WRIST"]
             if all(k in f for k in keys):
@@ -131,33 +127,29 @@ class PullUpAnalyzer:
                 return np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
             return None
 
-        angles = []
-        noses = []
+        elbow_angles = []
         for f in frames:
-            ang_l = elbow_angle(f, "LEFT")
-            ang_r = elbow_angle(f, "RIGHT")
-            ang = np.mean([a for a in [ang_l, ang_r] if a is not None]) if ang_l or ang_r else None
-            angles.append(ang)
-            noses.append(f["NOSE"][1] if "NOSE" in f else None)
+            l = elbow_angle(f, "LEFT")
+            r = elbow_angle(f, "RIGHT")
+            avg = np.mean([a for a in [l, r] if a is not None]) if l or r else None
+            elbow_angles.append(avg)
 
+        state = "waiting"
+        start_idx = None
         reps = []
-        in_rep = False
-        start_idx = 0
 
-        for i in range(1, len(frames)):
-            if angles[i] is None or noses[i] is None:
+        for i in range(len(elbow_angles)):
+            angle = elbow_angles[i]
+            if angle is None:
                 continue
 
-            elbow_flexed = angles[i] < 100
-            nose_moved_up = noses[i] < noses[i-1] - 0.01
-
-            if not in_rep and elbow_flexed and nose_moved_up:
-                in_rep = True
+            if state == "waiting" and angle < 100:
+                state = "in_rep"
                 start_idx = i
-            elif in_rep and angles[i] > 165:
-                if i - start_idx > min_gap:
-                    reps.append((max(0, start_idx-2), min(len(frames), i+2)))
-                in_rep = False
+            elif state == "in_rep" and angle > 170:
+                if i - start_idx >= min_gap:
+                    reps.append((max(0, start_idx - 2), min(len(frames), i + 2)))
+                state = "waiting"
 
         return reps
 
