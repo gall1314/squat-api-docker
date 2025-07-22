@@ -7,7 +7,8 @@ import uuid
 # ייבוא פונקציות ניתוח
 from squat_analysis import run_analysis
 from deadlift_analysis import run_deadlift_analysis
-from bulgarian_split_squat_analysis import run_bulgarian_analysis  # חדש
+from bulgarian_split_squat_analysis import run_bulgarian_analysis
+from pullup_analysis import run_pullup_analysis  # ✅ חדש
 
 app = Flask(__name__)
 CORS(app)
@@ -35,14 +36,16 @@ def compress_video(input_path, output_path, scale=0.4):
     out.release()
     return True
 
-# מיפוי שמות תרגילים לשמות קוד
+# ✅ הוספנו את pull-up למפה
 EXERCISE_MAP = {
     "barbell squat": "squat",
     "barbell back squat": "squat",
     "squat": "squat",
     "deadlift": "deadlift",
     "bulgarian split squat": "bulgarian",
-    "split squat": "bulgarian"
+    "split squat": "bulgarian",
+    "pull-up": "pullup",
+    "pull up": "pullup"
 }
 
 @app.route('/analyze', methods=['POST'])
@@ -55,7 +58,6 @@ def analyze():
     if not video_file:
         return jsonify({"error": "No video uploaded"}), 400
 
-    # קריאת exercise_type ובדיקה שהוא תקין
     exercise_type = request.form.get('exercise_type')
     if not exercise_type:
         return jsonify({"error": "Missing exercise_type"}), 400
@@ -65,7 +67,6 @@ def analyze():
     if not resolved_type:
         return jsonify({"error": f"Unsupported exercise type: {exercise_type}"}), 400
 
-    # שמירה זמנית של הסרטון
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     video_file.save(temp.name)
 
@@ -78,13 +79,15 @@ def analyze():
     if not success:
         return jsonify({"error": "Video compression failed"}), 500
 
-    # הרצת ניתוח לפי סוג התרגיל
+    # ✅ הוספנו את ההרצה עבור pull-up
     if resolved_type == 'squat':
         result = run_analysis(output_path, frame_skip=3, scale=0.4)
     elif resolved_type == 'deadlift':
         result = run_deadlift_analysis(output_path, frame_skip=3, scale=0.4)
     elif resolved_type == 'bulgarian':
         result = run_bulgarian_analysis(output_path, frame_skip=3, scale=0.4)
+    elif resolved_type == 'pullup':
+        result = run_pullup_analysis(output_path, frame_skip=3, scale=0.4)
 
     result["video_url"] = f"/media/{output_filename}"
     return jsonify(result)
