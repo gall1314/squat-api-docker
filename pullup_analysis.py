@@ -116,7 +116,7 @@ class PullUpAnalyzer:
         peak_movement = max(diffs) if diffs else 0
         return peak_movement > 30
 
-    def segment_reps(self, frames, min_separation=5):
+    def segment_reps(self, frames, min_separation=3):
         """Detect reps by identifying upward pull (elbow flex + nose rise)"""
         def elbow_angle(f, side="LEFT"):
             keys = [f"{side}_SHOULDER", f"{side}_ELBOW", f"{side}_WRIST"]
@@ -152,8 +152,8 @@ class PullUpAnalyzer:
             if angle is None or prev_nose is None or curr_nose is None:
                 continue
 
-            upward_motion = curr_nose < prev_nose - 0.005
-            elbow_flexed = angle < 100
+            upward_motion = curr_nose < prev_nose - 0.002
+            elbow_flexed = angle < 105
 
             if upward_motion and elbow_flexed:
                 start = max(0, i - 3)
@@ -191,4 +191,3 @@ def run_pullup_analysis(video_path, frame_skip=3, scale=0.4):
     pose.close()
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
-
