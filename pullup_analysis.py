@@ -1,4 +1,6 @@
+import cv2
 import numpy as np
+import mediapipe as mp
 
 class PullUpAnalyzer:
     def __init__(self):
@@ -93,7 +95,7 @@ class PullUpAnalyzer:
             return False
 
         z_range = max(all_z) - min(all_z)
-        return z_range > 0.15  # הערכה בלבד – רגיש לרעש
+        return z_range > 0.15
 
     def segment_reps(self, frames, min_frames_between=8):
         nose_ys = [f["NOSE"][1] if "NOSE" in f else None for f in frames]
@@ -118,3 +120,40 @@ class PullUpAnalyzer:
                 state = "down"
 
         return reps
+
+# ✅ זוהי הפונקציה ש־api.py קורא לה
+def run_pullup_analysis(video_path, frame_skip=3, scale=0.4):
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(static_image_mode=False, model_complexity=1)
+
+    cap = cv2.VideoCapture(video_path)
+    landmarks_list = []
+    frame_count = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_count % frame_skip != 0:
+            frame_count += 1
+            continue
+
+        frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(image_rgb)
+
+        frame_landmarks = {}
+        if results.pose_landmarks:
+            for i, lm in enumerate(results.pose_landmarks.landmark):
+                frame_landmarks[mp_pose.PoseLandmark(i).name] = (lm.x, lm.y, lm.z)
+
+        landmarks_list.append(frame_landmarks)
+        frame_count += 1
+
+    cap.release()
+    pose.close()
+
+    analyzer = PullUpAnalyzer()
+    return analyzer.analyze_all_reps(landmarks_list)
+
