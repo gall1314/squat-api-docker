@@ -17,7 +17,7 @@ class PullUpAnalyzer:
             result = self.analyze_rep(rep_frames)
             rep_reports.append(result)
 
-            if result["technique_score"] >= 0.8:
+            if result["technique_score"] >= 8:
                 good_reps += 1
             else:
                 bad_reps += 1
@@ -41,91 +41,129 @@ class PullUpAnalyzer:
         errors = []
 
         if not self.full_range(rep_frames):
-            errors.append("טווח תנועה חלקי")
+            errors.append("Did not pull high enough (chin should reach wrist height)")
         if not self.full_extension(rep_frames):
-            errors.append("לא יישר ידיים בסוף")
+            errors.append("Did not fully extend arms at the bottom")
         if self.has_excessive_momentum(rep_frames):
-            errors.append("שימוש מופרז במומנטום")
+            errors.append("Used excessive leg momentum (kipping)")
 
-        technique_score = 1 - 0.2 * len(errors)
-        technique_score = max(0.0, technique_score)
+        score_map = {
+            0: 10,
+            1: 8,
+            2: 6,
+            3: 5
+        }
+        technique_score = score_map.get(len(errors), 4)
 
         return {
-            "technique_score": round(technique_score, 2),
+            "technique_score": technique_score,
             "errors": errors
         }
 
     def full_range(self, frames):
-        nose_ys = [f["NOSE"][1] for f in frames if "NOSE" in f]
-        shoulder_ys = [(f["LEFT_SHOULDER"][1] + f["RIGHT_SHOULDER"][1]) / 2 for f in frames if "LEFT_SHOULDER" in f and "RIGHT_SHOULDER" in f]
-        if not nose_ys or not shoulder_ys:
-            return False
-
-        min_nose_y = min(nose_ys)
-        max_nose_y = max(nose_ys)
-        delta = max_nose_y - min_nose_y
-        return delta > 0.15
-
-    def full_extension(self, frames):
-        def angle(a, b, c):
-            ba = np.array(a) - np.array(b)
-            bc = np.array(c) - np.array(b)
-            cosine_angle = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-            return np.degrees(np.arccos(np.clip(cosine_angle, -1.0, 1.0)))
-
-        for f in frames[-5:]:
-            if all(k in f for k in ["LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"]):
-                ang = angle(f["LEFT_SHOULDER"], f["LEFT_ELBOW"], f["LEFT_WRIST"])
-                if ang > 165:
-                    return True
-            if all(k in f for k in ["RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"]):
-                ang = angle(f["RIGHT_SHOULDER"], f["RIGHT_ELBOW"], f["RIGHT_WRIST"])
-                if ang > 165:
+        """Check if nose reaches wrist height"""
+        for f in frames:
+            if all(k in f for k in ["NOSE", "LEFT_WRIST", "RIGHT_WRIST"]):
+                nose_y = f["NOSE"][1]
+                avg_wrist_y = (f["LEFT_WRIST"][1] + f["RIGHT_WRIST"][1]) / 2
+                if nose_y < avg_wrist_y:  # chin above wrist level
                     return True
         return False
 
-    def has_excessive_momentum(self, frames):
-        all_z = []
+    def full_extension(self, frames):
+        """Check if elbow gets near full extension (>170°) at bottom"""
+        def angle(a, b, c):
+            ba = np.array(a) - np.array(b)
+            bc = np.array(c) - np.array(b)
+            cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+            return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+
+        max_angles = []
         for f in frames:
-            if "LEFT_ANKLE" in f:
-                all_z.append(f["LEFT_ANKLE"][2])
-            if "RIGHT_ANKLE" in f:
-                all_z.append(f["RIGHT_ANKLE"][2])
-        if not all_z:
+            if all(k in f for k in ["LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"]):
+                ang = angle(f["LEFT_SHOULDER"], f["LEFT_ELBOW"], f["LEFT_WRIST"])
+                max_angles.append(ang)
+            if all(k in f for k in ["RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"]):
+                ang = angle(f["RIGHT_SHOULDER"], f["RIGHT_ELBOW"], f["RIGHT_WRIST"])
+                max_angles.append(ang)
+
+        return any(a > 170 for a in max_angles)
+
+    def has_excessive_momentum(self, frames):
+        """Detect fast knee bend & extend = kipping"""
+        def knee_angle(f, side="LEFT"):
+            keys = [f"{side}_HIP", f"{side}_KNEE", f"{side}_ANKLE"]
+            if all(k in f for k in keys):
+                a = f[keys[0]]
+                b = f[keys[1]]
+                c = f[keys[2]]
+                ba = np.array(a) - np.array(b)
+                bc = np.array(c) - np.array(b)
+                cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+                return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+            return None
+
+        knee_angles = []
+        for f in frames:
+            left = knee_angle(f, "LEFT")
+            right = knee_angle(f, "RIGHT")
+            if left:
+                knee_angles.append(left)
+            elif right:
+                knee_angles.append(right)
+
+        if len(knee_angles) < 3:
             return False
 
-        z_range = max(all_z) - min(all_z)
-        return z_range > 0.15
+        diffs = [abs(knee_angles[i+1] - knee_angles[i]) for i in range(len(knee_angles)-1)]
+        peak_movement = max(diffs) if diffs else 0
+        return peak_movement > 30  # large swing in knee angle = kick
 
-    def segment_reps(self, frames, min_frames_between=8):
-        nose_ys = [f["NOSE"][1] if "NOSE" in f else None for f in frames]
-        deltas = []
-        for i in range(1, len(nose_ys)):
-            if nose_ys[i] is not None and nose_ys[i-1] is not None:
-                deltas.append(nose_ys[i] - nose_ys[i-1])
-            else:
-                deltas.append(0)
+    def segment_reps(self, frames, min_gap=8):
+        """Detect reps by combining elbow angle and head rise"""
+        def elbow_angle(f, side="LEFT"):
+            keys = [f"{side}_SHOULDER", f"{side}_ELBOW", f"{side}_WRIST"]
+            if all(k in f for k in keys):
+                a, b, c = f[keys[0]], f[keys[1]], f[keys[2]]
+                ba = np.array(a) - np.array(b)
+                bc = np.array(c) - np.array(b)
+                cos = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+                return np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
+            return None
 
-        state = "down"
-        rep_start = None
+        angles = []
+        noses = []
+        for f in frames:
+            ang_l = elbow_angle(f, "LEFT")
+            ang_r = elbow_angle(f, "RIGHT")
+            ang = np.mean([a for a in [ang_l, ang_r] if a is not None]) if ang_l or ang_r else None
+            angles.append(ang)
+            noses.append(f["NOSE"][1] if "NOSE" in f else None)
+
         reps = []
+        in_rep = False
+        start_idx = 0
 
-        for i in range(1, len(deltas)):
-            if state == "down" and deltas[i] < -0.01:
-                rep_start = i
-                state = "up"
-            elif state == "up" and deltas[i] > 0.01:
-                if rep_start and i - rep_start > min_frames_between:
-                    reps.append((max(0, rep_start - 2), min(len(frames), i + 2)))
-                state = "down"
+        for i in range(1, len(frames)):
+            if angles[i] is None or noses[i] is None:
+                continue
+
+            elbow_flexed = angles[i] < 100
+            nose_moved_up = noses[i] < noses[i-1] - 0.01
+
+            if not in_rep and elbow_flexed and nose_moved_up:
+                in_rep = True
+                start_idx = i
+            elif in_rep and angles[i] > 165:
+                if i - start_idx > min_gap:
+                    reps.append((max(0, start_idx-2), min(len(frames), i+2)))
+                in_rep = False
 
         return reps
 
-# ✅ זוהי הפונקציה ש־api.py קורא לה
 def run_pullup_analysis(video_path, frame_skip=3, scale=0.4):
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(static_image_mode=False, model_complexity=1)
-
     cap = cv2.VideoCapture(video_path)
     landmarks_list = []
     frame_count = 0
@@ -134,26 +172,21 @@ def run_pullup_analysis(video_path, frame_skip=3, scale=0.4):
         ret, frame = cap.read()
         if not ret:
             break
-
         if frame_count % frame_skip != 0:
             frame_count += 1
             continue
-
         frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(image_rgb)
-
         frame_landmarks = {}
         if results.pose_landmarks:
             for i, lm in enumerate(results.pose_landmarks.landmark):
                 frame_landmarks[mp_pose.PoseLandmark(i).name] = (lm.x, lm.y, lm.z)
-
         landmarks_list.append(frame_landmarks)
         frame_count += 1
 
     cap.release()
     pose.close()
-
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
 
