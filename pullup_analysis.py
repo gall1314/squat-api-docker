@@ -29,9 +29,6 @@ class PullUpAnalyzer:
         else:
             technique_score = 0.0
 
-        if technique_score < 10 and not all_feedback:
-            all_feedback.append("General technique could be improved")
-
         return {
             "squat_count": len(rep_reports),
             "technique_score": technique_score,
@@ -131,7 +128,7 @@ class PullUpAnalyzer:
 
         reps = []
         last_rep_frame = -min_separation
-        for i in range(1, len(frames)):
+        for i in range(2, len(frames)):
             if i - last_rep_frame < min_separation:
                 continue
 
@@ -142,8 +139,8 @@ class PullUpAnalyzer:
             if angle is None or prev_nose is None or curr_nose is None:
                 continue
 
-            upward_motion = curr_nose < prev_nose - 0.001
-            elbow_flexed = angle < 105
+            upward_motion = curr_nose < prev_nose - 0.003
+            elbow_flexed = angle < 110
 
             if upward_motion and elbow_flexed:
                 start = max(0, i - 3)
@@ -181,3 +178,4 @@ def run_pullup_analysis(video_path, frame_skip=3, scale=0.4):
     pose.close()
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
+
