@@ -15,7 +15,7 @@ class PullUpAnalyzer:
             result = self.analyze_rep(rep_frames)
             rep_reports.append(result)
 
-            if result["technique_score"] >= 0.8:
+            if result["technique_score"] >= 8:
                 good_reps += 1
             else:
                 bad_reps += 1
@@ -76,10 +76,10 @@ class PullUpAnalyzer:
 
         angles = []
         for f in frames[-10:]:
-            if all(k in f for k in ["LEFT_SHOULDER", "LEFT_ELBOW", "LEFT_WRIST"]):
-                angles.append(angle(f["LEFT_SHOULDER"], f["LEFT_ELBOW"], f["LEFT_WRIST"]))
-            if all(k in f for k in ["RIGHT_SHOULDER", "RIGHT_ELBOW", "RIGHT_WRIST"]):
-                angles.append(angle(f["RIGHT_SHOULDER"], f["RIGHT_ELBOW"], f["RIGHT_WRIST"]))
+            for side in ["LEFT", "RIGHT"]:
+                keys = [f"{side}_SHOULDER", f"{side}_ELBOW", f"{side}_WRIST"]
+                if all(k in f for k in keys):
+                    angles.append(angle(f[keys[0]], f[keys[1]], f[keys[2]]))
 
         angles = [a for a in angles if a is not None]
         return sum(a > 165 for a in angles) >= 3
@@ -93,10 +93,10 @@ class PullUpAnalyzer:
 
         angles = []
         for f in frames:
-            if all(k in f for k in ["LEFT_HIP", "LEFT_KNEE", "LEFT_ANKLE"]):
-                angles.append(angle(f["LEFT_HIP"], f["LEFT_KNEE"], f["LEFT_ANKLE"]))
-            elif all(k in f for k in ["RIGHT_HIP", "RIGHT_KNEE", "RIGHT_ANKLE"]):
-                angles.append(angle(f["RIGHT_HIP"], f["RIGHT_KNEE"], f["RIGHT_ANKLE"]))
+            for side in ["LEFT", "RIGHT"]:
+                keys = [f"{side}_HIP", f"{side}_KNEE", f"{side}_ANKLE"]
+                if all(k in f for k in keys):
+                    angles.append(angle(f[keys[0]], f[keys[1]], f[keys[2]]))
 
         if len(angles) < 3:
             return False
@@ -114,17 +114,16 @@ class PullUpAnalyzer:
                 continue
             delta_y = frames[i - 1]["NOSE"][1] - frames[i]["NOSE"][1]
 
-            # נבדוק אם זווית המרפק ירדה במהלך התנועה
             elbow_angles = []
             for side in ["LEFT", "RIGHT"]:
                 keys = [f"{side}_SHOULDER", f"{side}_ELBOW", f"{side}_WRIST"]
                 if all(k in frames[i] for k in keys):
-                    shoulder, elbow, wrist = (frames[i][keys[0]], frames[i][keys[1]], frames[i][keys[2]])
-                    ba = np.array(shoulder) - np.array(elbow)
-                    bc = np.array(wrist) - np.array(elbow)
+                    a, b, c = frames[i][keys[0]], frames[i][keys[1]], frames[i][keys[2]]
+                    ba = np.array(a) - np.array(b)
+                    bc = np.array(c) - np.array(b)
                     cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-                    angle = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
-                    elbow_angles.append(angle)
+                    angle_val = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+                    elbow_angles.append(angle_val)
 
             if delta_y > 0.0025 and any(a < 110 for a in elbow_angles):
                 if not in_rep:
@@ -137,3 +136,9 @@ class PullUpAnalyzer:
 
         return reps
 
+
+def run_pullup_analysis(video_path, frame_skip=3, scale=0.4):
+    from video_utils import extract_keypoints  # החלק הזה תלוי בקוד הקיים אצלך
+    frames = extract_keypoints(video_path, frame_skip=frame_skip, scale=scale)
+    analyzer = PullUpAnalyzer()
+    return analyzer.analyze_all_reps(frames)
