@@ -116,7 +116,8 @@ class PullUpAnalyzer:
         peak_movement = max(diffs) if diffs else 0
         return peak_movement > 30
 
-    def segment_reps(self, frames, min_gap=5):
+    def segment_reps(self, frames, min_separation=5):
+        """Detect reps by identifying upward pull (elbow flex + nose rise)"""
         def elbow_angle(f, side="LEFT"):
             keys = [f"{side}_SHOULDER", f"{side}_ELBOW", f"{side}_WRIST"]
             if all(k in f for k in keys):
@@ -128,28 +129,37 @@ class PullUpAnalyzer:
             return None
 
         elbow_angles = []
+        noses = []
+
         for f in frames:
             l = elbow_angle(f, "LEFT")
             r = elbow_angle(f, "RIGHT")
             avg = np.mean([a for a in [l, r] if a is not None]) if l or r else None
             elbow_angles.append(avg)
+            noses.append(f["NOSE"][1] if "NOSE" in f else None)
 
-        state = "waiting"
-        start_idx = None
         reps = []
+        last_rep_frame = -min_separation
 
-        for i in range(len(elbow_angles)):
-            angle = elbow_angles[i]
-            if angle is None:
+        for i in range(1, len(frames)):
+            if i - last_rep_frame < min_separation:
                 continue
 
-            if state == "waiting" and angle < 100:
-                state = "in_rep"
-                start_idx = i
-            elif state == "in_rep" and angle > 170:
-                if i - start_idx >= min_gap:
-                    reps.append((max(0, start_idx - 2), min(len(frames), i + 2)))
-                state = "waiting"
+            angle = elbow_angles[i]
+            prev_nose = noses[i - 1]
+            curr_nose = noses[i]
+
+            if angle is None or prev_nose is None or curr_nose is None:
+                continue
+
+            upward_motion = curr_nose < prev_nose - 0.005
+            elbow_flexed = angle < 100
+
+            if upward_motion and elbow_flexed:
+                start = max(0, i - 3)
+                end = min(len(frames), i + 5)
+                reps.append((start, end))
+                last_rep_frame = i
 
         return reps
 
