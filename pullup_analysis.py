@@ -21,13 +21,16 @@ class PullUpAnalyzer:
                 good_reps += 1
             else:
                 bad_reps += 1
-                all_feedback.extend(result["errors"])
+            all_feedback.extend(result["errors"])
 
         if rep_reports:
             avg_score = np.mean([r["technique_score"] for r in rep_reports])
             technique_score = round(avg_score * 2) / 2  # round to .0 or .5
         else:
             technique_score = 0.0
+
+        if technique_score == 10 and not all_feedback:
+            all_feedback.append("Great form! Keep it up 💪")
 
         return {
             "squat_count": len(rep_reports),
@@ -42,11 +45,11 @@ class PullUpAnalyzer:
         errors = []
 
         if not self.full_range(rep_frames):
-            errors.append("Did not pull high enough (chin should reach wrist height)")
+            errors.append("Try to pull yourself a bit higher – aim to get your chin up to wrist level")
         if not self.full_extension(rep_frames):
-            errors.append("Did not fully extend arms at the bottom")
+            errors.append("Make sure to fully extend your arms at the bottom before the next rep")
         if self.has_excessive_momentum(rep_frames):
-            errors.append("Used excessive leg momentum (kipping)")
+            errors.append("Try to minimize leg movement – avoid kicking or using momentum")
 
         score_map = {0: 10, 1: 8, 2: 6, 3: 5}
         technique_score = score_map.get(len(errors), 4)
@@ -139,7 +142,7 @@ class PullUpAnalyzer:
             if angle is None or prev_nose is None or curr_nose is None:
                 continue
 
-            upward_motion = curr_nose < prev_nose - 0.003
+            upward_motion = curr_nose < prev_nose - 0.0025
             elbow_flexed = angle < 110
 
             if upward_motion and elbow_flexed:
