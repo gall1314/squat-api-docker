@@ -1,7 +1,8 @@
 import numpy as np
 
 class PullUpAnalyzer:
-    def __init__(self): pass
+    def __init__(self):
+        pass
 
     def analyze_all_reps(self, frames):
         rep_ranges = self.segment_reps(frames)
@@ -40,6 +41,7 @@ class PullUpAnalyzer:
 
     def analyze_rep(self, rep_frames):
         errors = []
+
         if not self.full_range(rep_frames):
             errors.append("Try to pull yourself a bit higher – aim for chin-to-wrist height")
         if not self.full_extension(rep_frames):
@@ -79,6 +81,7 @@ class PullUpAnalyzer:
                 if all(k in f for k in keys):
                     angles.append(angle(f[keys[0]], f[keys[1]], f[keys[2]]))
 
+        angles = [a for a in angles if a is not None]
         return sum(a > 170 for a in angles) >= 3
 
     def has_excessive_momentum(self, frames):
@@ -98,7 +101,8 @@ class PullUpAnalyzer:
         if len(angles) < 3:
             return False
 
-        return max(angles) - min(angles) > 35
+        diff = max(angles) - min(angles)
+        return diff > 35
 
     def segment_reps(self, frames, min_frames_between=6):
         reps = []
@@ -118,7 +122,8 @@ class PullUpAnalyzer:
                     ba = np.array(a) - np.array(b)
                     bc = np.array(c) - np.array(b)
                     cosine = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-                    elbow_angles.append(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+                    angle_val = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+                    elbow_angles.append(angle_val)
 
             if delta_y > 0.0025 and any(a < 110 for a in elbow_angles):
                 if not in_rep:
@@ -137,4 +142,3 @@ def run_pullup_analysis(video_path, frame_skip=3, scale=0.4):
     frames = extract_keypoints(video_path, frame_skip=frame_skip, scale=scale)
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(frames)
-
