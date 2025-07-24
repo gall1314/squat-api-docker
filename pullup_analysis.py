@@ -1,4 +1,6 @@
 import numpy as np
+import cv2
+from blazepose import BlazePose  # שימוש במודל BlazePose GH
 
 class PullUpAnalyzer:
     def __init__(self):
@@ -82,7 +84,7 @@ class PullUpAnalyzer:
                     angles.append(angle(f[keys[0]], f[keys[1]], f[keys[2]]))
 
         angles = [a for a in angles if a is not None]
-        return sum(a > 165 for a in angles) >= 3
+        return sum(a > 170 for a in angles) >= 3
 
     def has_excessive_momentum(self, frames):
         def angle(a, b, c):
@@ -137,8 +139,29 @@ class PullUpAnalyzer:
         return reps
 
 
+def extract_keypoints(video_path, frame_skip=3, scale=0.4):
+    detector = BlazePose()
+    frames = []
+
+    cap = cv2.VideoCapture(video_path)
+    i = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if i % frame_skip != 0:
+            i += 1
+            continue
+        image = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+        keypoints = detector.process_frame(image)
+        if keypoints:
+            frames.append(keypoints)
+        i += 1
+    cap.release()
+
+    return frames
+
 def run_pullup_analysis(video_path, frame_skip=3, scale=0.4):
-    from video_utils import extract_keypoints  # החלק הזה תלוי בקוד הקיים אצלך
     frames = extract_keypoints(video_path, frame_skip=frame_skip, scale=scale)
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(frames)
