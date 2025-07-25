@@ -4,10 +4,6 @@ import mediapipe as mp
 
 class PullUpAnalyzer:
     def __init__(self, angle_drop_threshold=18.0, min_separation=5):
-        """
-        :param angle_drop_threshold: ירידה בזווית המרפק (במעלות) שתיחשב כתחילת חזרה
-        :param min_separation: מינימום פריימים בין חזרות כדי למנוע זיהוי כפול
-        """
         self.angle_drop_threshold = angle_drop_threshold
         self.min_separation = min_separation
 
@@ -15,7 +11,7 @@ class PullUpAnalyzer:
         rep_ranges = self.segment_reps(frames)
         return {
             "rep_count": len(rep_ranges),
-            "squat_count": len(rep_ranges),  # תאימות אם יש קוד אחר שמצפה לשם הזה
+            "squat_count": len(rep_ranges),
             "technique_score": 10.0 if len(rep_ranges) > 0 else 0.0,
             "good_reps": len(rep_ranges),
             "bad_reps": 0,
@@ -57,13 +53,11 @@ class PullUpAnalyzer:
             angle_drop = prev - curr
 
             if state == "waiting" and angle_drop >= self.angle_drop_threshold and (i - last_rep_index) >= self.min_separation:
-                # התחלת חזרה (יד נעה מפתוחה למקופלת)
                 state = "in_rep"
                 start_idx = i - 1
                 start_angle = curr
 
             elif state == "in_rep" and curr > start_angle:
-                # חזרה הסתיימה (יד חזרה להיפתח)
                 reps.append((start_idx, i))
                 last_rep_index = i
                 state = "waiting"
@@ -72,13 +66,7 @@ class PullUpAnalyzer:
 
         return reps
 
-def run_pullup_analysis(video_path, frame_skip=2, scale=0.4):
-    """
-    :param video_path: נתיב לסרטון
-    :param frame_skip: דילוג פריימים (כדי לחסוך זמן)
-    :param scale: שינוי קנה מידה לתמונה (לזרוז עיבוד)
-    :return: dict עם נתוני ניתוח
-    """
+def run_pullup_analysis(video_path, frame_skip=3, scale=0.3, verbose=True):
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(static_image_mode=False, model_complexity=1)
     cap = cv2.VideoCapture(video_path)
@@ -92,19 +80,29 @@ def run_pullup_analysis(video_path, frame_skip=2, scale=0.4):
         if frame_count % frame_skip != 0:
             frame_count += 1
             continue
+
+        # Resize frame to speed up processing
         frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(image_rgb)
-        frame_landmarks = {}
+
+        # Only add frames where pose landmarks exist
         if results.pose_landmarks:
+            frame_landmarks = {}
             for i, lm in enumerate(results.pose_landmarks.landmark):
                 frame_landmarks[mp_pose.PoseLandmark(i).name] = (lm.x, lm.y, lm.z)
-        landmarks_list.append(frame_landmarks)
+            landmarks_list.append(frame_landmarks)
+
         frame_count += 1
+        if verbose and frame_count % 30 == 0:
+            print(f"Processed {frame_count} frames...")
 
     cap.release()
     pose.close()
+
+    if verbose:
+        print(f"Total frames with landmarks: {len(landmarks_list)}")
+
     analyzer = PullUpAnalyzer(angle_drop_threshold=18.0, min_separation=5)
     return analyzer.analyze_all_reps(landmarks_list)
-
 
