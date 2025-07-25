@@ -3,20 +3,31 @@ import numpy as np
 import mediapipe as mp
 
 class PullUpAnalyzer:
-    def __init__(self, angle_drop_threshold=18.0, min_separation=5):
+    def __init__(self, angle_drop_threshold=18.0, min_separation=5, nose_rise_thresh=0.001):
         self.angle_drop_threshold = angle_drop_threshold
         self.min_separation = min_separation
+        self.nose_rise_thresh = nose_rise_thresh
 
     def analyze_all_reps(self, frames):
         rep_ranges = self.segment_reps(frames)
+        good_reps = len(rep_ranges)
+        bad_reps = 0  # טרם נוספה לוגיקת איכות
+
+        if good_reps == 0:
+            feedback = ["No pull-ups detected"]
+            score = 0.0
+        else:
+            score = 10.0
+            feedback = ["Great form! Keep it up 💪"]
+
         return {
             "rep_count": len(rep_ranges),
             "squat_count": len(rep_ranges),
-            "technique_score": 10.0 if len(rep_ranges) > 0 else 0.0,
-            "good_reps": len(rep_ranges),
-            "bad_reps": 0,
-            "feedback": [] if len(rep_ranges) > 0 else ["No pull-ups detected"],
-            "reps": [{"technique_score": 10.0, "errors": []} for _ in rep_ranges]
+            "technique_score": score,
+            "good_reps": good_reps,
+            "bad_reps": bad_reps,
+            "feedback": feedback,
+            "reps": [{"technique_score": score, "errors": []} for _ in rep_ranges]
         }
 
     def segment_reps(self, frames):
@@ -31,12 +42,15 @@ class PullUpAnalyzer:
             return None
 
         elbow_angles = []
+        noses_y = []
+
         for f in frames:
             l = elbow_angle(f, "LEFT")
             r = elbow_angle(f, "RIGHT")
             valid = [a for a in [l, r] if a is not None]
             avg = np.mean(valid) if valid else None
             elbow_angles.append(avg)
+            noses_y.append(f["NOSE"][1] if "NOSE" in f else None)
 
         reps = []
         last_rep_index = -self.min_separation
@@ -45,19 +59,28 @@ class PullUpAnalyzer:
         start_angle = None
 
         for i in range(1, len(elbow_angles)):
-            curr = elbow_angles[i]
-            prev = elbow_angles[i - 1]
-            if curr is None or prev is None:
+            curr_angle = elbow_angles[i]
+            prev_angle = elbow_angles[i - 1]
+            curr_nose = noses_y[i]
+            prev_nose = noses_y[i - 1]
+
+            if None in (curr_angle, prev_angle, curr_nose, prev_nose):
                 continue
 
-            angle_drop = prev - curr
+            angle_drop = prev_angle - curr_angle
+            nose_rising = curr_nose < prev_nose - self.nose_rise_thresh
 
-            if state == "waiting" and angle_drop >= self.angle_drop_threshold and (i - last_rep_index) >= self.min_separation:
+            if (
+                state == "waiting"
+                and angle_drop >= self.angle_drop_threshold
+                and nose_rising
+                and (i - last_rep_index) >= self.min_separation
+            ):
                 state = "in_rep"
                 start_idx = i - 1
-                start_angle = curr
+                start_angle = curr_angle
 
-            elif state == "in_rep" and curr > start_angle:
+            elif state == "in_rep" and curr_angle > start_angle:
                 reps.append((start_idx, i))
                 last_rep_index = i
                 state = "waiting"
@@ -81,12 +104,10 @@ def run_pullup_analysis(video_path, frame_skip=3, scale=0.3, verbose=True):
             frame_count += 1
             continue
 
-        # Resize frame to speed up processing
         frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(image_rgb)
 
-        # Only add frames where pose landmarks exist
         if results.pose_landmarks:
             frame_landmarks = {}
             for i, lm in enumerate(results.pose_landmarks.landmark):
@@ -103,6 +124,6 @@ def run_pullup_analysis(video_path, frame_skip=3, scale=0.3, verbose=True):
     if verbose:
         print(f"Total frames with landmarks: {len(landmarks_list)}")
 
-    analyzer = PullUpAnalyzer(angle_drop_threshold=18.0, min_separation=5)
+    analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
 
