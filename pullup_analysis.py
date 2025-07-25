@@ -3,15 +3,19 @@ import numpy as np
 import mediapipe as mp
 
 class PullUpAnalyzer:
-    def __init__(self, flex_threshold=100, min_separation=5):
-        self.flex_threshold = flex_threshold  # זווית מתחתיה נחשב ככיפוף
-        self.min_separation = min_separation  # רווח מינימלי בין חזרות
+    def __init__(self, angle_drop_threshold=18.0, min_separation=5):
+        """
+        :param angle_drop_threshold: ירידה בזווית המרפק (במעלות) שתיחשב כתחילת חזרה
+        :param min_separation: מינימום פריימים בין חזרות כדי למנוע זיהוי כפול
+        """
+        self.angle_drop_threshold = angle_drop_threshold
+        self.min_separation = min_separation
 
     def analyze_all_reps(self, frames):
         rep_ranges = self.segment_reps(frames)
         return {
             "rep_count": len(rep_ranges),
-            "squat_count": len(rep_ranges),  # תאימות לשם ישן אם נדרש
+            "squat_count": len(rep_ranges),  # תאימות אם יש קוד אחר שמצפה לשם הזה
             "technique_score": 10.0 if len(rep_ranges) > 0 else 0.0,
             "good_reps": len(rep_ranges),
             "bad_reps": 0,
@@ -39,28 +43,42 @@ class PullUpAnalyzer:
             elbow_angles.append(avg)
 
         reps = []
-        last_rep_frame = -self.min_separation
-        in_rep = False
+        last_rep_index = -self.min_separation
+        state = "waiting"
+        start_idx = None
+        start_angle = None
 
         for i in range(1, len(elbow_angles)):
-            angle = elbow_angles[i]
-            if angle is None:
+            curr = elbow_angles[i]
+            prev = elbow_angles[i - 1]
+            if curr is None or prev is None:
                 continue
 
-            if not in_rep and angle < self.flex_threshold and (i - last_rep_frame) > self.min_separation:
-                # התחלה של כיפוף
-                start = max(0, i - 2)
-                in_rep = True
-            elif in_rep and angle > self.flex_threshold + 10:
-                # סיום חזרה
-                end = min(len(frames), i + 2)
-                reps.append((start, end))
-                last_rep_frame = i
-                in_rep = False
+            angle_drop = prev - curr
+
+            if state == "waiting" and angle_drop >= self.angle_drop_threshold and (i - last_rep_index) >= self.min_separation:
+                # התחלת חזרה (יד נעה מפתוחה למקופלת)
+                state = "in_rep"
+                start_idx = i - 1
+                start_angle = curr
+
+            elif state == "in_rep" and curr > start_angle:
+                # חזרה הסתיימה (יד חזרה להיפתח)
+                reps.append((start_idx, i))
+                last_rep_index = i
+                state = "waiting"
+                start_idx = None
+                start_angle = None
 
         return reps
 
-def run_pullup_analysis(video_path, frame_skip=3, scale=0.4):
+def run_pullup_analysis(video_path, frame_skip=2, scale=0.4):
+    """
+    :param video_path: נתיב לסרטון
+    :param frame_skip: דילוג פריימים (כדי לחסוך זמן)
+    :param scale: שינוי קנה מידה לתמונה (לזרוז עיבוד)
+    :return: dict עם נתוני ניתוח
+    """
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(static_image_mode=False, model_complexity=1)
     cap = cv2.VideoCapture(video_path)
@@ -86,6 +104,7 @@ def run_pullup_analysis(video_path, frame_skip=3, scale=0.4):
 
     cap.release()
     pose.close()
-    analyzer = PullUpAnalyzer()
+    analyzer = PullUpAnalyzer(angle_drop_threshold=18.0, min_separation=5)
     return analyzer.analyze_all_reps(landmarks_list)
+
 
