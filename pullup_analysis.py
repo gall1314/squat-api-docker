@@ -28,7 +28,7 @@ class PullUpAnalyzer:
         else:
             rounded_score = 0.0
 
-        feedback = list(set(all_errors)) if all_errors else (["Great form! Keep it up 💪"] if rep_reports else ["No pull-ups detected"])
+        feedback = list(set(all_errors)) if all_errors else (["Great form! Keep it up"] if rep_reports else ["No pull-ups detected"])
         tips = list(set(all_tips))
 
         return {
@@ -74,22 +74,22 @@ class PullUpAnalyzer:
                 wrist_ys.append(wrist_y)
 
         # Full range up
-        if not any(n < w - 0.01 for n, w in zip(nose_ys, wrist_ys)):
-            errors.append("Did not pull high enough (chin above wrist level)")
+        if not any(n < w - 0.005 for n, w in zip(nose_ys, wrist_ys)):
+            errors.append("Try to pull a bit higher – chin past the bar")
 
         # Full extension bottom
-        if not any(a > 170 for a in elbow_angles[:4]):
-            errors.append("Did not fully extend arms at bottom")
+        if not any(a > 165 for a in elbow_angles[:4]):
+            errors.append("Start each rep from straight arms for full range")
 
         # Kipping
-        if knee_angles and (max(knee_angles) - min(knee_angles)) > 30:
-            errors.append("Used excessive leg momentum (kipping)")
+        if knee_angles and (max(knee_angles) - min(knee_angles)) > 40:
+            errors.append("Keep legs steadier for more control")
 
         # Tip: slow descent
         if len(elbow_angles) >= 6:
             descent_len = self.detect_descent_duration(elbow_angles)
             if descent_len < 2:
-                tips.append("For hypertrophy, consider controlling the lowering phase more slowly 💡")
+                tips.append("Control the lowering phase for better muscle growth")
 
         score_map = {0: 10, 1: 8, 2: 6, 3: 5}
         technique_score = score_map.get(len(errors), 4)
@@ -208,5 +208,3 @@ def run_pullup_analysis(video_path, frame_skip=3, scale=0.3, verbose=True):
 
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
-
-
