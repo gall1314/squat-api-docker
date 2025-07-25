@@ -3,52 +3,35 @@ import mediapipe as mp
 import numpy as np
 from collections import defaultdict
 
-# =========================
-# Config (שנה אם צריך)
-# =========================
-ANGLE_DOWN_THRESH = 95      # מתחת לזה אנחנו ב"ירידה"
-ANGLE_UP_THRESH   = 160     # מעל זה "עלייה" וסיום חזרה
+# --- Config ---
+ANGLE_DOWN_THRESH = 95
+ANGLE_UP_THRESH   = 160
 GOOD_REP_MIN_SCORE = 8.0
 
-DEPTH_MAX_KNEE_ANGLE = 110  # אם מעל – "Go deeper"
-TORSO_LEAN_MIN       = 145  # אם מתחת – "Stand taller"
-VALGUS_X_TOL         = 0.02 # knee.x לא צריך להיות הרבה יותר פנימה מהקרסול
+TORSO_LEAN_MIN = 135
+VALGUS_X_TOL = 0.03  # ריכוך
 
-# =========================
-# MediaPipe
-# =========================
 mp_pose = mp.solutions.pose
 
-# =========================
-# Helpers
-# =========================
 def calculate_angle(a, b, c):
-    """חישוב זווית בין שלוש נקודות (2D)"""
     a, b, c = np.array(a), np.array(b), np.array(c)
     radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
 def lm_xy(landmarks, idx, w, h):
-    """החזרה כנקודת (x,y) בפיקסלים"""
     return (landmarks[idx].x * w, landmarks[idx].y * h)
 
 def detect_active_leg_simple(landmarks):
-    """הגדרה נאיבית – איזו ברך זזה יותר עמוק (בפועל אפשר לשפר)"""
-    left  = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y
+    left = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y
     right = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y
     return 'right' if left < right else 'left'
 
 def valgus_ok_norm(landmarks, side):
-    """בדיקת Valgus גסה בציר X הנורמליזי (0-1) של Mediapipe"""
-    knee   = landmarks[getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value].x
-    ankle  = landmarks[getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value].x
-    # נניח מצלמה מקדימה: אם הברך נכנסת יותר מדי פנימה (לכיוון קו האמצע)
-    return not (knee < ankle - VALGUS_X_TOL)
+    knee_x = landmarks[getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value].x
+    ankle_x = landmarks[getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value].x
+    return not (knee_x < ankle_x - VALGUS_X_TOL)
 
-# =========================
-# Rep Counter
-# =========================
 class BulgarianRepCounter:
     def __init__(self):
         self.count = 0
@@ -60,9 +43,8 @@ class BulgarianRepCounter:
 
         self.good_reps = 0
         self.bad_reps = 0
-        self.all_feedback = []
+        self.all_feedback = set()
 
-        # מעקב מינ/מקס פר-חזרה
         self._curr_min_knee = None
         self._curr_max_knee = None
         self._curr_min_torso = None
@@ -80,7 +62,7 @@ class BulgarianRepCounter:
             self.good_reps += 1
         else:
             self.bad_reps += 1
-            self.all_feedback.extend(feedback)
+            self.all_feedback.update(feedback)
 
         rep_result = {
             "rep_index": self.rep_index,
@@ -100,17 +82,10 @@ class BulgarianRepCounter:
         feedback = []
         score = 10.0
 
-        # עומק
-        if min_knee_angle is None or min_knee_angle > DEPTH_MAX_KNEE_ANGLE:
-            feedback.append("Go deeper")
-            score -= 2
-
-        # גב
         if min_torso_angle is None or min_torso_angle < TORSO_LEAN_MIN:
             feedback.append("Stand taller")
             score -= 2
 
-        # Valgus
         if valgus_bad_frames > 0:
             feedback.append("Avoid knee collapse")
             score -= 2
@@ -121,7 +96,6 @@ class BulgarianRepCounter:
         return score, feedback
 
     def update(self, knee_angle, torso_angle, valgus_ok, frame_no):
-        # קביעת סטייג'
         if knee_angle < ANGLE_DOWN_THRESH:
             if self.stage != 'down':
                 self.stage = 'down'
@@ -129,13 +103,11 @@ class BulgarianRepCounter:
 
         elif knee_angle > ANGLE_UP_THRESH:
             if self.stage == 'down':
-                # סיום חזרה
                 self.count += 1
                 score, fb = self.evaluate_form(self._curr_min_knee, self._curr_min_torso, self._curr_valgus_bad)
                 self._finish_rep(frame_no, score, fb)
             self.stage = 'up'
 
-        # תוך כדי חזרה – עדכן מינ/מקס
         if self.stage == 'down' and self.rep_start_frame is not None:
             self._curr_min_knee = min(self._curr_min_knee, knee_angle)
             self._curr_max_knee = max(self._curr_max_knee, knee_angle)
@@ -162,13 +134,10 @@ class BulgarianRepCounter:
             "technique_score": technique_score,
             "good_reps": self.good_reps,
             "bad_reps": self.bad_reps,
-            "feedback": self.all_feedback,
+            "feedback": list(self.all_feedback),
             "reps": self.rep_reports
         }
 
-# =========================
-# Main analysis function
-# =========================
 def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0):
     cap = cv2.VideoCapture(video_path)
     counter = BulgarianRepCounter()
@@ -223,10 +192,8 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0):
     cv2.destroyAllWindows()
     return counter.result()
 
-# =========================
-# CLI usage example
-# =========================
 if __name__ == "__main__":
     path = "video1.mp4"
     res = run_bulgarian_analysis(path, frame_skip=3, scale=0.4)
     print(res)
+
