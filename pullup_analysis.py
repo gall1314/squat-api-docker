@@ -73,16 +73,16 @@ class PullUpAnalyzer:
                 wrist_y = (f["LEFT_WRIST"][1] + f["RIGHT_WRIST"][1]) / 2
                 wrist_ys.append(wrist_y)
 
-        # Full range up
-        if not any(n < w - 0.005 for n, w in zip(nose_ys, wrist_ys)):
+        # Full range up (relaxed)
+        if not any(n < w - 0.003 for n, w in zip(nose_ys, wrist_ys)):
             errors.append("Try to pull a bit higher – chin past the bar")
 
-        # Full extension bottom
-        if not any(a > 165 for a in elbow_angles[:4]):
+        # Full extension bottom (relaxed)
+        if not any(a > 160 for a in elbow_angles[:4]):
             errors.append("Start each rep from straight arms for full range")
 
-        # Kipping
-        if knee_angles and (max(knee_angles) - min(knee_angles)) > 40:
+        # Kipping (relaxed)
+        if knee_angles and (max(knee_angles) - min(knee_angles)) > 45:
             errors.append("Keep legs steadier for more control")
 
         # Tip: slow descent
@@ -208,3 +208,4 @@ def run_pullup_analysis(video_path, frame_skip=3, scale=0.3, verbose=True):
 
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
+
