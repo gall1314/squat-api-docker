@@ -10,43 +10,130 @@ class PullUpAnalyzer:
 
     def analyze_all_reps(self, frames):
         rep_ranges = self.segment_reps(frames)
-        good_reps = len(rep_ranges)
-        bad_reps = 0  # טרם נוספה לוגיקת איכות
+        rep_reports = []
+        all_errors = []
+        all_tips = []
 
-        if good_reps == 0:
-            feedback = ["No pull-ups detected"]
-            score = 0.0
+        for start, end in rep_ranges:
+            rep_frames = frames[start:end]
+            result = self.analyze_rep(rep_frames)
+            rep_reports.append(result)
+            all_errors.extend(result["errors"])
+            all_tips.extend(result["tips"])
+
+        if rep_reports:
+            raw_scores = [r["technique_score"] for r in rep_reports]
+            avg_score = np.mean(raw_scores)
+            rounded_score = np.clip(round(avg_score * 2) / 2, 4.0, 10.0)
         else:
-            score = 10.0
-            feedback = ["Great form! Keep it up 💪"]
+            rounded_score = 0.0
+
+        feedback = list(set(all_errors)) if all_errors else (["Great form! Keep it up 💪"] if rep_reports else ["No pull-ups detected"])
+        tips = list(set(all_tips))
 
         return {
-            "rep_count": len(rep_ranges),
-            "squat_count": len(rep_ranges),
-            "technique_score": score,
-            "good_reps": good_reps,
-            "bad_reps": bad_reps,
+            "rep_count": len(rep_reports),
+            "squat_count": len(rep_reports),
+            "technique_score": rounded_score,
+            "good_reps": sum(1 for r in rep_reports if r["technique_score"] >= 8),
+            "bad_reps": sum(1 for r in rep_reports if r["technique_score"] < 8),
             "feedback": feedback,
-            "reps": [{"technique_score": score, "errors": []} for _ in rep_ranges]
+            "tips": tips,
+            "reps": rep_reports
         }
 
-    def segment_reps(self, frames):
-        def elbow_angle(f, side="LEFT"):
-            keys = [f"{side}_SHOULDER", f"{side}_ELBOW", f"{side}_WRIST"]
-            if all(k in f for k in keys):
-                a, b, c = f[keys[0]], f[keys[1]], f[keys[2]]
-                ba = np.array(a) - np.array(b)
-                bc = np.array(c) - np.array(b)
-                cos = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
-                return np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
-            return None
+    def analyze_rep(self, frames):
+        errors = []
+        tips = []
 
+        elbow_angles = []
+        knee_angles = []
+        nose_ys = []
+        wrist_ys = []
+
+        for f in frames:
+            # Elbow angles
+            l = self.elbow_angle(f, "LEFT")
+            r = self.elbow_angle(f, "RIGHT")
+            valid_elbows = [a for a in [l, r] if a is not None]
+            if valid_elbows:
+                elbow_angles.append(np.mean(valid_elbows))
+
+            # Knee angles for kipping
+            kl = self.knee_angle(f, "LEFT")
+            kr = self.knee_angle(f, "RIGHT")
+            valid_knees = [a for a in [kl, kr] if a is not None]
+            if valid_knees:
+                knee_angles.append(np.mean(valid_knees))
+
+            # Nose and wrists for range check
+            if "NOSE" in f:
+                nose_ys.append(f["NOSE"][1])
+            if all(k in f for k in ["LEFT_WRIST", "RIGHT_WRIST"]):
+                wrist_y = (f["LEFT_WRIST"][1] + f["RIGHT_WRIST"][1]) / 2
+                wrist_ys.append(wrist_y)
+
+        # Full range up
+        if not any(n < w - 0.01 for n, w in zip(nose_ys, wrist_ys)):
+            errors.append("Did not pull high enough (chin above wrist level)")
+
+        # Full extension bottom
+        if not any(a > 170 for a in elbow_angles[:4]):
+            errors.append("Did not fully extend arms at bottom")
+
+        # Kipping
+        if knee_angles and (max(knee_angles) - min(knee_angles)) > 30:
+            errors.append("Used excessive leg momentum (kipping)")
+
+        # Tip: slow descent
+        if len(elbow_angles) >= 6:
+            descent_len = self.detect_descent_duration(elbow_angles)
+            if descent_len < 2:
+                tips.append("For hypertrophy, consider controlling the lowering phase more slowly 💡")
+
+        score_map = {0: 10, 1: 8, 2: 6, 3: 5}
+        technique_score = score_map.get(len(errors), 4)
+
+        return {
+            "technique_score": technique_score,
+            "errors": errors,
+            "tips": tips
+        }
+
+    def detect_descent_duration(self, angles):
+        min_idx = np.argmin(angles)
+        for i in range(min_idx + 1, len(angles)):
+            if angles[i] > angles[min_idx] + 5:
+                return i - min_idx
+        return len(angles) - min_idx
+
+    def elbow_angle(self, f, side):
+        keys = [f"{side}_SHOULDER", f"{side}_ELBOW", f"{side}_WRIST"]
+        if all(k in f for k in keys):
+            a, b, c = f[keys[0]], f[keys[1]], f[keys[2]]
+            ba = np.array(a) - np.array(b)
+            bc = np.array(c) - np.array(b)
+            cos = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+            return np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
+        return None
+
+    def knee_angle(self, f, side):
+        keys = [f"{side}_HIP", f"{side}_KNEE", f"{side}_ANKLE"]
+        if all(k in f for k in keys):
+            a, b, c = f[keys[0]], f[keys[1]], f[keys[2]]
+            ba = np.array(a) - np.array(b)
+            bc = np.array(c) - np.array(b)
+            cos = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+            return np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
+        return None
+
+    def segment_reps(self, frames):
         elbow_angles = []
         noses_y = []
 
         for f in frames:
-            l = elbow_angle(f, "LEFT")
-            r = elbow_angle(f, "RIGHT")
+            l = self.elbow_angle(f, "LEFT")
+            r = self.elbow_angle(f, "RIGHT")
             valid = [a for a in [l, r] if a is not None]
             avg = np.mean(valid) if valid else None
             elbow_angles.append(avg)
@@ -84,8 +171,6 @@ class PullUpAnalyzer:
                 reps.append((start_idx, i))
                 last_rep_index = i
                 state = "waiting"
-                start_idx = None
-                start_angle = None
 
         return reps
 
@@ -121,9 +206,7 @@ def run_pullup_analysis(video_path, frame_skip=3, scale=0.3, verbose=True):
     cap.release()
     pose.close()
 
-    if verbose:
-        print(f"Total frames with landmarks: {len(landmarks_list)}")
-
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
+
 
