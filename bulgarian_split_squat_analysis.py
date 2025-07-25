@@ -1,8 +1,15 @@
-
-
 import cv2
 import mediapipe as mp
 import numpy as np
+
+# === Setup ===
+mp_drawing = mp.solutions.drawing_utils
+mp_pose = mp.solutions.pose
+
+# === Helper Functions ===
+def get_landmark_coords(landmarks, index, shape):
+    h, w = shape[:2]
+    return int(landmarks[index].x * w), int(landmarks[index].y * h)
 
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
@@ -10,143 +17,143 @@ def calculate_angle(a, b, c):
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
-def get_coords(landmarks, index, shape):
-    h, w = shape[:2]
-    return [
-        landmarks[index].x * w,
-        landmarks[index].y * h
-    ]
+def detect_active_leg(landmarks):
+    left = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y
+    right = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y
+    return 'right' if left < right else 'left'
 
-def get_feedback_and_score(knee_angle, back_angle, heel_y, foot_index_y, knee_x, foot_x,
-                           shoulder_x, hip_x, front_hip_y, back_knee_y, front_knee_y):
-    feedback = []
-    score = 10
+# === Rep Counter & Feedback ===
+class BulgarianRepCounter:
+    def __init__(self):
+        self.count = 0
+        self.stage = None
+        self.feedback = ""
+        self.score = 10
+        self.rep_reports = []
+        self.good_reps = 0
+        self.bad_reps = 0
+        self.all_feedback = []
+        self.rep_index = 1
+        self.rep_start_frame = None
 
-    if knee_angle > 120:
-        feedback.append("⚠️ Try to go a bit deeper – front knee isn't bent enough.")
-        score -= 1
+    def evaluate_form(self, hip, knee, ankle, shoulder):
+        knee_angle = calculate_angle(hip, knee, ankle)
+        torso_angle = calculate_angle(shoulder, hip, knee)
+        knee_valgus_angle = calculate_angle(hip, knee, ankle)  # TODO: fix for true valgus
 
-    if back_angle < 135:
-        feedback.append("⚠️ Try to keep your torso slightly more upright.")
-        score -= 1
+        feedback = []
+        score = 10
 
-    if heel_y > foot_index_y + 10:
-        feedback.append("⚠️ Keep your front heel grounded.")
-        score -= 1
+        if knee_angle > 110:
+            feedback.append("Go deeper")
+            score -= 2
 
-    if knee_x > foot_x + 40:
-        feedback.append("⚠️ Front knee is going too far past the toes.")
-        score -= 1
+        if torso_angle < 145:
+            feedback.append("Stand taller")
+            score -= 2
 
-    if abs(shoulder_x - hip_x) > 60:
-        feedback.append("⚠️ Avoid leaning sideways during the rep.")
-        score -= 1
+        if knee_valgus_angle < 150:
+            feedback.append("Avoid knee collapse")
+            score -= 2
 
-    if front_hip_y < front_knee_y - 20:
-        feedback.append("⚠️ Try lowering your hip a bit more for proper depth.")
-        score -= 1
+        return score, feedback
 
-    if back_knee_y > front_knee_y + 50:
-        feedback.append("⚠️ Be careful – your back knee is hitting the floor.")
-        score -= 1
+    def update(self, hip, knee, ankle, shoulder, frame_number):
+        angle = calculate_angle(hip, knee, ankle)
 
-    return feedback, max(1, score)
+        if angle < 90:
+            if self.stage != 'down':
+                self.stage = 'down'
+                self.rep_start_frame = frame_number
 
-def run_bulgarian_analysis(video_path, frame_skip=3, scale=0.4):
-    mp_drawing = mp.solutions.drawing_utils
-    mp_pose = mp.solutions.pose
+        elif angle > 160 and self.stage == 'down':
+            self.stage = 'up'
+            self.count += 1
+            score, feedback = self.evaluate_form(hip, knee, ankle, shoulder)
 
-    counter = 0
-    side = "RIGHT"
-    rep_reports = []
+            if score >= 8:
+                self.good_reps += 1
+            else:
+                self.bad_reps += 1
+                self.all_feedback.extend(feedback)
 
-    rep_started = False
-    down_frame_count = 0
-    DOWN_FRAMES_REQUIRED = 3
+            rep_result = {
+                "rep_index": self.rep_index,
+                "score": round(score, 1),
+                "feedback": feedback,
+                "start_frame": self.rep_start_frame or 0,
+                "end_frame": frame_number,
+                "min_knee_angle": angle,
+                "max_knee_angle": angle  # אפשר לשפר אם שומרים זוויות לאורך החזרה
+            }
+            self.rep_reports.append(rep_result)
+            self.rep_index += 1
 
+    def get_result(self, video_path):
+        if self.count == 0:
+            return {
+                "squat_count": 0,
+                "technique_score": 0.0,
+                "good_reps": 0,
+                "bad_reps": 0,
+                "feedback": [],
+                "reps": []
+            }
+
+        avg_score = np.mean([r["score"] for r in self.rep_reports])
+        technique_score = round(round(avg_score * 2) / 2, 2)
+
+        return {
+            "squat_count": self.count,
+            "technique_score": technique_score,
+            "good_reps": self.good_reps,
+            "bad_reps": self.bad_reps,
+            "feedback": self.all_feedback,
+            "reps": self.rep_reports
+        }
+
+# === Main Code ===
+def run_bulgarian_analysis(video_path):
     cap = cv2.VideoCapture(video_path)
+    counter = BulgarianRepCounter()
 
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as pose:
+        frame_number = 0
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image.flags.writeable = False
-            results = pose.process(image)
-            image.flags.writeable = True
-            shape = image.shape
+            frame_number += 1
+            frame = cv2.resize(frame, (960, 540))
+            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = pose.process(image_rgb)
 
-            try:
-                lm = results.pose_landmarks.landmark
+            if results.pose_landmarks:
+                landmarks = results.pose_landmarks.landmark
+                shape = frame.shape
+                active = detect_active_leg(landmarks)
 
-                hip = get_coords(lm, getattr(mp_pose.PoseLandmark, f"{side}_HIP"), shape)
-                knee = get_coords(lm, getattr(mp_pose.PoseLandmark, f"{side}_KNEE"), shape)
-                ankle = get_coords(lm, getattr(mp_pose.PoseLandmark, f"{side}_ANKLE"), shape)
-                shoulder = get_coords(lm, getattr(mp_pose.PoseLandmark, f"{side}_SHOULDER"), shape)
-                heel = get_coords(lm, getattr(mp_pose.PoseLandmark, f"{side}_HEEL"), shape)
-                foot_index = get_coords(lm, getattr(mp_pose.PoseLandmark, f"{side}_FOOT_INDEX"), shape)
-
-                other_side = "LEFT" if side == "RIGHT" else "RIGHT"
-                back_knee = get_coords(lm, getattr(mp_pose.PoseLandmark, f"{other_side}_KNEE"), shape)
-
-                knee_angle = calculate_angle(hip, knee, ankle)
-                back_angle = calculate_angle(shoulder, hip, knee)
-
-                if knee_angle < 100:
-                    down_frame_count += 1
-                    if down_frame_count >= DOWN_FRAMES_REQUIRED:
-                        rep_started = True
+                if active == 'right':
+                    hip = get_landmark_coords(landmarks, mp_pose.PoseLandmark.RIGHT_HIP.value, shape)
+                    knee = get_landmark_coords(landmarks, mp_pose.PoseLandmark.RIGHT_KNEE.value, shape)
+                    ankle = get_landmark_coords(landmarks, mp_pose.PoseLandmark.RIGHT_ANKLE.value, shape)
+                    shoulder = get_landmark_coords(landmarks, mp_pose.PoseLandmark.RIGHT_SHOULDER.value, shape)
                 else:
-                    down_frame_count = 0
+                    hip = get_landmark_coords(landmarks, mp_pose.PoseLandmark.LEFT_HIP.value, shape)
+                    knee = get_landmark_coords(landmarks, mp_pose.PoseLandmark.LEFT_KNEE.value, shape)
+                    ankle = get_landmark_coords(landmarks, mp_pose.PoseLandmark.LEFT_ANKLE.value, shape)
+                    shoulder = get_landmark_coords(landmarks, mp_pose.PoseLandmark.LEFT_SHOULDER.value, shape)
 
-                if knee_angle > 160 and rep_started:
-                    counter += 1
-                    rep_started = False
+                counter.update(hip, knee, ankle, shoulder, frame_number)
 
-                    shoulder_x = shoulder[0]
-                    hip_x = hip[0]
-                    front_hip_y = hip[1]
-                    front_knee_y = knee[1]
-                    back_knee_y = back_knee[1]
+        cap.release()
+        cv2.destroyAllWindows()
 
-                    feedback, score = get_feedback_and_score(
-                        knee_angle, back_angle, heel[1], foot_index[1],
-                        knee[0], foot_index[0],
-                        shoulder_x, hip_x, front_hip_y, back_knee_y, front_knee_y
-                    )
+    return counter.get_result(video_path)
 
-                    rep_reports.append({
-                        "rep": counter,
-                        "score": score,
-                        "feedback": feedback
-                    })
-
-            except:
-                pass
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-    technique_score = round(np.mean([r['score'] for r in rep_reports]), 2) if rep_reports else 0
-    good_reps = sum(1 for r in rep_reports if r['score'] == 10)
-    bad_reps = sum(1 for r in rep_reports if r['score'] != 10)
-
-    all_feedback = []
-    seen = set()
-    for rep in rep_reports:
-        for fb in rep["feedback"]:
-            if fb not in seen:
-                all_feedback.append(fb)
-                seen.add(fb)
-
-    return {
-        "squat_count": len(rep_reports),
-        "technique_score": technique_score,
-        "good_reps": good_reps,
-        "bad_reps": bad_reps,
-        "feedback": all_feedback,
-        "reps": rep_reports
-    }
+# === Run Example ===
+if __name__ == "__main__":
+    result = run_bulgarian_analysis("video1.mp4")
+    print(result)
 
