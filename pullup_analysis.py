@@ -168,13 +168,14 @@ class PullUpAnalyzer:
 
         return reps
 
-
-def run_pullup_analysis(video_path, frame_skip=4, scale=0.25, verbose=True):
+def run_pullup_analysis_dynamic_skip(video_path, scale=0.25, verbose=True):
     cv2.setNumThreads(1)
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(static_image_mode=False, model_complexity=0)
     cap = cv2.VideoCapture(video_path)
     landmarks_list = []
+    prev_elbow_angle = None
+    prev_nose_y = None
     frame_count = 0
 
     start_time = time.time()
@@ -183,11 +184,6 @@ def run_pullup_analysis(video_path, frame_skip=4, scale=0.25, verbose=True):
         if not ret:
             break
 
-        if frame_count % frame_skip != 0:
-            frame_count += 1
-            continue
-
-        print(f"Reading frame {frame_count}...")
         frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(image_rgb)
@@ -196,16 +192,39 @@ def run_pullup_analysis(video_path, frame_skip=4, scale=0.25, verbose=True):
             frame_landmarks = {}
             for i, lm in enumerate(results.pose_landmarks.landmark):
                 frame_landmarks[mp_pose.PoseLandmark(i).name] = (lm.x, lm.y, lm.z)
-            landmarks_list.append(frame_landmarks)
+
+            def elbow_angle(side):
+                keys = [f"{side}_SHOULDER", f"{side}_ELBOW", f"{side}_WRIST"]
+                if all(k in frame_landmarks for k in keys):
+                    a, b, c = frame_landmarks[keys[0]], frame_landmarks[keys[1]], frame_landmarks[keys[2]]
+                    ba = np.array(a) - np.array(b)
+                    bc = np.array(c) - np.array(b)
+                    cos = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc))
+                    return np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
+                return None
+
+            l_angle = elbow_angle("LEFT")
+            r_angle = elbow_angle("RIGHT")
+            valid_angles = [a for a in [l_angle, r_angle] if a is not None]
+            curr_elbow_angle = np.mean(valid_angles) if valid_angles else None
+
+            nose_y = frame_landmarks.get("NOSE", (None, None))[1]
+
+            angle_change = abs(curr_elbow_angle - prev_elbow_angle) if curr_elbow_angle and prev_elbow_angle else None
+            nose_change = abs(nose_y - prev_nose_y) if nose_y and prev_nose_y else None
+
+            if angle_change and angle_change > 5 or nose_change and nose_change > 0.001:
+                landmarks_list.append(frame_landmarks)
+                prev_elbow_angle = curr_elbow_angle
+                prev_nose_y = nose_y
 
         frame_count += 1
         if verbose and frame_count % 30 == 0:
-            print(f"Processed {frame_count} frames...")
+            print(f"Checked {frame_count} frames...")
 
     cap.release()
     pose.close()
-    print(f"Total frames processed: {frame_count} in {round(time.time() - start_time, 2)} seconds")
+    print(f"Total frames checked: {frame_count} → {len(landmarks_list)} kept")
 
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
-
