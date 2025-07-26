@@ -33,7 +33,7 @@ class PullUpAnalyzer:
 
         return {
             "rep_count": len(rep_reports),
-            "squat_count": len(rep_reports),
+            "squat_count": len(rep_reports),  # legacy key
             "technique_score": rounded_score,
             "good_reps": sum(1 for r in rep_reports if r["technique_score"] >= 8),
             "bad_reps": sum(1 for r in rep_reports if r["technique_score"] < 8),
@@ -70,16 +70,16 @@ class PullUpAnalyzer:
                 wrist_y = (f["LEFT_WRIST"][1] + f["RIGHT_WRIST"][1]) / 2
                 wrist_ys.append(wrist_y)
 
-        # Full range up – relaxed
-        if not any(n < w - 0.0025 for n, w in zip(nose_ys, wrist_ys)):
+        # Full range up
+        if not any(n < w - 0.005 for n, w in zip(nose_ys, wrist_ys)):
             errors.append("Try to pull a bit higher – chin past the bar")
 
-        # Full extension – use max, not just beginning
-        if not (elbow_angles and max(elbow_angles) > 158):
+        # Full extension bottom – use max elbow angle (lowest point)
+        if max(elbow_angles, default=0) < 155:
             errors.append("Start each rep from straight arms for full range")
 
         # Kipping
-        if knee_angles and (max(knee_angles) - min(knee_angles)) > 45:
+        if knee_angles and (max(knee_angles) - min(knee_angles)) > 40:
             errors.append("Keep legs steadier for more control")
 
         # Tip: slow descent
@@ -202,6 +202,9 @@ def run_pullup_analysis(video_path, frame_skip=3, scale=0.3, verbose=True):
 
     cap.release()
     pose.close()
+
+    analyzer = PullUpAnalyzer()
+    return analyzer.analyze_all_reps(landmarks_list)
 
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
