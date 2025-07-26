@@ -208,3 +208,4 @@ def run_pullup_analysis(video_path, frame_skip=4, scale=0.25, verbose=True):
 
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
+
