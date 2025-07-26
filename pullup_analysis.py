@@ -71,14 +71,14 @@ class PullUpAnalyzer:
                 wrist_y = (f["LEFT_WRIST"][1] + f["RIGHT_WRIST"][1]) / 2
                 wrist_ys.append(wrist_y)
 
-        # שיפור בדיקת עלייה עד הסוף
+        # בדיקת עלייה עד הסוף
         if nose_ys and wrist_ys:
             min_nose_y = min(nose_ys)
             max_wrist_y = max(wrist_ys)
             if min_nose_y > max_wrist_y - 0.01:
                 errors.append("Try to pull a bit higher – chin past the bar")
 
-        # שיפור בדיקת יישור למטה
+        # בדיקת יישור מלא
         min_elbow_angle = min(elbow_angles, default=180)
         if min_elbow_angle > 165:
             errors.append("Start each rep from straight arms for full range")
@@ -174,34 +174,43 @@ class PullUpAnalyzer:
 
         return reps
 
+# ✅ פונקציה שגורמת ל־pullup_analysis.py להיות שימושי כמודול
+def run_pullup_analysis(video_path, frame_skip=4, scale=0.25, verbose=True):
+    cv2.setNumThreads(1)
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(static_image_mode=False, model_complexity=0)
+    cap = cv2.VideoCapture(video_path)
+    landmarks_list = []
+    frame_count = 0
 
-        if frame_count % frame_skip == 0:
-            if verbose and frame_count % (30 * frame_skip) == 0:
-                print(f"Reading raw frame #{frame_count}...")
-            frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
-            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = pose.process(image_rgb)
+    start_time = time.time()
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-            if results.pose_landmarks:
-                fl = {}
-                for i, lm in enumerate(results.pose_landmarks.landmark):
-                    fl[mp_pose.PoseLandmark(i).name] = (lm.x, lm.y, lm.z)
-                frames.append(fl)
+        if frame_count % frame_skip != 0:
+            frame_count += 1
+            continue
+
+        frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(image_rgb)
+
+        if results.pose_landmarks:
+            frame_landmarks = {}
+            for i, lm in enumerate(results.pose_landmarks.landmark):
+                frame_landmarks[mp_pose.PoseLandmark(i).name] = (lm.x, lm.y, lm.z)
+            landmarks_list.append(frame_landmarks)
 
         frame_count += 1
+        if verbose and frame_count % 30 == 0:
+            print(f"Processed {frame_count} frames...")
 
     cap.release()
     pose.close()
-
-    if verbose:
-        print(f"Processed {frame_count} raw frames in {time.time() - t0:.2f}s")
-        print(f"Frames with landmarks kept: {len(frames)}")
+    print(f"Total frames processed: {frame_count} in {round(time.time() - start_time, 2)} seconds")
 
     analyzer = PullUpAnalyzer()
-    return analyzer.analyze_all_reps(frames)
-
-
-# Example usage:
-# result = run_pullup_analysis("pullups.mp4", frame_skip=4, scale=0.25, verbose=True)
-# print(result)
+    return analyzer.analyze_all_reps(landmarks_list)
 
