@@ -52,36 +52,33 @@ class PullUpAnalyzer:
         wrist_ys = []
 
         for f in frames:
-            # Elbow angles
             l = self.elbow_angle(f, "LEFT")
             r = self.elbow_angle(f, "RIGHT")
             valid_elbows = [a for a in [l, r] if a is not None]
             if valid_elbows:
                 elbow_angles.append(np.mean(valid_elbows))
 
-            # Knee angles for kipping
             kl = self.knee_angle(f, "LEFT")
             kr = self.knee_angle(f, "RIGHT")
             valid_knees = [a for a in [kl, kr] if a is not None]
             if valid_knees:
                 knee_angles.append(np.mean(valid_knees))
 
-            # Nose and wrists for range check
             if "NOSE" in f:
                 nose_ys.append(f["NOSE"][1])
             if all(k in f for k in ["LEFT_WRIST", "RIGHT_WRIST"]):
                 wrist_y = (f["LEFT_WRIST"][1] + f["RIGHT_WRIST"][1]) / 2
                 wrist_ys.append(wrist_y)
 
-        # Full range up (relaxed)
-        if not any(n < w - 0.003 for n, w in zip(nose_ys, wrist_ys)):
+        # Full range up – relaxed
+        if not any(n < w - 0.0025 for n, w in zip(nose_ys, wrist_ys)):
             errors.append("Try to pull a bit higher – chin past the bar")
 
-        # Full extension bottom (relaxed)
-        if not any(a > 160 for a in elbow_angles[:4]):
+        # Full extension – use max, not just beginning
+        if not (elbow_angles and max(elbow_angles) > 158):
             errors.append("Start each rep from straight arms for full range")
 
-        # Kipping (relaxed)
+        # Kipping
         if knee_angles and (max(knee_angles) - min(knee_angles)) > 45:
             errors.append("Keep legs steadier for more control")
 
@@ -208,4 +205,5 @@ def run_pullup_analysis(video_path, frame_skip=3, scale=0.3, verbose=True):
 
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
+
 
