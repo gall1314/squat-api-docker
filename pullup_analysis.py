@@ -29,7 +29,7 @@ class PullUpAnalyzer:
         else:
             rounded_score = 0.0
 
-        feedback = list(set(all_errors)) if all_errors else (["Great form! Keep it up 💪"] if rep_reports else ["No pull-ups detected"])
+        feedback = list(set(all_errors)) if all_errors else (["Great form! Keep it up"] if rep_reports else ["No pull-ups detected"])
         tips = list(set(all_tips))
 
         return {
@@ -71,16 +71,10 @@ class PullUpAnalyzer:
                 wrist_y = (f["LEFT_WRIST"][1] + f["RIGHT_WRIST"][1]) / 2
                 wrist_ys.append(wrist_y)
 
-        # בדיקת עלייה עד הסוף
-        if nose_ys and wrist_ys:
-            min_nose_y = min(nose_ys)
-            max_wrist_y = max(wrist_ys)
-            if min_nose_y > max_wrist_y - 0.01:
-                errors.append("Try to pull a bit higher – chin past the bar")
+        if not any(n < w - 0.0018 for n, w in zip(nose_ys, wrist_ys)):
+            errors.append("Try to pull a bit higher – chin past the bar")
 
-        # בדיקת יישור מלא
-        min_elbow_angle = min(elbow_angles, default=180)
-        if min_elbow_angle > 165:
+        if max(elbow_angles, default=0) < 155:
             errors.append("Start each rep from straight arms for full range")
 
         if knee_angles and (max(knee_angles) - min(knee_angles)) > 40:
@@ -174,7 +168,7 @@ class PullUpAnalyzer:
 
         return reps
 
-# ✅ פונקציה שגורמת ל־pullup_analysis.py להיות שימושי כמודול
+
 def run_pullup_analysis(video_path, frame_skip=4, scale=0.25, verbose=True):
     cv2.setNumThreads(1)
     mp_pose = mp.solutions.pose
@@ -193,6 +187,7 @@ def run_pullup_analysis(video_path, frame_skip=4, scale=0.25, verbose=True):
             frame_count += 1
             continue
 
+        print(f"Reading frame {frame_count}...")
         frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(image_rgb)
@@ -213,4 +208,3 @@ def run_pullup_analysis(video_path, frame_skip=4, scale=0.25, verbose=True):
 
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
-
