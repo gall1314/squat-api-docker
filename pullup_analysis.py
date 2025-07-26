@@ -168,6 +168,7 @@ class PullUpAnalyzer:
 
         return reps
 
+
 def run_pullup_analysis_dynamic_skip(video_path, scale=0.25, verbose=True):
     cv2.setNumThreads(1)
     mp_pose = mp.solutions.pose
@@ -228,3 +229,7 @@ def run_pullup_analysis_dynamic_skip(video_path, scale=0.25, verbose=True):
 
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
+
+
+# ✅ יצוא שם סטנדרטי לייבוא אחיד בכל מקום
+run_pullup_analysis = run_pullup_analysis_dynamic_skip
