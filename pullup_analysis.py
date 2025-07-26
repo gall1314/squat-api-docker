@@ -9,40 +9,39 @@ class PullUpAnalyzer:
         self.min_separation = min_separation
         self.nose_rise_thresh = nose_rise_thresh
 
-   def analyze_all_reps(self, frames):
-    rep_ranges = self.segment_reps(frames)
-    rep_reports = []
-    all_errors = []
-    all_tips = []
+    def analyze_all_reps(self, frames):
+        rep_ranges = self.segment_reps(frames)
+        rep_reports = []
+        all_errors = []
+        all_tips = []
 
-    for start, end in rep_ranges:
-        rep_frames = frames[start:end]
-        result = self.analyze_rep(rep_frames)
-        rep_reports.append(result)
-        all_errors.extend(result["errors"])
-        all_tips.extend(result["tips"])
+        for start, end in rep_ranges:
+            rep_frames = frames[start:end]
+            result = self.analyze_rep(rep_frames)
+            rep_reports.append(result)
+            all_errors.extend(result["errors"])
+            all_tips.extend(result["tips"])
 
-    if rep_reports:
-        raw_scores = [r["technique_score"] for r in rep_reports]
-        avg_score = np.mean(raw_scores)
-        rounded_score = np.clip(round(avg_score * 2) / 2, 4.0, 10.0)
-    else:
-        rounded_score = 0.0
+        if rep_reports:
+            raw_scores = [r["technique_score"] for r in rep_reports]
+            avg_score = np.mean(raw_scores)
+            rounded_score = np.clip(round(avg_score * 2) / 2, 4.0, 10.0)
+        else:
+            rounded_score = 0.0
 
-    feedback = list(set(all_errors)) if all_errors else (["Great form! Keep it up"] if rep_reports else ["No pull-ups detected"])
-    tips = list(set(all_tips))
+        feedback = list(set(all_errors)) if all_errors else (["Great form! Keep it up"] if rep_reports else ["No pull-ups detected"])
+        tips = list(set(all_tips))
 
-    return {
-        "rep_count": len(rep_reports),
-        "squat_count": len(rep_reports),
-        "technique_score": rounded_score,
-        "good_reps": sum(1 for r in rep_reports if r["technique_score"] >= 8),
-        "bad_reps": sum(1 for r in rep_reports if r["technique_score"] < 8),
-        "feedback": feedback,
-        "tips": tips,
-        "reps": rep_reports
-    }
-
+        return {
+            "rep_count": len(rep_reports),
+            "squat_count": len(rep_reports),
+            "technique_score": rounded_score,
+            "good_reps": sum(1 for r in rep_reports if r["technique_score"] >= 8),
+            "bad_reps": sum(1 for r in rep_reports if r["technique_score"] < 8),
+            "feedback": feedback,
+            "tips": tips,
+            "reps": rep_reports
+        }
 
     def analyze_rep(self, frames):
         errors = []
