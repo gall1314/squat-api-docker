@@ -33,7 +33,7 @@ class PullUpAnalyzer:
 
         return {
             "rep_count": len(rep_reports),
-            "squat_count": len(rep_reports),  # legacy key
+            "squat_count": len(rep_reports),
             "technique_score": rounded_score,
             "good_reps": sum(1 for r in rep_reports if r["technique_score"] >= 8),
             "bad_reps": sum(1 for r in rep_reports if r["technique_score"] < 8),
@@ -70,19 +70,19 @@ class PullUpAnalyzer:
                 wrist_y = (f["LEFT_WRIST"][1] + f["RIGHT_WRIST"][1]) / 2
                 wrist_ys.append(wrist_y)
 
-        # Full range up
-        if not any(n < w - 0.005 for n, w in zip(nose_ys, wrist_ys)):
+        # Full range up (chin above bar)
+        if not any(n < w - 0.0018 for n, w in zip(nose_ys, wrist_ys)):
             errors.append("Try to pull a bit higher – chin past the bar")
 
-        # Full extension bottom – use max elbow angle (lowest point)
-        if max(elbow_angles, default=0) < 155:
+        # Full extension (straight arms)
+        if elbow_angles and max(elbow_angles) < 155:
             errors.append("Start each rep from straight arms for full range")
 
-        # Kipping
+        # Kipping detection
         if knee_angles and (max(knee_angles) - min(knee_angles)) > 40:
             errors.append("Keep legs steadier for more control")
 
-        # Tip: slow descent
+        # Eccentric control (tip)
         if len(elbow_angles) >= 6:
             descent_len = self.detect_descent_duration(elbow_angles)
             if descent_len < 2:
@@ -171,7 +171,8 @@ class PullUpAnalyzer:
 
         return reps
 
-def run_pullup_analysis(video_path, frame_skip=3, scale=0.3, verbose=True):
+
+def run_pullup_analysis(video_path, frame_skip=4, scale=0.3, verbose=True):
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(static_image_mode=False, model_complexity=1)
     cap = cv2.VideoCapture(video_path)
@@ -205,8 +206,4 @@ def run_pullup_analysis(video_path, frame_skip=3, scale=0.3, verbose=True):
 
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
-
-    analyzer = PullUpAnalyzer()
-    return analyzer.analyze_all_reps(landmarks_list)
-
 
