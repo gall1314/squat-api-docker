@@ -169,7 +169,8 @@ class PullUpAnalyzer:
         return reps
 
 
-def run_pullup_analysis_dynamic_skip(video_path, scale=0.25, verbose=True):
+# ✅ תומך בפרמטרים נוספים (כמו frame_skip) שלא ישברו את הקוד
+def run_pullup_analysis_dynamic_skip(video_path, scale=0.25, verbose=True, **kwargs):
     cv2.setNumThreads(1)
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(static_image_mode=False, model_complexity=0)
@@ -230,6 +231,5 @@ def run_pullup_analysis_dynamic_skip(video_path, scale=0.25, verbose=True):
     analyzer = PullUpAnalyzer()
     return analyzer.analyze_all_reps(landmarks_list)
 
-
-# ✅ יצוא שם סטנדרטי לייבוא אחיד בכל מקום
+# ✅ שם קבוע עבור app.py
 run_pullup_analysis = run_pullup_analysis_dynamic_skip
