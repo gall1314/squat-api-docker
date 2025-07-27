@@ -8,7 +8,8 @@ import uuid
 from squat_analysis import run_analysis
 from deadlift_analysis import run_deadlift_analysis
 from bulgarian_split_squat_analysis import run_bulgarian_analysis
-from pullup_analysis import run_pullup_analysis  # ✅ חדש
+from pullup_analysis import run_pullup_analysis
+from barbell_bicep_curl import run_barbell_bicep_curl_analysis  # ✅ חדש
 
 app = Flask(__name__)
 CORS(app)
@@ -36,7 +37,7 @@ def compress_video(input_path, output_path, scale=0.4):
     out.release()
     return True
 
-# ✅ הוספנו את pull-up למפה
+# ✅ מיפוי שמות תרגיל לשם פונקציונלי
 EXERCISE_MAP = {
     "barbell squat": "squat",
     "barbell back squat": "squat",
@@ -45,7 +46,8 @@ EXERCISE_MAP = {
     "bulgarian split squat": "bulgarian",
     "split squat": "bulgarian",
     "pull-up": "pullup",
-    "pull up": "pullup"
+    "pull up": "pullup",
+    "barbell bicep curl": "bicep_curl",  # ✅ חדש
 }
 
 @app.route('/analyze', methods=['POST'])
@@ -79,7 +81,7 @@ def analyze():
     if not success:
         return jsonify({"error": "Video compression failed"}), 500
 
-    # ✅ הוספנו את ההרצה עבור pull-up
+    # ✅ הרצת הניתוח לפי סוג התרגיל
     if resolved_type == 'squat':
         result = run_analysis(output_path, frame_skip=3, scale=0.4)
     elif resolved_type == 'deadlift':
@@ -88,6 +90,8 @@ def analyze():
         result = run_bulgarian_analysis(output_path, frame_skip=3, scale=0.4)
     elif resolved_type == 'pullup':
         result = run_pullup_analysis(output_path, frame_skip=3, scale=0.4)
+    elif resolved_type == 'bicep_curl':
+        result = run_barbell_bicep_curl_analysis(output_path, frame_skip=3, scale=0.4)
 
     result["video_url"] = f"/media/{output_filename}"
     return jsonify(result)
