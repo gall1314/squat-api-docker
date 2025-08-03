@@ -3,40 +3,40 @@ from flask_cors import CORS
 import tempfile
 import os
 import uuid
+import subprocess
 
 # ייבוא פונקציות ניתוח
 from squat_analysis import run_analysis
 from deadlift_analysis import run_deadlift_analysis
 from bulgarian_split_squat_analysis import run_bulgarian_analysis
 from pullup_analysis import run_pullup_analysis
-from barbell_bicep_curl import run_barbell_bicep_curl_analysis  # ✅ חדש
+from barbell_bicep_curl import run_barbell_bicep_curl_analysis
 
 app = Flask(__name__)
 CORS(app)
 
-# שימוש בנתיב מוחלט עבור media
-MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media")
+MEDIA_DIR = "media"
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
 def compress_video(input_path, output_path, scale=0.4):
-    import cv2
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
+    command = [
+        "ffmpeg",
+        "-i", input_path,
+        "-vf", f"scale=iw*{scale}:ih*{scale}",
+        "-c:v", "libx264",
+        "-crf", "28",
+        "-preset", "fast",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-y",  # overwrite output
+        output_path
+    ]
+    try:
+        subprocess.run(command, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print("FFmpeg error:", e)
         return False
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame = cv2.resize(frame, (width, height))
-        out.write(frame)
-    cap.release()
-    out.release()
-    return True
 
 EXERCISE_MAP = {
     "barbell squat": "squat",
@@ -81,7 +81,6 @@ def analyze():
     if not success:
         return jsonify({"error": "Video compression failed"}), 500
 
-    # הרצת הניתוח בהתאם לסוג התרגיל
     if resolved_type == 'squat':
         result = run_analysis(output_path, frame_skip=3, scale=0.4)
     elif resolved_type == 'deadlift':
@@ -92,19 +91,18 @@ def analyze():
         result = run_pullup_analysis(output_path, frame_skip=3, scale=0.4)
     elif resolved_type == 'bicep_curl':
         result = run_barbell_bicep_curl_analysis(output_path, frame_skip=3, scale=0.4)
-    else:
-        return jsonify({"error": "Unsupported exercise type"}), 400
 
-    return jsonify({
+    response = {
         "result": result,
         "video_url": f"/media/{output_filename}"
-    })
+    }
+    return jsonify(response)
 
-# ✅ תיקון נתיב לוידאו: תמיכה ב־<path:filename>
-@app.route('/media/<path:filename>')
+@app.route('/media/<filename>')
 def media(filename):
     return send_from_directory(MEDIA_DIR, filename)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
 
