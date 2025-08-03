@@ -37,7 +37,6 @@ def compress_video(input_path, output_path, scale=0.4):
     out.release()
     return True
 
-# ✅ מיפוי שמות תרגיל לשם פונקציונלי
 EXERCISE_MAP = {
     "barbell squat": "squat",
     "barbell back squat": "squat",
@@ -47,7 +46,7 @@ EXERCISE_MAP = {
     "split squat": "bulgarian",
     "pull-up": "pullup",
     "pull up": "pullup",
-    "barbell bicep curl": "bicep_curl",  # ✅ חדש
+    "barbell bicep curl": "bicep_curl",
 }
 
 @app.route('/analyze', methods=['POST'])
@@ -81,20 +80,24 @@ def analyze():
     if not success:
         return jsonify({"error": "Video compression failed"}), 500
 
-    # ✅ הרצת הניתוח לפי סוג התרגיל
+    # הרצת הניתוח בהתאם לסוג התרגיל
     if resolved_type == 'squat':
         result = run_analysis(output_path, frame_skip=3, scale=0.4)
+        response = {"result": result, "video_url": f"/media/{output_filename}"}
     elif resolved_type == 'deadlift':
         result = run_deadlift_analysis(output_path, frame_skip=3, scale=0.4)
+        response = {"result": result, "video_url": f"/media/{output_filename}"}
     elif resolved_type == 'bulgarian':
-        result = run_bulgarian_analysis(output_path, frame_skip=3, scale=0.4)
+        result_data, _, _ = run_bulgarian_analysis(output_path, frame_skip=3, scale=0.4)
+        response = {"result": result_data, "video_url": f"/media/{output_filename}"}
     elif resolved_type == 'pullup':
         result = run_pullup_analysis(output_path, frame_skip=3, scale=0.4)
+        response = {"result": result, "video_url": f"/media/{output_filename}"}
     elif resolved_type == 'bicep_curl':
         result = run_barbell_bicep_curl_analysis(output_path, frame_skip=3, scale=0.4)
+        response = {"result": result, "video_url": f"/media/{output_filename}"}
 
-    result["video_url"] = f"/media/{output_filename}"
-    return jsonify(result)
+    return jsonify(response)
 
 @app.route('/media/<filename>')
 def media(filename):
@@ -102,4 +105,3 @@ def media(filename):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
