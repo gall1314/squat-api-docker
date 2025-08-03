@@ -14,7 +14,8 @@ from barbell_bicep_curl import run_barbell_bicep_curl_analysis  # ✅ חדש
 app = Flask(__name__)
 CORS(app)
 
-MEDIA_DIR = "media"
+# שימוש בנתיב מוחלט עבור media
+MEDIA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
 def compress_video(input_path, output_path, scale=0.4):
@@ -83,25 +84,27 @@ def analyze():
     # הרצת הניתוח בהתאם לסוג התרגיל
     if resolved_type == 'squat':
         result = run_analysis(output_path, frame_skip=3, scale=0.4)
-        response = {"result": result, "video_url": f"/media/{output_filename}"}
     elif resolved_type == 'deadlift':
         result = run_deadlift_analysis(output_path, frame_skip=3, scale=0.4)
-        response = {"result": result, "video_url": f"/media/{output_filename}"}
     elif resolved_type == 'bulgarian':
-        result_data, _, _ = run_bulgarian_analysis(output_path, frame_skip=3, scale=0.4)
-        response = {"result": result_data, "video_url": f"/media/{output_filename}"}
+        result, _, _ = run_bulgarian_analysis(output_path, frame_skip=3, scale=0.4)
     elif resolved_type == 'pullup':
         result = run_pullup_analysis(output_path, frame_skip=3, scale=0.4)
-        response = {"result": result, "video_url": f"/media/{output_filename}"}
     elif resolved_type == 'bicep_curl':
         result = run_barbell_bicep_curl_analysis(output_path, frame_skip=3, scale=0.4)
-        response = {"result": result, "video_url": f"/media/{output_filename}"}
+    else:
+        return jsonify({"error": "Unsupported exercise type"}), 400
 
-    return jsonify(response)
+    return jsonify({
+        "result": result,
+        "video_url": f"/media/{output_filename}"
+    })
 
-@app.route('/media/<filename>')
+# ✅ תיקון נתיב לוידאו: תמיכה ב־<path:filename>
+@app.route('/media/<path:filename>')
 def media(filename):
     return send_from_directory(MEDIA_DIR, filename)
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
