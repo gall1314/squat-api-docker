@@ -3,7 +3,7 @@ from flask_cors import CORS
 import tempfile
 import os
 import uuid
-import subprocess
+import shutil
 
 # ייבוא פונקציות ניתוח
 from squat_analysis import run_analysis
@@ -17,26 +17,6 @@ CORS(app)
 
 MEDIA_DIR = "media"
 os.makedirs(MEDIA_DIR, exist_ok=True)
-
-def compress_video(input_path, output_path, scale=0.4):
-    command = [
-        "ffmpeg",
-        "-i", input_path,
-        "-vf", f"scale=iw*{scale}:ih*{scale}",
-        "-c:v", "libx264",
-        "-crf", "28",
-        "-preset", "fast",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-y",  # overwrite output
-        output_path
-    ]
-    try:
-        subprocess.run(command, check=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        print("FFmpeg error:", e)
-        return False
 
 EXERCISE_MAP = {
     "barbell squat": "squat",
@@ -76,11 +56,11 @@ def analyze():
     output_filename = f"{resolved_type}_{unique_id}.mp4"
     output_path = os.path.join(MEDIA_DIR, output_filename)
 
-    success = compress_video(temp.name, output_path, scale=0.4)
+    # ✅ העתקה פשוטה במקום דחיסה
+    shutil.copyfile(temp.name, output_path)
     os.remove(temp.name)
-    if not success:
-        return jsonify({"error": "Video compression failed"}), 500
 
+    # ✅ ניתוח בהתאם לסוג
     if resolved_type == 'squat':
         result = run_analysis(output_path, frame_skip=3, scale=0.4)
     elif resolved_type == 'deadlift':
