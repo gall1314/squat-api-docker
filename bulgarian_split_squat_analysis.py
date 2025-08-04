@@ -4,7 +4,6 @@ import numpy as np
 import subprocess
 import os
 
-# ==== Constants ====
 ANGLE_DOWN_THRESH = 95
 ANGLE_UP_THRESH = 160
 GOOD_REP_MIN_SCORE = 8.0
@@ -13,19 +12,16 @@ VALGUS_X_TOL = 0.03
 
 mp_pose = mp.solutions.pose
 
-# ==== Overlay: Top+Bottom Bars ====
 def draw_overlay(frame, reps, feedback):
     h, w, _ = frame.shape
     bar_height = int(h * 0.07)
 
-    # Top bar
     top_overlay = frame.copy()
     cv2.rectangle(top_overlay, (0, 0), (w, bar_height), (0, 0, 0), -1)
     frame = cv2.addWeighted(top_overlay, 0.6, frame, 0.4, 0)
     cv2.putText(frame, f"Reps: {reps}", (20, int(bar_height * 0.7)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-    # Bottom bar
     if feedback:
         bottom_overlay = frame.copy()
         cv2.rectangle(bottom_overlay, (0, h - bar_height), (w, h), (0, 0, 0), -1)
@@ -37,7 +33,6 @@ def draw_overlay(frame, reps, feedback):
 
     return frame
 
-# ==== Helpers ====
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
     radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
@@ -57,7 +52,6 @@ def valgus_ok(landmarks, side):
     ankle_x = landmarks[getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value].x
     return not (knee_x < ankle_x - VALGUS_X_TOL)
 
-# ==== Rep Counter ====
 class BulgarianRepCounter:
     def __init__(self):
         self.count = 0
@@ -132,47 +126,26 @@ class BulgarianRepCounter:
                 self._curr_valgus_bad += 1
 
     def result(self):
-        if self.count == 0:
-            return {
-                "squat_count": 0,
-                "technique_score": 0.0,
-                "good_reps": 0,
-                "bad_reps": 0,
-                "feedback": [],
-                "reps": []
-            }
-
-        avg_score = np.mean([r["score"] for r in self.rep_reports])
+        avg_score = np.mean([r["score"] for r in self.rep_reports]) if self.rep_reports else 0.0
         technique_score = round(round(avg_score * 2) / 2, 2)
-
-        if self.bad_reps == 0 and len(self.all_feedback) == 0:
-            return {
-                "squat_count": self.count,
-                "technique_score": 10.0,
-                "good_reps": self.good_reps,
-                "bad_reps": 0,
-                "feedback": ["Great form! Keep it up 💪"],
-                "reps": self.rep_reports
-            }
 
         return {
             "squat_count": self.count,
-            "technique_score": technique_score,
+            "technique_score": technique_score if self.count else 0.0,
             "good_reps": self.good_reps,
             "bad_reps": self.bad_reps,
-            "feedback": list(self.all_feedback),
+            "feedback": list(self.all_feedback) if self.bad_reps > 0 else ["Great form! Keep it up 💪"],
             "reps": self.rep_reports
         }
 
-# ==== Main Analysis ====
 def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="analyzed_output.mp4", feedback_path="feedback_summary.txt"):
     cap = cv2.VideoCapture(video_path)
     counter = BulgarianRepCounter()
     frame_no = 0
     active_leg = None
+    out = None
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = None
     pose = mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7)
 
     while cap.isOpened():
@@ -244,7 +217,6 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
             for fb in result["feedback"]:
                 f.write(f"- {fb}\n")
 
-    # Re-encode with FFmpeg
     encoded_path = output_path.replace(".mp4", "_encoded.mp4")
     subprocess.run([
         "ffmpeg", "-y",
@@ -256,8 +228,11 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
         encoded_path
     ])
     os.remove(output_path)
-    output_path = encoded_path
 
-    return result, output_path, feedback_path
+    return {
+        **result,
+        "video_path": encoded_path,
+        "feedback_path": feedback_path
+    }
 
 
