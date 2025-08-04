@@ -14,7 +14,6 @@ VALGUS_X_TOL = 0.03
 mp_pose = mp.solutions.pose
 
 # ==== Overlay Function ====
-
 def draw_overlay(frame, reps, feedback):
     h, w, _ = frame.shape
     bar_height = int(h * 0.07)
@@ -39,7 +38,6 @@ def draw_overlay(frame, reps, feedback):
     return frame
 
 # ==== Helper Functions ====
-
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
     radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
@@ -60,7 +58,6 @@ def valgus_ok(landmarks, side):
     return not (knee_x < ankle_x - VALGUS_X_TOL)
 
 # ==== Rep Counter ====
-
 class BulgarianRepCounter:
     def __init__(self):
         self.count = 0
@@ -168,7 +165,6 @@ class BulgarianRepCounter:
         }
 
 # ==== Main Function ====
-
 def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="analyzed_output.mp4", feedback_path="feedback_summary.txt"):
     cap = cv2.VideoCapture(video_path)
     counter = BulgarianRepCounter()
@@ -177,6 +173,8 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
+
+    pose = mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7)
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -194,51 +192,52 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
         if out is None:
             out = cv2.VideoWriter(output_path, fourcc, 8, (w, h))
 
-        with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as pose:
-            image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = pose.process(image_rgb)
+        image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(image_rgb)
 
-            if not results.pose_landmarks:
-                out.write(frame)
-                continue
-
-            landmarks = results.pose_landmarks.landmark
-            if active_leg is None:
-                active_leg = detect_active_leg(landmarks)
-
-            side = "RIGHT" if active_leg == "right" else "LEFT"
-            hip = lm_xy(landmarks, getattr(mp_pose.PoseLandmark, f"{side}_HIP").value, w, h)
-            knee = lm_xy(landmarks, getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value, w, h)
-            ankle = lm_xy(landmarks, getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value, w, h)
-            shoulder = lm_xy(landmarks, getattr(mp_pose.PoseLandmark, f"{side}_SHOULDER").value, w, h)
-
-            knee_angle = calculate_angle(hip, knee, ankle)
-            torso_angle = calculate_angle(shoulder, hip, knee)
-            v_ok = valgus_ok(landmarks, side)
-
-            counter.update(knee_angle, torso_angle, v_ok, frame_no)
-
-            mp.solutions.drawing_utils.draw_landmarks(
-                frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-
-            # Draw simplified overlay
-            feedback = ""
-            if counter.stage == "down":
-                if torso_angle < TORSO_LEAN_MIN:
-                    feedback = "Keep your back straight"
-                elif not v_ok:
-                    feedback = "Avoid knee collapse"
-
-            frame = draw_overlay(frame, reps=counter.count, feedback=feedback)
+        if not results.pose_landmarks:
             out.write(frame)
+            continue
 
+        landmarks = results.pose_landmarks.landmark
+        if active_leg is None:
+            active_leg = detect_active_leg(landmarks)
+
+        side = "RIGHT" if active_leg == "right" else "LEFT"
+        hip = lm_xy(landmarks, getattr(mp_pose.PoseLandmark, f"{side}_HIP").value, w, h)
+        knee = lm_xy(landmarks, getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value, w, h)
+        ankle = lm_xy(landmarks, getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value, w, h)
+        shoulder = lm_xy(landmarks, getattr(mp_pose.PoseLandmark, f"{side}_SHOULDER").value, w, h)
+
+        knee_angle = calculate_angle(hip, knee, ankle)
+        torso_angle = calculate_angle(shoulder, hip, knee)
+        v_ok = valgus_ok(landmarks, side)
+
+        counter.update(knee_angle, torso_angle, v_ok, frame_no)
+
+        mp.solutions.drawing_utils.draw_landmarks(
+            frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+        # Overlay
+        feedbacks = []
+        if counter.stage == "down":
+            if torso_angle < TORSO_LEAN_MIN:
+                feedbacks.append("Keep your back straight")
+            if not v_ok:
+                feedbacks.append("Avoid knee collapse")
+
+        feedback = " | ".join(feedbacks) if feedbacks else ""
+        frame = draw_overlay(frame, reps=counter.count, feedback=feedback)
+
+        out.write(frame)
+
+    pose.close()
     cap.release()
     out.release()
     cv2.destroyAllWindows()
 
     result = counter.result()
 
-    # Save feedback
     with open(feedback_path, "w", encoding="utf-8") as f:
         f.write(f"Total Reps: {result['squat_count']}\n")
         f.write(f"Technique Score: {result['technique_score']}/10\n")
@@ -247,7 +246,6 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
             for fb in result["feedback"]:
                 f.write(f"- {fb}\n")
 
-    # Re-encode with ffmpeg
     encoded_path = output_path.replace(".mp4", "_encoded.mp4")
     subprocess.run([
         "ffmpeg", "-y",
