@@ -54,28 +54,31 @@ def analyze():
 
     unique_id = str(uuid.uuid4())[:8]
     base_filename = f"{resolved_type}_{unique_id}"
-    output_path = os.path.join(MEDIA_DIR, base_filename + ".mp4")
+    raw_video_path = os.path.join(MEDIA_DIR, base_filename + ".mp4")
 
     # שמירת הקובץ המקורי
-    shutil.copyfile(temp.name, output_path)
+    shutil.copyfile(temp.name, raw_video_path)
     os.remove(temp.name)
 
     # ניתוח לפי סוג
     if resolved_type == 'squat':
-        result = run_analysis(output_path, frame_skip=3, scale=0.4)
+        result = run_analysis(raw_video_path, frame_skip=3, scale=0.4)
+        output_path = raw_video_path
     elif resolved_type == 'deadlift':
-        result = run_deadlift_analysis(output_path, frame_skip=3, scale=0.4)
+        result = run_deadlift_analysis(raw_video_path, frame_skip=3, scale=0.4)
+        output_path = raw_video_path
     elif resolved_type == 'bulgarian':
-        analyzed_filename = base_filename + "_analyzed.mp4"
-        analyzed_path = os.path.join(MEDIA_DIR, analyzed_filename)
-        result, analyzed_path, _ = run_bulgarian_analysis(
-            output_path, frame_skip=3, scale=0.4, output_path=analyzed_path
+        analyzed_path = os.path.join(MEDIA_DIR, base_filename + "_analyzed.mp4")
+        result, final_video_path, _ = run_bulgarian_analysis(
+            raw_video_path, frame_skip=3, scale=0.4, output_path=analyzed_path
         )
-        output_path = analyzed_path  # 🔥 נשתמש בווידאו עם ציורים
+        output_path = final_video_path  # ✅ נתיב סופי עם ציורים (גם אם קודד מחדש)
     elif resolved_type == 'pullup':
-        result = run_pullup_analysis(output_path, frame_skip=3, scale=0.4)
+        result = run_pullup_analysis(raw_video_path, frame_skip=3, scale=0.4)
+        output_path = raw_video_path
     elif resolved_type == 'bicep_curl':
-        result = run_barbell_bicep_curl_analysis(output_path, frame_skip=3, scale=0.4)
+        result = run_barbell_bicep_curl_analysis(raw_video_path, frame_skip=3, scale=0.4)
+        output_path = raw_video_path
 
     response = {
         "result": result,
