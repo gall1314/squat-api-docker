@@ -13,19 +13,19 @@ VALGUS_X_TOL = 0.03
 
 mp_pose = mp.solutions.pose
 
-# ==== Overlay Function ====
+# ==== Overlay: Top+Bottom Bars ====
 def draw_overlay(frame, reps, feedback):
     h, w, _ = frame.shape
     bar_height = int(h * 0.07)
 
-    # Top bar – reps
+    # Top bar
     top_overlay = frame.copy()
     cv2.rectangle(top_overlay, (0, 0), (w, bar_height), (0, 0, 0), -1)
     frame = cv2.addWeighted(top_overlay, 0.6, frame, 0.4, 0)
     cv2.putText(frame, f"Reps: {reps}", (20, int(bar_height * 0.7)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-    # Bottom bar – feedback
+    # Bottom bar
     if feedback:
         bottom_overlay = frame.copy()
         cv2.rectangle(bottom_overlay, (0, h - bar_height), (w, h), (0, 0, 0), -1)
@@ -37,7 +37,7 @@ def draw_overlay(frame, reps, feedback):
 
     return frame
 
-# ==== Helper Functions ====
+# ==== Helpers ====
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
     radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
@@ -87,7 +87,7 @@ class BulgarianRepCounter:
             self.bad_reps += 1
             self.all_feedback.update(feedback)
 
-        rep_result = {
+        self.rep_reports.append({
             "rep_index": self.rep_index,
             "score": round(score, 1),
             "feedback": feedback,
@@ -96,9 +96,7 @@ class BulgarianRepCounter:
             "min_knee_angle": round(self._curr_min_knee, 2),
             "max_knee_angle": round(self._curr_max_knee, 2),
             "torso_min_angle": round(self._curr_min_torso, 2)
-        }
-
-        self.rep_reports.append(rep_result)
+        })
         self.rep_index += 1
         self.rep_start_frame = None
 
@@ -120,7 +118,9 @@ class BulgarianRepCounter:
                 self._start_rep(frame_no)
         elif knee_angle > ANGLE_UP_THRESH and self.stage == 'down':
             self.count += 1
-            score, feedback = self.evaluate_form(self._curr_min_knee, self._curr_min_torso, self._curr_valgus_bad)
+            score, feedback = self.evaluate_form(
+                self._curr_min_knee, self._curr_min_torso, self._curr_valgus_bad
+            )
             self._finish_rep(frame_no, score, feedback)
             self.stage = 'up'
 
@@ -164,7 +164,7 @@ class BulgarianRepCounter:
             "reps": self.rep_reports
         }
 
-# ==== Main Function ====
+# ==== Main Analysis ====
 def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="analyzed_output.mp4", feedback_path="feedback_summary.txt"):
     cap = cv2.VideoCapture(video_path)
     counter = BulgarianRepCounter()
@@ -173,7 +173,6 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
-
     pose = mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7)
 
     while cap.isOpened():
@@ -218,7 +217,6 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
         mp.solutions.drawing_utils.draw_landmarks(
             frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
-        # Overlay
         feedbacks = []
         if counter.stage == "down":
             if torso_angle < TORSO_LEAN_MIN:
@@ -246,6 +244,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
             for fb in result["feedback"]:
                 f.write(f"- {fb}\n")
 
+    # Re-encode with FFmpeg
     encoded_path = output_path.replace(".mp4", "_encoded.mp4")
     subprocess.run([
         "ffmpeg", "-y",
@@ -260,4 +259,5 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
     output_path = encoded_path
 
     return result, output_path, feedback_path
+
 
