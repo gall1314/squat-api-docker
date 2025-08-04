@@ -49,43 +49,53 @@ def analyze():
     if not resolved_type:
         return jsonify({"error": f"Unsupported exercise type: {exercise_type}"}), 400
 
+    # שמירה זמנית של הסרטון שהמשתמש העלה
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     video_file.save(temp.name)
 
+    # שם ייחודי לסרטון
     unique_id = str(uuid.uuid4())[:8]
-    output_filename = f"{resolved_type}_{unique_id}.mp4"
-    output_path = os.path.join(MEDIA_DIR, output_filename)
-
-    # שמירה של הסרטון המקורי לתיקיית media
-    shutil.copyfile(temp.name, output_path)
+    raw_video_filename = f"{resolved_type}_{unique_id}.mp4"
+    raw_video_path = os.path.join(MEDIA_DIR, raw_video_filename)
+    shutil.copyfile(temp.name, raw_video_path)
     os.remove(temp.name)
 
-    # ניתוח בהתאם לתרגיל
-    if resolved_type == 'squat':
-        result = run_analysis(output_path, frame_skip=3, scale=0.4)
-        analyzed_path = output_path  # אין פלט חדש לסקוואט כרגע
-    elif resolved_type == 'deadlift':
-        result = run_deadlift_analysis(output_path, frame_skip=3, scale=0.4)
-        analyzed_path = output_path
-    elif resolved_type == 'bulgarian':
-        result, analyzed_path, _ = run_bulgarian_analysis(output_path, frame_skip=3, scale=0.4)
-    elif resolved_type == 'pullup':
-        result = run_pullup_analysis(output_path, frame_skip=3, scale=0.4)
-        analyzed_path = output_path
-    elif resolved_type == 'bicep_curl':
-        result = run_barbell_bicep_curl_analysis(output_path, frame_skip=3, scale=0.4)
-        analyzed_path = output_path
+    # שם לפלט מנותח
+    analyzed_filename = f"{resolved_type}_{unique_id}_analyzed.mp4"
+    analyzed_path = os.path.join(MEDIA_DIR, analyzed_filename)
 
-    # מחזיר JSON שטוח (כמו ש-FF צריך)
+    # ניתוח לפי סוג תרגיל
+    if resolved_type == 'squat':
+        result = run_analysis(raw_video_path, frame_skip=3, scale=0.4)
+        analyzed_video_url = f"/media/{raw_video_filename}"  # אין וידאו מנותח
+    elif resolved_type == 'deadlift':
+        result = run_deadlift_analysis(raw_video_path, frame_skip=3, scale=0.4)
+        analyzed_video_url = f"/media/{raw_video_filename}"  # אין וידאו מנותח
+    elif resolved_type == 'bulgarian':
+        result, output_path, _ = run_bulgarian_analysis(
+            video_path=raw_video_path,
+            frame_skip=3,
+            scale=0.4,
+            output_path=analyzed_path
+        )
+        analyzed_video_url = f"/media/{os.path.basename(output_path)}"
+    elif resolved_type == 'pullup':
+        result = run_pullup_analysis(raw_video_path, frame_skip=3, scale=0.4)
+        analyzed_video_url = f"/media/{raw_video_filename}"  # אם תומך ניתוח וידאו – תעדכן
+    elif resolved_type == 'bicep_curl':
+        result = run_barbell_bicep_curl_analysis(raw_video_path, frame_skip=3, scale=0.4)
+        analyzed_video_url = f"/media/{raw_video_filename}"
+
     return jsonify({
-        **result,
-        "video_url": f"/media/{os.path.basename(analyzed_path)}"
+        "result": result,
+        "video_url": analyzed_video_url
     })
+
 
 @app.route('/media/<filename>')
 def media(filename):
     return send_from_directory(MEDIA_DIR, filename)
 
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
-
