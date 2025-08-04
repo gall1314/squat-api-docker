@@ -13,6 +13,31 @@ VALGUS_X_TOL = 0.03
 
 mp_pose = mp.solutions.pose
 
+# ==== Overlay Function ====
+
+def draw_overlay(frame, reps, feedback):
+    h, w, _ = frame.shape
+    bar_height = int(h * 0.07)
+
+    # Top bar – reps
+    top_overlay = frame.copy()
+    cv2.rectangle(top_overlay, (0, 0), (w, bar_height), (0, 0, 0), -1)
+    frame = cv2.addWeighted(top_overlay, 0.6, frame, 0.4, 0)
+    cv2.putText(frame, f"Reps: {reps}", (20, int(bar_height * 0.7)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    # Bottom bar – feedback
+    if feedback:
+        bottom_overlay = frame.copy()
+        cv2.rectangle(bottom_overlay, (0, h - bar_height), (w, h), (0, 0, 0), -1)
+        frame = cv2.addWeighted(bottom_overlay, 0.6, frame, 0.4, 0)
+        text_size = cv2.getTextSize(feedback, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)[0]
+        text_x = int((w - text_size[0]) / 2)
+        cv2.putText(frame, feedback, (text_x, h - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    return frame
+
 # ==== Helper Functions ====
 
 def calculate_angle(a, b, c):
@@ -84,7 +109,7 @@ class BulgarianRepCounter:
         feedback = []
         score = 10.0
         if min_torso_angle < TORSO_LEAN_MIN:
-            feedback.append("Stand taller")
+            feedback.append("Keep your back straight")
             score -= 2
         if valgus_bad_frames > 0:
             feedback.append("Avoid knee collapse")
@@ -196,16 +221,15 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
             mp.solutions.drawing_utils.draw_landmarks(
                 frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
 
-            cv2.putText(frame, f"Reps: {counter.count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, f"Knee angle: {int(knee_angle)}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-            cv2.putText(frame, f"Torso angle: {int(torso_angle)}", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-
+            # Draw simplified overlay
+            feedback = ""
             if counter.stage == "down":
                 if torso_angle < TORSO_LEAN_MIN:
-                    cv2.putText(frame, "Keep your back straight", (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                if not v_ok:
-                    cv2.putText(frame, "Avoid knee collapse", (10, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    feedback = "Keep your back straight"
+                elif not v_ok:
+                    feedback = "Avoid knee collapse"
 
+            frame = draw_overlay(frame, reps=counter.count, feedback=feedback)
             out.write(frame)
 
     cap.release()
@@ -238,3 +262,4 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
     output_path = encoded_path
 
     return result, output_path, feedback_path
+
