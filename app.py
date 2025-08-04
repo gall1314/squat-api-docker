@@ -3,7 +3,7 @@ from flask_cors import CORS
 import tempfile
 import os
 import uuid
-import subprocess
+import shutil
 
 # ייבוא פונקציות ניתוח
 from squat_analysis import run_analysis
@@ -17,32 +17,6 @@ CORS(app)
 
 MEDIA_DIR = "media"
 os.makedirs(MEDIA_DIR, exist_ok=True)
-
-def compress_video(input_path, output_path, scale=0.4):
-    command = [
-        "ffmpeg",
-        "-i", input_path,
-        "-vf", f"scale='trunc(iw*{scale}/2)*2:trunc(ih*{scale}/2)*2'",
-        "-c:v", "libx264",
-        "-profile:v", "baseline",
-        "-level", "3.0",
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-y",
-        output_path
-    ]
-    try:
-        subprocess.run(command, check=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        print("FFmpeg compression error:", e)
-        return False
-
-    except subprocess.CalledProcessError as e:
-        print("FFmpeg compression error:", e)
-        return False
 
 EXERCISE_MAP = {
     "barbell squat": "squat",
@@ -82,27 +56,31 @@ def analyze():
     output_filename = f"{resolved_type}_{unique_id}.mp4"
     output_path = os.path.join(MEDIA_DIR, output_filename)
 
-    success = compress_video(temp.name, output_path, scale=0.4)
+    # שמירה של הסרטון המקורי לתיקיית media
+    shutil.copyfile(temp.name, output_path)
     os.remove(temp.name)
-    if not success:
-        return jsonify({"error": "Video compression failed"}), 500
 
+    # ניתוח בהתאם לתרגיל
     if resolved_type == 'squat':
         result = run_analysis(output_path, frame_skip=3, scale=0.4)
+        analyzed_path = output_path  # אין פלט חדש לסקוואט כרגע
     elif resolved_type == 'deadlift':
         result = run_deadlift_analysis(output_path, frame_skip=3, scale=0.4)
+        analyzed_path = output_path
     elif resolved_type == 'bulgarian':
-        result, _, _ = run_bulgarian_analysis(output_path, frame_skip=3, scale=0.4)
+        result, analyzed_path, _ = run_bulgarian_analysis(output_path, frame_skip=3, scale=0.4)
     elif resolved_type == 'pullup':
         result = run_pullup_analysis(output_path, frame_skip=3, scale=0.4)
+        analyzed_path = output_path
     elif resolved_type == 'bicep_curl':
         result = run_barbell_bicep_curl_analysis(output_path, frame_skip=3, scale=0.4)
+        analyzed_path = output_path
 
-    response = {
-        "result": result,
-        "video_url": f"/media/{output_filename}"
-    }
-    return jsonify(response)
+    # מחזיר JSON שטוח (כמו ש-FF צריך)
+    return jsonify({
+        **result,
+        "video_url": f"/media/{os.path.basename(analyzed_path)}"
+    })
 
 @app.route('/media/<filename>')
 def media(filename):
