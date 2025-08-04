@@ -1,6 +1,8 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+import subprocess
+import os
 
 # ==== Constants ====
 ANGLE_DOWN_THRESH = 95
@@ -32,7 +34,7 @@ def valgus_ok(landmarks, side):
     ankle_x = landmarks[getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value].x
     return not (knee_x < ankle_x - VALGUS_X_TOL)
 
-# ==== Rep Counter Class ====
+# ==== Rep Counter ====
 
 class BulgarianRepCounter:
     def __init__(self):
@@ -81,15 +83,12 @@ class BulgarianRepCounter:
     def evaluate_form(self, min_knee_angle, min_torso_angle, valgus_bad_frames):
         feedback = []
         score = 10.0
-
         if min_torso_angle < TORSO_LEAN_MIN:
             feedback.append("Stand taller")
             score -= 2
-
         if valgus_bad_frames > 0:
             feedback.append("Avoid knee collapse")
             score -= 2
-
         return score, feedback
 
     def update(self, knee_angle, torso_angle, valgus_ok, frame_no):
@@ -143,7 +142,7 @@ class BulgarianRepCounter:
             "reps": self.rep_reports
         }
 
-# ==== Main Analysis Function ====
+# ==== Main Function ====
 
 def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="analyzed_output.mp4", feedback_path="feedback_summary.txt"):
     cap = cv2.VideoCapture(video_path)
@@ -154,24 +153,23 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
 
-    with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as pose:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-            frame_no += 1
-            if frame_skip > 1 and (frame_no % frame_skip) != 0:
-                continue
+        frame_no += 1
+        if frame_skip > 1 and (frame_no % frame_skip) != 0:
+            continue
 
-            if scale != 1.0:
-                frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+        if scale != 1.0:
+            frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
 
-            h, w = frame.shape[:2]
+        h, w = frame.shape[:2]
+        if out is None:
+            out = cv2.VideoWriter(output_path, fourcc, 8, (w, h))
 
-            if out is None:
-                out = cv2.VideoWriter(output_path, fourcc, 8, (w, h))
-
+        with mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7) as pose:
             image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image_rgb)
 
@@ -216,44 +214,27 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
 
     result = counter.result()
 
-    # Save feedback to text file
+    # Save feedback
     with open(feedback_path, "w", encoding="utf-8") as f:
-        f.write("📊 Bulgarian Split Squat Feedback Summary\n")
-        f.write("="*40 + "\n")
         f.write(f"Total Reps: {result['squat_count']}\n")
-        f.write(f"Good Reps: {result['good_reps']}\n")
-        f.write(f"Bad Reps: {result['bad_reps']}\n")
-        f.write(f"Overall Technique Score: {result['technique_score']}/10\n\n")
-
+        f.write(f"Technique Score: {result['technique_score']}/10\n")
         if result["feedback"]:
-            f.write("💡 General Feedback:\n")
+            f.write("Feedback:\n")
             for fb in result["feedback"]:
-                f.write(f" - {fb}\n")
-            f.write("\n")
+                f.write(f"- {fb}\n")
 
-        if result["reps"]:
-            f.write("📈 Rep-by-Rep Breakdown:\n")
-            for rep in result["reps"]:
-                f.write(f"\n➡️ Rep #{rep['rep_index']}:\n")
-                f.write(f"   Score: {rep['score']}/10\n")
-                f.write(f"   Min Knee Angle: {rep['min_knee_angle']}°\n")
-                f.write(f"   Max Knee Angle: {rep['max_knee_angle']}°\n")
-                f.write(f"   Min Torso Angle: {rep['torso_min_angle']}°\n")
-                if rep["feedback"]:
-                    f.write("   ❗ Issues:\n")
-                    for issue in rep["feedback"]:
-                        f.write(f"    - {issue}\n")
-                else:
-                    f.write("   ✅ Perfect form\n")
-
+    # Re-encode with ffmpeg
+    encoded_path = output_path.replace(".mp4", "_encoded.mp4")
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", output_path,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-movflags", "+faststart",
+        "-pix_fmt", "yuv420p",
+        encoded_path
+    ])
+    os.remove(output_path)
+    output_path = encoded_path
 
     return result, output_path, feedback_path
-
-# ==== Run Analysis ====
-
-if __name__ == "__main__":
-    result, video_file, feedback_file = run_bulgarian_analysis("video1.mp4", frame_skip=3, scale=0.4)
-    print("\n===== ANALYSIS COMPLETE =====")
-    print("Video saved to:", video_file)
-    print("Feedback saved to:", feedback_file)
-    print("Summary:", result)
