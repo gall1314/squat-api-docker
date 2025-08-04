@@ -22,7 +22,7 @@ def compress_video(input_path, output_path, scale=0.4):
     command = [
         "ffmpeg",
         "-i", input_path,
-        "-vf", f"scale=iw*{scale}:ih*{scale}",
+        "-vf", f"scale='trunc(iw*{scale}/2)*2:trunc(ih*{scale}/2)*2'",
         "-c:v", "libx264",
         "-profile:v", "baseline",
         "-level", "3.0",
@@ -36,6 +36,10 @@ def compress_video(input_path, output_path, scale=0.4):
     try:
         subprocess.run(command, check=True)
         return True
+    except subprocess.CalledProcessError as e:
+        print("FFmpeg compression error:", e)
+        return False
+
     except subprocess.CalledProcessError as e:
         print("FFmpeg compression error:", e)
         return False
