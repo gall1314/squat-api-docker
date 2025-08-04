@@ -56,11 +56,10 @@ def analyze():
     base_filename = f"{resolved_type}_{unique_id}"
     raw_video_path = os.path.join(MEDIA_DIR, base_filename + ".mp4")
 
-    # שמירת הקובץ המקורי
     shutil.copyfile(temp.name, raw_video_path)
     os.remove(temp.name)
 
-    # ניתוח לפי סוג
+    # עיבוד לפי סוג התרגיל
     if resolved_type == 'squat':
         result = run_analysis(raw_video_path, frame_skip=3, scale=0.4)
         output_path = raw_video_path
@@ -72,7 +71,7 @@ def analyze():
         result, final_video_path, _ = run_bulgarian_analysis(
             raw_video_path, frame_skip=3, scale=0.4, output_path=analyzed_path
         )
-        output_path = final_video_path  # ✅ נתיב סופי עם ציורים (גם אם קודד מחדש)
+        output_path = final_video_path
     elif resolved_type == 'pullup':
         result = run_pullup_analysis(raw_video_path, frame_skip=3, scale=0.4)
         output_path = raw_video_path
@@ -80,9 +79,11 @@ def analyze():
         result = run_barbell_bicep_curl_analysis(raw_video_path, frame_skip=3, scale=0.4)
         output_path = raw_video_path
 
+    # ✅ החזרת כתובת URL מלאה
+    full_url = request.host_url.rstrip('/') + '/media/' + os.path.basename(output_path)
     response = {
         "result": result,
-        "video_url": f"/media/{os.path.basename(output_path)}"
+        "video_url": full_url
     }
     return jsonify(response)
 
@@ -92,4 +93,5 @@ def media(filename):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
 
