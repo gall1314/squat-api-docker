@@ -68,10 +68,10 @@ def analyze():
         output_path = raw_video_path
     elif resolved_type == 'bulgarian':
         analyzed_path = os.path.join(MEDIA_DIR, base_filename + "_analyzed.mp4")
-        result = run_bulgarian_analysis(
+        result, final_video_path, _ = run_bulgarian_analysis(
             raw_video_path, frame_skip=3, scale=0.4, output_path=analyzed_path
         )
-        output_path = result["video_path"]
+        output_path = final_video_path
     elif resolved_type == 'pullup':
         result = run_pullup_analysis(raw_video_path, frame_skip=3, scale=0.4)
         output_path = raw_video_path
@@ -79,10 +79,10 @@ def analyze():
         result = run_barbell_bicep_curl_analysis(raw_video_path, frame_skip=3, scale=0.4)
         output_path = raw_video_path
 
-    # ✅ החזרת כתובת URL מלאה
+    # ✅ החזרת JSON שטוח
     full_url = request.host_url.rstrip('/') + '/media/' + os.path.basename(output_path)
     response = {
-        "result": result,
+        **result,  # כל הערכים שהיו תחת result ייכנסו ישירות כאן
         "video_url": full_url
     }
     return jsonify(response)
