@@ -19,7 +19,7 @@ FEEDBACK_FONT_SIZE = 22
 mp_pose = mp.solutions.pose
 
 # ===== ציור טקסט =====
-def draw_overlay(frame, reps, feedback):
+def draw_overlay(frame, reps=0, feedback=None):
     h, w, _ = frame.shape
     bar_height = int(h * 0.07)
 
@@ -28,19 +28,18 @@ def draw_overlay(frame, reps, feedback):
     frame = cv2.addWeighted(top_overlay, 0.6, frame, 0.4, 0)
 
     pil_img = Image.fromarray(frame)
-    draw = ImageDraw.Draw(pil_img)
     reps_font = ImageFont.truetype(FONT_PATH, REPS_FONT_SIZE)
-    draw.text((20, int(bar_height * 0.2)), f"Reps: {reps}", font=reps_font, fill=(255, 255, 255))
+    draw = ImageDraw.Draw(pil_img)
+    draw.text((20, bar_height * 0.2), f"Reps: {reps}", font=reps_font, fill=(255, 255, 255))
 
     if feedback:
-        bottom_overlay = np.array(pil_img).copy()
+        bottom_overlay = np.array(pil_img.copy())
         cv2.rectangle(bottom_overlay, (0, h - bar_height), (w, h), (0, 0, 0), -1)
         frame = cv2.addWeighted(bottom_overlay, 0.6, np.array(pil_img), 0.4, 0)
         pil_img = Image.fromarray(frame)
 
         draw = ImageDraw.Draw(pil_img)
-        FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
-
+        feedback_font = ImageFont.truetype(FONT_PATH, FEEDBACK_FONT_SIZE)
 
         max_width = int(w * 0.9)
         words = feedback.split()
@@ -63,9 +62,9 @@ def draw_overlay(frame, reps, feedback):
             draw.text((x, y), line, font=feedback_font, fill=(255, 255, 255))
             y += FEEDBACK_FONT_SIZE + 4
 
-        frame = np.array(pil_img)
-
+    frame = np.array(pil_img)
     return frame
+
 
 # ===== חישובי זויות =====
 def calculate_angle(a, b, c):
