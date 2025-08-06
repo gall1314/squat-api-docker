@@ -3,27 +3,26 @@ import mediapipe as mp
 import numpy as np
 import subprocess
 import os
-from PIL import ImageFont, ImageDraw, Image  # נוספה לתמיכה בפונט איכותי
+from PIL import ImageFont, ImageDraw, Image
 
-# ========== קבועים ==========
+# ===== קבועים =====
 ANGLE_DOWN_THRESH = 95
 ANGLE_UP_THRESH = 160
 GOOD_REP_MIN_SCORE = 8.0
 TORSO_LEAN_MIN = 135
 VALGUS_X_TOL = 0.03
 
-FONT_PATH = "C:/Users/lenovo/Downloads/Roboto/Roboto-Bold.ttf"
+FONT_PATH = "fonts/Roboto-Bold.ttf"
 REPS_FONT_SIZE = 28
 FEEDBACK_FONT_SIZE = 22
 
 mp_pose = mp.solutions.pose
 
-# ========== ציור טקסט על המסך ==========
+# ===== ציור טקסט =====
 def draw_overlay(frame, reps, feedback):
     h, w, _ = frame.shape
     bar_height = int(h * 0.07)
 
-    # רקע עליון
     top_overlay = frame.copy()
     cv2.rectangle(top_overlay, (0, 0), (w, bar_height), (0, 0, 0), -1)
     frame = cv2.addWeighted(top_overlay, 0.6, frame, 0.4, 0)
@@ -67,7 +66,7 @@ def draw_overlay(frame, reps, feedback):
 
     return frame
 
-# ========== חישובי זויות וכו' ==========
+# ===== חישובי זויות =====
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
     radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
@@ -87,7 +86,7 @@ def valgus_ok(landmarks, side):
     ankle_x = landmarks[getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value].x
     return not (knee_x < ankle_x - VALGUS_X_TOL)
 
-# ========== ספירת חזרות ==========
+# ===== ספירת חזרות =====
 class BulgarianRepCounter:
     def __init__(self):
         self.count = 0
@@ -174,7 +173,7 @@ class BulgarianRepCounter:
             "reps": self.rep_reports
         }
 
-# ========== פונקציית הרצה ==========
+# ===== פונקציה ראשית =====
 def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="analyzed_output.mp4", feedback_path="feedback_summary.txt"):
     cap = cv2.VideoCapture(video_path)
     counter = BulgarianRepCounter()
