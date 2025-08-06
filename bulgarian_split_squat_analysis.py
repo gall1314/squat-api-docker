@@ -12,7 +12,8 @@ GOOD_REP_MIN_SCORE = 8.0
 TORSO_LEAN_MIN = 135
 VALGUS_X_TOL = 0.03
 
-FONT_PATH = "fonts/Roboto-Bold.ttf"
+# ✅ עדכון נתיב הפונט לשם הקובץ בלבד (כי הוא ברוט)
+FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
 REPS_FONT_SIZE = 28
 FEEDBACK_FONT_SIZE = 22
 
@@ -270,5 +271,4 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0, output_path="ana
         "video_path": encoded_path,
         "feedback_path": feedback_path
     }
-
 
