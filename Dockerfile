@@ -15,7 +15,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# ✅ העתק את תיקיית הפונטים
-COPY fonts/ /app/fonts/
-
 CMD ["python", "app.py"]
