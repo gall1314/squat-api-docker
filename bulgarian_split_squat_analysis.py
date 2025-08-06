@@ -39,7 +39,8 @@ def draw_overlay(frame, reps, feedback):
         pil_img = Image.fromarray(frame)
 
         draw = ImageDraw.Draw(pil_img)
-        feedback_font = ImageFont.truetype(FONT_PATH, FEEDBACK_FONT_SIZE)
+        FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
+
 
         max_width = int(w * 0.9)
         words = feedback.split()
