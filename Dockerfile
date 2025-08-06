@@ -1,4 +1,3 @@
-
 FROM python:3.10-slim
 
 RUN apt-get update && apt-get install -y \
@@ -15,5 +14,8 @@ COPY requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+
+# ✅ העתק את תיקיית הפונטים
+COPY fonts/ /app/fonts/
 
 CMD ["python", "app.py"]
