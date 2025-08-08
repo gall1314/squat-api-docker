@@ -18,7 +18,7 @@ class PullUpAnalyzer:
     def __init__(
         self,
         angle_drop_threshold: float = 18.0,  # כמה המרפק "נסגר" בתחילת ריפ
-        min_separation: int = 5,            # מינימום פריימים בין ריפים
+        min_separation: int = 5,            # מינימום פריימים בין ריפים (אחרי frame_skip)
         nose_rise_thresh: float = 0.001     # כמה ה-NOSE צריך "לעלות" (y קטן) בתחילת ריפ
     ):
         self.angle_drop_threshold = angle_drop_threshold
@@ -73,7 +73,7 @@ class PullUpAnalyzer:
             "feedback": feedback,
             "tips": tips,
             "reps": rep_reports,
-            "rom_full": full_rom,     # <— חדש: ROM לכל פריים
+            "rom_full": full_rom,     # ROM לכל פריים
             "rep_ranges": rep_ranges, # שימושי לאוברליי/דיבוג
         }
 
@@ -136,7 +136,7 @@ class PullUpAnalyzer:
             "technique_score": technique_score,
             "errors": errors,
             "tips": tips,
-            "rom_series": rom_series,  # <— נשתמש ברינדור
+            "rom_series": rom_series,  # לניצול ברינדור
         }
 
     # ---------- Helpers ----------
@@ -247,7 +247,8 @@ class PullUpAnalyzer:
             curr_nose = noses_y[i]
             prev_nose = noses_y[i - 1]
 
-            if None in (curr_angle, prev_angle, curr_nose, prev_nose):
+        # טיפול בזהירות ב-None
+            if curr_angle is None or prev_angle is None or curr_nose is None or prev_nose is None:
                 continue
 
             angle_drop = prev_angle - curr_angle
@@ -336,14 +337,91 @@ def draw_rom_donut(frame, rom, center=(110, 110), radius=60):
     cv2.putText(frame, "ROM-Up", (center[0] - 40, center[1] - radius - 12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2, cv2.LINE_AA)
 
-def run_pullup_analysis(video_path, output_path=None, frame_skip=3, scale=0.3, verbose=True):
+def render_pullup_video(input_path, output_path, analysis_result,
+                        frame_skip=3, scale=0.3, only_reps=False):
     """
-    מריץ Mediapipe Pose על הווידאו ומחזיר תוצאת ניתוח מה-Analyzer.
-    אם נשלח output_path — ירנדר גם וידאו (שלד + דונאט ROM‑Up).
-    חשוב: כדי שהרינדור יתאם לאורך ה-ROM, הרץ את render_pullup_video עם אותם frame_skip ו-scale.
+    מרנדר וידאו: שלד גוף + דונאט ROM‑Up.
+    אם only_reps=True — מרנדר רק את פריימי הריפים. אחרת — את כל הווידאו.
+    """
+    cap = cv2.VideoCapture(input_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) / max(frame_skip, 1)
+    w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
+    h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(output_path, fourcc, fps, (w0, h0))
+
+    mp_pose = mp.solutions.pose
+    pose = mp_pose.Pose(static_image_mode=False, model_complexity=0)
+
+    rom_full = analysis_result.get("rom_full", [])
+    rep_ranges = analysis_result.get("rep_ranges", [])
+
+    # בנה מסכת ריפים אם צריך
+    rep_mask = None
+    if only_reps and rep_ranges:
+        rep_mask = set()
+        for s, e in rep_ranges:
+            rep_mask.update(range(s, e))
+
+    idx = 0          # אינדקס "פריימים שנדגמו" אחרי frame_skip
+    frame_id = 0     # אינדקס פריים אמיתי
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_id % max(frame_skip, 1) != 0:
+            frame_id += 1
+            continue
+
+        # אם only_reps מופעל – דלג על פריימים שלא בתוך ריפ
+        if rep_mask is not None and idx not in rep_mask:
+            idx += 1
+            frame_id += 1
+            continue
+
+        frame = cv2.resize(frame, (w0, h0))
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        res = pose.process(rgb)
+
+        # שלד גוף בלבד
+        if res.pose_landmarks:
+            lms = {}
+            for i, lm in enumerate(res.pose_landmarks.landmark):
+                lms[mp_pose.PoseLandmark(i).name] = (lm.x, lm.y, lm.z)
+            draw_skeleton(frame, lms)
+
+        # דונאט ROM-Up
+        rom = rom_full[idx] if idx < len(rom_full) else 0.0
+        draw_rom_donut(frame, rom)
+
+        out.write(frame)
+        idx += 1
+        frame_id += 1
+
+    cap.release()
+    out.release()
+    pose.close()
+
+# =================
+# Orchestrator
+# =================
+def run_pullup_analysis(
+    video_path,
+    output_path=None,
+    frame_skip=5,           # מהיר יותר מ-3
+    scale=0.22,             # מקטין תמונה — מהיר יותר
+    model_complexity=0,     # 0 מהיר, 1 מדוייק יותר
+    render_mode="reps",     # "none" | "full" | "reps"
+    verbose=False,
+):
+    """
+    מריץ Mediapipe Pose על הווידאו ומחזיר תוצאת ניתוח.
+    אם נשלח output_path — ירנדר גם וידאו (שלד + דונאט ROM‑Up) לפי render_mode.
     """
     mp_pose = mp.solutions.pose
-    pose = mp_pose.Pose(static_image_mode=False, model_complexity=1)
+    pose = mp_pose.Pose(static_image_mode=False, model_complexity=model_complexity)
 
     cap = cv2.VideoCapture(video_path)
     landmarks_list = []
@@ -379,63 +457,20 @@ def run_pullup_analysis(video_path, output_path=None, frame_skip=3, scale=0.3, v
     analyzer = PullUpAnalyzer()
     analysis = analyzer.analyze_all_reps(landmarks_list)
 
-    # תמיכה ב-output_path כמו שה-API שלך קורא
-    if output_path:
-        render_pullup_video(video_path, output_path, analysis,
-                            frame_skip=frame_skip, scale=scale)
+    # רינדור וידאו בהתאם לבקשה
+    if output_path and render_mode != "none":
+        only_reps = (render_mode == "reps")
+        render_pullup_video(
+            input_path=video_path,
+            output_path=output_path,
+            analysis_result=analysis,
+            frame_skip=frame_skip,
+            scale=scale,
+            only_reps=only_reps,
+        )
+        analysis["video_path"] = output_path  # כדי שה-API יוכל לשלוף
 
     return analysis
-
-def render_pullup_video(input_path, output_path, analysis_result, frame_skip=3, scale=0.3):
-    """
-    מרנדר וידאו: שלד גוף + דונאט ROM‑Up.
-    השתמש באותם frame_skip ו-scale כמו בפונקציית הניתוח כדי שתווי ה-ROM יתאימו לאורך.
-    """
-    cap = cv2.VideoCapture(input_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) / max(frame_skip, 1)
-    w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
-    h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_path, fourcc, fps, (w0, h0))
-
-    mp_pose = mp.solutions.pose
-    pose = mp_pose.Pose(static_image_mode=False, model_complexity=1)
-
-    rom_full = analysis_result.get("rom_full", [])
-    idx = 0
-    frame_id = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_id % max(frame_skip, 1) != 0:
-            frame_id += 1
-            continue
-
-        frame = cv2.resize(frame, (w0, h0))
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = pose.process(rgb)
-
-        # שלד גוף בלבד
-        if res.pose_landmarks:
-            lms = {}
-            for i, lm in enumerate(res.pose_landmarks.landmark):
-                lms[mp_pose.PoseLandmark(i).name] = (lm.x, lm.y, lm.z)
-            draw_skeleton(frame, lms)
-
-        # דונאט ROM-Up
-        rom = rom_full[idx] if idx < len(rom_full) else 0.0
-        draw_rom_donut(frame, rom)
-
-        out.write(frame)
-        idx += 1
-        frame_id += 1
-
-    cap.release()
-    out.release()
-    pose.close()
 
 
 # =================
@@ -453,7 +488,15 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3:
         in_path = sys.argv[1]
         out_path = sys.argv[2]
-        analysis = run_pullup_analysis(in_path, output_path=out_path, frame_skip=3, scale=0.3, verbose=True)
+        analysis = run_pullup_analysis(
+            in_path,
+            output_path=out_path,
+            frame_skip=5,
+            scale=0.22,
+            model_complexity=0,
+            render_mode="reps",
+            verbose=True,
+        )
         print("Done:", {k: v for k, v in analysis.items() if k not in ("rom_full", "reps", "rep_ranges")})
     else:
         print("Usage: python pullup_analysis.py <input.mp4> <output.mp4>")
