@@ -1,9 +1,60 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+import subprocess
+import os
 from utils import calculate_angle, calculate_body_angle
+from PIL import ImageFont, ImageDraw, Image
 
-def run_analysis(video_path, frame_skip=3, scale=0.4):
+# ====== סגנון גרפי ======
+FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
+REPS_FONT_SIZE = 28
+FEEDBACK_FONT_SIZE = 22
+
+try:
+    REPS_FONT = ImageFont.truetype(FONT_PATH, REPS_FONT_SIZE)
+    FEEDBACK_FONT = ImageFont.truetype(FONT_PATH, FEEDBACK_FONT_SIZE)
+except Exception:
+    REPS_FONT = ImageFont.load_default()
+    FEEDBACK_FONT = ImageFont.load_default()
+
+def draw_plain_text(pil_img, xy, text, font, color=(255,255,255)):
+    ImageDraw.Draw(pil_img).text((int(xy[0]), int(xy[1])), text, font=font, fill=color)
+    return np.array(pil_img)
+
+def draw_overlay(frame, reps=0, feedback=None):
+    """פס עליון עם ספירה, פס תחתון עם פידבק."""
+    h, w, _ = frame.shape
+    bar_h = int(h * 0.065)
+
+    # פס עליון שקוף
+    top = frame.copy()
+    cv2.rectangle(top, (0, 0), (w, bar_h), (0, 0, 0), -1)
+    frame = cv2.addWeighted(top, 0.55, frame, 0.45, 0)
+
+    pil = Image.fromarray(frame)
+    frame = draw_plain_text(pil, (16, int(bar_h*0.22)), f"Reps: {reps}", REPS_FONT)
+
+    # פידבק תחתון
+    if feedback:
+        bottom_h = int(h * 0.07)
+        over = frame.copy()
+        cv2.rectangle(over, (0, h-bottom_h), (w, h), (0, 0, 0), -1)
+        frame = cv2.addWeighted(over, 0.55, frame, 0.45, 0)
+
+        pil = Image.fromarray(frame)
+        draw = ImageDraw.Draw(pil)
+        tw = draw.textlength(feedback, font=FEEDBACK_FONT)
+        tx = (w - int(tw)) // 2
+        ty = h - bottom_h + 6
+        draw.text((tx, ty), feedback, font=FEEDBACK_FONT, fill=(255,255,255))
+        frame = np.array(pil)
+
+    return frame
+
+def run_analysis(video_path, frame_skip=3, scale=0.4,
+                 output_path="squat_output.mp4",
+                 feedback_path="squat_feedback.txt"):
     mp_pose = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -21,6 +72,12 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
     max_lean_down = 0
     top_back_angle = 0
 
+    out = None
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+
+    fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
+    effective_fps = max(1.0, fps_in / max(1, frame_skip))
+
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         frame_idx = 0
         while cap.isOpened():
@@ -32,10 +89,18 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                 continue
             if scale != 1.0:
                 frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+
+            h, w = frame.shape[:2]
+            if out is None:
+                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
+
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
             if not results.pose_landmarks:
+                frame = draw_overlay(frame, reps=counter, feedback=None)
+                out.write(frame)
                 continue
+
             try:
                 lm = results.pose_landmarks.landmark
                 hip = [lm[mp_pose.PoseLandmark.RIGHT_HIP.value].x, lm[mp_pose.PoseLandmark.RIGHT_HIP.value].y]
@@ -117,9 +182,18 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
                     max_lean_down = 0
 
             except Exception:
-                continue
+                pass
+
+            # ציור Overlay
+            live_feedback = " | ".join(feedbacks) if counter and feedbacks else None
+            frame = draw_overlay(frame, reps=counter, feedback=live_feedback)
+            out.write(frame)
 
     cap.release()
+    if out:
+        out.release()
+    cv2.destroyAllWindows()
+
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
 
     if depth_distances and not depth_feedback_given:
@@ -134,6 +208,29 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
     if not overall_feedback:
         overall_feedback.append("Great form! Keep it up 💪")
 
+    # כתיבת קובץ פידבק
+    with open(feedback_path, "w", encoding="utf-8") as f:
+        f.write(f"Total Reps: {counter}\n")
+        f.write(f"Technique Score: {technique_score}/10\n")
+        if overall_feedback:
+            f.write("Feedback:\n")
+            for fb in overall_feedback:
+                f.write(f"- {fb}\n")
+
+    # קידוד ל-mp4 תואם
+    encoded_path = output_path.replace(".mp4", "_encoded.mp4")
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", output_path,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-movflags", "+faststart",
+        "-pix_fmt", "yuv420p",
+        encoded_path
+    ])
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
     return {
         "technique_score": technique_score,
         "squat_count": counter,
@@ -141,4 +238,6 @@ def run_analysis(video_path, frame_skip=3, scale=0.4):
         "bad_reps": bad_reps,
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
+        "video_path": encoded_path,
+        "feedback_path": feedback_path
     }
