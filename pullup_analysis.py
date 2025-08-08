@@ -1,10 +1,12 @@
 # pullup_analysis.py
-import os, time
+import os, time, subprocess
 import cv2
 import numpy as np
 import mediapipe as mp
 
 __all__ = ["run_pullup_analysis", "render_pullup_video", "PullUpAnalyzer"]
+
+mp_pose = mp.solutions.pose
 
 # =========================
 # Pull-up Analyzer + Render
@@ -293,7 +295,7 @@ def render_pullup_video(input_path, output_path, analysis_result,
                         frame_skip=3, scale=0.3, draw_skeleton_flag=True):
     cap = cv2.VideoCapture(input_path)
 
-    # *** תיקון לסרטון: כמו סקוואט/בולגרי — FPS אחרי הדילול + קודק mp4v ***
+    # כמו סקוואט/בולגרי – FPS אחרי הדילול + mp4v (ואח"כ FFmpeg יקודד ל-h264)
     fps = (cap.get(cv2.CAP_PROP_FPS) or 30.0) / max(frame_skip, 1)
     w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
     h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
@@ -335,14 +337,12 @@ def render_pullup_video(input_path, output_path, analysis_result,
     cap.release()
     out.release()
 
-    # בדיקת תקינות קובץ
+    # בדיקת תקינות קובץ גולמי
     try:
         size = os.path.getsize(output_path)
-        print(f"[pullup] wrote video: {output_path} | frames={wrote} | size={size} bytes")
-        if size < 1024:
-            raise RuntimeError("Rendered video too small – codec/path issue")
+        print(f"[pullup] wrote RAW: {output_path} | frames={wrote} | size={size} bytes")
     except Exception as e:
-        print("[pullup] render check failed:", e)
+        print("[pullup] raw render check failed:", e)
 
 
 # =================
@@ -357,8 +357,8 @@ def run_pullup_analysis(
     verbose=False,
 ):
     """
-    מריץ ניתוח + מרנדר סרטון תמיד, ומחזיר גם video_path כדי שה-API יוכל להעלות.
-    עובד בדיוק כמו בסקוואט/בולגרי.
+    מריץ ניתוח + מרנדר סרטון תמיד, ואז מקודד ל-H.264 (ffmpeg) ומחזיר video_path של המקודד.
+    עובד בדיוק כמו בבולגרי/סקוואט מבחינת ממשק ה-API.
     """
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(static_image_mode=False, model_complexity=model_complexity)
@@ -396,13 +396,13 @@ def run_pullup_analysis(
 
     analyzer = PullUpAnalyzer()
     analysis = analyzer.analyze_all_reps(landmarks_list)
-    analysis["frames_landmarks"] = landmarks_list  # נשתמש ברינדור — אין ריצת Pose שנייה
+    analysis["frames_landmarks"] = landmarks_list  # שימוש ברינדור — אין ריצת Pose שנייה
 
-    # ודא שיש לנו נתיב בטוח
+    # ודא שיש נתיב קובץ
     if not output_path:
         output_path = _safe_output_path("pullup")
 
-    # רינדור תמיד, כמו בסקוואט/בולגרי
+    # שלב 1: רינדור MP4 גולמי (mp4v)
     render_pullup_video(
         input_path=video_path,
         output_path=output_path,
@@ -411,7 +411,28 @@ def run_pullup_analysis(
         scale=scale,
         draw_skeleton_flag=True,
     )
-    analysis["video_path"] = output_path  # כדי שה-API שלך ירים את הקובץ
+
+    # שלב 2: קידוד H.264 כמו בבולגרי (libx264 + faststart + yuv420p)
+    encoded_path = output_path.replace(".mp4", "_encoded.mp4")
+    try:
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-i", output_path,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p",
+            encoded_path
+        ], check=False)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        print(f"[pullup] encoded: {encoded_path}")
+    except Exception as e:
+        print("[pullup] ffmpeg encode failed:", e)
+        # במקרה תקלה – נחזיר את הגולמי
+        encoded_path = output_path
+
+    analysis["video_path"] = encoded_path  # כדי שה-API יחזיר קובץ מנגן
 
     return analysis
 
@@ -425,6 +446,7 @@ if __name__ == "__main__":
     python pullup_analysis.py input.mp4 output.mp4
 
     pip install mediapipe opencv-python numpy
+    (וצריך ffmpeg מותקן במערכת)
     """
     import sys
     if len(sys.argv) >= 3:
@@ -433,5 +455,3 @@ if __name__ == "__main__":
         print("Done:", {k: v for k, v in res.items() if k not in ("rom_full","reps","rep_ranges","frames_landmarks")})
     else:
         print("Usage: python pullup_analysis.py <input.mp4> <output.mp4>")
-
-
