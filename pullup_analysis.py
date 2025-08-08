@@ -8,6 +8,18 @@ __all__ = ["run_pullup_analysis", "render_pullup_video", "PullUpAnalyzer"]
 
 mp_pose = mp.solutions.pose
 
+# ===== Performance knobs (safe) =====
+DRAW_SKELETON_EVERY = 3   # מציירים שלד כל 3 פריימים כדי לחסוך זמן (1 = כל פריים)
+ROM_EMA_ALPHA = 0.25      # החלקת ROM בדונאט
+FFMPEG_PRESET = "veryfast"  # "fast" / "veryfast"
+FFMPEG_CRF = "22"           # איכות/משקל; 22 סביר ומהיר
+
+# נסה להגביל ת'רדים של OpenCV (שיפור קטן וחינמי)
+try:
+    cv2.setNumThreads(max(1, os.cpu_count() // 2))
+except Exception:
+    pass
+
 # =========================
 # Pull-up Analyzer (UNCHANGED LOGIC)
 # =========================
@@ -215,6 +227,7 @@ class PullUpAnalyzer:
             if curr_angle is None or prev_angle is None or curr_nose is None or prev_nose is None:
                 continue
 
+        # תחילת ריפ: ירידה בזווית מרפק + עליית אף
             angle_drop = prev_angle - curr_angle
             nose_rising = curr_nose < prev_nose - self.nose_rise_thresh
 
@@ -278,17 +291,17 @@ def draw_reps_counter(frame, reps_so_far: int):
     cv2.putText(frame, f"Reps: {reps_so_far}", (16, 36),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2, cv2.LINE_AA)
 
-def draw_rom_donut(frame, rom, center=(110,110), radius=60):
-    # דונאט שמאל־למעלה כמו בבולגרי, בלי שום ציון נוסף
-    pct = int(round(float(rom)*100))
+def draw_rom_donut(frame, rom, center, radius=50):
+    # דונאט ימין־עליון כמו בבולגרי, בלי ציון טכניקה
+    pct = int(round(float(rom) * 100))
     pct = max(0, min(100, pct))
     cv2.ellipse(frame, center, (radius, radius), 0, 0, 360, (50,50,50), 10, cv2.LINE_AA)
     ang = 360 * (pct / 100.0)
     cv2.ellipse(frame, center, (radius, radius), 0, -90, -90 + ang, (80,220,120), 10, cv2.LINE_AA)
-    cv2.putText(frame, f"{pct}%", (center[0]-28, center[1]+10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
-    cv2.putText(frame, "ROM-Up", (center[0]-40, center[1]-radius-12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2, cv2.LINE_AA)
+    cv2.putText(frame, f"{pct}%", (center[0]-24, center[1]+8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(frame, "ROM-Up", (center[0]-36, center[1]-radius-10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 2, cv2.LINE_AA)
 
 def draw_feedback_banner(frame, text):
     if not text: return
@@ -302,9 +315,21 @@ def draw_feedback_banner(frame, text):
 def _safe_output_path(prefix="pullup"):
     return f"/tmp/{prefix}_{int(time.time())}.mp4"
 
+# בונה טיימליין לפידבק רק לריפים עם טעויות
+def _build_feedback_schedule(analysis_result):
+    rep_ranges = analysis_result.get("rep_ranges", [])
+    rep_reports = analysis_result.get("reps", [])
+    schedule = []
+    for i, (s, e) in enumerate(rep_ranges):
+        if i < len(rep_reports):
+            errs = rep_reports[i].get("errors", [])
+            if errs:
+                schedule.append((s, e, errs[0]))
+    return schedule
+
 
 # =================
-# Video rendering (dynamic reps, donut top-left, no score)
+# Video rendering (dynamic reps, donut top-right, sampled skeleton)
 # =================
 def render_pullup_video(input_path, output_path, analysis_result,
                         frame_skip=3, scale=0.30, draw_skeleton_flag=True):
@@ -313,17 +338,31 @@ def render_pullup_video(input_path, output_path, analysis_result,
     fps = (cap.get(cv2.CAP_PROP_FPS) or 30.0) / max(frame_skip, 1)
     w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
     h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(output_path, fourcc, fps, (w0, h0))
+    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w0, h0))
 
     rom_full     = analysis_result.get("rom_full", [])
     frames_lms   = analysis_result.get("frames_landmarks", [])
-    rep_ranges   = analysis_result.get("rep_ranges", [])  # [(start,end), ...]
-    feedback_txt = (analysis_result.get("feedback") or [""])[0]
+    rep_ranges   = analysis_result.get("rep_ranges", [])
+    fb_schedule  = _build_feedback_schedule(analysis_result)
 
-    # למונה דינמי: נתקדם לפי סוף הריפ הבא
+    # מונה חזרות דינמי
     next_rep_idx = 0
     reps_so_far  = 0
+
+    # פידבק “רק כשקורה” + החזקה קצרה
+    fb_ptr = 0
+    active_fb = ""
+    hold_frames = 8
+    fb_visible_until = -1
+
+    # החלקת ROM + ציור שלד מדוגם
+    rom_smoothed = 0.0
+    last_skeleton_idx = -999
+    last_skeleton_lms = None
+
+    # מיקום הדונאט – ימין למעלה באותה שורה עם Reps
+    donut_center = (w0 - 80, 60)
+    donut_radius = 50
 
     idx = 0
     frame_id = 0
@@ -338,24 +377,40 @@ def render_pullup_video(input_path, output_path, analysis_result,
 
         frame = cv2.resize(frame, (w0, h0), interpolation=cv2.INTER_AREA)
 
-        # שלד — משתמשים בלנדמרקס שחושבו בשלב הניתוח (אין ריצת Pose נוספת)
+        # שלד – מדוגם
         if draw_skeleton_flag and idx < len(frames_lms):
-            lms = frames_lms[idx]
-            if lms:
-                draw_skeleton(frame, lms)
+            if idx - last_skeleton_idx >= DRAW_SKELETON_EVERY:
+                last_skeleton_lms = frames_lms[idx]
+                last_skeleton_idx = idx
+            if last_skeleton_lms:
+                draw_skeleton(frame, last_skeleton_lms)
 
-        # עדכון דינמי של מונה החזרות לפי פריים נוכחי
+        # עדכון מונה חזרות (דינמי לפי סוף ריפ)
         while next_rep_idx < len(rep_ranges) and rep_ranges[next_rep_idx][1] <= idx:
             reps_so_far += 1
             next_rep_idx += 1
         draw_reps_counter(frame, reps_so_far)
 
-        # דונאט ROM‑Up (שמאל‑למעלה)
+        # ROM donut – החלקה קלה + ימין־עליון
         rom = rom_full[idx] if idx < len(rom_full) else 0.0
-        draw_rom_donut(frame, rom)
+        rom_smoothed = ROM_EMA_ALPHA * rom + (1 - ROM_EMA_ALPHA) * rom_smoothed
+        draw_rom_donut(frame, rom_smoothed, center=donut_center, radius=donut_radius)
 
-        # באנר פידבק בתחתית
-        draw_feedback_banner(frame, feedback_txt)
+        # פידבק רק כשיש שגיאה בריפ הרלוונטי (עם החזקה קצרה)
+        while fb_ptr < len(fb_schedule) and fb_schedule[fb_ptr][1] < idx:
+            fb_ptr += 1
+
+        show_now = False
+        if fb_ptr < len(fb_schedule):
+            s, e, msg = fb_schedule[fb_ptr]
+            if s <= idx <= e + hold_frames:
+                active_fb = msg
+                fb_visible_until = e + hold_frames
+                show_now = True
+        if not show_now and idx <= fb_visible_until:
+            show_now = True
+
+        draw_feedback_banner(frame, active_fb if show_now else "")
 
         out.write(frame)
         idx += 1
@@ -364,16 +419,9 @@ def render_pullup_video(input_path, output_path, analysis_result,
     cap.release()
     out.release()
 
-    # בדיקה קצרה (לא חובה)
-    try:
-        size = os.path.getsize(output_path)
-        print(f"[pullup] wrote RAW: {output_path} | frames={idx} | size={size} bytes")
-    except Exception as e:
-        print("[pullup] raw render check failed:", e)
-
 
 # =================
-# Orchestrator (UNCHANGED)
+# Orchestrator (encoding fast)
 # =================
 def run_pullup_analysis(
     video_path,
@@ -437,18 +485,20 @@ def run_pullup_analysis(
         draw_skeleton_flag=True,
     )
 
-    # שלב 2: קידוד H.264 (libx264 + faststart + yuv420p)
+    # שלב 2: קידוד H.264 מהיר (libx264 + faststart + yuv420p)
     encoded_path = output_path.replace(".mp4", "_encoded.mp4")
     try:
         subprocess.run([
             "ffmpeg", "-y",
             "-i", output_path,
             "-c:v", "libx264",
-            "-preset", "fast",
+            "-preset", FFMPEG_PRESET,   # veryfast / fast
+            "-crf", FFMPEG_CRF,         # 22 = איכות טובה ומהירות
             "-movflags", "+faststart",
             "-pix_fmt", "yuv420p",
+            "-threads", str(max(1, os.cpu_count()//2)),
             encoded_path
-        ], check=False)
+        ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         if os.path.exists(output_path):
             os.remove(output_path)
         print(f"[pullup] encoded: {encoded_path}")
