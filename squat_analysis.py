@@ -80,6 +80,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         frame_idx = 0
+        feedbacks = []
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -184,8 +185,8 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
             except Exception:
                 pass
 
-            # ציור Overlay
-            live_feedback = " | ".join(feedbacks) if counter and feedbacks else None
+            # ציור Overlay בזמן אמת
+            live_feedback = " | ".join(feedbacks) if feedbacks else None
             frame = draw_overlay(frame, reps=counter, feedback=live_feedback)
             out.write(frame)
 
@@ -241,3 +242,4 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         "video_path": encoded_path,
         "feedback_path": feedback_path
     }
+
