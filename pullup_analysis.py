@@ -9,7 +9,7 @@ __all__ = ["run_pullup_analysis", "render_pullup_video", "PullUpAnalyzer"]
 mp_pose = mp.solutions.pose
 
 # =========================
-# Pull-up Analyzer (UNCHANGED)
+# Pull-up Analyzer (UNCHANGED LOGIC)
 # =========================
 
 class PullUpAnalyzer:
@@ -20,9 +20,9 @@ class PullUpAnalyzer:
 
     def __init__(
         self,
-        angle_drop_threshold: float = 18.0,  # כמו אצלך
-        min_separation: int = 5,            # כמו אצלך
-        nose_rise_thresh: float = 0.001     # כמו אצלך
+        angle_drop_threshold: float = 18.0,  # כמו הגרסה שעבדה
+        min_separation: int = 5,
+        nose_rise_thresh: float = 0.001
     ):
         self.angle_drop_threshold = angle_drop_threshold
         self.min_separation = min_separation
@@ -113,7 +113,7 @@ class PullUpAnalyzer:
             if descent_len < 2:
                 tips.append("Control the lowering phase for better muscle growth")
 
-        # ROM‑Up% (עלייה למעלה)
+        # ROM‑Up% (עלייה למעלה) + החלקה קלה
         rom_series = self.compute_rom_series(nose_ys, wrist_ys)
         rom_series = self.ema_smooth(rom_series, alpha=0.25)
 
@@ -237,7 +237,7 @@ class PullUpAnalyzer:
 
 
 # =================
-# Overlay helpers (NEW, only UI)
+# Overlay helpers (UI only)
 # =================
 
 _DRAW_LMS = [
@@ -273,36 +273,22 @@ def draw_skeleton(frame, lms):
         if p:
             cv2.circle(frame, p, 3, (255,255,255), -1)
 
+def draw_reps_counter(frame, reps_so_far: int):
+    # "Reps: N" שמאל למעלה (דינמי, מתעדכן תוך כדי)
+    cv2.putText(frame, f"Reps: {reps_so_far}", (16, 36),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2, cv2.LINE_AA)
+
 def draw_rom_donut(frame, rom, center=(110,110), radius=60):
-    # מהיר ונקי כמו בבולגרי – קשת אחת
+    # דונאט שמאל־למעלה כמו בבולגרי, בלי שום ציון נוסף
     pct = int(round(float(rom)*100))
     pct = max(0, min(100, pct))
-    # טבעת רקע
     cv2.ellipse(frame, center, (radius, radius), 0, 0, 360, (50,50,50), 10, cv2.LINE_AA)
-    # קשת ערך
     ang = 360 * (pct / 100.0)
     cv2.ellipse(frame, center, (radius, radius), 0, -90, -90 + ang, (80,220,120), 10, cv2.LINE_AA)
-    # טקסט
     cv2.putText(frame, f"{pct}%", (center[0]-28, center[1]+10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
     cv2.putText(frame, "ROM-Up", (center[0]-40, center[1]-radius-12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2, cv2.LINE_AA)
-
-def draw_top_hud(frame, reps, score):
-    # "Reps: N" שמאל למעלה + תג ציון מימין — כמו בסקוואט/בולגרי
-    h, w = frame.shape[:2]
-    cv2.putText(frame, f"Reps: {reps}", (16, 36),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2, cv2.LINE_AA)
-    tag = f"{score:.1f}"
-    (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
-    pad = 10
-    x2 = w - 16
-    y1 = 16
-    x1 = x2 - (tw + pad*2)
-    y2 = y1 + (th + pad*2)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (40,40,40), -1)
-    cv2.putText(frame, tag, (x1 + pad, y2 - pad - 2),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
 
 def draw_feedback_banner(frame, text):
     if not text: return
@@ -318,26 +304,26 @@ def _safe_output_path(prefix="pullup"):
 
 
 # =================
-# Video rendering (ONLY overlay changed)
+# Video rendering (dynamic reps, donut top-left, no score)
 # =================
 def render_pullup_video(input_path, output_path, analysis_result,
                         frame_skip=3, scale=0.30, draw_skeleton_flag=True):
     cap = cv2.VideoCapture(input_path)
 
-    # fps/scale נשארים כמו אצלך
     fps = (cap.get(cv2.CAP_PROP_FPS) or 30.0) / max(frame_skip, 1)
     w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
     h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(output_path, fourcc, fps, (w0, h0))
 
-    rom_full = analysis_result.get("rom_full", [])
-    frames_lms = analysis_result.get("frames_landmarks", [])
+    rom_full     = analysis_result.get("rom_full", [])
+    frames_lms   = analysis_result.get("frames_landmarks", [])
+    rep_ranges   = analysis_result.get("rep_ranges", [])  # [(start,end), ...]
+    feedback_txt = (analysis_result.get("feedback") or [""])[0]
 
-    # ל‑HUD
-    reps_total = analysis_result.get("rep_count", 0)
-    score = analysis_result.get("technique_score", 0.0)
-    banner_text = (analysis_result.get("feedback") or [""])[0]
+    # למונה דינמי: נתקדם לפי סוף הריפ הבא
+    next_rep_idx = 0
+    reps_so_far  = 0
 
     idx = 0
     frame_id = 0
@@ -352,21 +338,24 @@ def render_pullup_video(input_path, output_path, analysis_result,
 
         frame = cv2.resize(frame, (w0, h0), interpolation=cv2.INTER_AREA)
 
-        # שלד — משתמשים בלנדמרקס שכבר חושבו
+        # שלד — משתמשים בלנדמרקס שחושבו בשלב הניתוח (אין ריצת Pose נוספת)
         if draw_skeleton_flag and idx < len(frames_lms):
             lms = frames_lms[idx]
             if lms:
                 draw_skeleton(frame, lms)
 
-        # HUD עליון
-        draw_top_hud(frame, reps_total, score)
+        # עדכון דינמי של מונה החזרות לפי פריים נוכחי
+        while next_rep_idx < len(rep_ranges) and rep_ranges[next_rep_idx][1] <= idx:
+            reps_so_far += 1
+            next_rep_idx += 1
+        draw_reps_counter(frame, reps_so_far)
 
-        # דונאט ROM-Up
+        # דונאט ROM‑Up (שמאל‑למעלה)
         rom = rom_full[idx] if idx < len(rom_full) else 0.0
         draw_rom_donut(frame, rom)
 
-        # באנר פידבק קבוע בתחתית
-        draw_feedback_banner(frame, banner_text)
+        # באנר פידבק בתחתית
+        draw_feedback_banner(frame, feedback_txt)
 
         out.write(frame)
         idx += 1
@@ -375,7 +364,7 @@ def render_pullup_video(input_path, output_path, analysis_result,
     cap.release()
     out.release()
 
-    # בדיקת תקינות קובץ גולמי (אופציונלי)
+    # בדיקה קצרה (לא חובה)
     try:
         size = os.path.getsize(output_path)
         print(f"[pullup] wrote RAW: {output_path} | frames={idx} | size={size} bytes")
@@ -389,16 +378,14 @@ def render_pullup_video(input_path, output_path, analysis_result,
 def run_pullup_analysis(
     video_path,
     output_path,            # ← חובה, כמו בסקוואט/בולגרי
-    frame_skip=3,           # כמו אצלך
-    scale=0.30,             # כמו אצלך
-    model_complexity=1,     # כמו אצלך
+    frame_skip=3,           # כמו שעבד
+    scale=0.30,
+    model_complexity=1,
     verbose=False,
 ):
     """
-    מריץ ניתוח + מרנדר סרטון תמיד, ואז מקודד ל-H.264 (ffmpeg) ומחזיר video_path של המקודד.
-    עובד בדיוק כמו בבולגרי/סקוואט מבחינת ממשק ה-API.
+    מריץ ניתוח + רינדור, ואז מקודד ל-H.264 (ffmpeg) ומחזיר video_path של המקודד.
     """
-    mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(static_image_mode=False, model_complexity=model_complexity)
 
     cap = cv2.VideoCapture(video_path)
@@ -450,7 +437,7 @@ def run_pullup_analysis(
         draw_skeleton_flag=True,
     )
 
-    # שלב 2: קידוד H.264 כמו בבולגרי (libx264 + faststart + yuv420p)
+    # שלב 2: קידוד H.264 (libx264 + faststart + yuv420p)
     encoded_path = output_path.replace(".mp4", "_encoded.mp4")
     try:
         subprocess.run([
@@ -467,11 +454,9 @@ def run_pullup_analysis(
         print(f"[pullup] encoded: {encoded_path}")
     except Exception as e:
         print("[pullup] ffmpeg encode failed:", e)
-        # במקרה תקלה – נחזיר את הגולמי
         encoded_path = output_path
 
-    analysis["video_path"] = encoded_path  # כדי שה-API יחזיר קובץ מנגן
-
+    analysis["video_path"] = encoded_path
     return analysis
 
 
@@ -479,13 +464,6 @@ def run_pullup_analysis(
 # Example (CLI)
 # =================
 if __name__ == "__main__":
-    """
-    שימוש לדוגמה:
-    python pullup_analysis.py input.mp4 output.mp4
-
-    pip install mediapipe opencv-python numpy
-    (וצריך ffmpeg מותקן במערכת)
-    """
     import sys
     if len(sys.argv) >= 3:
         in_path, out_path = sys.argv[1], sys.argv[2]
