@@ -71,6 +71,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
     rep_min_knee_angle = 180
     max_lean_down = 0
     top_back_angle = 0
+    last_rep_feedback = None  # הפידבק שיוצג עד סיום החזרה הבאה
 
     out = None
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -80,7 +81,6 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
 
     with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         frame_idx = 0
-        feedbacks = []
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -98,7 +98,8 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
             if not results.pose_landmarks:
-                frame = draw_overlay(frame, reps=counter, feedback=None)
+                frame = draw_overlay(frame, reps=counter,
+                                     feedback=" | ".join(last_rep_feedback) if last_rep_feedback else None)
                 out.write(frame)
                 continue
 
@@ -125,6 +126,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                     top_back_angle = max(top_back_angle, body_angle)
 
                 if knee_angle > 160 and stage == "down":
+                    # === סיום חזרה ===
                     stage = "up"
                     feedbacks = []
                     penalty = 0
@@ -133,26 +135,20 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                     depth_distances.append(hip_to_heel_dist)
 
                     if hip_to_heel_dist > 0.48:
-                        if not depth_feedback_given:
-                            feedbacks.append("Too shallow — squat lower")
-                            depth_feedback_given = True
+                        feedbacks.append("Too shallow — squat lower")
                         depth_penalty = 3
                     elif hip_to_heel_dist > 0.45:
-                        if not depth_feedback_given:
-                            feedbacks.append("Almost there — go a bit lower")
-                            depth_feedback_given = True
+                        feedbacks.append("Almost there — go a bit lower")
                         depth_penalty = 1.5
                     elif hip_to_heel_dist > 0.43:
-                        if not depth_feedback_given:
-                            feedbacks.append("Looking good — just a bit more depth")
-                            depth_feedback_given = True
+                        feedbacks.append("Looking good — just a bit more depth")
                         depth_penalty = 0.5
                     else:
                         depth_penalty = 0
 
                     penalty += depth_penalty
 
-                    if stage == "up" and back_angle < 140:
+                    if back_angle < 140:
                         feedbacks.append("Try to straighten your back more at the top")
                         penalty += 1
 
@@ -164,12 +160,17 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                         feedbacks.append("Incomplete lockout")
                         penalty += 1
 
-                    penalty = min(penalty, 6)
-                    score = round(max(4, 10 - penalty) * 2) / 2
+                    if not feedbacks:
+                        score = 10.0
+                    else:
+                        penalty = min(penalty, 6)
+                        score = round(max(4, 10 - penalty) * 2) / 2
 
                     for f in feedbacks:
                         if f not in overall_feedback:
                             overall_feedback.append(f)
+
+                    last_rep_feedback = feedbacks[:] if feedbacks else None
 
                     counter += 1
                     if score >= 9.5:
@@ -185,9 +186,9 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
             except Exception:
                 pass
 
-            # ציור Overlay בזמן אמת
-            live_feedback = " | ".join(feedbacks) if feedbacks else None
-            frame = draw_overlay(frame, reps=counter, feedback=live_feedback)
+            # ציור Overlay עם הפידבק של החזרה האחרונה
+            overlay_text = " | ".join(last_rep_feedback) if last_rep_feedback else None
+            frame = draw_overlay(frame, reps=counter, feedback=overlay_text)
             out.write(frame)
 
     cap.release()
@@ -197,7 +198,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
 
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
 
-    if depth_distances and not depth_feedback_given:
+    if depth_distances and not overall_feedback:
         avg_depth = np.mean(depth_distances)
         if avg_depth > 0.48:
             overall_feedback.append("Try squatting lower")
@@ -242,4 +243,3 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         "video_path": encoded_path,
         "feedback_path": feedback_path
     }
-
