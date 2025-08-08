@@ -7,28 +7,57 @@ from utils import calculate_angle, calculate_body_angle
 from PIL import ImageFont, ImageDraw, Image
 
 # ========= Debug / Version tag =========
-VERSION_TAG = "SQUAT_v3_sync_2025-08-08"
+VERSION_TAG = "SQUAT_v4_bulgarian_ui_sync"
 
 # ========= Fonts / Overlay =========
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
 REPS_FONT_SIZE = 28
 FEEDBACK_FONT_SIZE = 22
+DEPTH_LABEL_FONT_SIZE = 14
+DEPTH_PCT_FONT_SIZE   = 18
 
 try:
     REPS_FONT = ImageFont.truetype(FONT_PATH, REPS_FONT_SIZE)
     FEEDBACK_FONT = ImageFont.truetype(FONT_PATH, FEEDBACK_FONT_SIZE)
+    DEPTH_LABEL_FONT = ImageFont.truetype(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
+    DEPTH_PCT_FONT   = ImageFont.truetype(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 except Exception:
     REPS_FONT = ImageFont.load_default()
     FEEDBACK_FONT = ImageFont.load_default()
+    DEPTH_LABEL_FONT = ImageFont.load_default()
+    DEPTH_PCT_FONT = ImageFont.load_default()
+
+# ========= Donut style (כמו בבולגרי) =========
+DEPTH_RADIUS_SCALE   = 0.70
+DEPTH_THICKNESS_FRAC = 0.28
+DEPTH_COLOR          = (40, 200, 80)   # BGR
+DEPTH_RING_BG        = (70, 70, 70)    # BGR
+
+# עומק יעד “מושלם” לנרמול ברך (כמו בבולגרי)
+PERFECT_MIN_KNEE = 70
 
 def draw_plain_text(pil_img, xy, text, font, color=(255,255,255)):
     ImageDraw.Draw(pil_img).text((int(xy[0]), int(xy[1])), text, font=font, fill=color)
     return np.array(pil_img)
 
-def draw_overlay(frame, reps=0, feedback=None, debug_tag=None):
+def draw_depth_donut(frame, center, radius, thickness, pct):
+    pct = float(np.clip(pct, 0.0, 1.0))
+    cx, cy = int(center[0]), int(center[1])
+    radius   = int(radius)
+    thickness = int(thickness)
+
+    # טבעת רקע
+    cv2.circle(frame, (cx, cy), radius, DEPTH_RING_BG, thickness, lineType=cv2.LINE_AA)
+    # מילוי
+    start_ang = -90
+    end_ang   = start_ang + int(360 * pct)
+    cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang,
+                DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
+    return frame
+
+def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0, debug_tag=None):
     """
-    פס עליון: Reps ; פס תחתון: פידבק החזרה האחרונה (אם יש).
-    debug_tag: טקסט קטן בפינה שמאל-עליון (לבדיקת גרסה שרצה).
+    פס עליון: Reps + DEPTH donut ; פס תחתון: פידבק של סוף-חזרה אחרונה (אם יש).
     """
     h, w, _ = frame.shape
     bar_h = int(h * 0.065)
@@ -42,13 +71,38 @@ def draw_overlay(frame, reps=0, feedback=None, debug_tag=None):
     pil = Image.fromarray(frame)
     frame = draw_plain_text(pil, (16, int(bar_h*0.22)), f"Reps: {reps}", REPS_FONT)
 
+    # DEPTH donut בפינה ימין-עליון
+    margin = 12
+    radius = int(bar_h * DEPTH_RADIUS_SCALE)
+    thick  = max(3, int(radius * DEPTH_THICKNESS_FRAC))
+    cx = w - margin - radius
+    cy = int(bar_h * 0.52)
+    frame = draw_depth_donut(frame, (cx, cy), radius, thick, depth_pct)
+
+    # טקסטים בתוך הדונאט
+    pil  = Image.fromarray(frame)
+    draw = ImageDraw.Draw(pil)
+    label_txt = "DEPTH"
+    pct_txt   = f"{int(depth_pct*100)}%"
+    label_w = draw.textlength(label_txt, font=DEPTH_LABEL_FONT)
+    pct_w   = draw.textlength(pct_txt,   font=DEPTH_PCT_FONT)
+    gap    = max(2, int(radius * 0.10))
+    block_h = DEPTH_LABEL_FONT_SIZE + gap + DEPTH_PCT_FONT_SIZE
+    base_y  = cy - block_h // 2
+    lx = cx - int(label_w // 2)
+    ly = base_y
+    draw.text((lx, ly), label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
+    px = cx - int(pct_w // 2)
+    py = ly + DEPTH_LABEL_FONT_SIZE + gap
+    draw.text((px, py), pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
+    frame = np.array(pil)
+
     # פידבק תחתון (אם יש)
     if feedback:
         bottom_h = int(h * 0.07)
         over = frame.copy()
         cv2.rectangle(over, (0, h-bottom_h), (w, h), (0, 0, 0), -1)
         frame = cv2.addWeighted(over, 0.55, frame, 0.45, 0)
-
         pil = Image.fromarray(frame)
         draw = ImageDraw.Draw(pil)
         tw = draw.textlength(feedback, font=FEEDBACK_FONT)
@@ -57,11 +111,10 @@ def draw_overlay(frame, reps=0, feedback=None, debug_tag=None):
         draw.text((tx, ty), feedback, font=FEEDBACK_FONT, fill=(255,255,255))
         frame = np.array(pil)
 
-    # תג גרסה קטן לשמאל-עליון (ויזואלי, לא מפריע)
+    # תג גרסה קטן לשמאל-עליון
     if debug_tag:
         cv2.putText(frame, debug_tag, (12, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (255,255,255), 1, cv2.LINE_AA)
-
     return frame
 
 # עיגול תצוגה לחצאים והסרת .0 כששלם
@@ -79,20 +132,24 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         print(f"[{VERSION_TAG}] ERROR: Could not open video")
         return {"error": "Could not open video", "debug_version": VERSION_TAG}
 
-    # מונים / צבירת תוצאות
+    # מונים / תוצאות
     counter = good_reps = bad_reps = 0
     all_scores = []
     problem_reps = []
     overall_feedback = []   # הערות ייחודיות לכל האימון
-    depth_distances = []    # לשימוש עתידי במידת הצורך
-    stage = None
+    any_feedback_session = False
 
-    # מעקבים (משאירים כמו המקור – לא שוברים לוגיקה)
+    # שלבים ומדדים
+    stage = None
     rep_min_knee_angle = 180
     max_lean_down = 0
     top_back_angle = 0
 
-    # מה שיוצג בסרטון – תמיד פידבק של סוף החזרה האחרונה בלבד
+    # עומק חי להצגה (כמו בבולגרי)
+    start_knee_angle = None
+    last_depth_for_ui = 0.0
+
+    # הפידבק שמוצג על המסך – של סוף החזרה האחרונה בלבד
     last_rep_feedback = []
 
     # וידאו יצוא
@@ -121,9 +178,11 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
 
+            # כשאין שלד – שומרים עומק 0 וממשיכים
             if not results.pose_landmarks:
                 overlay_text = " | ".join(last_rep_feedback) if last_rep_feedback else None
-                frame = draw_overlay(frame, reps=counter, feedback=overlay_text, debug_tag=VERSION_TAG)
+                frame = draw_overlay(frame, reps=counter, feedback=overlay_text,
+                                     depth_pct=0.0, debug_tag=VERSION_TAG)
                 out.write(frame)
                 continue
 
@@ -141,16 +200,27 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                 body_angle = calculate_body_angle(shoulder, hip)
                 heel_lifted = foot_y - heel_y > 0.03
 
-                # התחלת ירידה – מנקים פידבק למסך עד סוף החזרה
+                # התחלת ירידה – איפוס פידבק למסך והגדרת baseline עומק
                 if knee_angle < 90:
                     if stage != "down":
                         last_rep_feedback = []
+                        start_knee_angle = float(knee_angle)
+                        rep_min_knee_angle = 180
+                        last_depth_for_ui = 0.0
                     stage = "down"
 
-                # מעקבים (כמו במקור)
+                # מעקבים (כמו המקור)
                 if stage == "down":
                     rep_min_knee_angle = min(rep_min_knee_angle, knee_angle)
                     max_lean_down = max(max_lean_down, body_angle)
+
+                    # עומק חי להצגה (כמו בבולגרי)
+                    if start_knee_angle is not None:
+                        denom = max(10.0, (start_knee_angle - PERFECT_MIN_KNEE))
+                        last_depth_for_ui = float(np.clip(
+                            (start_knee_angle - rep_min_knee_angle) / denom, 0, 1
+                        ))
+
                 if stage == "up":
                     top_back_angle = max(top_back_angle, body_angle)
 
@@ -160,22 +230,17 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                     feedbacks = []
                     penalty = 0
 
-                    # עומק (לפי המקור)
+                    # עומק לפי הקוד שלך (hip->heel) – לדרוג פידבק; הדונאט מוצג לפי זווית ברך
                     hip_to_heel_dist = abs(hip[1] - heel_y)
-                    depth_distances.append(hip_to_heel_dist)
-
                     if hip_to_heel_dist > 0.48:
                         feedbacks.append("Too shallow — squat lower")
-                        depth_penalty = 3
+                        penalty += 3
                     elif hip_to_heel_dist > 0.45:
                         feedbacks.append("Almost there — go a bit lower")
-                        depth_penalty = 1.5
+                        penalty += 1.5
                     elif hip_to_heel_dist > 0.43:
                         feedbacks.append("Looking good — just a bit more depth")
-                        depth_penalty = 0.5
-                    else:
-                        depth_penalty = 0
-                    penalty += depth_penalty
+                        penalty += 0.5
 
                     # גב למעלה
                     if back_angle < 140:
@@ -196,6 +261,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                     if not feedbacks:
                         score = 10.0
                     else:
+                        any_feedback_session = True
                         penalty = min(penalty, 6)
                         score = round(max(4, 10 - penalty) * 2) / 2
 
@@ -204,8 +270,11 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                         if f not in overall_feedback:
                             overall_feedback.append(f)
 
-                    # זה מה שיוצג בווידאו עד סוף החזרה הבאה
-                    last_rep_feedback = feedbacks[:]  # ריק -> לא יוצג טקסט
+                    # מה שיוצג בווידאו עד סוף החזרה הבאה
+                    last_rep_feedback = feedbacks[:]  # ריק -> אין טקסט
+                    # אפס עומק להצגה (כדי לא להיתקע על 100% בין חזרות)
+                    last_depth_for_ui = 0.0
+                    start_knee_angle = None
 
                     # מונים
                     counter += 1
@@ -214,20 +283,17 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                     else:
                         bad_reps += 1
                         problem_reps.append(counter)
+
                     all_scores.append(score)
-
                     print(f"[{VERSION_TAG}] rep {counter}: score={score}, fb={feedbacks}")
-
-                    # reset
-                    rep_min_knee_angle = 180
-                    max_lean_down = 0
 
             except Exception as e:
                 print(f"[{VERSION_TAG}] WARN frame error: {e}")
 
-            # ציור Overlay – רק פידבק סוף-חזרה אחרונה
+            # ציור Overlay – דונאט עומק חי + פידבק של סוף-חזרה אחרונה בלבד
             overlay_text = " | ".join(last_rep_feedback) if last_rep_feedback else None
-            frame = draw_overlay(frame, reps=counter, feedback=overlay_text, debug_tag=VERSION_TAG)
+            frame = draw_overlay(frame, reps=counter, feedback=overlay_text,
+                                 depth_pct=last_depth_for_ui, debug_tag=VERSION_TAG)
             out.write(frame)
 
     cap.release()
@@ -235,17 +301,20 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         out.release()
     cv2.destroyAllWindows()
 
-    # ציון סופי (חצאים) + כפייה ל-10 אם אין הערות בכלל
+    # ציון סופי (חצאים) + אל תשאיר 10 אם היו הערות כלשהן
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0.0
-    if counter > 0 and not overall_feedback:
-        technique_score = 10.0
+    if (len(all_scores) > 0) and (not any_feedback_session) and technique_score < 10.0:
+        # אם באמת לא היו הערות אבל ממוצע לא 10 (למשל 9.5) – נשאיר ככה
+        pass
+    if any_feedback_session and technique_score == 10.0:
+        technique_score = 9.5  # אין 10 אם היו הערות כלשהן
+
     technique_score_display = _format_score_value(technique_score)
 
-    # מסר חיובי כשאין הערות
     if not overall_feedback:
         overall_feedback.append("Great form! Keep it up 💪")
 
-    # קובץ תקציר
+    # כתיבת קובץ פידבק
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
             f.write(f"Version: {VERSION_TAG}\n")
@@ -288,4 +357,3 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         "feedback_path": feedback_path,
         "debug_version": VERSION_TAG
     }
-
