@@ -12,16 +12,16 @@ GOOD_REP_MIN_SCORE = 8.0
 TORSO_LEAN_MIN     = 135
 
 VALGUS_X_TOL = 0.03
-MIN_VALID_KNEE   = 90
-PERFECT_MIN_KNEE = 70
-MIN_DOWN_FRAMES  = 5
+MIN_VALID_KNEE   = 90   # עומק מינימלי לספירה (ככל שקטן יותר -> עמוק יותר)
+PERFECT_MIN_KNEE = 70   # עומק "מושלם" לחישוב ROM=100%
+MIN_DOWN_FRAMES  = 5    # מינימום פריימים בשלב ירידה כדי להיחשב חזרה
 
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
 REPS_FONT_SIZE = 28
 FEEDBACK_FONT_SIZE = 22
-LEGEND_FONT_SIZE = 18  # להסבר ROM בתחילת הווידאו
+LEGEND_FONT_SIZE = 18
 
-# Load fonts once
+# ===== טעינת פונט פעם אחת =====
 try:
     REPS_FONT = ImageFont.truetype(FONT_PATH, REPS_FONT_SIZE)
     FEEDBACK_FONT = ImageFont.truetype(FONT_PATH, FEEDBACK_FONT_SIZE)
@@ -33,46 +33,53 @@ except Exception:
 
 mp_pose = mp.solutions.pose
 
+
 # ===== ציור =====
-def draw_text_with_outline(draw, xy, text, font, fill=(255,255,255)):
+def draw_text_with_outline(draw, xy, text, font, fill=(255, 255, 255)):
     x, y = xy
-    for dx, dy in [(-1,0),(1,0),(0,-1),(0,1)]:
+    for dx, dy in [(-1,0), (1,0), (0,-1), (0,1)]:
         draw.text((x+dx, y+dy), text, font=font, fill=(0,0,0))
     draw.text((x, y), text, font=font, fill=fill)
 
+
 def draw_rom_badge(frame, pil_img, bar_height, rom_pct):
-    """תגית ROM נקייה בפינה ימנית-עליונה"""
+    """ROM badge נקיה בפינה הימנית העליונה: 'ROM 85%'"""
     h, w, _ = frame.shape
     draw = ImageDraw.Draw(pil_img)
 
     rom_pct = float(np.clip(rom_pct, 0.0, 1.0))
     txt = f"{int(rom_pct*100)}%"
 
-    # נכתוב "ROM" קטן בצד שמאל של התגית
     label = "ROM"
     label_w = draw.textlength(label, font=REPS_FONT)
-    txt_w = draw.textlength(txt, font=REPS_FONT)
+    txt_w   = draw.textlength(txt,   font=REPS_FONT)
     pad_x, pad_y = 10, 6
-    spacing = 8
-    total_w = label_w + spacing + txt_w + pad_x*2
-    total_h = REPS_FONT_SIZE + pad_y*2
+    spacing      = 8
 
-    x1 = w - 20
-    x0 = x1 - total_w
-    y0 = int(bar_height*0.18)
-    y1 = y0 + total_h
+    total_w = int(label_w + spacing + txt_w + pad_x*2)
+    total_h = int(REPS_FONT_SIZE + pad_y*2)
+
+    x1 = int(w - 20)
+    x0 = int(x1 - total_w)
+    y0 = int(bar_height * 0.18)
+    y1 = int(y0 + total_h)
+
+    # קלמפ לגבולות הפריים
+    x0 = max(0, x0); y0 = max(0, y0)
+    x1 = min(w-1, x1); y1 = min(h-1, y1)
 
     frame_np = np.array(pil_img)
-    overlay = frame_np.copy()
-    cv2.rectangle(overlay, (x0, y0), (x1, y1), (0,0,0), -1)
+    overlay  = frame_np.copy()
+    cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 0, 0), -1)
     frame_np = cv2.addWeighted(overlay, 0.35, frame_np, 0.65, 0)
-    cv2.rectangle(frame_np, (x0, y0), (x1, y1), (255,255,255), 2)
+    cv2.rectangle(frame_np, (x0, y0), (x1, y1), (255, 255, 255), 2)
 
     pil_img = Image.fromarray(frame_np)
     draw = ImageDraw.Draw(pil_img)
     draw_text_with_outline(draw, (x0+pad_x, y0+pad_y), label, REPS_FONT)
-    draw_text_with_outline(draw, (x0+pad_x+label_w+spacing, y0+pad_y), txt, REPS_FONT)
+    draw_text_with_outline(draw, (x0+pad_x+int(label_w)+spacing, y0+pad_y), txt, REPS_FONT)
     return np.array(pil_img)
+
 
 def draw_overlay(frame, reps=0, feedback=None, rom_pct=None, show_legend=False):
     h, w, _ = frame.shape
@@ -93,22 +100,27 @@ def draw_overlay(frame, reps=0, feedback=None, rom_pct=None, show_legend=False):
     if rom_pct is not None:
         frame = draw_rom_badge(frame, pil_img, bar_height, rom_pct)
         pil_img = Image.fromarray(frame)
+        draw = ImageDraw.Draw(pil_img)
 
-    # Legend: הסבר קצר לשתי השניות הראשונות
+    # הסבר קצר בתחילת הווידאו (~2 שניות)
     if show_legend:
         legend = "ROM = Range of Motion (depth per rep)"
         tw = draw.textlength(legend, font=LEGEND_FONT)
         pad_x, pad_y = 10, 6
+
         x0 = 20
-        y0 = bar_height + 10
-        x1 = x0 + tw + pad_x*2
-        y1 = y0 + LEGEND_FONT_SIZE + pad_y*2
+        y0 = int(bar_height + 10)
+        x1 = int(x0 + tw + pad_x*2)
+        y1 = int(y0 + LEGEND_FONT_SIZE + pad_y*2)
+
+        x0 = max(0, x0); y0 = max(0, y0)
+        x1 = min(w-1, x1); y1 = min(h-1, y1)
 
         frame_np = np.array(pil_img)
-        overlay = frame_np.copy()
-        cv2.rectangle(overlay, (x0, y0), (x1, y1), (0,0,0), -1)
+        overlay  = frame_np.copy()
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 0, 0), -1)
         frame_np = cv2.addWeighted(overlay, 0.35, frame_np, 0.65, 0)
-        cv2.rectangle(frame_np, (x0, y0), (x1, y1), (255,255,255), 1)
+        cv2.rectangle(frame_np, (x0, y0), (x1, y1), (255, 255, 255), 1)
 
         pil_img = Image.fromarray(frame_np)
         draw = ImageDraw.Draw(pil_img)
@@ -138,11 +150,12 @@ def draw_overlay(frame, reps=0, feedback=None, rom_pct=None, show_legend=False):
         y = h - bar_height + 5
         for line in lines:
             tw = draw.textlength(line, font=FEEDBACK_FONT)
-            x = (w - tw) // 2
+            x = (w - int(tw)) // 2
             draw_text_with_outline(draw, (x, y), line, FEEDBACK_FONT)
             y += FEEDBACK_FONT_SIZE + 4
 
     return np.array(pil_img)
+
 
 # ===== גאומטריה =====
 def calculate_angle(a, b, c):
@@ -163,6 +176,7 @@ def valgus_ok(landmarks, side):
     knee_x = landmarks[getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value].x
     ankle_x = landmarks[getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value].x
     return not (knee_x < ankle_x - VALGUS_X_TOL)
+
 
 # ===== מונה חזרות =====
 class BulgarianRepCounter:
@@ -191,10 +205,12 @@ class BulgarianRepCounter:
         self._down_frames = 0
 
     def _finish_rep(self, frame_no, score, feedback, extra=None):
-        if score >= GOOD_REP_MIN_SCORE: self.good_reps += 1
+        if score >= GOOD_REP_MIN_SCORE:
+            self.good_reps += 1
         else:
             self.bad_reps += 1
-            if feedback: self.all_feedback.update(feedback)
+            if feedback:
+                self.all_feedback.update(feedback)
 
         report = {
             "rep_index": self.rep_index,
@@ -206,30 +222,42 @@ class BulgarianRepCounter:
             "max_knee_angle": round(self._curr_max_knee, 2),
             "torso_min_angle": round(self._curr_min_torso, 2)
         }
-        if extra: report.update(extra)
+        if extra:
+            report.update(extra)
+
         self.rep_reports.append(report)
         self.rep_index += 1
         self.rep_start_frame = None
 
     def evaluate_form(self, min_knee_angle, min_torso_angle, valgus_bad_frames):
-        feedback, score = [], 10.0
-        rom_pct = np.clip((MIN_VALID_KNEE - min_knee_angle) / (MIN_VALID_KNEE - PERFECT_MIN_KNEE), 0, 1)
+        feedback = []
+        score = 10.0
+
+        rom_pct = np.clip(
+            (MIN_VALID_KNEE - min_knee_angle) / (MIN_VALID_KNEE - PERFECT_MIN_KNEE),
+            0, 1
+        )
+
         if min_torso_angle < TORSO_LEAN_MIN:
             feedback.append("Keep your back straight"); score -= 2
         if valgus_bad_frames > 0:
-            feedback.append("Avoid knee collapse"); score -= 2
+            feedback.append("Avoid knee collapse");     score -= 2
         if rom_pct < 0.8:
-            feedback.append("Go a bit deeper"); score -= 1
+            feedback.append("Go a bit deeper");         score -= 1
+
         return score, feedback, float(rom_pct)
 
     def update(self, knee_angle, torso_angle, valgus_ok_flag, frame_no):
         if knee_angle < ANGLE_DOWN_THRESH:
             if self.stage != 'down':
-                self.stage = 'down'; self._start_rep(frame_no)
+                self.stage = 'down'
+                self._start_rep(frame_no)
             self._down_frames += 1
         elif knee_angle > ANGLE_UP_THRESH and self.stage == 'down':
             if self._down_frames >= MIN_DOWN_FRAMES and self._curr_min_knee <= MIN_VALID_KNEE:
-                score, fb, rom = self.evaluate_form(self._curr_min_knee, self._curr_min_torso, self._curr_valgus_bad)
+                score, fb, rom = self.evaluate_form(
+                    self._curr_min_knee, self._curr_min_torso, self._curr_valgus_bad
+                )
                 self.count += 1
                 self._finish_rep(frame_no, score, fb, extra={"rom_pct": rom})
             self.stage = 'up'
@@ -238,11 +266,15 @@ class BulgarianRepCounter:
             self._curr_min_knee = min(self._curr_min_knee, knee_angle)
             self._curr_max_knee = max(self._curr_max_knee, knee_angle)
             self._curr_min_torso = min(self._curr_min_torso, torso_angle)
-            if not valgus_ok_flag: self._curr_valgus_bad += 1
+            if not valgus_ok_flag:
+                self._curr_valgus_bad += 1
 
     def current_rom_pct(self):
-        if self.stage != 'down' or self._curr_min_knee in (None, 999.0): return None
-        return float(np.clip((MIN_VALID_KNEE - self._curr_min_knee) / (MIN_VALID_KNEE - PERFECT_MIN_KNEE), 0, 1))
+        if self.stage != 'down' or self._curr_min_knee in (None, 999.0):
+            return None
+        return float(np.clip(
+            (MIN_VALID_KNEE - self._curr_min_knee) / (MIN_VALID_KNEE - PERFECT_MIN_KNEE), 0, 1
+        ))
 
     def result(self):
         avg = np.mean([r["score"] for r in self.rep_reports]) if self.rep_reports else 0.0
@@ -255,6 +287,7 @@ class BulgarianRepCounter:
             "feedback": list(self.all_feedback) if self.bad_reps > 0 else ["Great form! Keep it up 💪"],
             "reps": self.rep_reports
         }
+
 
 # ===== ריצה =====
 def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
@@ -274,9 +307,12 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret: break
+        if not ret:
+            break
+
         frame_no += 1
-        if frame_skip > 1 and (frame_no % frame_skip) != 0: continue
+        if frame_skip > 1 and (frame_no % frame_skip) != 0:
+            continue
 
         if scale != 1.0:
             frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
@@ -288,7 +324,8 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(image_rgb)
         if not results.pose_landmarks:
-            out.write(frame); continue
+            out.write(frame)
+            continue
 
         landmarks = results.pose_landmarks.landmark
         if active_leg is None:
@@ -306,8 +343,12 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
         counter.update(knee_angle, torso_angle, v_ok, frame_no)
 
-        mp.solutions.drawing_utils.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+        # שלד
+        mp.solutions.drawing_utils.draw_landmarks(
+            frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
+        )
 
+        # פידבק בזמן אמת בזמן ירידה
         feedbacks = []
         if counter.stage == "down":
             if torso_angle < TORSO_LEAN_MIN: feedbacks.append("Keep your back straight")
@@ -315,10 +356,11 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
         feedback = " | ".join(feedbacks) if feedbacks else ""
 
         rom_live = counter.current_rom_pct()
-        # הסבר מוצג רק בתחילת הסרטון ~2 שניות
         show_legend = (frame_no / effective_fps) < 2.0
 
-        frame = draw_overlay(frame, reps=counter.count, feedback=feedback, rom_pct=rom_live, show_legend=show_legend)
+        frame = draw_overlay(frame, reps=counter.count, feedback=feedback,
+                             rom_pct=rom_live, show_legend=show_legend)
+
         out.write(frame)
 
     pose.close()
@@ -328,6 +370,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
     result = counter.result()
 
+    # קובץ תקציר
     with open(feedback_path, "w", encoding="utf-8") as f:
         f.write(f"Total Reps: {result['squat_count']}\n")
         f.write(f"Technique Score: {result['technique_score']}/10\n")
@@ -337,6 +380,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             for fb in result["feedback"]:
                 f.write(f"- {fb}\n")
 
+    # קידוד יצוא
     encoded_path = output_path.replace(".mp4", "_encoded.mp4")
     subprocess.run([
         "ffmpeg", "-y",
@@ -350,5 +394,10 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
     if os.path.exists(output_path):
         os.remove(output_path)
 
-    return {**result, "video_path": encoded_path, "feedback_path": feedback_path}
+    return {
+        **result,
+        "video_path": encoded_path,
+        "feedback_path": feedback_path
+    }
+
 
