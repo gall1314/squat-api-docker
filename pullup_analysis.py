@@ -1,4 +1,5 @@
 # pullup_analysis.py
+import os, time
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -285,21 +286,28 @@ def draw_rom_donut(frame, rom, center=(110,110), radius=60):
     cv2.putText(frame, "ROM-Up", (center[0]-40, center[1]-radius-12),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2, cv2.LINE_AA)
 
-def render_pullup_video(input_path, output_path, analysis_result, frame_skip=3, scale=0.3):
+def _safe_output_path(prefix="pullup"):
+    return f"/tmp/{prefix}_{int(time.time())}.mp4"
+
+def render_pullup_video(input_path, output_path, analysis_result,
+                        frame_skip=3, scale=0.3, draw_skeleton_flag=True):
     cap = cv2.VideoCapture(input_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) / max(frame_skip, 1)
+    in_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0   # שמור FPS המקורי
+    fps = float(in_fps)
+
     w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
     h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    # כתיבה ב-H.264 ליציבות נגן
+    fourcc = cv2.VideoWriter_fourcc(*"avc1")
     out = cv2.VideoWriter(output_path, fourcc, fps, (w0, h0))
 
-    mp_pose = mp.solutions.pose
-    pose = mp_pose.Pose(static_image_mode=False, model_complexity=1)
-
     rom_full = analysis_result.get("rom_full", [])
+    frames_lms = analysis_result.get("frames_landmarks", [])
+
     idx = 0
     frame_id = 0
+    wrote = 0
 
     while True:
         ret, frame = cap.read()
@@ -310,25 +318,33 @@ def render_pullup_video(input_path, output_path, analysis_result, frame_skip=3, 
             continue
 
         frame = cv2.resize(frame, (w0, h0))
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = pose.process(rgb)
 
-        if res.pose_landmarks:
-            lms = {}
-            for i, lm in enumerate(res.pose_landmarks.landmark):
-                lms[mp_pose.PoseLandmark(i).name] = (lm.x, lm.y, lm.z)
-            draw_skeleton(frame, lms)
+        # שלד – משתמשים בלנדמרקס שחושבו בשלב הניתוח
+        if draw_skeleton_flag and idx < len(frames_lms):
+            lms = frames_lms[idx]
+            if lms:
+                draw_skeleton(frame, lms)
 
+        # דונאט ROM-Up
         rom = rom_full[idx] if idx < len(rom_full) else 0.0
         draw_rom_donut(frame, rom)
 
         out.write(frame)
         idx += 1
         frame_id += 1
+        wrote += 1
 
     cap.release()
     out.release()
-    pose.close()
+
+    # בדיקת תקינות קובץ
+    try:
+        size = os.path.getsize(output_path)
+        print(f"[pullup] wrote video: {output_path} | frames={wrote} | size={size} bytes")
+        if size < 1024:
+            raise RuntimeError("Rendered video too small – codec/path issue")
+    except Exception as e:
+        print("[pullup] render check failed:", e)
 
 
 # =================
@@ -382,14 +398,20 @@ def run_pullup_analysis(
 
     analyzer = PullUpAnalyzer()
     analysis = analyzer.analyze_all_reps(landmarks_list)
+    analysis["frames_landmarks"] = landmarks_list  # נשתמש ברינדור — אין ריצת Pose שנייה
 
-    # רינדור תמיד, כמו בסקוואט/בולגרי
+    # ודא שיש לנו נתיב בטוח
+    if not output_path:
+        output_path = _safe_output_path("pullup")
+
+    # רינדור תמיד, כמו בסקוואט/בולגרי (חוסך זמן כי לא מריצים Pose שוב)
     render_pullup_video(
         input_path=video_path,
         output_path=output_path,
         analysis_result=analysis,
         frame_skip=frame_skip,
         scale=scale,
+        draw_skeleton_flag=True,
     )
     analysis["video_path"] = output_path  # כדי שה-API שלך ירים את הקובץ
 
@@ -410,6 +432,7 @@ if __name__ == "__main__":
     if len(sys.argv) >= 3:
         in_path, out_path = sys.argv[1], sys.argv[2]
         res = run_pullup_analysis(in_path, out_path, frame_skip=3, scale=0.30, model_complexity=1, verbose=True)
-        print("Done:", {k: v for k, v in res.items() if k not in ("rom_full","reps","rep_ranges")})
+        print("Done:", {k: v for k, v in res.items() if k not in ("rom_full","reps","rep_ranges","frames_landmarks")})
     else:
         print("Usage: python pullup_analysis.py <input.mp4> <output.mp4>")
+
