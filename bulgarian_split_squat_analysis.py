@@ -8,13 +8,20 @@ from PIL import ImageFont, ImageDraw, Image
 # ===================== קבועים =====================
 ANGLE_DOWN_THRESH   = 95     # כניסה לירידה
 ANGLE_UP_THRESH     = 160    # יציאה לעלייה
-MIN_RANGE_DELTA_DEG = 15     # שינוי מינימלי (Top->Bottom) כדי לספור חזרה
+MIN_RANGE_DELTA_DEG = 12     # שינוי מינימלי (Top->Bottom) כדי לספור חזרה (הוקל מ-15)
 MIN_DOWN_FRAMES     = 5      # מינ' פריימים בירידה (היסטרזיס)
 
 GOOD_REP_MIN_SCORE  = 8.0
 TORSO_LEAN_MIN      = 135    # גב פחות מזה -> הערה
 VALGUS_X_TOL        = 0.03   # סטייה מותרת X בין ברך לקרסול
 PERFECT_MIN_KNEE    = 70     # יעד "מושלם" לנרמול עומק (לא לספירה)
+
+# === שיפורי יציבות ===
+EMA_ALPHA             = 0.6   # החלקת זוויות (0=הרבה החלקה, 1=בלי)
+TORSO_MARGIN_DEG      = 3     # חוצץ קטן לפני הערת גב
+TORSO_BAD_MIN_FRAMES  = 4     # חייבים X פריימים רצופים לפני הערת גב
+VALGUS_BAD_MIN_FRAMES = 3     # חייבים X פריימים רצופים לוואלגוס
+REP_DEBOUNCE_FRAMES   = 6     # מרווח מינ' פריימים בין חזרות
 
 # פונטים
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
@@ -41,6 +48,25 @@ DEPTH_COLOR          = (40, 200, 80)  # BGR ירוק
 DEPTH_RING_BG        = (70, 70, 70)   # רקע טבעת אפור
 
 mp_pose = mp.solutions.pose
+
+# ===================== החלקת זוויות (EMA) =====================
+class AngleEMA:
+    def __init__(self, alpha=EMA_ALPHA):
+        self.alpha = float(alpha)
+        self.knee = None
+        self.torso = None
+
+    def update(self, knee_angle, torso_angle):
+        ka = float(knee_angle)
+        ta = float(torso_angle)
+        if self.knee is None:
+            self.knee = ka
+            self.torso = ta
+        else:
+            a = self.alpha
+            self.knee  = a * ka + (1.0 - a) * self.knee
+            self.torso = a * ta + (1.0 - a) * self.torso
+        return self.knee, self.torso
 
 # ===================== עזרי ציור =====================
 def draw_plain_text(pil_img, xy, text, font, color=(255,255,255)):
@@ -164,21 +190,30 @@ class BulgarianRepCounter:
         self.all_feedback = set()
 
         self._start_knee_angle = None  # Top angle בתחילת החזרה
-        self._curr_min_knee = None
-        self._curr_max_knee = None
-        self._curr_min_torso = None
+        self._curr_min_knee = 999.0
+        self._curr_max_knee = -999.0
+        self._curr_min_torso = 999.0
         self._curr_valgus_bad = 0
+        self._torso_bad_frames = 0        # חדש: סופרים רצף גב עקום
+        self._valgus_bad_frames = 0       # חדש: סופרים רצף וואלגוס
         self._down_frames = 0
-        self._last_depth_for_ui = 0.0  # להצגה תמידית
+        self._last_depth_for_ui = 0.0     # להצגה תמידית
+        self._last_rep_end_frame = -10    # חדש: ל-debounce
 
     def _start_rep(self, frame_no, start_knee_angle):
+        # אל תתחיל חזרה אם לא עבר debounce
+        if frame_no - self._last_rep_end_frame < REP_DEBOUNCE_FRAMES:
+            return False
         self.rep_start_frame = frame_no
         self._start_knee_angle = float(start_knee_angle)
         self._curr_min_knee = 999.0
         self._curr_max_knee = -999.0
         self._curr_min_torso = 999.0
         self._curr_valgus_bad = 0
+        self._torso_bad_frames = 0
+        self._valgus_bad_frames = 0
         self._down_frames = 0
+        return True
 
     def _finish_rep(self, frame_no, score, feedback, extra=None):
         if score >= GOOD_REP_MIN_SCORE:
@@ -205,7 +240,8 @@ class BulgarianRepCounter:
         self.rep_index += 1
         self.rep_start_frame = None
         self._start_knee_angle = None
-        self._last_depth_for_ui = 0.0  # לאפס תצוגה לאחר סיום חזרה
+        self._last_depth_for_ui = 0.0
+        self._last_rep_end_frame = frame_no  # חשוב ל-debounce
 
     def evaluate_form(self, start_knee_angle, min_knee_angle, min_torso_angle, valgus_bad_frames):
         feedback = []
@@ -215,9 +251,10 @@ class BulgarianRepCounter:
         denom = max(10.0, (start_knee_angle - PERFECT_MIN_KNEE))
         depth_pct = np.clip((start_knee_angle - min_knee_angle) / denom, 0, 1)
 
-        if min_torso_angle < TORSO_LEAN_MIN:
+        # דרוש רצף פריימים אמיתי לפני הערות
+        if self._torso_bad_frames >= TORSO_BAD_MIN_FRAMES:
             feedback.append("Keep your back straight"); score -= 2
-        if valgus_bad_frames > 0:
+        if valgus_bad_frames >= VALGUS_BAD_MIN_FRAMES:
             feedback.append("Avoid knee collapse");     score -= 2
         if depth_pct < 0.8:
             feedback.append("Go a bit deeper");         score -= 1
@@ -229,7 +266,11 @@ class BulgarianRepCounter:
         if knee_angle < ANGLE_DOWN_THRESH:
             if self.stage != 'down':
                 self.stage = 'down'
-                self._start_rep(frame_no, knee_angle)
+                started = self._start_rep(frame_no, knee_angle)
+                if not started:
+                    # עדיין ב-debounce: אל תספור חזרה חדשה
+                    self.stage = 'up'
+                    return
             self._down_frames += 1
 
         # יציאה לעלייה -> בדיקת חזרה
@@ -254,13 +295,24 @@ class BulgarianRepCounter:
 
             self.stage = 'up'
 
-        # אגרגציה בזמן ירידה
+        # אגרגציה בזמן ירידה + סופרי "רצף" להערות
         if self.stage == 'down' and self.rep_start_frame:
             self._curr_min_knee = min(self._curr_min_knee, knee_angle)
             self._curr_max_knee = max(self._curr_max_knee, knee_angle)
             self._curr_min_torso = min(self._curr_min_torso, torso_angle)
+
+            # גב: דרוש מתחת לסף-מרווח כדי להיחשב "רע"
+            if torso_angle < (TORSO_LEAN_MIN - TORSO_MARGIN_DEG):
+                self._torso_bad_frames += 1
+            else:
+                self._torso_bad_frames = 0
+
+            # ברך: דרוש רצף פריימים
             if not valgus_ok_flag:
+                self._valgus_bad_frames += 1
                 self._curr_valgus_bad += 1
+            else:
+                self._valgus_bad_frames = 0
 
             # עומק להצגה חיה
             denom = max(10.0, (self._start_knee_angle - PERFECT_MIN_KNEE))
@@ -296,6 +348,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     pose = mp_pose.Pose(min_detection_confidence=0.7, min_tracking_confidence=0.7)
+    ema = AngleEMA(alpha=EMA_ALPHA)
 
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
@@ -334,8 +387,12 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
         ankle = lm_xy(landmarks, getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value, w, h)
         shoulder = lm_xy(landmarks, getattr(mp_pose.PoseLandmark, f"{side}_SHOULDER").value, w, h)
 
-        knee_angle = calculate_angle(hip, knee, ankle)
-        torso_angle = calculate_angle(shoulder, hip, knee)
+        knee_angle_raw = calculate_angle(hip, knee, ankle)
+        torso_angle_raw = calculate_angle(shoulder, hip, knee)
+
+        # החלקת זוויות
+        knee_angle, torso_angle = ema.update(knee_angle_raw, torso_angle_raw)
+
         v_ok = valgus_ok(landmarks, side)
 
         counter.update(knee_angle, torso_angle, v_ok, frame_no)
@@ -345,11 +402,13 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
         )
 
-        # פידבק בזמן אמת (בזמן ירידה)
+        # פידבק בזמן אמת – רק אם יש רצף קצר של פריימים "רע"
         feedbacks = []
         if counter.stage == "down":
-            if torso_angle < TORSO_LEAN_MIN: feedbacks.append("Keep your back straight")
-            if not v_ok: feedbacks.append("Avoid knee collapse")
+            if counter._torso_bad_frames >= TORSO_BAD_MIN_FRAMES:
+                feedbacks.append("Keep your back straight")
+            if counter._valgus_bad_frames >= VALGUS_BAD_MIN_FRAMES:
+                feedbacks.append("Avoid knee collapse")
         feedback = " | ".join(feedbacks) if feedbacks else ""
 
         # עומק להצגה תמידית
@@ -394,4 +453,5 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
         "video_path": encoded_path,
         "feedback_path": feedback_path
     }
+
 
