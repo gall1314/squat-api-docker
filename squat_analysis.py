@@ -6,7 +6,7 @@ import os
 from utils import calculate_angle, calculate_body_angle
 from PIL import ImageFont, ImageDraw, Image
 
-# ========= Debug / Version tag =========F
+# ========= Debug / Version tag =========
 VERSION_TAG = "SQUAT_v3_sync_2025-08-08"
 
 # ========= Fonts / Overlay =========
