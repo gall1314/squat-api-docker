@@ -23,25 +23,23 @@ def draw_plain_text(pil_img, xy, text, font, color=(255,255,255)):
     return np.array(pil_img)
 
 def draw_overlay(frame, reps=0, feedback=None):
-    """פס עליון עם ספירה, פס תחתון עם פידבק."""
+    """פס עליון עם ספירה, פס תחתון עם פידבק (אם יש)."""
     h, w, _ = frame.shape
     bar_h = int(h * 0.065)
 
-    # פס עליון שקוף
+    # פס עליון שקוף + Reps
     top = frame.copy()
     cv2.rectangle(top, (0, 0), (w, bar_h), (0, 0, 0), -1)
     frame = cv2.addWeighted(top, 0.55, frame, 0.45, 0)
-
     pil = Image.fromarray(frame)
     frame = draw_plain_text(pil, (16, int(bar_h*0.22)), f"Reps: {reps}", REPS_FONT)
 
-    # פידבק תחתון
+    # פס תחתון לפידבק (רק אם יש)
     if feedback:
         bottom_h = int(h * 0.07)
         over = frame.copy()
         cv2.rectangle(over, (0, h-bottom_h), (w, h), (0, 0, 0), -1)
         frame = cv2.addWeighted(over, 0.55, frame, 0.45, 0)
-
         pil = Image.fromarray(frame)
         draw = ImageDraw.Draw(pil)
         tw = draw.textlength(feedback, font=FEEDBACK_FONT)
@@ -51,6 +49,11 @@ def draw_overlay(frame, reps=0, feedback=None):
         frame = np.array(pil)
 
     return frame
+
+# עיגול לחצאים והצגת מספר שלם בלי .0
+def _format_score_value(x: float):
+    x = round(x * 2) / 2
+    return int(x) if float(x).is_integer() else round(x, 1)
 
 def run_analysis(video_path, frame_skip=3, scale=0.4,
                  output_path="squat_output.mp4",
@@ -63,19 +66,20 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
     counter = good_reps = bad_reps = 0
     all_scores = []
     problem_reps = []
-    overall_feedback = []
-    depth_distances = []
-    depth_feedback_given = False
-
+    overall_feedback = []          # רשימת הערות ייחודיות לכל האימון
+    depth_distances = []           # לשיקלול עומק ממוצע אם לא היו הערות כלל
     stage = None
+
+    # מעקבים שונים (נשארים כמו בקוד שלך, לשימור הלוגיקה)
     rep_min_knee_angle = 180
     max_lean_down = 0
     top_back_angle = 0
-    last_rep_feedback = None  # הפידבק שיוצג עד סיום החזרה הבאה
+
+    # הפידבק שיוצג על המסך – תמיד זה של סוף החזרה האחרונה (או ריק)
+    last_rep_feedback = []
 
     out = None
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
 
@@ -88,6 +92,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
             frame_idx += 1
             if frame_idx % frame_skip != 0:
                 continue
+
             if scale != 1.0:
                 frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
 
@@ -97,9 +102,10 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
 
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
+
             if not results.pose_landmarks:
-                frame = draw_overlay(frame, reps=counter,
-                                     feedback=" | ".join(last_rep_feedback) if last_rep_feedback else None)
+                overlay_text = " | ".join(last_rep_feedback) if last_rep_feedback else None
+                frame = draw_overlay(frame, reps=counter, feedback=overlay_text)
                 out.write(frame)
                 continue
 
@@ -117,6 +123,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                 body_angle = calculate_body_angle(shoulder, hip)
                 heel_lifted = foot_y - heel_y > 0.03
 
+                # שלבי תנועה
                 if knee_angle < 90:
                     stage = "down"
                 if stage == "down":
@@ -125,12 +132,13 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                 if stage == "up":
                     top_back_angle = max(top_back_angle, body_angle)
 
+                # סוף חזרה
                 if knee_angle > 160 and stage == "down":
-                    # === סיום חזרה ===
                     stage = "up"
                     feedbacks = []
                     penalty = 0
 
+                    # עומק יחסי לפי לוגיקה המקורית שלך
                     hip_to_heel_dist = abs(hip[1] - heel_y)
                     depth_distances.append(hip_to_heel_dist)
 
@@ -145,33 +153,39 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                         depth_penalty = 0.5
                     else:
                         depth_penalty = 0
-
                     penalty += depth_penalty
 
+                    # גב למעלה
                     if back_angle < 140:
                         feedbacks.append("Try to straighten your back more at the top")
                         penalty += 1
 
+                    # עקבים
                     if heel_lifted:
                         feedbacks.append("Keep your heels down")
                         penalty += 1
 
+                    # נעילה מלאה
                     if knee_angle < 160:
                         feedbacks.append("Incomplete lockout")
                         penalty += 1
 
+                    # ניקוד חזרה
                     if not feedbacks:
                         score = 10.0
                     else:
                         penalty = min(penalty, 6)
                         score = round(max(4, 10 - penalty) * 2) / 2
 
+                    # עדכון דו"ח: אוסף הערות ייחודי
                     for f in feedbacks:
                         if f not in overall_feedback:
                             overall_feedback.append(f)
 
-                    last_rep_feedback = feedbacks[:] if feedbacks else None
+                    # מה שמופיע על המסך עד החזרה הבאה
+                    last_rep_feedback = feedbacks[:]  # אם ריק – לא יוצג טקסט
 
+                    # עדכוני מונים
                     counter += 1
                     if score >= 9.5:
                         good_reps += 1
@@ -180,13 +194,15 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                         problem_reps.append(counter)
                     all_scores.append(score)
 
+                    # אפס מעקבים לחזרה הבאה
                     rep_min_knee_angle = 180
                     max_lean_down = 0
 
             except Exception:
+                # לא מפיל ריצה על פריים בעייתי
                 pass
 
-            # ציור Overlay עם הפידבק של החזרה האחרונה
+            # ציור Overlay עם הפידבק של החזרה האחרונה בלבד
             overlay_text = " | ".join(last_rep_feedback) if last_rep_feedback else None
             frame = draw_overlay(frame, reps=counter, feedback=overlay_text)
             out.write(frame)
@@ -196,24 +212,27 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         out.release()
     cv2.destroyAllWindows()
 
-    technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0
+    # ציון סופי
+    technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0.0
+    if counter > 0 and not overall_feedback:
+        # לא היו הערות בכלל -> 10
+        technique_score = 10.0
+    technique_score_display = _format_score_value(technique_score)
 
+    # אם לא היו הערות בכלל, אפשר עדיין לתת רמז עומק ממוצע (אופציונלי)
     if depth_distances and not overall_feedback:
         avg_depth = np.mean(depth_distances)
-        if avg_depth > 0.48:
-            overall_feedback.append("Try squatting lower")
-        elif avg_depth > 0.45:
-            overall_feedback.append("Almost there — go a bit lower")
-        elif avg_depth > 0.43:
-            overall_feedback.append("Looking good — just a bit more depth")
+        # לא מוסיפים overall_feedback כדי לשמור על "ללא הערות" = 10,
+        # אבל אם תרצה להציג טיפ לא-מוריד-ציון, אפשר להחזיר בשדה tips נוסף.
 
     if not overall_feedback:
+        # מסר כללי חיובי כשאין הערות
         overall_feedback.append("Great form! Keep it up 💪")
 
     # כתיבת קובץ פידבק
     with open(feedback_path, "w", encoding="utf-8") as f:
         f.write(f"Total Reps: {counter}\n")
-        f.write(f"Technique Score: {technique_score}/10\n")
+        f.write(f"Technique Score: {technique_score_display}/10\n")
         if overall_feedback:
             f.write("Feedback:\n")
             for fb in overall_feedback:
@@ -234,7 +253,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         os.remove(output_path)
 
     return {
-        "technique_score": technique_score,
+        "technique_score": technique_score_display,  # כבר בפורמט 10 / 8.5 וכו'
         "squat_count": counter,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
@@ -243,3 +262,4 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         "video_path": encoded_path,
         "feedback_path": feedback_path
     }
+
