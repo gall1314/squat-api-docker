@@ -5,58 +5,69 @@ import subprocess
 import os
 from PIL import ImageFont, ImageDraw, Image
 
-# ===== קבועים =====
-ANGLE_DOWN_THRESH   = 95    # זווית ברך שמתחתיה נכנסים לשלב "ירידה"
-ANGLE_UP_THRESH     = 160   # זווית ברך שמעליה יוצאים חזרה ל"למעלה"
-MIN_RANGE_DELTA_DEG = 15    # שינוי זווית מינימלי (Top->Bottom) כדי לספור חזרה
-MIN_DOWN_FRAMES     = 5     # מינימום פריימים בשלב הירידה (היסטרזיס)
+# ===================== קבועים =====================
+ANGLE_DOWN_THRESH   = 95     # כניסה לירידה
+ANGLE_UP_THRESH     = 160    # יציאה לעלייה
+MIN_RANGE_DELTA_DEG = 15     # שינוי מינימלי (Top->Bottom) כדי לספור חזרה
+MIN_DOWN_FRAMES     = 5      # מינ' פריימים בירידה (היסטרזיס)
 
-GOOD_REP_MIN_SCORE  = 8.0   # סף ציון לחזרה "טובה" (לא משפיע על ספירה)
-TORSO_LEAN_MIN      = 135   # זווית גב מינימלית (פחות מזה -> גב נשבר)
-VALGUS_X_TOL        = 0.03  # סטייה מותרת X בין ברך לקרסול (ולגוס)
-
-# יעד איכות (לא לספירה): כמה רחוק מה-Top נחשב "מושלם" לצורך נרמול עומק
-PERFECT_MIN_KNEE    = 70
+GOOD_REP_MIN_SCORE  = 8.0
+TORSO_LEAN_MIN      = 135    # גב פחות מזה -> הערה
+VALGUS_X_TOL        = 0.03   # סטייה מותרת X בין ברך לקרסול
+PERFECT_MIN_KNEE    = 70     # יעד "מושלם" לנרמול עומק (לא לספירה)
 
 # פונטים
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
 REPS_FONT_SIZE = 28
 FEEDBACK_FONT_SIZE = 22
+DEPTH_LABEL_FONT_SIZE = 14     # "DEPTH"
+DEPTH_PCT_FONT_SIZE   = 18     # "72%"
 
 try:
     REPS_FONT = ImageFont.truetype(FONT_PATH, REPS_FONT_SIZE)
     FEEDBACK_FONT = ImageFont.truetype(FONT_PATH, FEEDBACK_FONT_SIZE)
+    DEPTH_LABEL_FONT = ImageFont.truetype(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
+    DEPTH_PCT_FONT   = ImageFont.truetype(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 except Exception:
     REPS_FONT = ImageFont.load_default()
     FEEDBACK_FONT = ImageFont.load_default()
+    DEPTH_LABEL_FONT = ImageFont.load_default()
+    DEPTH_PCT_FONT = ImageFont.load_default()
+
+# סגנון דונאט
+DEPTH_RADIUS_SCALE   = 0.70   # יחס לגובה הפס העליון (bar_h)
+DEPTH_THICKNESS_FRAC = 0.28   # עובי הטבעת ביחס לרדיוס
+DEPTH_COLOR          = (40, 200, 80)  # BGR ירוק
+DEPTH_RING_BG        = (70, 70, 70)   # רקע טבעת אפור
 
 mp_pose = mp.solutions.pose
 
-# ===== ציור =====
+# ===================== עזרי ציור =====================
 def draw_plain_text(pil_img, xy, text, font, color=(255,255,255)):
     ImageDraw.Draw(pil_img).text((int(xy[0]), int(xy[1])), text, font=font, fill=color)
     return np.array(pil_img)
 
 def draw_depth_donut(frame, center, radius, thickness, pct):
     """
-    טבעת DEPTH: pct ∈ [0..1], 0=ריק, 1=מלא. התחלה מלמעלה, עם כיוון השעון.
+    טבעת DEPTH: pct ∈ [0..1], 0=ריק, 1=מלא. מתחיל מלמעלה (-90°) עם כיוון השעון.
     """
     pct = float(np.clip(pct, 0.0, 1.0))
     cx, cy = int(center[0]), int(center[1])
-    radius = int(radius)
+    radius   = int(radius)
     thickness = int(thickness)
 
-    # רקע הטבעת (אפור כהה)
-    cv2.circle(frame, (cx, cy), radius, (60, 60, 60), thickness, lineType=cv2.LINE_AA)
-    # קשת מילוי (לבן)
-    end_angle = -90 + int(360 * pct)
-    cv2.ellipse(frame, (cx, cy), (radius, radius), 0, -90, end_angle,
-                (255, 255, 255), thickness, lineType=cv2.LINE_AA)
+    # טבעת רקע אפורה
+    cv2.circle(frame, (cx, cy), radius, DEPTH_RING_BG, thickness, lineType=cv2.LINE_AA)
+    # קשת מילוי ירוקה
+    start_ang = -90
+    end_ang   = start_ang + int(360 * pct)
+    cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang,
+                DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
     return frame
 
-def draw_overlay(frame, reps=0, feedback=None, depth_pct=None):
+def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     """
-    פס עליון עם Reps + Depth donut קטן; פס תחתון לפידבק (אם יש).
+    פס עליון: Reps + Depth donut קטן (מוצג תמיד) ; פס תחתון: פידבק.
     """
     h, w, _ = frame.shape
     bar_h = int(h * 0.065)
@@ -66,27 +77,44 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=None):
     cv2.rectangle(top, (0, 0), (w, bar_h), (0, 0, 0), -1)
     frame = cv2.addWeighted(top, 0.55, frame, 0.45, 0)
 
-    # Reps (טקסט נקי)
+    # Reps
     pil = Image.fromarray(frame)
-    frame = draw_plain_text(pil, (16, int(bar_h*0.2)), f"Reps: {reps}", REPS_FONT)
+    frame = draw_plain_text(pil, (16, int(bar_h*0.22)), f"Reps: {reps}", REPS_FONT)
 
-    # Depth donut קטן בפינה ימין-עליון
-    if depth_pct is not None:
-        margin = 12
-        radius = int(bar_h * 0.45)
-        thick  = max(3, int(radius * 0.35))
-        cx = w - margin - radius
-        cy = int(bar_h * 0.5)
-        frame = draw_depth_donut(frame, (cx, cy), radius, thick, depth_pct)
+    # DEPTH donut בפינה ימין-עליון
+    margin = 12
+    radius = int(bar_h * DEPTH_RADIUS_SCALE)
+    thick  = max(3, int(radius * DEPTH_THICKNESS_FRAC))
+    cx = w - margin - radius
+    cy = int(bar_h * 0.52)
 
-        # אחוז במרכז הטבעת
-        pct_txt = f"{int(depth_pct*100)}%"
-        pil = Image.fromarray(frame)
-        draw = ImageDraw.Draw(pil)
-        tw = draw.textlength(pct_txt, font=REPS_FONT)
-        frame = draw_plain_text(pil, (cx - int(tw)//2, cy - REPS_FONT_SIZE//2), pct_txt, REPS_FONT)
+    frame = draw_depth_donut(frame, (cx, cy), radius, thick, depth_pct)
 
-    # פידבק תחתון (אם יש)
+    # טקסטים בתוך הדונאט: "DEPTH" למעלה, אחוז מתחת – ממורכזים
+    pil  = Image.fromarray(frame)
+    draw = ImageDraw.Draw(pil)
+
+    label_txt = "DEPTH"
+    pct_txt   = f"{int(depth_pct*100)}%"
+
+    label_w = draw.textlength(label_txt, font=DEPTH_LABEL_FONT)
+    pct_w   = draw.textlength(pct_txt,   font=DEPTH_PCT_FONT)
+
+    gap    = max(2, int(radius * 0.10))
+    block_h = DEPTH_LABEL_FONT_SIZE + gap + DEPTH_PCT_FONT_SIZE
+    base_y  = cy - block_h // 2
+
+    lx = cx - int(label_w // 2)
+    ly = base_y
+    draw.text((lx, ly), label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
+
+    px = cx - int(pct_w // 2)
+    py = ly + DEPTH_LABEL_FONT_SIZE + gap
+    draw.text((px, py), pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
+
+    frame = np.array(pil)
+
+    # פידבק תחתון
     if feedback:
         bottom_h = int(h * 0.07)
         over = frame.copy()
@@ -103,7 +131,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=None):
 
     return frame
 
-# ===== גאומטריה =====
+# ===================== גאומטריה =====================
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
     radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
@@ -123,7 +151,7 @@ def valgus_ok(landmarks, side):
     ankle_x = landmarks[getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value].x
     return not (knee_x < ankle_x - VALGUS_X_TOL)
 
-# ===== ספירה ואיכות =====
+# ===================== מונה חזרות =====================
 class BulgarianRepCounter:
     def __init__(self):
         self.count = 0
@@ -135,12 +163,13 @@ class BulgarianRepCounter:
         self.bad_reps = 0
         self.all_feedback = set()
 
-        self._start_knee_angle = None  # ה"טופ" של אותה חזרה
+        self._start_knee_angle = None  # Top angle בתחילת החזרה
         self._curr_min_knee = None
         self._curr_max_knee = None
         self._curr_min_torso = None
         self._curr_valgus_bad = 0
         self._down_frames = 0
+        self._last_depth_for_ui = 0.0  # להצגה תמידית
 
     def _start_rep(self, frame_no, start_knee_angle):
         self.rep_start_frame = frame_no
@@ -172,21 +201,18 @@ class BulgarianRepCounter:
         }
         if extra:
             report.update(extra)
-
         self.rep_reports.append(report)
         self.rep_index += 1
         self.rep_start_frame = None
         self._start_knee_angle = None
+        self._last_depth_for_ui = 0.0  # לאפס תצוגה לאחר סיום חזרה
 
     def evaluate_form(self, start_knee_angle, min_knee_angle, min_torso_angle, valgus_bad_frames):
-        """
-        איכות/עומק נמדדים יחסית ל-Top של אותה חזרה.
-        """
         feedback = []
         score = 10.0
 
-        # עומק יחסי: כמה ירדתי מהטופ עד המינימום, מנורמל ליעד "מושלם"
-        denom = max(10.0, (start_knee_angle - PERFECT_MIN_KNEE))  # הגנה על חילוק קטן
+        # עומק יחסי: כמה ירדתי מהטופ עד המינימום, מנורמל לסף "מושלם"
+        denom = max(10.0, (start_knee_angle - PERFECT_MIN_KNEE))
         depth_pct = np.clip((start_knee_angle - min_knee_angle) / denom, 0, 1)
 
         if min_torso_angle < TORSO_LEAN_MIN:
@@ -206,7 +232,7 @@ class BulgarianRepCounter:
                 self._start_rep(frame_no, knee_angle)
             self._down_frames += 1
 
-        # מעבר למעלה -> סיום חזרה (אם באמת זזנו)
+        # יציאה לעלייה -> בדיקת חזרה
         elif knee_angle > ANGLE_UP_THRESH and self.stage == 'down':
             depth_delta = (self._start_knee_angle or 0) - (self._curr_min_knee or 0)
             did_move_enough = depth_delta >= MIN_RANGE_DELTA_DEG
@@ -220,10 +246,15 @@ class BulgarianRepCounter:
                 )
                 self.count += 1
                 self._finish_rep(frame_no, score, fb, extra={"depth_pct": depth})
+            else:
+                # חזרה לא תקינה – אפס עומק תצוגה
+                self._last_depth_for_ui = 0.0
+                self.rep_start_frame = None
+                self._start_knee_angle = None
 
             self.stage = 'up'
 
-        # אגרגציה בזמן הירידה
+        # אגרגציה בזמן ירידה
         if self.stage == 'down' and self.rep_start_frame:
             self._curr_min_knee = min(self._curr_min_knee, knee_angle)
             self._curr_max_knee = max(self._curr_max_knee, knee_angle)
@@ -231,12 +262,15 @@ class BulgarianRepCounter:
             if not valgus_ok_flag:
                 self._curr_valgus_bad += 1
 
-    def current_depth_pct(self):
-        """עומק Live בזמן ירידה, יחסית ל-Top של אותה חזרה."""
-        if self.stage != 'down' or self._curr_min_knee in (None, 999.0) or self._start_knee_angle is None:
-            return None
-        denom = max(10.0, (self._start_knee_angle - PERFECT_MIN_KNEE))
-        return float(np.clip((self._start_knee_angle - self._curr_min_knee) / denom, 0, 1))
+            # עומק להצגה חיה
+            denom = max(10.0, (self._start_knee_angle - PERFECT_MIN_KNEE))
+            self._last_depth_for_ui = float(np.clip(
+                (self._start_knee_angle - self._curr_min_knee) / denom, 0, 1
+            ))
+
+    def depth_for_overlay(self):
+        """ערך להצגה תמידית: 0 כשאין ירידה כרגע."""
+        return float(self._last_depth_for_ui)
 
     def result(self):
         avg = np.mean([r["score"] for r in self.rep_reports]) if self.rep_reports else 0.0
@@ -250,7 +284,7 @@ class BulgarianRepCounter:
             "reps": self.rep_reports
         }
 
-# ===== ריצה =====
+# ===================== ריצה =====================
 def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
                            output_path="analyzed_output.mp4",
                            feedback_path="feedback_summary.txt"):
@@ -285,6 +319,8 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = pose.process(image_rgb)
         if not results.pose_landmarks:
+            # הצג overlay גם כשאין זיהוי: עומק 0
+            frame = draw_overlay(frame, reps=counter.count, feedback=None, depth_pct=0.0)
             out.write(frame)
             continue
 
@@ -309,15 +345,15 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
         )
 
-        # פידבק בזמן אמת בזמן ירידה
+        # פידבק בזמן אמת (בזמן ירידה)
         feedbacks = []
         if counter.stage == "down":
             if torso_angle < TORSO_LEAN_MIN: feedbacks.append("Keep your back straight")
             if not v_ok: feedbacks.append("Avoid knee collapse")
         feedback = " | ".join(feedbacks) if feedbacks else ""
 
-        # עומק ל‑donut בזמן אמת
-        depth_live = counter.current_depth_pct()
+        # עומק להצגה תמידית
+        depth_live = counter.depth_for_overlay()
         frame = draw_overlay(frame, reps=counter.count, feedback=feedback, depth_pct=depth_live)
 
         out.write(frame)
