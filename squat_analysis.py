@@ -9,7 +9,7 @@ from PIL import ImageFont, ImageDraw, Image
 # ========= Fonts / Overlay =========
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
 REPS_FONT_SIZE = 28
-FEEDBACK_FONT_SIZE = 22
+FEEDBACK_FONT_SIZE = 26     # גדול ואחיד (לא משתנה)
 DEPTH_LABEL_FONT_SIZE = 14
 DEPTH_PCT_FONT_SIZE   = 18
 
@@ -25,7 +25,7 @@ DEPTH_LABEL_FONT = _load_font(DEPTH_LABEL_FONT_SIZE)
 DEPTH_PCT_FONT   = _load_font(DEPTH_PCT_FONT_SIZE)
 
 # ========= Donut style =========
-DEPTH_RADIUS_SCALE   = 0.70
+DEPTH_RADIUS_SCALE   = 0.70   # אפשר לעלות ל-0.75/0.78 אם תרצה גדול יותר
 DEPTH_THICKNESS_FRAC = 0.28
 DEPTH_COLOR          = (40, 200, 80)   # BGR
 DEPTH_RING_BG        = (70, 70, 70)    # BGR
@@ -74,6 +74,27 @@ def fit_text_to_width(draw: ImageDraw.ImageDraw, text: str, max_width: int,
         size -= 1
     return ImageFont.load_default()
 
+def wrap_text_by_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int):
+    """שובר טקסט לשורות כך שכל שורה לא תעבור max_width (בלי להקטין פונט)."""
+    words = text.split()
+    if not words:
+        return []
+    lines, line = [], ""
+    for w in words:
+        test = (line + " " + w).strip()
+        if draw.textlength(test, font=font) <= max_width:
+            line = test
+        else:
+            if line:
+                lines.append(line)
+                line = w
+            else:
+                lines.append(w)  # מילה ארוכה במיוחד
+                line = ""
+    if line:
+        lines.append(line)
+    return lines
+
 # ========= Donut =========
 def draw_depth_donut(frame, center, radius, thickness, pct):
     pct = float(np.clip(pct, 0.0, 1.0))
@@ -90,29 +111,29 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
 # ========= Overlay =========
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     """
-    - פס עליון גדול יותר שמכסה גם את הדונאט וגם את Reps
-    - הדונאט הונמך מעט כדי שלא ייחתך
-    - טקסט הפידבק מתאים את עצמו לרוחב שלא יגלוש/יחתך
+    - פס עליון גדול שמכסה גם את הדונאט וגם את Reps
+    - הדונאט הונמך וממוקם כך שלא ייחתך (cy >= radius)
+    - פידבק: פונט גדול ואחיד; עיטוף שורות; גובה הפס התחתון דינמי
     """
     h, w, _ = frame.shape
 
-    # פס עליון רחב
-    bar_h = int(h * 0.095)  # מוגדל (היה ~0.065)
+    # פס עליון רחב שמכסה הכל
+    bar_h = int(h * 0.11)  # גבוה יותר כדי לכסות דונאט גדול
     top = frame.copy()
     cv2.rectangle(top, (0, 0), (w, bar_h), (0, 0, 0), -1)
     frame = cv2.addWeighted(top, 0.55, frame, 0.45, 0)
 
-    # Reps
+    # Reps משמאל
     pil = Image.fromarray(frame)
-    ImageDraw.Draw(pil).text((16, int(bar_h * 0.25)), f"Reps: {reps}", font=REPS_FONT, fill=(255,255,255))
+    ImageDraw.Draw(pil).text((16, int(bar_h * 0.26)), f"Reps: {reps}", font=REPS_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-    # Donut – ימני/עליון, טיפה נמוך יותר
+    # דונאט בימין-עליון: מוודאים שלא ייחתך (cy >= radius)
     margin = 12
     radius = int(bar_h * DEPTH_RADIUS_SCALE)
     thick  = max(3, int(radius * DEPTH_THICKNESS_FRAC))
     cx = w - margin - radius
-    cy = int(bar_h * 0.65)  # היה ~0.52
+    cy = int(bar_h * 0.84)  # נמוך יותר; עם DEPTH_RADIUS_SCALE=0.70 נקבל cy >= radius
     frame = draw_depth_donut(frame, (cx, cy), radius, thick, depth_pct)
 
     # טקסטים בתוך הדונאט
@@ -129,20 +150,28 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     draw.text((cx - int(pw // 2), base_y + DEPTH_LABEL_FONT_SIZE + gap), pct_txt,   font=DEPTH_PCT_FONT,   fill=(255,255,255))
     frame = np.array(pil)
 
-    # פס תחתון לפידבק – התאמה דינמית לרוחב
+    # פס תחתון לפידבק – עיטוף לשורות, גובה דינמי
     if feedback:
-        bottom_h = int(h * 0.07)
-        over = frame.copy()
-        cv2.rectangle(over, (0, h-bottom_h), (w, h), (0, 0, 0), -1)
-        frame = cv2.addWeighted(over, 0.55, frame, 0.45, 0)
         pil = Image.fromarray(frame)
         draw = ImageDraw.Draw(pil)
-        max_w = w - 24  # מרווחים
-        fb_font = fit_text_to_width(draw, feedback, max_w, base_px=FEEDBACK_FONT_SIZE, min_px=14)
-        tw = draw.textlength(feedback, font=fb_font)
-        tx = (w - int(tw)) // 2
-        ty = h - bottom_h + max(4, (bottom_h - fb_font.size) // 2)
-        draw.text((tx, ty), feedback, font=fb_font, fill=(255,255,255))
+        max_w = w - 2 * 16
+        lines = wrap_text_by_width(draw, feedback, FEEDBACK_FONT, max_w)
+
+        line_h = FEEDBACK_FONT.size + 2
+        needed_h = 10 + len(lines) * line_h + 10
+        bottom_h = max(int(h * 0.10), needed_h)  # גבוה יותר כברירת מחדל
+        over = np.array(pil).copy()
+        cv2.rectangle(over, (0, h-bottom_h), (w, h), (0, 0, 0), -1)
+        frame = cv2.addWeighted(over, 0.55, np.array(pil), 0.45, 0)
+
+        pil = Image.fromarray(frame)
+        draw = ImageDraw.Draw(pil)
+        y = h - bottom_h + (bottom_h - len(lines) * line_h) // 2
+        for line in lines:
+            tw = draw.textlength(line, font=FEEDBACK_FONT)
+            tx = (w - int(tw)) // 2
+            draw.text((tx, y), line, font=FEEDBACK_FONT, fill=(255,255,255))
+            y += line_h
         frame = np.array(pil)
 
     return frame
@@ -160,8 +189,7 @@ class DepthSmoother:
     def start_fade(self, seconds): self.hold_timer = 0.0; self.fade_timer = float(seconds)
     def update(self, dt):
         if self.hold_timer > 0:
-            self.hold_timer = max(0.0, self.hold_timer - dt)
-            return self.display
+            self.hold_timer = max(0.0, self.hold_timer - dt); return self.display
         if self.fade_timer > 0:
             if self.fade_timer <= dt:
                 self.display = 0.0; self.fade_timer = 0.0
@@ -277,17 +305,13 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                     elif hip_to_heel_dist > 0.43:
                         feedbacks.append("Looking good — just a bit more depth"); penalty += 0.5
 
-                    # גב למעלה
                     if back_angle < 140:
                         feedbacks.append("Try to straighten your back more at the top"); penalty += 1
-                    # עקבים
                     if heel_lifted:
                         feedbacks.append("Keep your heels down"); penalty += 1
-                    # נעילה מלאה
                     if knee_angle < 160:
                         feedbacks.append("Incomplete lockout"); penalty += 1
 
-                    # ניקוד
                     if not feedbacks:
                         score = 10.0
                     else:
@@ -370,3 +394,4 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         "video_path": final_video_path,
         "feedback_path": feedback_path
     }
+
