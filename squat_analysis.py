@@ -426,6 +426,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
     except Exception:
         pass
     # קידוד MP4 (faststart)
+      # קידוד MP4 (faststart)
     encoded_path = output_path.replace(".mp4", "_encoded.mp4")
     try:
         subprocess.run([
@@ -442,18 +443,15 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
     except Exception:
         pass
 
-    # החזרה בפורמט המקורי: result + video_path נפרד
-    result = {
+    # החזרה כפי שהיה במקור (שטוח)
+    return {
         "technique_score": technique_score_display,  # 10 / 9.5 / 9 / ...
         "squat_count": counter,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
+        "video_path": encoded_path,
         "feedback_path": feedback_path
     }
 
-    return {
-        "result": result,
-        "video_path": encoded_path
-    }
