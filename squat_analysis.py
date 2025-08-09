@@ -66,7 +66,21 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
     end_ang   = start_ang + int(360 * pct)
     cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang,
                 DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
-    return frame
+    return frame 
+    
+    def fit_text_to_width(draw: ImageDraw.ImageDraw, text: str, max_width: int,
+                      base_px: int, min_px: int) -> ImageFont.FreeTypeFont:
+    size = int(base_px)
+    while size >= int(min_px):
+        try:
+            f = ImageFont.truetype(FONT_PATH, size)
+        except Exception:
+            f = ImageFont.load_default()
+        if draw.textlength(text, font=f) <= max_width:
+            return f
+        size -= 1
+    return ImageFont.load_default()
+
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     """
     פס עליון: Reps + DEPTH donut ; פס תחתון: פידבק של סוף-חזרה אחרונה (אם יש).
