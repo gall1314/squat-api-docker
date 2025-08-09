@@ -67,10 +67,17 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
     cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang,
                 DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
     return frame
-
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
+    """
+    פס עליון: Reps + DEPTH donut ; פס תחתון: פידבק של סוף-חזרה אחרונה (אם יש).
+    - הפס העליון הוגדל כדי לכסות את הדונאט ואת החזרות.
+    - הדונאט הונמך מעט כדי שלא ייחתך.
+    - טקסט הפידבק מותאם לרוחב המסך כדי שלא יגלוש/ייחתך.
+    """
     h, w, _ = frame.shape
-    bar_h = int(h * 0.065)
+
+    # פס עליון רחב יותר (כיסוי מלא לדונאט + טקסט Reps)
+    bar_h = int(h * 0.095)  # היה ~0.065
 
     # פס עליון שקוף
     top = frame.copy()
@@ -79,15 +86,20 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
     # Reps
     pil = Image.fromarray(frame)
-    ImageDraw.Draw(pil).text((16, int(bar_h*0.22)), f"Reps: {reps}", font=REPS_FONT, fill=(255,255,255))
+    ImageDraw.Draw(pil).text(
+        (16, int(bar_h * 0.25)),
+        f"Reps: {reps}",
+        font=REPS_FONT,
+        fill=(255, 255, 255),
+    )
     frame = np.array(pil)
 
-    # DEPTH donut בפינה ימין-עליון
+    # DEPTH donut בפינה ימין-עליון – הוזז מעט למטה
     margin = 12
     radius = int(bar_h * DEPTH_RADIUS_SCALE)
     thick  = max(3, int(radius * DEPTH_THICKNESS_FRAC))
     cx = w - margin - radius
-    cy = int(bar_h * 0.52)
+    cy = int(bar_h * 0.65)  # היה ~0.52, הונמך כדי שלא ייחתך
     frame = draw_depth_donut(frame, (cx, cy), radius, thick, depth_pct)
 
     # טקסטים בתוך הדונאט
@@ -98,25 +110,33 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     gap    = max(2, int(radius * 0.10))
     block_h = DEPTH_LABEL_FONT_SIZE + gap + DEPTH_PCT_FONT_SIZE
     base_y  = cy - block_h // 2
+
     lw = draw.textlength(label_txt, font=DEPTH_LABEL_FONT)
     pw = draw.textlength(pct_txt,   font=DEPTH_PCT_FONT)
-    draw.text((cx - int(lw//2), base_y), label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
-    draw.text((cx - int(pw//2), base_y + DEPTH_LABEL_FONT_SIZE + gap), pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
+    draw.text((cx - int(lw // 2), base_y), label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
+    draw.text((cx - int(pw // 2), base_y + DEPTH_LABEL_FONT_SIZE + gap), pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-    # פס תחתון לפידבק – רק אם יש
+    # פס תחתון לפידבק – התאמת גודל טקסט לרוחב המסך
     if feedback:
         bottom_h = int(h * 0.07)
         over = frame.copy()
         cv2.rectangle(over, (0, h-bottom_h), (w, h), (0, 0, 0), -1)
         frame = cv2.addWeighted(over, 0.55, frame, 0.45, 0)
+
         pil = Image.fromarray(frame)
         draw = ImageDraw.Draw(pil)
-        tw = draw.textlength(feedback, font=FEEDBACK_FONT)
-        draw.text(((w - int(tw)) // 2, h - bottom_h + 6), feedback, font=FEEDBACK_FONT, fill=(255,255,255))
+        max_w = w - 2 * 12  # מרווחים משני הצדדים
+        # התאמת פונט דינמית כדי שלא יחרוג
+        fb_font = fit_text_to_width(draw, feedback, max_w, base_px=22, min_px=14)
+        tw = draw.textlength(feedback, font=fb_font)
+        tx = (w - int(tw)) // 2
+        ty = h - bottom_h + max(4, (bottom_h - fb_font.size) // 2)
+        draw.text((tx, ty), feedback, font=fb_font, fill=(255,255,255))
         frame = np.array(pil)
 
     return frame
+
 
 # ========= Depth smoother =========
 class DepthSmoother:
