@@ -6,10 +6,10 @@ import os
 from utils import calculate_angle, calculate_body_angle
 from PIL import ImageFont, ImageDraw, Image
 
-# ========= Fonts / Overlay =========
+# ========= Fonts =========
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
-REPS_FONT_SIZE = 28
-FEEDBACK_FONT_SIZE = 22     # גדול ואחיד (לא משתנה)
+REPS_FONT_SIZE = 24         # קטן יותר
+FEEDBACK_FONT_SIZE = 24     # אחיד וקריא
 DEPTH_LABEL_FONT_SIZE = 14
 DEPTH_PCT_FONT_SIZE   = 18
 
@@ -24,8 +24,15 @@ FEEDBACK_FONT    = _load_font(FEEDBACK_FONT_SIZE)
 DEPTH_LABEL_FONT = _load_font(DEPTH_LABEL_FONT_SIZE)
 DEPTH_PCT_FONT   = _load_font(DEPTH_PCT_FONT_SIZE)
 
+# ========= Top bar & Donut layout (קבועים) =========
+TOP_BAR_HEIGHT_FRAC = 0.09   # גובה הפס העליון
+TOP_BAR_WIDTH_FRAC  = 0.30   # רוחב הפס העליון (שמאל) – קבוע, לא קופץ
+TOP_BAR_ALPHA       = 0.55   # שקיפות
+
+DONUT_BASE_FRAC     = 0.11   # בסיס גודל הדונאט מתוך גובה הווידאו
+
 # ========= Donut style =========
-DEPTH_RADIUS_SCALE   = 0.70   # אפשר לעלות ל-0.75/0.78 אם תרצה גדול יותר
+DEPTH_RADIUS_SCALE   = 0.70
 DEPTH_THICKNESS_FRAC = 0.28
 DEPTH_COLOR          = (40, 200, 80)   # BGR
 DEPTH_RING_BG        = (70, 70, 70)    # BGR
@@ -57,10 +64,6 @@ def draw_body_skeleton(frame, landmarks, w, h):
     return frame
 
 # ========= Text helpers =========
-def draw_plain_text(pil_img, xy, text, font, color=(255,255,255)):
-    ImageDraw.Draw(pil_img).text((int(xy[0]), int(xy[1])), text, font=font, fill=color)
-    return np.array(pil_img)
-
 def fit_text_to_width(draw: ImageDraw.ImageDraw, text: str, max_width: int,
                       base_px: int, min_px: int) -> ImageFont.FreeTypeFont:
     size = int(base_px)
@@ -75,7 +78,6 @@ def fit_text_to_width(draw: ImageDraw.ImageDraw, text: str, max_width: int,
     return ImageFont.load_default()
 
 def wrap_text_by_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int):
-    """שובר טקסט לשורות כך שכל שורה לא תעבור max_width (בלי להקטין פונט)."""
     words = text.split()
     if not words:
         return []
@@ -89,7 +91,7 @@ def wrap_text_by_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.Fre
                 lines.append(line)
                 line = w
             else:
-                lines.append(w)  # מילה ארוכה במיוחד
+                lines.append(w)  # מילה בודדת ארוכה
                 line = ""
     if line:
         lines.append(line)
@@ -111,75 +113,65 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
 # ========= Overlay =========
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     """
-    - פס שחור שקוף קבוע (רוחב וגובה קבועים) רק לאזור Reps – לא יקפוץ.
-    - הדונאט חופשי בצד ימין, בגודל קבוע לפי DONUT_BASE_FRAC, לא נחתך.
-    - פידבק למטה: עיטוף שורות + גובה דינמי.
+    - פס עליון קבוע (רוחב/גובה) מתחת ל-Reps בלבד.
+    - הדונאט חופשי בצד ימין, בגודל יציב, לא מכוסה ולא נחתך.
+    - פידבק בתחתית: פונט אחיד + עיטוף שורות + גובה דינמי.
     """
     h, w, _ = frame.shape
     PADDING = 14
 
-    # ---------- פס עליון קבוע (לא דינמי) ----------
+    # --- פס עליון קבוע ---
     bar_h = int(h * TOP_BAR_HEIGHT_FRAC)
     bar_w = int(w * TOP_BAR_WIDTH_FRAC)
-
     top = frame.copy()
     cv2.rectangle(top, (0, 0), (bar_w, bar_h), (0, 0, 0), -1)
     frame = cv2.addWeighted(top, TOP_BAR_ALPHA, frame, 1 - TOP_BAR_ALPHA, 0)
 
-    # טקסט Reps בתוך הפס
+    # Reps
     pil = Image.fromarray(frame)
     draw = ImageDraw.Draw(pil)
     reps_text = f"Reps: {reps}"
     rx = PADDING
     ry = max(4, (bar_h - REPS_FONT.size) // 2)
-    draw.text((rx, ry), reps_text, font=REPS_FONT, fill=(255, 255, 255))
+    draw.text((rx, ry), reps_text, font=REPS_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-    # ---------- דונאט חופשי (לא מכוסה) ----------
-    # גודל קבוע יחסית לגובה הווידאו, בלי תלות ב-bar_h כדי שלא ישתנה
+    # --- דונאט חופשי ---
     donut_base = int(h * DONUT_BASE_FRAC)
     radius = int(donut_base * DEPTH_RADIUS_SCALE)
     thick  = max(3, int(radius * DEPTH_THICKNESS_FRAC))
 
     margin = 12
     cx = w - margin - radius
-
-    # מיקום בטוח: לא ייחתך מלמעלה (לפחות רדיוס + 2px)
-    cy_candidate = int(donut_base * 0.84)
-    cy = max(radius + 2, cy_candidate)
-
+    cy = max(radius + 2, int(donut_base * 0.84))  # בטוח לא נחתך
     frame = draw_depth_donut(frame, (cx, cy), radius, thick, depth_pct)
 
     # טקסטים בתוך הדונאט
     pil  = Image.fromarray(frame)
     draw = ImageDraw.Draw(pil)
     label_txt = "DEPTH"
-    pct_txt   = f"{int(depth_pct * 100)}%"
-
+    pct_txt   = f"{int(depth_pct*100)}%"
     gap    = max(2, int(radius * 0.10))
     block_h = DEPTH_LABEL_FONT_SIZE + gap + DEPTH_PCT_FONT_SIZE
     base_y  = cy - block_h // 2
-
     lw = draw.textlength(label_txt, font=DEPTH_LABEL_FONT)
     pw = draw.textlength(pct_txt,   font=DEPTH_PCT_FONT)
-    draw.text((cx - int(lw // 2), base_y),                          label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
+    draw.text((cx - int(lw // 2), base_y),                            label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
     draw.text((cx - int(pw // 2), base_y + DEPTH_LABEL_FONT_SIZE + gap), pct_txt,   font=DEPTH_PCT_FONT,   fill=(255,255,255))
     frame = np.array(pil)
 
-    # ---------- פס תחתון לפידבק (עיטוף שורות) ----------
+    # --- פס תחתון לפידבק עם עיטוף שורות ---
     if feedback:
         pil = Image.fromarray(frame)
         draw = ImageDraw.Draw(pil)
-
         max_w = w - 2 * 16
         lines = wrap_text_by_width(draw, feedback, FEEDBACK_FONT, max_w)
 
         line_h = FEEDBACK_FONT.size + 2
         needed_h = 10 + len(lines) * line_h + 10
         bottom_h = max(int(h * 0.10), needed_h)
-
         over = np.array(pil).copy()
-        cv2.rectangle(over, (0, h - bottom_h), (w, h), (0, 0, 0), -1)
+        cv2.rectangle(over, (0, h-bottom_h), (w, h), (0, 0, 0), -1)
         frame = cv2.addWeighted(over, 0.55, np.array(pil), 0.45, 0)
 
         pil = Image.fromarray(frame)
@@ -188,12 +180,11 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
         for line in lines:
             tw_line = draw.textlength(line, font=FEEDBACK_FONT)
             tx = (w - int(tw_line)) // 2
-            draw.text((tx, y), line, font=FEEDBACK_FONT, fill=(255, 255, 255))
+            draw.text((tx, y), line, font=FEEDBACK_FONT, fill=(255,255,255))
             y += line_h
         frame = np.array(pil)
 
     return frame
-
 
 # ========= Depth smoother =========
 class DepthSmoother:
@@ -402,7 +393,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         output_path if os.path.exists(output_path) else ""
     )
 
-    # ==== החזרה – סכימה שעובדת (אין 'reps') ====
+    # ==== החזרה – סכימה שעובדת ====
     return {
         "technique_score": technique_score_display,
         "squat_count": counter,
