@@ -406,10 +406,15 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         out.release()
     cv2.destroyAllWindows()
 
-    # ========== חישוב תוצאות ==========
+       # ========== חישוב תוצאות ==========
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0.0
     if any_feedback_session and technique_score == 10.0:
         technique_score = 9.5
+
+    def _format_score_value(x: float):
+        x = round(x * 2) / 2
+        return int(x) if float(x).is_integer() else round(x, 1)
+
     technique_score_display = _format_score_value(technique_score)
 
     if not overall_feedback:
@@ -435,12 +440,19 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
             "-c:v","libx264","-preset","fast","-movflags","+faststart","-pix_fmt","yuv420p",
             encoded_path
         ], check=False)
-        if os.path.exists(output_path):
-            os.remove(output_path)
+        # Fallback: אם ההמרה לא יצרה קובץ, אל תמחק את המקורי
+        if os.path.exists(encoded_path):
+            if os.path.exists(output_path):
+                os.remove(output_path)
     except Exception:
         pass
 
-    # ==== החזרה EXACTLY כמו במקורי (שטוח) + reps ריק לתאימות ====
+    # הבטח שהנתיב שמוחזר מצביע לקובץ שקיים בפועל
+    final_video_path = encoded_path if os.path.exists(encoded_path) else (
+        output_path if os.path.exists(output_path) else ""
+    )
+
+    # ==== החזרה EXACT כמו בקובץ שעובד (ללא 'reps') ====
     return {
         "technique_score": technique_score_display,
         "squat_count": counter,
@@ -448,8 +460,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         "bad_reps": bad_reps,
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
-        "reps": [],  # תאימות מול הבולגרי; לא פוגע ב-UI ישן
-        "video_path": encoded_path,
+        "video_path": final_video_path,
         "feedback_path": feedback_path
     }
 
