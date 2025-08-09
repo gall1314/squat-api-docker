@@ -427,6 +427,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         pass
     # קידוד MP4 (faststart)
       # קידוד MP4 (faststart)
+        # קידוד MP4 (faststart)
     encoded_path = output_path.replace(".mp4", "_encoded.mp4")
     try:
         subprocess.run([
@@ -443,16 +444,26 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
     except Exception:
         pass
 
-    # החזרה כפי שהיה במקור (שטוח)
- return {
-    "technique_score": technique_score_display,
-    "squat_count": counter,
-    "good_reps": good_reps,
-    "bad_reps": bad_reps,
-    "feedback": overall_feedback,
-    "problem_reps": problem_reps,
-    "video_path": encoded_path,
-    "feedback_path": feedback_path,
-}
+    # פורמט החזרה זהה לבולגרי: שטוח, כולל video_path ו-feedback_path למעלה
+    technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0.0
+    if any_feedback_session and technique_score == 10.0:
+        technique_score = 9.5
+    technique_score_display = int(technique_score) if float(technique_score).is_integer() else round(technique_score, 1)
+
+    if not overall_feedback:
+        overall_feedback.append("Great form! Keep it up 💪")
+
+    return {
+        "squat_count": counter,
+        "technique_score": technique_score_display,
+        "good_reps": good_reps,
+        "bad_reps": bad_reps,
+        "feedback": overall_feedback,
+        "problem_reps": problem_reps,
+        "reps": [],  # לשמירת תאימות מפתחות מול הבולגרי (שם יש list של דוחות חזרה)
+        "video_path": encoded_path,
+        "feedback_path": feedback_path
+    }
+
 
 
