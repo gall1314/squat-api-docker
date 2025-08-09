@@ -13,18 +13,18 @@ FEEDBACK_FONT_SIZE = 22
 DEPTH_LABEL_FONT_SIZE = 14
 DEPTH_PCT_FONT_SIZE   = 18
 
-try:
-    REPS_FONT = ImageFont.truetype(FONT_PATH, REPS_FONT_SIZE)
-    FEEDBACK_FONT = ImageFont.truetype(FONT_PATH, FEEDBACK_FONT_SIZE)
-    DEPTH_LABEL_FONT = ImageFont.truetype(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
-    DEPTH_PCT_FONT   = ImageFont.truetype(FONT_PATH, DEPTH_PCT_FONT_SIZE)
-except Exception:
-    REPS_FONT = ImageFont.load_default()
-    FEEDBACK_FONT = ImageFont.load_default()
-    DEPTH_LABEL_FONT = ImageFont.load_default()
-    DEPTH_PCT_FONT = ImageFont.load_default()
+def _load_font(size):
+    try:
+        return ImageFont.truetype(FONT_PATH, size)
+    except Exception:
+        return ImageFont.load_default()
 
-# ========= Donut style (כמו בבולגרי) =========
+REPS_FONT        = _load_font(REPS_FONT_SIZE)
+FEEDBACK_FONT    = _load_font(FEEDBACK_FONT_SIZE)
+DEPTH_LABEL_FONT = _load_font(DEPTH_LABEL_FONT_SIZE)
+DEPTH_PCT_FONT   = _load_font(DEPTH_PCT_FONT_SIZE)
+
+# ========= Donut style =========
 DEPTH_RADIUS_SCALE   = 0.70
 DEPTH_THICKNESS_FRAC = 0.28
 DEPTH_COLOR          = (40, 200, 80)   # BGR
@@ -56,19 +56,12 @@ def draw_body_skeleton(frame, landmarks, w, h):
             cv2.circle(frame, (x, y), JOINT_RADIUS, SKELETON_COLOR, -1, cv2.LINE_AA)
     return frame
 
-# ========= Depth donut drawing =========
-def draw_depth_donut(frame, center, radius, thickness, pct):
-    pct = float(np.clip(pct, 0.0, 1.0))
-    cx, cy = int(center[0]), int(center[1])
-    radius   = int(radius); thickness = int(thickness)
-    cv2.circle(frame, (cx, cy), radius, DEPTH_RING_BG, thickness, lineType=cv2.LINE_AA)
-    start_ang = -90
-    end_ang   = start_ang + int(360 * pct)
-    cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang,
-                DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
-    return frame 
-    
-    def fit_text_to_width(draw: ImageDraw.ImageDraw, text: str, max_width: int,
+# ========= Text helpers =========
+def draw_plain_text(pil_img, xy, text, font, color=(255,255,255)):
+    ImageDraw.Draw(pil_img).text((int(xy[0]), int(xy[1])), text, font=font, fill=color)
+    return np.array(pil_img)
+
+def fit_text_to_width(draw: ImageDraw.ImageDraw, text: str, max_width: int,
                       base_px: int, min_px: int) -> ImageFont.FreeTypeFont:
     size = int(base_px)
     while size >= int(min_px):
@@ -81,39 +74,45 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
         size -= 1
     return ImageFont.load_default()
 
+# ========= Donut =========
+def draw_depth_donut(frame, center, radius, thickness, pct):
+    pct = float(np.clip(pct, 0.0, 1.0))
+    cx, cy = int(center[0]), int(center[1])
+    radius   = int(radius)
+    thickness = int(thickness)
+    cv2.circle(frame, (cx, cy), radius, DEPTH_RING_BG, thickness, lineType=cv2.LINE_AA)
+    start_ang = -90
+    end_ang   = start_ang + int(360 * pct)
+    cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang,
+                DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
+    return frame
+
+# ========= Overlay =========
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     """
-    פס עליון: Reps + DEPTH donut ; פס תחתון: פידבק של סוף-חזרה אחרונה (אם יש).
-    - הפס העליון הוגדל כדי לכסות את הדונאט ואת החזרות.
-    - הדונאט הונמך מעט כדי שלא ייחתך.
-    - טקסט הפידבק מותאם לרוחב המסך כדי שלא יגלוש/ייחתך.
+    - פס עליון גדול יותר שמכסה גם את הדונאט וגם את Reps
+    - הדונאט הונמך מעט כדי שלא ייחתך
+    - טקסט הפידבק מתאים את עצמו לרוחב שלא יגלוש/יחתך
     """
     h, w, _ = frame.shape
 
-    # פס עליון רחב יותר (כיסוי מלא לדונאט + טקסט Reps)
-    bar_h = int(h * 0.095)  # היה ~0.065
-
-    # פס עליון שקוף
+    # פס עליון רחב
+    bar_h = int(h * 0.095)  # מוגדל (היה ~0.065)
     top = frame.copy()
     cv2.rectangle(top, (0, 0), (w, bar_h), (0, 0, 0), -1)
     frame = cv2.addWeighted(top, 0.55, frame, 0.45, 0)
 
     # Reps
     pil = Image.fromarray(frame)
-    ImageDraw.Draw(pil).text(
-        (16, int(bar_h * 0.25)),
-        f"Reps: {reps}",
-        font=REPS_FONT,
-        fill=(255, 255, 255),
-    )
+    ImageDraw.Draw(pil).text((16, int(bar_h * 0.25)), f"Reps: {reps}", font=REPS_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-    # DEPTH donut בפינה ימין-עליון – הוזז מעט למטה
+    # Donut – ימני/עליון, טיפה נמוך יותר
     margin = 12
     radius = int(bar_h * DEPTH_RADIUS_SCALE)
     thick  = max(3, int(radius * DEPTH_THICKNESS_FRAC))
     cx = w - margin - radius
-    cy = int(bar_h * 0.65)  # היה ~0.52, הונמך כדי שלא ייחתך
+    cy = int(bar_h * 0.65)  # היה ~0.52
     frame = draw_depth_donut(frame, (cx, cy), radius, thick, depth_pct)
 
     # טקסטים בתוך הדונאט
@@ -124,25 +123,22 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     gap    = max(2, int(radius * 0.10))
     block_h = DEPTH_LABEL_FONT_SIZE + gap + DEPTH_PCT_FONT_SIZE
     base_y  = cy - block_h // 2
-
     lw = draw.textlength(label_txt, font=DEPTH_LABEL_FONT)
     pw = draw.textlength(pct_txt,   font=DEPTH_PCT_FONT)
-    draw.text((cx - int(lw // 2), base_y), label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
-    draw.text((cx - int(pw // 2), base_y + DEPTH_LABEL_FONT_SIZE + gap), pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
+    draw.text((cx - int(lw // 2), base_y),                            label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
+    draw.text((cx - int(pw // 2), base_y + DEPTH_LABEL_FONT_SIZE + gap), pct_txt,   font=DEPTH_PCT_FONT,   fill=(255,255,255))
     frame = np.array(pil)
 
-    # פס תחתון לפידבק – התאמת גודל טקסט לרוחב המסך
+    # פס תחתון לפידבק – התאמה דינמית לרוחב
     if feedback:
         bottom_h = int(h * 0.07)
         over = frame.copy()
         cv2.rectangle(over, (0, h-bottom_h), (w, h), (0, 0, 0), -1)
         frame = cv2.addWeighted(over, 0.55, frame, 0.45, 0)
-
         pil = Image.fromarray(frame)
         draw = ImageDraw.Draw(pil)
-        max_w = w - 2 * 12  # מרווחים משני הצדדים
-        # התאמת פונט דינמית כדי שלא יחרוג
-        fb_font = fit_text_to_width(draw, feedback, max_w, base_px=22, min_px=14)
+        max_w = w - 24  # מרווחים
+        fb_font = fit_text_to_width(draw, feedback, max_w, base_px=FEEDBACK_FONT_SIZE, min_px=14)
         tw = draw.textlength(feedback, font=fb_font)
         tx = (w - int(tw)) // 2
         ty = h - bottom_h + max(4, (bottom_h - fb_font.size) // 2)
@@ -150,7 +146,6 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
         frame = np.array(pil)
 
     return frame
-
 
 # ========= Depth smoother =========
 class DepthSmoother:
@@ -165,7 +160,8 @@ class DepthSmoother:
     def start_fade(self, seconds): self.hold_timer = 0.0; self.fade_timer = float(seconds)
     def update(self, dt):
         if self.hold_timer > 0:
-            self.hold_timer = max(0.0, self.hold_timer - dt); return self.display
+            self.hold_timer = max(0.0, self.hold_timer - dt)
+            return self.display
         if self.fade_timer > 0:
             if self.fade_timer <= dt:
                 self.display = 0.0; self.fade_timer = 0.0
@@ -177,10 +173,12 @@ class DepthSmoother:
         self.display += k * (self.target - self.display)
         return self.display
 
+# ========= Utils =========
 def _format_score_value(x: float):
     x = round(x * 2) / 2
     return int(x) if float(x).is_integer() else round(x, 1)
 
+# ========= Main =========
 def run_analysis(video_path, frame_skip=3, scale=0.4,
                  output_path="squat_output.mp4",
                  feedback_path="squat_feedback.txt"):
@@ -253,7 +251,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                         rep_min_knee_angle = 180.0
                     stage = "down"
 
-                # בזמן ירידה – יעד עומק לדונאט
+                # יעד עומק לדונאט בזמן ירידה
                 if stage == "down":
                     rep_min_knee_angle = min(rep_min_knee_angle, knee_angle)
                     if start_knee_angle is not None:
@@ -270,7 +268,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                     feedbacks = []
                     penalty = 0
 
-                    # עומק לפי hip->heel (פידבק בלבד)
+                    # עומק (hip->heel) לפידבק
                     hip_to_heel_dist = abs(hip[1] - heel_y)
                     if hip_to_heel_dist > 0.48:
                         feedbacks.append("Too shallow — squat lower"); penalty += 3
@@ -323,6 +321,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
     if out: out.release()
     cv2.destroyAllWindows()
 
+    # ========== תוצאות ==========
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0.0
     if any_feedback_session and technique_score == 10.0:
         technique_score = 9.5
@@ -331,7 +330,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
     if not overall_feedback:
         overall_feedback.append("Great form! Keep it up 💪")
 
-    # קובץ תקציר
+    # קובץ פידבק
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
             f.write(f"Total Reps: {counter}\n")
@@ -360,7 +359,7 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         output_path if os.path.exists(output_path) else ""
     )
 
-    # החזרה – בדיוק הסכימה שעובדת אצלך (בלי 'reps')
+    # ==== החזרה – סכימה שעובדת (אין 'reps') ====
     return {
         "technique_score": technique_score_display,
         "squat_count": counter,
@@ -371,4 +370,3 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         "video_path": final_video_path,
         "feedback_path": feedback_path
     }
-
