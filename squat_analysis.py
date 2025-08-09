@@ -438,14 +438,21 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
     except Exception:
         pass
 
-    return {
+
+          result = {
         "technique_score": technique_score_display,
         "squat_count": counter,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
         "feedback": overall_feedback,
         "problem_reps": problem_reps,
-        "video_path": encoded_path,
         "feedback_path": feedback_path
+    }
+
+    return {
+        "result": result,
+        "video_path": encoded_path
+    }
+
     }
 
