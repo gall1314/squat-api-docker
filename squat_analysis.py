@@ -425,12 +425,16 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                     f.write(f"- {fb}\n")
     except Exception:
         pass
-
+    # קידוד MP4 (faststart)
     encoded_path = output_path.replace(".mp4", "_encoded.mp4")
     try:
         subprocess.run([
-            "ffmpeg","-y","-i",output_path,
-            "-c:v","libx264","-preset","fast","-movflags","+faststart","-pix_fmt","yuv420p",
+            "ffmpeg", "-y",
+            "-i", output_path,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p",
             encoded_path
         ], check=False)
         if os.path.exists(output_path):
@@ -438,9 +442,9 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
     except Exception:
         pass
 
-
-          result = {
-        "technique_score": technique_score_display,
+    # החזרה בפורמט המקורי: result + video_path נפרד
+    result = {
+        "technique_score": technique_score_display,  # 10 / 9.5 / 9 / ...
         "squat_count": counter,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
@@ -453,6 +457,3 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         "result": result,
         "video_path": encoded_path
     }
-
-    }
-
