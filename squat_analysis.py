@@ -9,7 +9,7 @@ from PIL import ImageFont, ImageDraw, Image
 # ========= Fonts / Overlay =========
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
 REPS_FONT_SIZE = 28
-FEEDBACK_FONT_SIZE = 26     # גדול ואחיד (לא משתנה)
+FEEDBACK_FONT_SIZE = 22     # גדול ואחיד (לא משתנה)
 DEPTH_LABEL_FONT_SIZE = 14
 DEPTH_PCT_FONT_SIZE   = 18
 
@@ -111,70 +111,89 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
 # ========= Overlay =========
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     """
-    - פס עליון גדול שמכסה גם את הדונאט וגם את Reps
-    - הדונאט הונמך וממוקם כך שלא ייחתך (cy >= radius)
-    - פידבק: פונט גדול ואחיד; עיטוף שורות; גובה הפס התחתון דינמי
+    - פס שחור שקוף קבוע (רוחב וגובה קבועים) רק לאזור Reps – לא יקפוץ.
+    - הדונאט חופשי בצד ימין, בגודל קבוע לפי DONUT_BASE_FRAC, לא נחתך.
+    - פידבק למטה: עיטוף שורות + גובה דינמי.
     """
     h, w, _ = frame.shape
+    PADDING = 14
 
-    # פס עליון רחב שמכסה הכל
-    bar_h = int(h * 0.11)  # גבוה יותר כדי לכסות דונאט גדול
+    # ---------- פס עליון קבוע (לא דינמי) ----------
+    bar_h = int(h * TOP_BAR_HEIGHT_FRAC)
+    bar_w = int(w * TOP_BAR_WIDTH_FRAC)
+
     top = frame.copy()
-    cv2.rectangle(top, (0, 0), (w, bar_h), (0, 0, 0), -1)
-    frame = cv2.addWeighted(top, 0.55, frame, 0.45, 0)
+    cv2.rectangle(top, (0, 0), (bar_w, bar_h), (0, 0, 0), -1)
+    frame = cv2.addWeighted(top, TOP_BAR_ALPHA, frame, 1 - TOP_BAR_ALPHA, 0)
 
-    # Reps משמאל
+    # טקסט Reps בתוך הפס
     pil = Image.fromarray(frame)
-    ImageDraw.Draw(pil).text((16, int(bar_h * 0.26)), f"Reps: {reps}", font=REPS_FONT, fill=(255,255,255))
+    draw = ImageDraw.Draw(pil)
+    reps_text = f"Reps: {reps}"
+    rx = PADDING
+    ry = max(4, (bar_h - REPS_FONT.size) // 2)
+    draw.text((rx, ry), reps_text, font=REPS_FONT, fill=(255, 255, 255))
     frame = np.array(pil)
 
-    # דונאט בימין-עליון: מוודאים שלא ייחתך (cy >= radius)
-    margin = 12
-    radius = int(bar_h * DEPTH_RADIUS_SCALE)
+    # ---------- דונאט חופשי (לא מכוסה) ----------
+    # גודל קבוע יחסית לגובה הווידאו, בלי תלות ב-bar_h כדי שלא ישתנה
+    donut_base = int(h * DONUT_BASE_FRAC)
+    radius = int(donut_base * DEPTH_RADIUS_SCALE)
     thick  = max(3, int(radius * DEPTH_THICKNESS_FRAC))
+
+    margin = 12
     cx = w - margin - radius
-    cy = int(bar_h * 0.84)  # נמוך יותר; עם DEPTH_RADIUS_SCALE=0.70 נקבל cy >= radius
+
+    # מיקום בטוח: לא ייחתך מלמעלה (לפחות רדיוס + 2px)
+    cy_candidate = int(donut_base * 0.84)
+    cy = max(radius + 2, cy_candidate)
+
     frame = draw_depth_donut(frame, (cx, cy), radius, thick, depth_pct)
 
     # טקסטים בתוך הדונאט
     pil  = Image.fromarray(frame)
     draw = ImageDraw.Draw(pil)
     label_txt = "DEPTH"
-    pct_txt   = f"{int(depth_pct*100)}%"
+    pct_txt   = f"{int(depth_pct * 100)}%"
+
     gap    = max(2, int(radius * 0.10))
     block_h = DEPTH_LABEL_FONT_SIZE + gap + DEPTH_PCT_FONT_SIZE
     base_y  = cy - block_h // 2
+
     lw = draw.textlength(label_txt, font=DEPTH_LABEL_FONT)
     pw = draw.textlength(pct_txt,   font=DEPTH_PCT_FONT)
-    draw.text((cx - int(lw // 2), base_y),                            label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
+    draw.text((cx - int(lw // 2), base_y),                          label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
     draw.text((cx - int(pw // 2), base_y + DEPTH_LABEL_FONT_SIZE + gap), pct_txt,   font=DEPTH_PCT_FONT,   fill=(255,255,255))
     frame = np.array(pil)
 
-    # פס תחתון לפידבק – עיטוף לשורות, גובה דינמי
+    # ---------- פס תחתון לפידבק (עיטוף שורות) ----------
     if feedback:
         pil = Image.fromarray(frame)
         draw = ImageDraw.Draw(pil)
+
         max_w = w - 2 * 16
         lines = wrap_text_by_width(draw, feedback, FEEDBACK_FONT, max_w)
 
         line_h = FEEDBACK_FONT.size + 2
         needed_h = 10 + len(lines) * line_h + 10
-        bottom_h = max(int(h * 0.10), needed_h)  # גבוה יותר כברירת מחדל
+        bottom_h = max(int(h * 0.10), needed_h)
+
         over = np.array(pil).copy()
-        cv2.rectangle(over, (0, h-bottom_h), (w, h), (0, 0, 0), -1)
+        cv2.rectangle(over, (0, h - bottom_h), (w, h), (0, 0, 0), -1)
         frame = cv2.addWeighted(over, 0.55, np.array(pil), 0.45, 0)
 
         pil = Image.fromarray(frame)
         draw = ImageDraw.Draw(pil)
         y = h - bottom_h + (bottom_h - len(lines) * line_h) // 2
         for line in lines:
-            tw = draw.textlength(line, font=FEEDBACK_FONT)
-            tx = (w - int(tw)) // 2
-            draw.text((tx, y), line, font=FEEDBACK_FONT, fill=(255,255,255))
+            tw_line = draw.textlength(line, font=FEEDBACK_FONT)
+            tx = (w - int(tw_line)) // 2
+            draw.text((tx, y), line, font=FEEDBACK_FONT, fill=(255, 255, 255))
             y += line_h
         frame = np.array(pil)
 
     return frame
+
 
 # ========= Depth smoother =========
 class DepthSmoother:
