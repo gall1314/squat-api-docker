@@ -3,14 +3,13 @@ import mediapipe as mp
 import numpy as np
 import subprocess
 import os
-from collections import deque
 from utils import calculate_angle, calculate_body_angle
 from PIL import ImageFont, ImageDraw, Image
 
 # ========= Fonts =========
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
-REPS_FONT_SIZE = 24         # קריא ולא מוגזם
-FEEDBACK_FONT_SIZE = 24     # אחיד ונקי
+REPS_FONT_SIZE = 24         # קטן יותר
+FEEDBACK_FONT_SIZE = 24     # אחיד וקריא
 DEPTH_LABEL_FONT_SIZE = 14
 DEPTH_PCT_FONT_SIZE   = 18
 
@@ -26,11 +25,11 @@ DEPTH_LABEL_FONT = _load_font(DEPTH_LABEL_FONT_SIZE)
 DEPTH_PCT_FONT   = _load_font(DEPTH_PCT_FONT_SIZE)
 
 # ========= Top bar & Donut layout (קבועים) =========
-TOP_BAR_HEIGHT_FRAC = 0.09   # גובה הפס העליון (יחסי לגובה הווידאו)
+TOP_BAR_HEIGHT_FRAC = 0.09   # גובה הפס העליון
 TOP_BAR_WIDTH_FRAC  = 0.30   # רוחב הפס העליון (שמאל) – קבוע, לא קופץ
 TOP_BAR_ALPHA       = 0.55   # שקיפות
 
-DONUT_BASE_FRAC     = 0.11   # בסיס לגודל הדונאט מתוך גובה הווידאו (יציב)
+DONUT_BASE_FRAC     = 0.11   # בסיס גודל הדונאט מתוך גובה הווידאו
 
 # ========= Donut style =========
 DEPTH_RADIUS_SCALE   = 0.70
@@ -52,17 +51,6 @@ SKELETON_COLOR = (255,255,255)
 SKELETON_THICK = 2
 JOINT_RADIUS   = 3
 
-# ========= יציבות / דיבאונס =========
-VIS_THRESH          = 0.50  # נדרשת נראות מינימלית לנקודות עיקריות
-INIT_REQUIRE_TOP_FR = 8     # כמה פריימים בטופ לפני שמתחילים לספור
-KNEE_DOWN_TRIG      = 140   # כניסה לירידה
-KNEE_BOTTOM_ZONE    = 95    # אזור תחתית
-KNEE_UP_TRIG        = 165   # חזרה לטופ
-MIN_FRAMES_DOWN     = 3     # מינימום פריימים בירידה
-MIN_FRAMES_AT_TOP   = 2     # מינימום פריימים בטופ לסגירת חזרה
-ANGLE_SMOOTH_WIN    = 5     # חלון החלקת זוויות קצר
-
-# ========= ציור =========
 def draw_body_skeleton(frame, landmarks, w, h):
     for a, b in BODY_CONNECTIONS:
         if a < len(landmarks) and b < len(landmarks):
@@ -75,6 +63,7 @@ def draw_body_skeleton(frame, landmarks, w, h):
             cv2.circle(frame, (x, y), JOINT_RADIUS, SKELETON_COLOR, -1, cv2.LINE_AA)
     return frame
 
+# ========= Text helpers =========
 def fit_text_to_width(draw: ImageDraw.ImageDraw, text: str, max_width: int,
                       base_px: int, min_px: int) -> ImageFont.FreeTypeFont:
     size = int(base_px)
@@ -102,12 +91,13 @@ def wrap_text_by_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.Fre
                 lines.append(line)
                 line = w
             else:
-                lines.append(w)  # מילה ארוכה במיוחד
+                lines.append(w)  # מילה בודדת ארוכה
                 line = ""
     if line:
         lines.append(line)
     return lines
 
+# ========= Donut =========
 def draw_depth_donut(frame, center, radius, thickness, pct):
     pct = float(np.clip(pct, 0.0, 1.0))
     cx, cy = int(center[0]), int(center[1])
@@ -120,16 +110,17 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
                 DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
     return frame
 
+# ========= Overlay =========
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     """
-    - פס עליון קבוע (רוחב/גובה) מתחת ל-Reps בלבד (לא מכסה את הדונאט).
-    - הדונאט חופשי בצד ימין, בגודל יציב, לא נחתך.
+    - פס עליון קבוע (רוחב/גובה) מתחת ל-Reps בלבד.
+    - הדונאט חופשי בצד ימין, בגודל יציב, לא מכוסה ולא נחתך.
     - פידבק בתחתית: פונט אחיד + עיטוף שורות + גובה דינמי.
     """
     h, w, _ = frame.shape
     PADDING = 14
 
-    # פס עליון – קבוע
+    # --- פס עליון קבוע ---
     bar_h = int(h * TOP_BAR_HEIGHT_FRAC)
     bar_w = int(w * TOP_BAR_WIDTH_FRAC)
     top = frame.copy()
@@ -145,13 +136,14 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     draw.text((rx, ry), reps_text, font=REPS_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-    # דונאט חופשי
+    # --- דונאט חופשי ---
     donut_base = int(h * DONUT_BASE_FRAC)
     radius = int(donut_base * DEPTH_RADIUS_SCALE)
     thick  = max(3, int(radius * DEPTH_THICKNESS_FRAC))
+
     margin = 12
     cx = w - margin - radius
-    cy = max(radius + 2, int(donut_base * 0.84))  # לא נחתך מלמעלה
+    cy = max(radius + 2, int(donut_base * 0.84))  # בטוח לא נחתך
     frame = draw_depth_donut(frame, (cx, cy), radius, thick, depth_pct)
 
     # טקסטים בתוך הדונאט
@@ -168,7 +160,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     draw.text((cx - int(pw // 2), base_y + DEPTH_LABEL_FONT_SIZE + gap), pct_txt,   font=DEPTH_PCT_FONT,   fill=(255,255,255))
     frame = np.array(pil)
 
-    # פידבק בתחתית – עטיפת שורות
+    # --- פס תחתון לפידבק עם עיטוף שורות ---
     if feedback:
         pil = Image.fromarray(frame)
         draw = ImageDraw.Draw(pil)
@@ -194,7 +186,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
     return frame
 
-# ========= Smoothers =========
+# ========= Depth smoother =========
 class DepthSmoother:
     def __init__(self, tau_sec=DEPTH_SMOOTH_TAU_SEC):
         self.tau = float(tau_sec)
@@ -219,29 +211,6 @@ class DepthSmoother:
         self.display += k * (self.target - self.display)
         return self.display
 
-class LandmarkSmoother:
-    """EMA על נקודות שלד להפחתת רעש."""
-    def __init__(self, alpha=0.70):
-        self.alpha = float(alpha)
-        self.prev = None  # np.ndarray [N,2]
-    def apply(self, lm, w, h):
-        pts = np.array([[p.x * w, p.y * h] for p in lm], dtype=np.float32)
-        if self.prev is None:
-            self.prev = pts
-            return pts
-        smoothed = self.alpha * self.prev + (1.0 - self.alpha) * pts
-        self.prev = smoothed
-        return smoothed
-
-class AngleSmoother:
-    """מחליק ערכי זווית בחלון קצר כדי למנוע קפיצות."""
-    def __init__(self, win=ANGLE_SMOOTH_WIN):
-        self.win = int(max(1, win))
-        self.buf = deque(maxlen=self.win)
-    def push(self, val: float) -> float:
-        self.buf.append(float(val))
-        return float(np.mean(self.buf)) if len(self.buf) > 0 else float(val)
-
 # ========= Utils =========
 def _format_score_value(x: float):
     x = round(x * 2) / 2
@@ -260,26 +229,14 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
     all_scores, problem_reps, overall_feedback = [], [], []
     any_feedback_session = False
 
-    # מצב / דיבאונס
-    stage = "init"  # init -> top/down/bottom/up
-    frames_down = frames_top = 0
-    init_top_frames = 0
-    seen_bottom_in_rep = False
-
-    # החלקות
-    depth_smoother = DepthSmoother()
-    angle_smoother = AngleSmoother()
-    lmk_smoother   = LandmarkSmoother(alpha=0.70)
-
+    stage = None
     start_knee_angle = None
     rep_min_knee_angle = 180.0
     last_rep_feedback = []
+    depth_smoother = DepthSmoother()
     last_depth_for_ui = 0.0
 
-    # כתיבת וידאו
     out = None
-    frames_written = 0
-    last_size = None  # (w, h)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
@@ -304,29 +261,14 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                 last_depth_for_ui = depth_smoother.update(dt)
                 overlay_text = " | ".join(last_rep_feedback) if last_rep_feedback else None
                 frame = draw_overlay(frame, reps=counter, feedback=overlay_text, depth_pct=last_depth_for_ui)
-                out.write(frame); frames_written += 1
-                if last_size is None: last_size = (w, h)
+                out.write(frame)
                 continue
 
             try:
                 lm = results.pose_landmarks.landmark
-
-                # סנן לפי visibility – אם נקודות עיקריות חלשות, דלג (מונע “קפיצות”)
-                r = mp_pose.PoseLandmark
-                needed = [r.RIGHT_HIP.value, r.RIGHT_KNEE.value, r.RIGHT_ANKLE.value, r.RIGHT_SHOULDER.value]
-                if any(lm[i].visibility < VIS_THRESH for i in needed):
-                    last_depth_for_ui = depth_smoother.update(dt)
-                    overlay_text = " | ".join(last_rep_feedback) if last_rep_feedback else None
-                    frame = draw_overlay(frame, reps=counter, feedback=overlay_text, depth_pct=last_depth_for_ui)
-                    out.write(frame); frames_written += 1
-                    if last_size is None: last_size = (w, h)
-                    continue
-
-                # ציור שלד (אפשר לשלב pts מהחלקת נקודות למסך בהמשך אם תרצה)
-                pts = lmk_smoother.apply(lm, w, h)
                 frame = draw_body_skeleton(frame, lm, w, h)
 
-                # נקודות
+                r = mp_pose.PoseLandmark
                 hip      = [lm[r.RIGHT_HIP.value].x,      lm[r.RIGHT_HIP.value].y]
                 knee     = [lm[r.RIGHT_KNEE.value].x,     lm[r.RIGHT_KNEE.value].y]
                 ankle    = [lm[r.RIGHT_ANKLE.value].x,    lm[r.RIGHT_ANKLE.value].y]
@@ -334,135 +276,84 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
                 heel_y   = lm[r.RIGHT_HEEL.value].y
                 foot_y   = lm[r.RIGHT_FOOT_INDEX.value].y
 
-                # זוויות + החלקת זווית ברך
-                knee_angle_raw = calculate_angle(hip, knee, ankle)
-                knee_angle = angle_smoother.push(knee_angle_raw)
+                knee_angle = calculate_angle(hip, knee, ankle)
                 back_angle = calculate_angle(shoulder, hip, knee)
                 body_angle = calculate_body_angle(shoulder, hip)
                 heel_lifted = (foot_y - heel_y) > 0.03
 
-                # ===== מכונת מצבים עם דיבאונס / Warm-up =====
-                if stage == "init":
-                    if knee_angle > KNEE_UP_TRIG:
-                        init_top_frames += 1
-                        if init_top_frames >= INIT_REQUIRE_TOP_FR:
-                            stage = "top"
-                            frames_top = 0
-                    else:
-                        init_top_frames = 0
-
-                elif stage == "top":
-                    frames_top += 1
-                    if knee_angle < KNEE_DOWN_TRIG:
-                        stage = "down"
-                        frames_down = 0
-                        seen_bottom_in_rep = False
+                # התחלת ירידה
+                if knee_angle < 90:
+                    if stage != "down":
                         last_rep_feedback = []
                         start_knee_angle = float(knee_angle)
                         rep_min_knee_angle = 180.0
+                    stage = "down"
 
-                elif stage == "down":
-                    frames_down += 1
+                # יעד עומק לדונאט בזמן ירידה
+                if stage == "down":
                     rep_min_knee_angle = min(rep_min_knee_angle, knee_angle)
-                    # יעד עומק לדונאט
                     if start_knee_angle is not None:
                         denom = max(10.0, (start_knee_angle - PERFECT_MIN_KNEE))
                         depth_target = float(np.clip((start_knee_angle - rep_min_knee_angle) / denom, 0, 1))
                         depth_smoother.set_target(depth_target)
-                    if knee_angle <= KNEE_BOTTOM_ZONE:
-                        stage = "bottom"
-                        seen_bottom_in_rep = True
-
-                elif stage == "bottom":
-                    if knee_angle > KNEE_BOTTOM_ZONE + 5:
-                        stage = "up"
-                        frames_top = 0  # נאסוף שוב בטופ
-
-                elif stage == "up":
-                    if knee_angle > KNEE_UP_TRIG:
-                        frames_top += 1
-                        if frames_down >= MIN_FRAMES_DOWN and seen_bottom_in_rep and frames_top >= MIN_FRAMES_AT_TOP:
-                            # ===== סיום חזרה =====
-                            feedbacks = []
-                            penalty = 0
-
-                            # עומק לפידבק (hip->heel)
-                            hip_to_heel_dist = abs(hip[1] - heel_y)
-                            if hip_to_heel_dist > 0.48:
-                                feedbacks.append("Too shallow — squat lower"); penalty += 3
-                            elif hip_to_heel_dist > 0.45:
-                                feedbacks.append("Almost there — go a bit lower"); penalty += 1.5
-                            elif hip_to_heel_dist > 0.43:
-                                feedbacks.append("Looking good — just a bit more depth"); penalty += 0.5
-
-                            if back_angle < 140:
-                                feedbacks.append("Try to straighten your back more at the top"); penalty += 1
-                            if heel_lifted:
-                                feedbacks.append("Keep your heels down"); penalty += 1
-                            if knee_angle < KNEE_UP_TRIG:
-                                feedbacks.append("Incomplete lockout"); penalty += 1
-
-                            # ניקוד
-                            if not feedbacks:
-                                score = 10.0
-                            else:
-                                any_feedback_session = True
-                                penalty = min(penalty, 6)
-                                score = round(max(4, 10 - penalty) * 2) / 2
-
-                            # פידבק לסשן ולמסך
-                            for f in feedbacks:
-                                if f not in overall_feedback: overall_feedback.append(f)
-                            last_rep_feedback = feedbacks[:]
-
-                            # אפקט דונאט
-                            depth_smoother.peak_hold(DEPTH_PEAK_HOLD_SEC)
-                            depth_smoother.start_fade(DEPTH_FADE_SEC)
-                            start_knee_angle = None
-
-                            # מונים
-                            counter += 1
-                            if score >= 9.5: good_reps += 1
-                            else:
-                                bad_reps += 1
-                                problem_reps.append(counter)
-                            all_scores.append(score)
-
-                            # חוזרים לטופ
-                            stage = "top"
-                            frames_down = frames_top = 0
-                    else:
-                        frames_top = 0  # עדיין לא בטופ
 
                 # עדכון הדונאט בכל פריים
                 last_depth_for_ui = depth_smoother.update(dt)
+
+                # סוף חזרה: עלייה מעל 160 אחרי ירידה
+                if knee_angle > 160 and stage == "down":
+                    stage = "up"
+                    feedbacks = []
+                    penalty = 0
+
+                    # עומק (hip->heel) לפידבק
+                    hip_to_heel_dist = abs(hip[1] - heel_y)
+                    if hip_to_heel_dist > 0.48:
+                        feedbacks.append("Too shallow — squat lower"); penalty += 3
+                    elif hip_to_heel_dist > 0.45:
+                        feedbacks.append("Almost there — go a bit lower"); penalty += 1.5
+                    elif hip_to_heel_dist > 0.43:
+                        feedbacks.append("Looking good — just a bit more depth"); penalty += 0.5
+
+                    if back_angle < 140:
+                        feedbacks.append("Try to straighten your back more at the top"); penalty += 1
+                    if heel_lifted:
+                        feedbacks.append("Keep your heels down"); penalty += 1
+                    if knee_angle < 160:
+                        feedbacks.append("Incomplete lockout"); penalty += 1
+
+                    if not feedbacks:
+                        score = 10.0
+                    else:
+                        any_feedback_session = True
+                        penalty = min(penalty, 6)
+                        score = round(max(4, 10 - penalty) * 2) / 2
+
+                    for f in feedbacks:
+                        if f not in overall_feedback: overall_feedback.append(f)
+                    last_rep_feedback = feedbacks[:]
+
+                    depth_smoother.peak_hold(DEPTH_PEAK_HOLD_SEC)
+                    depth_smoother.start_fade(DEPTH_FADE_SEC)
+                    start_knee_angle = None
+
+                    counter += 1
+                    if score >= 9.5: good_reps += 1
+                    else:
+                        bad_reps += 1
+                        problem_reps.append(counter)
+                    all_scores.append(score)
 
             except Exception:
                 pass
 
             overlay_text = " | ".join(last_rep_feedback) if last_rep_feedback else None
             frame = draw_overlay(frame, reps=counter, feedback=overlay_text, depth_pct=last_depth_for_ui)
-            out.write(frame); frames_written += 1
-            if last_size is None: last_size = (w, h)
+            out.write(frame)
 
     cap.release()
     if out: out.release()
     cv2.destroyAllWindows()
-
-    # אם לא נכתב אף פריים – נייצר פלייסהולדר MP4 שחור קצר כדי למנוע "מסך אפור"
-    if frames_written == 0:
-        try:
-            if last_size is None:
-                last_size = (640, 360)
-            w_ph, h_ph = last_size
-            placeholder_path = output_path  # אותו נתיב שה‑UI מצפה לו
-            fourcc_ph = cv2.VideoWriter_fourcc(*'mp4v')
-            vw = cv2.VideoWriter(placeholder_path, fourcc_ph, 10, (w_ph, h_ph))
-            black = np.zeros((h_ph, w_ph, 3), dtype=np.uint8)
-            vw.write(black)
-            vw.release()
-        except Exception:
-            pass
 
     # ========== תוצאות ==========
     technique_score = round(np.mean(all_scores) * 2) / 2 if all_scores else 0.0
@@ -485,65 +376,32 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
     except Exception:
         pass
 
-    # קידוד MP4 (faststart) בטוח
+    # קידוד MP4 (faststart) + Fallback בטוח
     encoded_path = output_path.replace(".mp4", "_encoded.mp4")
     try:
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            subprocess.run([
-                "ffmpeg","-y","-i",output_path,
-                "-c:v","libx264","-preset","fast","-movflags","+faststart","-pix_fmt","yuv420p",
-                encoded_path
-            ], check=False)
-            if os.path.exists(encoded_path) and os.path.getsize(encoded_path) > 0:
-                try:
-                    os.remove(output_path)
-                except Exception:
-                    pass
+        subprocess.run([
+            "ffmpeg","-y","-i",output_path,
+            "-c:v","libx264","-preset","fast","-movflags","+faststart","-pix_fmt","yuv420p",
+            encoded_path
+        ], check=False)
+        if os.path.exists(encoded_path):
+            if os.path.exists(output_path): os.remove(output_path)
     except Exception:
         pass
 
-    # בחירת נתיב סופי שקיים בפועל
-    if os.path.exists(encoded_path) and os.path.getsize(encoded_path) > 0:
-        final_video_path = encoded_path
-    elif os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-        final_video_path = output_path
-    else:
-        final_video_path = ""  # לא אמור לקרות בזכות הפלייסהולדר
+    final_video_path = encoded_path if os.path.exists(encoded_path) else (
+        output_path if os.path.exists(output_path) else ""
+    )
 
-    # ==== החזרה – קומפטביליות מלאה (ללא numpy), אותה סכימה ====
-    def _py(x):
-        if isinstance(x, np.generic):
-            return x.item()
-        return x
-
-    _ts = _py(technique_score_display)
-    # שמירה על ההתנהגות: int כשהמספר שלם, אחרת float
-    if float(_ts).is_integer():
-        _ts = int(_ts)
-    else:
-        _ts = float(_ts)
-
-    payload = {
-        "technique_score": _ts,                                  # int או float
-        "squat_count": int(_py(counter)),
-        "good_reps": int(_py(good_reps)),
-        "bad_reps": int(_py(bad_reps)),
-        "feedback": [str(s) for s in (overall_feedback or [])],
-        "problem_reps": [int(_py(i)) for i in (problem_reps or [])],
-        "video_path": str(final_video_path or ""),
-        "feedback_path": str(feedback_path or ""),
+    # ==== החזרה – סכימה שעובדת ====
+    return {
+        "technique_score": technique_score_display,
+        "squat_count": counter,
+        "good_reps": good_reps,
+        "bad_reps": bad_reps,
+        "feedback": overall_feedback,
+        "problem_reps": problem_reps,
+        "video_path": final_video_path,
+        "feedback_path": feedback_path
     }
-
-    # דיאגנוסטיקה ללוג (בטוח)
-    try:
-        print("ANALYSIS_PAYLOAD_TYPES", {k: type(v).__name__ for k, v in payload.items()})
-        print("ANALYSIS_PAYLOAD_LENS", {
-            "feedback": len(payload["feedback"]),
-            "problem_reps": len(payload["problem_reps"]),
-            "video_path_len": len(payload["video_path"]),
-        })
-    except Exception:
-        pass
-
-    return payload
 
