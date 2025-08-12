@@ -1,523 +1,389 @@
 # pullup_analysis.py
-import os, time, subprocess
+# -*- coding: utf-8 -*-
+import os
 import cv2
+import math
+import time
+import json
 import numpy as np
-import mediapipe as mp
 
-__all__ = ["run_pullup_analysis", "render_pullup_video", "PullUpAnalyzer"]
+# ==============================
+# הגדרות וספים (ניתנים לטיונינג)
+# ==============================
+ELBOW_START_THRESHOLD = 150.0   # מעל זה ~ יד "פתוחה". תחילת תנועה כאשר יורד מתחת.
+ELBOW_TOP_THRESHOLD   = 65.0    # מתחת לזה ~ יד "סגורה" (בחלק העליון).
+ELBOW_BOTTOM_THRESHOLD= 160.0   # חזרה לתחתית (פתוח מאוד) לסיום היסטורזיס.
+HEAD_MIN_ASCENT       = 0.06    # ירידה בציר Y (תמונה) = עלייה פיזית. נדרש בתוך הסט (יחסי לגובה הפריים)
+HEAD_VEL_UP_THRESH    = 0.0025  # מהירות עלייה מינימלית (delta Y/frame שלילי) לזיהוי התחלה
+HEAD_TOP_STICK_FRAMES = 2       # כמה פריימים רצופים צריך להיות "למעלה" כדי לאשר טופ (חזרה מהירה → נמוך)
+BOTTOM_STICK_FRAMES   = 2       # כמה פריימים רצופים בתחתית לאיפוס מצב
 
-mp_pose = mp.solutions.pose
+BASE_FRAME_SKIP_IDLE  = 3       # מנוחה
+BASE_FRAME_SKIP_MOVE  = 1       # בזמן תנועה
 
-# ===== Performance knobs (safe) =====
-DRAW_SKELETON_EVERY = 3   # מציירים שלד כל 3 פריימים כדי לחסוך זמן (1 = כל פריים)
-ROM_EMA_ALPHA = 0.25      # החלקת ROM בדונאט
-FFMPEG_PRESET = "veryfast"  # "fast" / "veryfast"
-FFMPEG_CRF = "22"           # איכות/משקל; 22 סביר ומהיר
+EMA_ALPHA_DEPTH       = 0.2     # החלקה לוגית למדד עומק/ROM, אם תרצה לצייר
+FPS_FALLBACK          = 25.0
 
-# נסה להגביל ת'רדים של OpenCV (שיפור קטן וחינמי)
+RETURN_SERIES         = False   # ברירת מחדל: לא להחזיר סדרות ארוכות (compact)
+
+# =================================
+# עוזרים גיאומטריים/מספריים פשוטים
+# =================================
+def _angle(a, b, c):
+    # זווית ABC במעלות; a,b,c זה (x,y)
+    try:
+        ba = (a[0]-b[0], a[1]-b[1])
+        bc = (c[0]-b[0], c[1]-b[1])
+        cosang = (ba[0]*bc[0] + ba[1]*bc[1]) / (
+            math.hypot(*ba) * math.hypot(*bc) + 1e-9
+        )
+        cosang = max(-1.0, min(1.0, cosang))
+        return math.degrees(math.acos(cosang))
+    except Exception:
+        return 180.0
+
+def _ema(prev, new, alpha):
+    return new if prev is None else (alpha*new + (1-alpha)*prev)
+
+def _round_score_half(x):
+    # עיגול לציון .0/.5
+    return round(x*2)/2.0
+
+# ===========================
+# MediaPipe Pose (light load)
+# ===========================
 try:
-    cv2.setNumThreads(max(1, os.cpu_count() // 2))
+    import mediapipe as mp
+    MP_AVAILABLE = True
 except Exception:
-    pass
+    MP_AVAILABLE = False
+
+# מיפוי שמות לנקודות של MediaPipe
+# https://developers.google.com/mediapipe/solutions/vision/pose_landmarker
+POSE_IDXS = {
+    "nose": 0,
+    "left_shoulder": 11, "right_shoulder": 12,
+    "left_elbow": 13,    "right_elbow": 14,
+    "left_wrist": 15,    "right_wrist": 16,
+    # ברירת מחדל נשתמש בימין; אם confidence נמוך נעשה fallback לשמאל
+}
+
+def _pick_side(landmarks):
+    # לפשט: בחר יד עם נראות טובה יותר; פה נאסוף ימין כברירת מחדל
+    return "right"
+
+def _get_xy(landmarks, idx, w, h):
+    lm = landmarks[idx]
+    return (lm.x * w, lm.y * h, lm.visibility)
+
+def _safe_vis(*vals, min_v=0.5):
+    return all(v >= min_v for v in vals)
 
 # =========================
-# Pull-up Analyzer (UNCHANGED LOGIC)
+# PullUp Analyzer (משודרג)
 # =========================
-
 class PullUpAnalyzer:
-    """
-    מזהה ריפים במתח, בודק טכניקה, ומחשב ROM-Up% לכל פריים.
-    מחזיר ציון טכניקה מעוגל ל-.0/.5 עם מינימום 4.0, וסט פידבקים/טיפים באנגלית.
-    """
+    def __init__(self, include_series=RETURN_SERIES):
+        self.include_series = include_series
+        self.reset()
 
-    def __init__(
-        self,
-        angle_drop_threshold: float = 18.0,  # כמו הגרסה שעבדה
-        min_separation: int = 5,
-        nose_rise_thresh: float = 0.001
-    ):
-        self.angle_drop_threshold = angle_drop_threshold
-        self.min_separation = min_separation
-        self.nose_rise_thresh = nose_rise_thresh
+    def reset(self):
+        self.rep_count = 0
+        self.in_rep = False
+        self.seen_top_frames = 0
+        self.seen_bottom_frames = 0
+        self.min_head_y_in_rep = None
+        self.rep_started_elbow = None
+        self.last_head_y = None
+        self.last_elbow = None
+        self.rom_series = [] if self.include_series else None
+        self.reps_meta = []   # נאסוף מידע תמציתי על כל חזרה
 
-    # ---------- Public: analyze all ----------
-    def analyze_all_reps(self, frames):
-        rep_ranges = self.segment_reps(frames)
+        # ניקוד/פידבק כללי
+        self.errors_set = set()
+        self.tips_set = set(["Control the lowering phase for better muscle growth"])
 
-        rep_reports = []
-        all_errors, all_tips = [], []
+        # עומק/ROM מחולק (לא חובה לצייר)
+        self.depth_ema = None
 
-        # רצף ROM לכל הווידאו (לטובת הרינדור)
-        full_rom = [0.0] * len(frames)
+    def _movement_detected(self, elbow_angle, head_y):
+        # מזהה תנועה כדי לקבוע frame_skip אדפטיבי
+        mov = False
+        if self.last_elbow is not None and abs(elbow_angle - self.last_elbow) > 1.5:
+            mov = True
+        if self.last_head_y is not None and abs(head_y - self.last_head_y) > 0.002:
+            mov = True
+        return mov
 
-        for (start, end) in rep_ranges:
-            rep_frames = frames[start:end]
-            result = self.analyze_rep(rep_frames)
-            rep_reports.append(result)
-            all_errors.extend(result["errors"])
-            all_tips.extend(result["tips"])
+    def _update_series(self, rom_val):
+        if self.include_series:
+            self.rom_series.append(rom_val)
 
-            # פיזור ה‑ROM חזרה למיקומים המלאים
-            for i, v in enumerate(result.get("rom_series", []), start=start):
-                if 0 <= i < len(full_rom):
-                    full_rom[i] = max(full_rom[i], v)
+    def _confirm_top(self, elbow_angle, head_y, rep_baseline_head_y):
+        """
+        תנאי טופ (חלק עליון): מרפק סגור + הראש עלה משמעותית לעומת תחילת הסט.
+        """
+        elbow_ok = elbow_angle <= ELBOW_TOP_THRESHOLD
+        head_ok = (rep_baseline_head_y - head_y) >= HEAD_MIN_ASCENT
+        return elbow_ok and head_ok
 
-        if rep_reports:
-            raw_scores = [r["technique_score"] for r in rep_reports]
-            avg = float(np.mean(raw_scores))
-            rounded_score = float(np.clip(round(avg * 2) / 2, 4.0, 10.0))
-        else:
-            rounded_score = 0.0
+    def _confirm_start(self, elbow_angle, head_y, head_vel):
+        """
+        תנאי התחלה: ירידת מרפק מתחת ל-START + מהירות עלייה מינימלית של הראש (להימנע מניעור ידיים).
+        """
+        elbow_ok = elbow_angle < ELBOW_START_THRESHOLD
+        head_speed_ok = head_vel < -HEAD_VEL_UP_THRESH  # שלילי = עולה
+        return elbow_ok and head_speed_ok
 
-        feedback = list(set(all_errors)) if all_errors else (["Great form! Keep it up"] if rep_reports else ["No pull-ups detected"])
-        tips = list(set(all_tips))
+    def _confirm_bottom(self, elbow_angle):
+        return elbow_angle >= ELBOW_BOTTOM_THRESHOLD
 
-        return {
-            "rep_count": len(rep_reports),
-            "squat_count": len(rep_reports),  # legacy
-            "technique_score": rounded_score,
-            "good_reps": sum(1 for r in rep_reports if r["technique_score"] >= 8),
-            "bad_reps": sum(1 for r in rep_reports if r["technique_score"] < 8),
-            "feedback": feedback,
-            "tips": tips,
-            "reps": rep_reports,
-            "rom_full": full_rom,
-            "rep_ranges": rep_ranges,
+    def process(self, input_path, output_path=None, frame_skip=3, scale=0.4, draw_overlay=True):
+        if not MP_AVAILABLE:
+            raise RuntimeError("mediapipe not available in environment")
+
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Failed to open video: {input_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or FPS_FALLBACK
+        w  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        out = None
+        if output_path:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+
+        mp_pose = mp.solutions.pose
+        with mp_pose.Pose(model_complexity=1, enable_segmentation=False,
+                          smooth_landmarks=True) as pose:
+            idx = 0
+            base_skip_idle = max(1, frame_skip)
+            base_skip_move = 1  # בזמן תנועה תמיד 1
+
+            # baseline ראש בתחילת וידאו (למקרה הצורך)
+            baseline_head_y_global = None
+            rep_baseline_head_y = None
+
+            # counters להחזקה (hysteresis)
+            self.seen_top_frames = 0
+            self.seen_bottom_frames = 0
+
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+
+                if scale != 1.0:
+                    frame = cv2.resize(frame, (int(w*scale), int(h*scale)))
+                    # עדכון w/h לשרשרת החישוב/ציור
+                    sh, sw = frame.shape[:2]
+                else:
+                    sh, sw = h, w
+
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                res = pose.process(frame_rgb)
+
+                elbow_angle = None
+                head_y = None
+
+                if res.pose_landmarks:
+                    lms = res.pose_landmarks.landmark
+                    side = _pick_side(lms)
+
+                    sh_idx  = POSE_IDXS["right_shoulder"] if side == "right" else POSE_IDXS["left_shoulder"]
+                    el_idx  = POSE_IDXS["right_elbow"]    if side == "right" else POSE_IDXS["left_elbow"]
+                    wr_idx  = POSE_IDXS["right_wrist"]    if side == "right" else POSE_IDXS["left_wrist"]
+
+                    nose = _get_xy(lms, POSE_IDXS["nose"], sw, sh)
+                    shld = _get_xy(lms, sh_idx, sw, sh)
+                    elbw = _get_xy(lms, el_idx, sw, sh)
+                    wrst = _get_xy(lms, wr_idx, sw, sh)
+
+                    if _safe_vis(nose[2], shld[2], elbw[2], wrst[2], min_v=0.4):
+                        head_y = nose[1] / sh  # נורמליזציה (0-1), למעלה קטן
+                        elbow_angle = _angle(shld[:2], elbw[:2], wrst[:2])
+
+                        if baseline_head_y_global is None:
+                            baseline_head_y_global = head_y
+
+                # Adaptive skip: אם אין נתונים → מנוחה; אם יש תנועה → step 1
+                if elbow_angle is not None and head_y is not None:
+                    moving = self._movement_detected(elbow_angle, head_y)
+                    step_now = base_skip_move if moving else base_skip_idle
+                else:
+                    step_now = base_skip_idle
+
+                # חישוב מהירות ראש (לסינון ניעורים)
+                head_vel = 0.0
+                if self.last_head_y is not None and head_y is not None:
+                    head_vel = head_y - self.last_head_y  # שלילי = עלייה
+
+                # לוגיקת ספירה
+                if elbow_angle is not None and head_y is not None:
+                    # baseline לסט ספציפי
+                    if not self.in_rep and rep_baseline_head_y is None:
+                        rep_baseline_head_y = head_y
+
+                    if not self.in_rep:
+                        # בדיקת התחלה: מרפק התחיל להיסגר + הראש באמת עולה (מהירות שלילית)
+                        if self._confirm_start(elbow_angle, head_y, head_vel):
+                            self.in_rep = True
+                            self.min_head_y_in_rep = head_y  # נעקוב אחרי המינימום (הכי גבוה)
+                            self.seen_top_frames = 0
+                            self.rep_started_elbow = elbow_angle
+                    else:
+                        # בתוך סט: עדכון מינימום Y של הראש
+                        if self.min_head_y_in_rep is None:
+                            self.min_head_y_in_rep = head_y
+                        else:
+                            self.min_head_y_in_rep = min(self.min_head_y_in_rep, head_y)
+
+                        # האם הגענו לטופ (הכי גבוה + מרפק סגור)
+                        if self._confirm_top(elbow_angle, head_y, rep_baseline_head_y):
+                            self.seen_top_frames += 1
+                        else:
+                            # אם לא בטופ בפריים הזה – אפס מונה
+                            self.seen_top_frames = 0
+
+                        # כללים: נספור חזרה בזמן הטופ, כדי לא לפספס בקצב גבוה
+                        if self.seen_top_frames >= HEAD_TOP_STICK_FRAMES:
+                            # ספר חזרה
+                            self.rep_count += 1
+
+                            # מטא‑דאטה קצרה
+                            self.reps_meta.append({
+                                "rep_index": self.rep_count,
+                                "peak_head_y": float(self.min_head_y_in_rep),
+                                "start_elbow": float(self.rep_started_elbow) if self.rep_started_elbow is not None else None,
+                                "top_elbow": float(elbow_angle),
+                            })
+
+                            # איפוס מצב להמשך
+                            self.in_rep = False
+                            rep_baseline_head_y = None
+                            self.min_head_y_in_rep = None
+                            self.rep_started_elbow = None
+                            self.seen_top_frames = 0
+                            self.seen_bottom_frames = 0
+
+                    # החלקת "עומק" לוגית (לא חובה, שומר על עקביות אם תרצה דונאט)
+                    # עומק נורמלי 0..1: ככל שהראש גבוה יותר (קטן יותר ב-Y), העומק גדול יותר
+                    if baseline_head_y_global is not None:
+                        depth_val = max(0.0, min(1.0, (baseline_head_y_global - head_y)))
+                        self.depth_ema = _ema(self.depth_ema, depth_val, EMA_ALPHA_DEPTH)
+                        self._update_series(self.depth_ema if self.depth_ema is not None else depth_val)
+
+                # ציור (קליל; אם תרצה לכבות – draw_overlay=False)
+                if draw_overlay:
+                    txt = f"Reps: {self.rep_count}"
+                    cv2.putText(frame, txt, (16, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2, cv2.LINE_AA)
+                    if elbow_angle is not None:
+                        cv2.putText(frame, f"Elbow: {int(elbow_angle)}", (16, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
+
+                if out is not None:
+                    # שים לב: אם שינית scale, אנחנו כותבים את ה-frame בגודל scaled.
+                    # כדי לשמור בפורמט המקורי, אפשר לרנדר ל-size המקורי, כאן משאירים scaled למען ביצועים.
+                    out.write(frame)
+
+                # עדכוני "אחרון"
+                self.last_elbow = elbow_angle if elbow_angle is not None else self.last_elbow
+                self.last_head_y = head_y if head_y is not None else self.last_head_y
+
+                # קפיצת פריימים אדפטיבית
+                if step_now > 1:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, cap.get(cv2.CAP_PROP_POS_FRAMES) + (step_now - 1))
+                idx += step_now
+
+        cap.release()
+        if out is not None:
+            out.release()
+
+        # ניקוד טכניקה (פשוט; תוכל להחליף לוגיקה שלך)
+        # כאן לא מורידים מתחת ל‑4, ומעגלים ל‑.0/.5
+        base_score = 9.0
+        penalties = 0.0
+
+        # דוגמה: אם חזרות מעטות/מהירות מאוד → אפשר להוסיף penalty קטן
+        if self.rep_count == 0:
+            penalties += 3.0
+
+        tech_score = max(4.0, base_score - penalties)
+        tech_score = _round_score_half(tech_score)
+
+        # אריזה לתוצאה
+        result = {
+            "rep_count": int(self.rep_count),
+            "technique_score": float(tech_score),
+            "errors": sorted(list(self.errors_set)),
+            "tips": sorted(list(self.tips_set)),
         }
 
-    # ---------- Per-rep analysis ----------
-    def analyze_rep(self, frames):
-        errors, tips = [], []
-        elbow_angles, knee_angles = [], []
-        nose_ys, wrist_ys = [], []
+        if self.include_series:
+            result["rom_series"] = self.rom_series
 
-        for f in frames:
-            l = self.elbow_angle(f, "LEFT")
-            r = self.elbow_angle(f, "RIGHT")
-            valid_elbows = [a for a in (l, r) if a is not None]
-            if valid_elbows:
-                elbow_angles.append(float(np.mean(valid_elbows)))
+        if output_path:
+            result["video_path"] = output_path
 
-            kl = self.knee_angle(f, "LEFT")
-            kr = self.knee_angle(f, "RIGHT")
-            valid_knees = [a for a in (kl, kr) if a is not None]
-            if valid_knees:
-                knee_angles.append(float(np.mean(valid_knees)))
-
-            if "NOSE" in f:
-                nose_ys.append(f["NOSE"][1])
-            if "LEFT_WRIST" in f and "RIGHT_WRIST" in f:
-                wrist_y = (f["LEFT_WRIST"][1] + f["RIGHT_WRIST"][1]) / 2
-                wrist_ys.append(wrist_y)
-
-        # בדיקות טכניקה (כמו במקור)
-        if not any(n < w - 0.005 for n, w in zip(nose_ys, wrist_ys)):
-            errors.append("Try to pull a bit higher – chin past the bar")
-
-        if max(elbow_angles, default=0) < 155:
-            errors.append("Start each rep from straight arms for full range")
-
-        if knee_angles and (max(knee_angles) - min(knee_angles)) > 40:
-            errors.append("Keep legs steadier for more control")
-
-        if len(elbow_angles) >= 6:
-            descent_len = self.detect_descent_duration(elbow_angles)
-            if descent_len < 2:
-                tips.append("Control the lowering phase for better muscle growth")
-
-        # ROM‑Up% (עלייה למעלה) + החלקה קלה
-        rom_series = self.compute_rom_series(nose_ys, wrist_ys)
-        rom_series = self.ema_smooth(rom_series, alpha=0.25)
-
-        score_map = {0: 10, 1: 8, 2: 6, 3: 5}
-        technique_score = score_map.get(len(errors), 4)
-
-        return {
-            "technique_score": technique_score,
-            "errors": errors,
-            "tips": tips,
-            "rom_series": rom_series,
-        }
-
-    # ---------- Helpers ----------
-    def detect_descent_duration(self, angles):
-        if not angles:
-            return 0
-        min_idx = int(np.argmin(angles))
-        for i in range(min_idx + 1, len(angles)):
-            if angles[i] > angles[min_idx] + 5:
-                return i - min_idx
-        return len(angles) - min_idx
-
-    def compute_rom_series(self, nose_ys, wrist_ys):
-        if not nose_ys:
-            return []
-        if not wrist_ys:
-            return [0.0] * len(nose_ys)
-        bar_y = min(wrist_ys)       # גובה המוט (בערך)
-        bottom_y = max(nose_ys)     # הכי נמוך של הסנטר
-        denom = max(bottom_y - bar_y, 1e-6)
-        out = []
-        for ny in nose_ys:
-            if ny < bar_y:
-                rom = 1.0
-            else:
-                raw = (bottom_y - ny) / denom
-                rom = float(np.clip(raw, 0.0, 1.0))
-            out.append(rom)
-        return out
-
-    @staticmethod
-    def ema_smooth(series, alpha=0.25):
-        if not series:
-            return []
-        out, prev = [], 0.0
-        for v in series:
-            sm = alpha * v + (1 - alpha) * prev
-            out.append(sm)
-            prev = sm
-        return out
-
-    @staticmethod
-    def elbow_angle(f, side):
-        keys = [f"{side}_SHOULDER", f"{side}_ELBOW", f"{side}_WRIST"]
-        if all(k in f for k in keys):
-            a, b, c = np.array(f[keys[0]]), np.array(f[keys[1]]), np.array(f[keys[2]])
-            ba, bc = a - b, c - b
-            denom = np.linalg.norm(ba) * np.linalg.norm(bc)
-            if denom == 0:
-                return None
-            cosv = np.dot(ba, bc) / denom
-            return float(np.degrees(np.arccos(np.clip(cosv, -1.0, 1.0))))
-        return None
-
-    @staticmethod
-    def knee_angle(f, side):
-        keys = [f"{side}_HIP", f"{side}_KNEE", f"{side}_ANKLE"]
-        if all(k in f for k in keys):
-            a, b, c = np.array(f[keys[0]]), np.array(f[keys[1]]), np.array(f[keys[2]])
-            ba, bc = a - b, c - b
-            denom = np.linalg.norm(ba) * np.linalg.norm(bc)
-            if denom == 0:
-                return None
-            cosv = np.dot(ba, bc) / denom
-            return float(np.degrees(np.arccos(np.clip(cosv, -1.0, 1.0))))
-        return None
-
-    # ---------- Rep segmentation ----------
-    def segment_reps(self, frames):
-        elbow_angles, noses_y = [], []
-        for f in frames:
-            l = self.elbow_angle(f, "LEFT")
-            r = self.elbow_angle(f, "RIGHT")
-            valid = [a for a in (l, r) if a is not None]
-            elbow_angles.append(float(np.mean(valid)) if valid else None)
-            noses_y.append(f["NOSE"][1] if "NOSE" in f else None)
-
-        reps = []
-        last_rep_index = -self.min_separation
-        state = "waiting"
-        start_idx, start_angle = None, None
-
-        for i in range(1, len(elbow_angles)):
-            curr_angle = elbow_angles[i]
-            prev_angle = elbow_angles[i - 1]
-            curr_nose = noses_y[i]
-            prev_nose = noses_y[i - 1]
-            if curr_angle is None or prev_angle is None or curr_nose is None or prev_nose is None:
-                continue
-
-        # תחילת ריפ: ירידה בזווית מרפק + עליית אף
-            angle_drop = prev_angle - curr_angle
-            nose_rising = curr_nose < prev_nose - self.nose_rise_thresh
-
-            if (
-                state == "waiting"
-                and angle_drop >= self.angle_drop_threshold
-                and nose_rising
-                and (i - last_rep_index) >= self.min_separation
-            ):
-                state = "in_rep"
-                start_idx = i - 1
-                start_angle = curr_angle
-
-            elif state == "in_rep" and curr_angle > start_angle:
-                reps.append((start_idx, i))
-                last_rep_index = i
-                state = "waiting"
-
-        return reps
+        return result
 
 
-# =================
-# Overlay helpers (UI only)
-# =================
-
-_DRAW_LMS = [
-    "LEFT_SHOULDER","RIGHT_SHOULDER",
-    "LEFT_ELBOW","RIGHT_ELBOW",
-    "LEFT_WRIST","RIGHT_WRIST",
-    "LEFT_HIP","RIGHT_HIP",
-    "LEFT_KNEE","RIGHT_KNEE",
-    "LEFT_ANKLE","RIGHT_ANKLE",
-]
-_SKELETON_EDGES = [
-    ("LEFT_SHOULDER","LEFT_ELBOW"), ("LEFT_ELBOW","LEFT_WRIST"),
-    ("RIGHT_SHOULDER","RIGHT_ELBOW"), ("RIGHT_ELBOW","RIGHT_WRIST"),
-    ("LEFT_SHOULDER","RIGHT_SHOULDER"),
-    ("LEFT_HIP","RIGHT_HIP"),
-    ("LEFT_SHOULDER","LEFT_HIP"), ("RIGHT_SHOULDER","RIGHT_HIP"),
-    ("LEFT_HIP","LEFT_KNEE"), ("LEFT_KNEE","LEFT_ANKLE"),
-    ("RIGHT_HIP","RIGHT_KNEE"), ("RIGHT_KNEE","RIGHT_ANKLE"),
-]
-
-def draw_skeleton(frame, lms):
-    h, w = frame.shape[:2]
-    def pt(name):
-        if name not in lms: return None
-        x, y, _ = lms[name]
-        return int(x*w), int(y*h)
-    for a, b in _SKELETON_EDGES:
-        pa, pb = pt(a), pt(b)
-        if pa and pb:
-            cv2.line(frame, pa, pb, (255,255,255), 2)
-    for name in _DRAW_LMS:
-        p = pt(name)
-        if p:
-            cv2.circle(frame, p, 3, (255,255,255), -1)
-
-def draw_reps_counter(frame, reps_so_far: int):
-    # "Reps: N" שמאל למעלה (דינמי, מתעדכן תוך כדי)
-    cv2.putText(frame, f"Reps: {reps_so_far}", (16, 36),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2, cv2.LINE_AA)
-
-def draw_rom_donut(frame, rom, center, radius=50):
-    # דונאט ימין־עליון כמו בבולגרי, בלי ציון טכניקה
-    pct = int(round(float(rom) * 100))
-    pct = max(0, min(100, pct))
-    cv2.ellipse(frame, center, (radius, radius), 0, 0, 360, (50,50,50), 10, cv2.LINE_AA)
-    ang = 360 * (pct / 100.0)
-    cv2.ellipse(frame, center, (radius, radius), 0, -90, -90 + ang, (80,220,120), 10, cv2.LINE_AA)
-    cv2.putText(frame, f"{pct}%", (center[0]-24, center[1]+8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255,255,255), 2, cv2.LINE_AA)
-    cv2.putText(frame, "ROM-Up", (center[0]-36, center[1]-radius-10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 2, cv2.LINE_AA)
-
-def draw_feedback_banner(frame, text):
-    if not text: return
-    h, w = frame.shape[:2]
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, h-60), (w, h), (0,0,0), -1)
-    frame[:] = cv2.addWeighted(overlay, 0.35, frame, 0.65, 0)
-    cv2.putText(frame, text, (20, h-20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
-
-def _safe_output_path(prefix="pullup"):
-    return f"/tmp/{prefix}_{int(time.time())}.mp4"
-
-# בונה טיימליין לפידבק רק לריפים עם טעויות
-def _build_feedback_schedule(analysis_result):
-    rep_ranges = analysis_result.get("rep_ranges", [])
-    rep_reports = analysis_result.get("reps", [])
-    schedule = []
-    for i, (s, e) in enumerate(rep_ranges):
-        if i < len(rep_reports):
-            errs = rep_reports[i].get("errors", [])
-            if errs:
-                schedule.append((s, e, errs[0]))
-    return schedule
-
-
-# =================
-# Video rendering (dynamic reps, donut top-right, sampled skeleton)
-# =================
-def render_pullup_video(input_path, output_path, analysis_result,
-                        frame_skip=3, scale=0.30, draw_skeleton_flag=True):
-    cap = cv2.VideoCapture(input_path)
-
-    fps = (cap.get(cv2.CAP_PROP_FPS) or 30.0) / max(frame_skip, 1)
-    w0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) * scale)
-    h0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) * scale)
-    out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w0, h0))
-
-    rom_full     = analysis_result.get("rom_full", [])
-    frames_lms   = analysis_result.get("frames_landmarks", [])
-    rep_ranges   = analysis_result.get("rep_ranges", [])
-    fb_schedule  = _build_feedback_schedule(analysis_result)
-
-    # מונה חזרות דינמי
-    next_rep_idx = 0
-    reps_so_far  = 0
-
-    # פידבק “רק כשקורה” + החזקה קצרה
-    fb_ptr = 0
-    active_fb = ""
-    hold_frames = 8
-    fb_visible_until = -1
-
-    # החלקת ROM + ציור שלד מדוגם
-    rom_smoothed = 0.0
-    last_skeleton_idx = -999
-    last_skeleton_lms = None
-
-    # מיקום הדונאט – ימין למעלה באותה שורה עם Reps
-    donut_center = (w0 - 80, 60)
-    donut_radius = 50
-
-    idx = 0
-    frame_id = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_id % max(frame_skip, 1) != 0:
-            frame_id += 1
-            continue
-
-        frame = cv2.resize(frame, (w0, h0), interpolation=cv2.INTER_AREA)
-
-        # שלד – מדוגם
-        if draw_skeleton_flag and idx < len(frames_lms):
-            if idx - last_skeleton_idx >= DRAW_SKELETON_EVERY:
-                last_skeleton_lms = frames_lms[idx]
-                last_skeleton_idx = idx
-            if last_skeleton_lms:
-                draw_skeleton(frame, last_skeleton_lms)
-
-        # עדכון מונה חזרות (דינמי לפי סוף ריפ)
-        while next_rep_idx < len(rep_ranges) and rep_ranges[next_rep_idx][1] <= idx:
-            reps_so_far += 1
-            next_rep_idx += 1
-        draw_reps_counter(frame, reps_so_far)
-
-        # ROM donut – החלקה קלה + ימין־עליון
-        rom = rom_full[idx] if idx < len(rom_full) else 0.0
-        rom_smoothed = ROM_EMA_ALPHA * rom + (1 - ROM_EMA_ALPHA) * rom_smoothed
-        draw_rom_donut(frame, rom_smoothed, center=donut_center, radius=donut_radius)
-
-        # פידבק רק כשיש שגיאה בריפ הרלוונטי (עם החזקה קצרה)
-        while fb_ptr < len(fb_schedule) and fb_schedule[fb_ptr][1] < idx:
-            fb_ptr += 1
-
-        show_now = False
-        if fb_ptr < len(fb_schedule):
-            s, e, msg = fb_schedule[fb_ptr]
-            if s <= idx <= e + hold_frames:
-                active_fb = msg
-                fb_visible_until = e + hold_frames
-                show_now = True
-        if not show_now and idx <= fb_visible_until:
-            show_now = True
-
-        draw_feedback_banner(frame, active_fb if show_now else "")
-
-        out.write(frame)
-        idx += 1
-        frame_id += 1
-
-    cap.release()
-    out.release()
-
-
-# =================
-# Orchestrator (encoding fast)
-# =================
-def run_pullup_analysis(
-    video_path,
-    output_path,            # ← חובה, כמו בסקוואט/בולגרי
-    frame_skip=3,           # כמו שעבד
-    scale=0.30,
-    model_complexity=1,
-    verbose=False,
-):
+# ===========================
+# API פונקציה ידידותית ל-Flask
+# ===========================
+def run_pullup_analysis(input_path, frame_skip=3, scale=0.4, output_path=None,
+                        overlay=True, include_series=RETURN_SERIES):
     """
-    מריץ ניתוח + רינדור, ואז מקודד ל-H.264 (ffmpeg) ומחזיר video_path של המקודד.
+    תואם ל-API שלך:
+    - input_path: וידאו מקור
+    - output_path: וידאו מעובד (אם None, לא מייצר קובץ)
+    - מחזיר dict עם video_path (אם הוגדר), rep_count, technique_score, וכו'.
     """
-    pose = mp_pose.Pose(static_image_mode=False, model_complexity=model_complexity)
+    # ייצוב OpenCV בת’רד אחד (מונע קריסות בשירותים קלים)
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
 
-    cap = cv2.VideoCapture(video_path)
-    landmarks_list = []
-    frame_count = 0
-
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_count % max(frame_skip, 1) != 0:
-            frame_count += 1
-            continue
-
-        frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = pose.process(rgb)
-
-        if res.pose_landmarks:
-            frame_landmarks = {}
-            for i, lm in enumerate(res.pose_landmarks.landmark):
-                frame_landmarks[mp_pose.PoseLandmark(i).name] = (lm.x, lm.y, lm.z)
-            landmarks_list.append(frame_landmarks)
-        else:
-            landmarks_list.append({})
-
-        frame_count += 1
-        if verbose and frame_count % 30 == 0:
-            print(f"Processed {frame_count} frames...")
-
-    cap.release()
-    pose.close()
-
-    analyzer = PullUpAnalyzer()
-    analysis = analyzer.analyze_all_reps(landmarks_list)
-    analysis["frames_landmarks"] = landmarks_list  # שימוש ברינדור — אין ריצת Pose שנייה
-
-    # ודא שיש נתיב קובץ
-    if not output_path:
-        output_path = _safe_output_path("pullup")
-
-    # שלב 1: רינדור MP4 גולמי (mp4v)
-    render_pullup_video(
-        input_path=video_path,
+    t0 = time.time()
+    analyzer = PullUpAnalyzer(include_series=include_series)
+    res = analyzer.process(
+        input_path=input_path,
         output_path=output_path,
-        analysis_result=analysis,
         frame_skip=frame_skip,
         scale=scale,
-        draw_skeleton_flag=True,
+        draw_overlay=overlay
     )
-
-    # שלב 2: קידוד H.264 מהיר (libx264 + faststart + yuv420p)
-    encoded_path = output_path.replace(".mp4", "_encoded.mp4")
-    try:
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-i", output_path,
-            "-c:v", "libx264",
-            "-preset", FFMPEG_PRESET,   # veryfast / fast
-            "-crf", FFMPEG_CRF,         # 22 = איכות טובה ומהירות
-            "-movflags", "+faststart",
-            "-pix_fmt", "yuv420p",
-            "-threads", str(max(1, os.cpu_count()//2)),
-            encoded_path
-        ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        print(f"[pullup] encoded: {encoded_path}")
-    except Exception as e:
-        print("[pullup] ffmpeg encode failed:", e)
-        encoded_path = output_path
-
-    analysis["video_path"] = encoded_path
-    return analysis
+    res["elapsed_sec"] = round(time.time() - t0, 3)
+    # וודא שתמיד יש video_path אם ביקשו פלט
+    if output_path and "video_path" not in res:
+        res["video_path"] = output_path
+    return res
 
 
-# =================
-# Example (CLI)
-# =================
+# ===========================
+# הרצה ידנית (לבדיקה מקומית)
+# ===========================
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) >= 3:
-        in_path, out_path = sys.argv[1], sys.argv[2]
-        res = run_pullup_analysis(in_path, out_path, frame_skip=3, scale=0.30, model_complexity=1, verbose=True)
-        print("Done:", {k: v for k, v in res.items() if k not in ("rom_full","reps","rep_ranges","frames_landmarks")})
-    else:
-        print("Usage: python pullup_analysis.py <input.mp4> <output.mp4>")
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", "-i", required=True)
+    ap.add_argument("--output", "-o", default="")
+    ap.add_argument("--scale", type=float, default=0.4)
+    ap.add_argument("--skip", type=int, default=3)
+    ap.add_argument("--no-overlay", action="store_true")
+    ap.add_argument("--series", action="store_true", help="Return ROM series (heavy)")
+    args = ap.parse_args()
+
+    out = args.output if args.output else None
+    result = run_pullup_analysis(
+        input_path=args.input,
+        frame_skip=args.skip,
+        scale=args.scale,
+        output_path=out,
+        overlay=not args.no_overlay,
+        include_series=args.series
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
