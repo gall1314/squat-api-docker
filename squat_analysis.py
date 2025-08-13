@@ -61,6 +61,21 @@ def merge_feedback(global_best, new_list):
     if not global_best: return cand
     return cand if FB_SEVERITY.get(cand,1) >= FB_SEVERITY.get(global_best,1) else global_best
 
+# ===================== תצוגה מילולית/מספרית לציון =====================
+def score_label(s):
+    s = float(s)
+    if s >= 9.5: return "Excellent"
+    if s >= 8.5: return "Very good"
+    if s >= 7.0: return "Good"
+    if s >= 5.5: return "Fair"
+    return "Needs work"
+
+def display_half_str(x):
+    q = round(float(x) * 2) / 2.0
+    if abs(q - round(q)) < 1e-9:
+        return str(int(round(q)))  # "10"
+    return f"{q:.1f}"            # "9.5"
+
 # ===================== OVERLAY =====================
 def draw_depth_donut(frame, center, radius, thickness, pct):
     pct = float(np.clip(pct, 0.0, 1.0))
@@ -221,7 +236,9 @@ def run_squat_analysis(video_path,
     if not cap.isOpened():
         return {
             "squat_count": 0, "technique_score": 0.0, "good_reps": 0, "bad_reps": 0,
-            "feedback": ["Could not open video"], "tips": [], "reps": [], "video_path": "", "feedback_path": feedback_path
+            "feedback": ["Could not open video"], "tips": [], "reps": [], "video_path": "", "feedback_path": feedback_path,
+            "technique_score_display": display_half_str(0.0),
+            "technique_label": score_label(0.0)
         }
 
     counter = 0
@@ -407,6 +424,7 @@ def run_squat_analysis(video_path,
                     rep_reports.append({
                         "rep_index": counter + 1,
                         "score": round(float(score), 1),
+                        "score_display": display_half_str(score),  # <-- נוסף להצגה
                         "feedback": ([pick_strongest_feedback(feedbacks)] if feedbacks else []),
                         "tip": None,
                         "start_frame": rep_start_frame or 0,
@@ -479,9 +497,12 @@ def run_squat_analysis(video_path,
         pass
     final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
 
+    # -------- החזרה המעודכנת (לוגיקה לא שונתה) --------
     return {
         "squat_count": counter,
-        "technique_score": technique_score,
+        "technique_score": technique_score,                             # double לחישובים/גרפים
+        "technique_score_display": display_half_str(technique_score),   # מחרוזת להצגה (ללא .0 אם שלם)
+        "technique_label": score_label(technique_score),                # ציון מילולי
         "good_reps": good_reps,
         "bad_reps": bad_reps,
         "feedback": feedback_list,
