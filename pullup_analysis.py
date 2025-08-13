@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-# pullup_analysis.py — Ascents-only (peaks) counting with softened thresholds to count ALL reps.
-# Fast read (no random seek), dynamic side by visibility, squat-style overlay (HEIGHT donut), RT feedback 0.8s.
-
+# pullup_analysis.py — Ascents-only counting driven by ELBOW ANGLE (more reliable) + head ascent.
+# No random seek; fast sequential read. Dynamic side by visibility. Light EMA smoothing.
+# Overlay תואם סקוואט: Reps שמאל-עליון, Donut HEIGHT ימין-עליון, RT feedback 0.8s.
 import os, math, subprocess
 import cv2, numpy as np
 from PIL import ImageFont, ImageDraw, Image
 
-# ===================== STYLE / FONTS (aligned with squat) =====================
+# ============== STYLE / FONTS (aligned with squat) ==============
 BAR_BG_ALPHA         = 0.55
 REPS_FONT_SIZE       = 28
 FEEDBACK_FONT_SIZE   = 22
@@ -18,21 +18,18 @@ DONUT_RADIUS_SCALE   = 0.72
 DONUT_THICKNESS_FRAC = 0.28
 ASCENT_COLOR         = (40, 200, 80)   # BGR
 DONUT_RING_BG        = (70, 70, 70)
-
 RT_FB_HOLD_SEC       = 0.8
 
 def _load_font(path, size):
-    try:
-        return ImageFont.truetype(path, size)
-    except Exception:
-        return ImageFont.load_default()
+    try: return ImageFont.truetype(path, size)
+    except Exception: return ImageFont.load_default()
 
 REPS_FONT        = _load_font(FONT_PATH, REPS_FONT_SIZE)
 FEEDBACK_FONT    = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
 DEPTH_LABEL_FONT = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
 DEPTH_PCT_FONT   = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 
-# ===================== MEDIAPIPE =====================
+# ============== MEDIAPIPE ==============
 try:
     import mediapipe as mp
     mp_pose = mp.solutions.pose
@@ -40,7 +37,7 @@ try:
 except Exception:
     MP_OK = False
 
-# ===================== score display helpers =====================
+# ============== score display helpers ==============
 def score_label(s):
     s = float(s)
     if s >= 9.5: return "Excellent"
@@ -53,7 +50,7 @@ def display_half_str(x):
     q = round(float(x) * 2) / 2.0
     return str(int(round(q))) if abs(q - round(q)) < 1e-9 else f"{q:.1f}"
 
-# ===================== BODY-ONLY (no face) for drawing =====================
+# ============== BODY-ONLY drawing (no face) ==============
 _FACE_LMS = set()
 _BODY_CONNECTIONS = tuple()
 _BODY_POINTS = tuple()
@@ -82,70 +79,61 @@ def draw_body_only(frame, landmarks, color=(255,255,255)):
         cv2.circle(frame, (x, y), 3, color, -1, cv2.LINE_AA)
     return frame
 
-# ===================== Overlay: Reps, HEIGHT donut, Feedback =====================
-def draw_height_donut(frame, center, radius, thickness, pct):
-    pct = float(np.clip(pct, 0.0, 1.0))
-    cx, cy = int(center[0]), int(center[1])
-    radius = int(radius); thickness = int(thickness)
-    cv2.circle(frame, (cx, cy), radius, DONUT_RING_BG, thickness, lineType=cv2.LINE_AA)
-    start_ang = -90; end_ang = start_ang + int(360 * pct)
-    cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang, ASCENT_COLOR, thickness, lineType=cv2.LINE_AA)
-    return frame
-
+# ============== Overlay (Reps, HEIGHT donut, Feedback) ==============
 def _wrap_two_lines(draw, text, font, max_width):
-    words = text.split()
+    words = text.split(); 
     if not words: return [""]
     lines, cur = [], ""
     for w in words:
         trial = (cur + " " + w).strip()
-        if draw.textlength(trial, font=font) <= max_width:
-            cur = trial
+        if draw.textlength(trial, font=font) <= max_width: cur = trial
         else:
             if cur: lines.append(cur)
             cur = w
         if len(lines) == 2: break
     if cur and len(lines) < 2: lines.append(cur)
-    leftover = len(words) - sum(len(l.split()) for l in lines)
-    if leftover > 0 and len(lines) >= 2:
+    if len(lines) >= 2 and draw.textlength(lines[-1], font=font) > max_width:
         last = lines[-1] + "…"
         while draw.textlength(last, font=font) > max_width and len(last) > 1:
             last = last[:-2] + "…"
         lines[-1] = last
     return lines
 
+def draw_height_donut(frame, center, radius, thickness, pct):
+    pct = float(np.clip(pct, 0.0, 1.0))
+    cx, cy = int(center[0]), int(center[1]); radius=int(radius); thickness=int(thickness)
+    cv2.circle(frame, (cx, cy), radius, DONUT_RING_BG, thickness, lineType=cv2.LINE_AA)
+    start_ang = -90; end_ang = start_ang + int(360 * pct)
+    cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang, ASCENT_COLOR, thickness, lineType=cv2.LINE_AA)
+    return frame
+
 def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
     h, w, _ = frame.shape
-    # Reps box (0,0)
+    # reps box
     pil = Image.fromarray(frame); draw = ImageDraw.Draw(pil)
-    reps_text = f"Reps: {reps}"
-    pad_x, pad_y = 10, 6
+    reps_text = f"Reps: {reps}"; pad_x, pad_y = 10, 6
     tw = draw.textlength(reps_text, font=REPS_FONT); th = REPS_FONT.size
-    x0, y0 = 0, 0; x1, y1 = int(tw + 2*pad_x), int(th + 2*pad_y)
+    x0,y0=0,0; x1=int(tw+2*pad_x); y1=int(th+2*pad_y)
     top = frame.copy(); cv2.rectangle(top, (x0,y0), (x1,y1), (0,0,0), -1)
-    frame = cv2.addWeighted(top, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
+    frame = cv2.addWeighted(top, BAR_BG_ALPHA, frame, 1-BAR_BG_ALPHA, 0)
     pil = Image.fromarray(frame); ImageDraw.Draw(pil).text((x0+pad_x, y0+pad_y-1), reps_text, font=REPS_FONT, fill=(255,255,255))
     frame = np.array(pil)
-
-    # Donut HEIGHT ימין-עליון
+    # HEIGHT donut (top-right)
     ref_h = max(int(h*0.06), int(REPS_FONT_SIZE*1.6))
-    radius = int(ref_h * DONUT_RADIUS_SCALE)
-    thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
+    radius = int(ref_h * DONUT_RADIUS_SCALE); thick = max(3, int(radius*DONUT_THICKNESS_FRAC))
     margin = 12; cx = w - margin - radius; cy = max(ref_h + radius//8, radius + thick//2 + 2)
     frame = draw_height_donut(frame, (cx, cy), radius, thick, float(np.clip(height_pct,0,1)))
-
     pil = Image.fromarray(frame); draw = ImageDraw.Draw(pil)
-    label_txt = "HEIGHT"; pct_txt = f"{int(float(np.clip(height_pct,0,1))*100)}%"
-    gap = max(2, int(radius*0.10))
-    base_y = cy - (DEPTH_LABEL_FONT_SIZE + gap + DEPTH_PCT_FONT_SIZE)//2
+    label_txt="HEIGHT"; pct_txt=f"{int(float(np.clip(height_pct,0,1))*100)}%"
+    gap=max(2,int(radius*0.10)); base_y = cy - (DEPTH_LABEL_FONT_SIZE + gap + DEPTH_PCT_FONT_SIZE)//2
     lw = draw.textlength(label_txt, font=DEPTH_LABEL_FONT); pw = draw.textlength(pct_txt, font=DEPTH_PCT_FONT)
     draw.text((cx - int(lw//2), base_y), label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
     draw.text((cx - int(pw//2), base_y + DEPTH_LABEL_FONT_SIZE + gap), pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
     frame = np.array(pil)
-
-    # Bottom feedback (עד 2 שורות)
+    # bottom feedback
     if feedback:
         pil_fb = Image.fromarray(frame); draw_fb = ImageDraw.Draw(pil_fb)
-        safe = max(6, int(h*0.02)); padx, pady, gap = 12, 8, 4
+        safe = max(6, int(h*0.02)); padx,pady,gap = 12,8,4
         max_w = int(w - 2*padx - 20)
         lines = _wrap_two_lines(draw_fb, feedback, FEEDBACK_FONT, max_w)
         line_h = FEEDBACK_FONT.size + 6
@@ -161,31 +149,35 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
         frame = np.array(pil_fb)
     return frame
 
-# ===================== helpers =====================
+# ============== helpers ==============
 def _ang(a,b,c):
     ba = np.array([a[0]-b[0], a[1]-b[1]]); bc = np.array([c[0]-b[0], c[1]-b[1]])
     den = (np.linalg.norm(ba)*np.linalg.norm(bc))+1e-9
     cosang = float(np.clip(np.dot(ba, bc)/den, -1.0, 1.0))
     return float(np.degrees(np.arccos(cosang)))
 
-# ===================== Ascents-only params (SOFTENED) =====================
-ELBOW_TOP_THRESHOLD   = 85.0    # was 75.0 — less strict top
-HEAD_MIN_ASCENT       = 0.018   # was 0.03 — ~1.8% frame height uplift
-RESET_DESCENT         = 0.010   # was 0.015 — faster reset between peaks
-RESET_ELBOW           = 145.0   # was 150.0 — easier reset by elbow opening
-TOP_HOLD_FRAMES       = 1
-REFRACTORY_FRAMES     = 3       # was 5 — allow closer peaks
-HEAD_VEL_UP_TINY      = 0.0003  # was 0.0005 — detect gentle start of ascent
+def _ema(prev, new, alpha):
+    return float(new) if prev is None else (alpha*float(new) + (1-alpha)*float(prev))
 
-# Global motion gate (avoid counting while walking to/from bar)
-HIP_VEL_THRESH_PCT    = 0.014
-ANKLE_VEL_THRESH_PCT  = 0.017
-MOTION_EMA_ALPHA      = 0.65
-MOVEMENT_CLEAR_FRAMES = 2
+# ============== Ascents-only by ELBOW (soft thresholds) ==============
+ELBOW_TOP_THRESHOLD     = 95.0   # פסגה נספרת כשהמרפק ≤ 95° (רך כדי לא להחמיר)
+ELBOW_RESET_THRESHOLD   = 140.0  # פתיחת מרפק מעל ערך זה משחררת ריסט לפסגה הבאה
+HEAD_MIN_ASCENT         = 0.015  # עליית ראש מינימלית (~1.5% גובה פריים) באותה עלייה
+RESET_DESCENT           = 0.008  # ירידת ראש קטנה לשחרור ספירה נוספת
+REFRACTORY_FRAMES       = 3      # דיבאונס קצר בין שתי פסגות
+HEAD_VEL_UP_TINY        = 0.00025
+ELBOW_EMA_ALPHA         = 0.35   # החלקת מרפק עדינה
+HEAD_EMA_ALPHA          = 0.30   # החלקת ראש עדינה
 
-# ===================== MAIN =====================
+# Gate תנועה גלובלית (לא סופרים בזמן הליכה/זחילה אל המתח)
+HIP_VEL_THRESH_PCT      = 0.016
+ANKLE_VEL_THRESH_PCT    = 0.020
+MOTION_EMA_ALPHA        = 0.65
+MOVEMENT_CLEAR_FRAMES   = 2
+
+# ============== MAIN ==============
 def run_pullup_analysis(video_path,
-                        frame_skip=1,           # 1 to avoid missing short peaks
+                        frame_skip=1,         # חשוב: 1 כדי לא לפספס פסגות קצרות
                         scale=1.0,
                         output_path="pullup_analyzed.mp4",
                         feedback_path="pullup_feedback.txt"):
@@ -211,22 +203,25 @@ def run_pullup_analysis(video_path,
     bad_reps  = 0
     all_scores = []
 
-    # dynamic side by visibility
+    # choose best side by visibility each frame
     def _pick_side_dyn(lms):
-        def vis(i): 
+        def vis(i):
             try: return float(lms[i].visibility or 0.0)
             except Exception: return 0.0
         vL = vis(mp_pose.PoseLandmark.LEFT_SHOULDER.value) + vis(mp_pose.PoseLandmark.LEFT_ELBOW.value) + vis(mp_pose.PoseLandmark.LEFT_WRIST.value)
         vR = vis(mp_pose.PoseLandmark.RIGHT_SHOULDER.value) + vis(mp_pose.PoseLandmark.RIGHT_ELBOW.value) + vis(mp_pose.PoseLandmark.RIGHT_WRIST.value)
         return "LEFT" if vL >= vR else "RIGHT"
 
-    # ascent peak state
+    # states
     allow_new_peak = True
-    peak_hold = 0
     last_peak_frame = -999999
-    asc_base_head = None   # per-ascent baseline
+    asc_base_head = None
     baseline_head_y_global = None
     ascent_live = 0.0
+
+    elbow_ema = None
+    head_ema  = None
+    head_prev = None
 
     # RT feedback
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
@@ -240,9 +235,6 @@ def run_pullup_analysis(video_path,
     prev_hip = prev_la = prev_ra = None
     hip_vel_ema = ankle_vel_ema = 0.0
     movement_free_streak = 0
-
-    last_head_y = None
-    last_elbow_angle = None
 
     with mp_pose.Pose(model_complexity=1, min_detection_confidence=0.6, min_tracking_confidence=0.6) as pose:
         while cap.isOpened():
@@ -266,21 +258,26 @@ def run_pullup_analysis(video_path,
             if res.pose_landmarks:
                 lms = res.pose_landmarks.landmark
 
-                # best side by visibility
+                # side
                 side = _pick_side_dyn(lms)
                 S = getattr(mp_pose.PoseLandmark, f"{side}_SHOULDER").value
                 E = getattr(mp_pose.PoseLandmark, f"{side}_ELBOW").value
                 W = getattr(mp_pose.PoseLandmark, f"{side}_WRIST").value
                 NOSE = mp_pose.PoseLandmark.NOSE.value
 
-                vis_ok = min(lms[NOSE].visibility, lms[S].visibility, lms[E].visibility, lms[W].visibility) >= 0.30
+                # relaxed visibility to avoid dropping frames
+                vis_ok = min(lms[NOSE].visibility, lms[S].visibility, lms[E].visibility, lms[W].visibility) >= 0.25
                 if vis_ok:
                     head_y = float(lms[NOSE].y)  # normalized (0=top)
-                    elbow_angle = _ang((lms[S].x, lms[S].y), (lms[E].x, lms[E].y), (lms[W].x, lms[W].y))
+                    raw_elbow = _ang((lms[S].x, lms[S].y), (lms[E].x, lms[E].y), (lms[W].x, lms[W].y))
+                    elbow_ema = _ema(elbow_ema, raw_elbow, ELBOW_EMA_ALPHA)
+                    head_ema  = _ema(head_ema,  head_y,    HEAD_EMA_ALPHA)
+                    elbow_angle = elbow_ema
+                    head_y = head_ema
                     if baseline_head_y_global is None:
                         baseline_head_y_global = head_y
 
-                # motion gate (hip/ankles)
+                # motion gate (hip/ankles), normalized by frame size
                 hip_px    = (lms[getattr(mp_pose.PoseLandmark, f"{side}_HIP").value].x * w,
                              lms[getattr(mp_pose.PoseLandmark, f"{side}_HIP").value].y * h)
                 l_ankle_px= (lms[mp_pose.PoseLandmark.LEFT_ANKLE.value].x * w,
@@ -303,51 +300,43 @@ def run_pullup_analysis(video_path,
 
             # head velocity (negative = going up)
             head_vel = 0.0
-            if last_head_y is not None and head_y is not None:
-                head_vel = head_y - last_head_y
+            if head_prev is not None and head_y is not None:
+                head_vel = head_y - head_prev
 
-            # ---- Ascents-only counting (peaks) ----
+            # -------- Ascents-only: elbow-driven peak + small head ascent --------
             if (not movement_block) and (head_y is not None) and (elbow_angle is not None):
                 # establish/update ascent baseline when head starts to rise gently
                 if asc_base_head is None:
                     if head_vel < -HEAD_VEL_UP_TINY:
                         asc_base_head = head_y
                 else:
-                    # if descended notably, refresh baseline so a new ascent can form
+                    # if descended notably — refresh baseline so a new ascent can form
                     if (head_y - asc_base_head) > RESET_DESCENT * 2:
                         asc_base_head = head_y
 
-                # top (peak) condition: elbow closed enough + relative ascent achieved
-                top_ok = False
-                if asc_base_head is not None:
-                    asc_amount = (asc_base_head - head_y)  # positive when rising
-                    if (elbow_angle <= ELBOW_TOP_THRESHOLD) and (asc_amount >= HEAD_MIN_ASCENT):
-                        top_ok = True
+                # top (peak) condition: elbow sufficiently closed OR (local max by velocity) + ascent achieved
+                top_by_elbow = (elbow_angle <= ELBOW_TOP_THRESHOLD)
+                top_by_vel   = (head_prev is not None and head_vel >= 0 and (asc_base_head is not None) and ((asc_base_head - head_y) >= HEAD_MIN_ASCENT))
+                top_ok = top_by_elbow or top_by_vel
 
                 can_count_again = (frame_no - last_peak_frame) >= REFRACTORY_FRAMES
-
                 if top_ok and allow_new_peak and can_count_again:
-                    peak_hold += 1
-                    if peak_hold >= TOP_HOLD_FRAMES:
-                        # count a peak
-                        rep_count += 1
-                        rep_reports.append({
-                            "rep_index": rep_count,
-                            "peak_head_y": float(head_y),
-                            "asc_from": float(asc_base_head),
-                            "top_elbow": float(elbow_angle)
-                        })
-                        good_reps += 1
-                        all_scores.append(10.0)  # counting-only
-                        last_peak_frame = frame_no
-                        allow_new_peak = False
-                        peak_hold = 0
-                else:
-                    peak_hold = 0
+                    # count the peak
+                    rep_count += 1
+                    rep_reports.append({
+                        "rep_index": rep_count,
+                        "top_elbow": float(elbow_angle),
+                        "peak_head_y": float(head_y),
+                        "asc_from": float(asc_base_head if asc_base_head is not None else head_y)
+                    })
+                    good_reps += 1
+                    all_scores.append(10.0)
+                    last_peak_frame = frame_no
+                    allow_new_peak = False
 
-                # reset condition (without requiring a full descent)
+                # reset condition for next peak (without full descent)
                 reset_by_descent = (asc_base_head is not None) and ((head_y - asc_base_head) >= RESET_DESCENT)
-                reset_by_elbow   = (elbow_angle >= RESET_ELBOW)
+                reset_by_elbow   = (elbow_angle >= ELBOW_RESET_THRESHOLD)
                 if reset_by_descent or reset_by_elbow:
                     allow_new_peak = True
                     asc_base_head = head_y
@@ -379,22 +368,18 @@ def run_pullup_analysis(video_path,
             if res.pose_landmarks:
                 frame = draw_body_only(frame, res.pose_landmarks.landmark)
             frame = draw_overlay(frame, reps=rep_count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=ascent_live)
-            if out is None:
-                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
             out.write(frame)
 
-            if head_y is not None: last_head_y = head_y
-            if elbow_angle is not None: last_elbow_angle = elbow_angle
+            if head_y is not None: head_prev = head_y
 
     cap.release()
     if out: out.release()
     cv2.destroyAllWindows()
 
-    # overall technique score for display (counting-only → 10 by default if any reps)
+    # technique score (counting-only → 10 if any reps)
     avg = np.mean(all_scores) if all_scores else 0.0
     technique_score = round(round(avg * 2) / 2, 2)
 
-    # one non-scoring session tip
     session_tip = "Slow down the lowering phase to maximize hypertrophy"
 
     # feedback file
