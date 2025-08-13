@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
-# pullup_analysis.py — Ascents-only counting driven by ELBOW ANGLE (more reliable) + head ascent.
-# No random seek; fast sequential read. Dynamic side by visibility. Light EMA smoothing.
-# Overlay תואם סקוואט: Reps שמאל-עליון, Donut HEIGHT ימין-עליון, RT feedback 0.8s.
+# pullup_analysis.py — Ascents-only counting driven by ELBOW angle + head ascent.
+# Startup rule: בתחילת הסט נספור רק אם אין תנועת הליכה (motion gate לא פעיל) וגם visibility "מחמיר" תקין.
+# בנוסף, בתחילת הסט נקבע baseline לעלייה מיד כדי לא לפספס עליות ראשונות.
+# מהיר (ללא seek), בחירת צד דינמית, EMA עדין, Overlay תואם סקווט (Reps + HEIGHT), RT feedback 0.8s.
+
 import os, math, subprocess
 import cv2, numpy as np
 from PIL import ImageFont, ImageDraw, Image
@@ -81,18 +83,20 @@ def draw_body_only(frame, landmarks, color=(255,255,255)):
 
 # ============== Overlay (Reps, HEIGHT donut, Feedback) ==============
 def _wrap_two_lines(draw, text, font, max_width):
-    words = text.split(); 
+    words = text.split()
     if not words: return [""]
     lines, cur = [], ""
     for w in words:
         trial = (cur + " " + w).strip()
-        if draw.textlength(trial, font=font) <= max_width: cur = trial
+        if draw.textlength(trial, font=font) <= max_width:
+            cur = trial
         else:
             if cur: lines.append(cur)
             cur = w
         if len(lines) == 2: break
     if cur and len(lines) < 2: lines.append(cur)
-    if len(lines) >= 2 and draw.textlength(lines[-1], font=font) > max_width:
+    leftover = len(words) - sum(len(l.split()) for l in lines)
+    if leftover > 0 and len(lines) >= 2:
         last = lines[-1] + "…"
         while draw.textlength(last, font=font) > max_width and len(last) > 1:
             last = last[:-2] + "…"
@@ -169,7 +173,12 @@ HEAD_VEL_UP_TINY        = 0.00025
 ELBOW_EMA_ALPHA         = 0.35   # החלקת מרפק עדינה
 HEAD_EMA_ALPHA          = 0.30   # החלקת ראש עדינה
 
-# Gate תנועה גלובלית (לא סופרים בזמן הליכה/זחילה אל המתח)
+# ---- Startup grace & visibility rules ----
+STARTUP_GRACE_SEC = 0.8        # בתחילת הסט: נספור רק אם אין תנועה גלובלית וגם visibility "מחמיר" תקין
+VIS_THR_RELAX     = 0.22       # סף רך לעיבוד/בייסליין
+VIS_THR_STRICT    = 0.35       # סף מחמיר לספירה (ודאי שלד)
+
+# Gate תנועה גלובלית
 HIP_VEL_THRESH_PCT      = 0.016
 ANKLE_VEL_THRESH_PCT    = 0.020
 MOTION_EMA_ALPHA        = 0.65
@@ -231,6 +240,10 @@ def run_pullup_analysis(video_path,
     rt_fb_msg = None
     rt_fb_hold = 0
 
+    # Startup grace frames counter
+    STARTUP_GRACE_FRAMES = max(1, int(STARTUP_GRACE_SEC * effective_fps))
+    startup_grace = STARTUP_GRACE_FRAMES
+
     # motion gate
     prev_hip = prev_la = prev_ra = None
     hip_vel_ema = ankle_vel_ema = 0.0
@@ -254,6 +267,11 @@ def run_pullup_analysis(video_path,
             elbow_angle = None
             head_y = None
             lms = None
+            min_vis = 0.0
+            vis_relaxed_ok = False
+            vis_strict_ok  = False
+
+            movement_block = False
 
             if res.pose_landmarks:
                 lms = res.pose_landmarks.landmark
@@ -265,21 +283,25 @@ def run_pullup_analysis(video_path,
                 W = getattr(mp_pose.PoseLandmark, f"{side}_WRIST").value
                 NOSE = mp_pose.PoseLandmark.NOSE.value
 
-                # relaxed visibility to avoid dropping frames
-                vis_ok = min(lms[NOSE].visibility, lms[S].visibility, lms[E].visibility, lms[W].visibility) >= 0.25
-                if vis_ok:
-                    head_y = float(lms[NOSE].y)  # normalized (0=top)
-                    raw_elbow = _ang((lms[S].x, lms[S].y), (lms[E].x, lms[E].y), (lms[W].x, lms[W].y))
-                    elbow_ema = _ema(elbow_ema, raw_elbow, ELBOW_EMA_ALPHA)
-                    head_ema  = _ema(head_ema,  head_y,    HEAD_EMA_ALPHA)
+                # visibility checks
+                min_vis = min(lms[NOSE].visibility, lms[S].visibility, lms[E].visibility, lms[W].visibility)
+                vis_relaxed_ok = (min_vis >= VIS_THR_RELAX)   # לעיבוד/בייסליין
+                vis_strict_ok  = (min_vis >= VIS_THR_STRICT)  # לספירה
+
+                # read head/elbow with relaxed thr (שומר על overlay ובייסליין)
+                if vis_relaxed_ok:
+                    head_y_raw = float(lms[NOSE].y)  # normalized (0=top)
+                    raw_elbow  = _ang((lms[S].x, lms[S].y), (lms[E].x, lms[E].y), (lms[W].x, lms[W].y))
+                    elbow_ema  = _ema(elbow_ema, raw_elbow, ELBOW_EMA_ALPHA)
+                    head_ema   = _ema(head_ema,  head_y_raw, HEAD_EMA_ALPHA)
                     elbow_angle = elbow_ema
                     head_y = head_ema
                     if baseline_head_y_global is None:
                         baseline_head_y_global = head_y
 
                 # motion gate (hip/ankles), normalized by frame size
-                hip_px    = (lms[getattr(mp_pose.PoseLandmark, f"{side}_HIP").value].x * w,
-                             lms[getattr(mp_pose.PoseLandmark, f"{side}_HIP").value].y * h)
+                hip_idx = getattr(mp_pose.PoseLandmark, f"{side}_HIP").value
+                hip_px    = (lms[hip_idx].x * w, lms[hip_idx].y * h)
                 l_ankle_px= (lms[mp_pose.PoseLandmark.LEFT_ANKLE.value].x * w,
                              lms[mp_pose.PoseLandmark.LEFT_ANKLE.value].y * h)
                 r_ankle_px= (lms[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x * w,
@@ -292,42 +314,71 @@ def run_pullup_analysis(video_path,
                 ankle_vel_ema = MOTION_EMA_ALPHA*an_vel  + (1-MOTION_EMA_ALPHA)*ankle_vel_ema
                 prev_hip, prev_la, prev_ra = hip_px, l_ankle_px, r_ankle_px
                 movement_block = (hip_vel_ema > HIP_VEL_THRESH_PCT) or (ankle_vel_ema > ANKLE_VEL_THRESH_PCT)
-                if movement_block: movement_free_streak = 0
-                else:              movement_free_streak = min(MOVEMENT_CLEAR_FRAMES, movement_free_streak + 1)
+
+                # הורדת גרייס רק כשיש שלד מזוהה (גם אם לא strict)
+                if vis_relaxed_ok and startup_grace > 0:
+                    startup_grace -= 1
             else:
-                movement_block = False
-                movement_free_streak = 0
+                movement_block = False  # אין שלד → בכל מקרה לא נספור (vis_strict_ok=False)
+                # לא מורידים גרייס אם אין שלד בכלל
 
             # head velocity (negative = going up)
             head_vel = 0.0
-            if head_prev is not None and head_y is not None:
-                head_vel = head_y - head_prev
-
-            # -------- Ascents-only: elbow-driven peak + small head ascent --------
-            if (not movement_block) and (head_y is not None) and (elbow_angle is not None):
-                # establish/update ascent baseline when head starts to rise gently
+            # head_prev נשמר אחר כך; כאן אם יש head_y נחשב
+            # ---- קביעת baseline לעלייה בתחילת הסט ----
+            if head_y is not None:
                 if asc_base_head is None:
-                    if head_vel < -HEAD_VEL_UP_TINY:
-                        asc_base_head = head_y
+                    # בתחילת הסט: להציב baseline מיד אך רק כשמותר עקרונית לספור (strict vis & no motion)
+                    if startup_grace > 0:
+                        if vis_strict_ok and not movement_block:
+                            asc_base_head = head_y
+                    else:
+                        # אחרי הגרייס: נדרוש רמז של עלייה (מהירות שלילית קטנה)
+                        if 'head_prev' in locals() and head_prev is not None:
+                            head_vel = head_y - head_prev
+                        if head_vel < -HEAD_VEL_UP_TINY:
+                            asc_base_head = head_y
                 else:
-                    # if descended notably — refresh baseline so a new ascent can form
+                    # אם ירדנו הרבה — רענן baseline כדי לזהות עלייה חדשה
+                    if head_prev is not None:
+                        head_vel = head_y - head_prev
                     if (head_y - asc_base_head) > RESET_DESCENT * 2:
                         asc_base_head = head_y
 
-                # top (peak) condition: elbow sufficiently closed OR (local max by velocity) + ascent achieved
-                top_by_elbow = (elbow_angle <= ELBOW_TOP_THRESHOLD)
-                top_by_vel   = (head_prev is not None and head_vel >= 0 and (asc_base_head is not None) and ((asc_base_head - head_y) >= HEAD_MIN_ASCENT))
-                top_ok = top_by_elbow or top_by_vel
+            # ---- gating ספירה: בתחילת הסט מחמיר רק על שני תנאים ----
+            if startup_grace > 0:
+                count_gate_ok = (vis_strict_ok and not movement_block)
+            else:
+                # אחרי ההתחלה: נדרוש גם streak קצר של "שקט" תנועתי
+                count_gate_ok = (vis_strict_ok and (not movement_block) and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES))
 
+            # עדכון streak של שקט תנועתי (לא משתמשים בו בזמן גרייס)
+            if not movement_block:
+                movement_free_streak = min(MOVEMENT_CLEAR_FRAMES, movement_free_streak + 1)
+            else:
+                movement_free_streak = 0
+
+            # -------- Ascents-only: elbow-driven peak + small head ascent --------
+            if count_gate_ok and (head_y is not None) and (elbow_angle is not None):
+                # top (peak) condition: מרפק נסגר מספיק או (היפוך מהירות) + עלייה מינימלית
+                top_by_elbow = (elbow_angle <= ELBOW_TOP_THRESHOLD)
+                top_by_vel   = False
+                if asc_base_head is not None and head_prev is not None:
+                    head_vel = head_y - head_prev
+                    asc_ok = ((asc_base_head - head_y) >= HEAD_MIN_ASCENT)
+                    top_by_vel = (head_vel >= 0) and asc_ok  # מעבר מעל לפסגה מקומית לאחר עלייה
+
+                top_ok = top_by_elbow or top_by_vel
                 can_count_again = (frame_no - last_peak_frame) >= REFRACTORY_FRAMES
+
                 if top_ok and allow_new_peak and can_count_again:
-                    # count the peak
                     rep_count += 1
                     rep_reports.append({
                         "rep_index": rep_count,
                         "top_elbow": float(elbow_angle),
                         "peak_head_y": float(head_y),
-                        "asc_from": float(asc_base_head if asc_base_head is not None else head_y)
+                        "asc_from": float(asc_base_head if asc_base_head is not None else head_y),
+                        "startup_gate_used": bool(startup_grace > 0)
                     })
                     good_reps += 1
                     all_scores.append(10.0)
@@ -335,7 +386,7 @@ def run_pullup_analysis(video_path,
                     allow_new_peak = False
 
                 # reset condition for next peak (without full descent)
-                reset_by_descent = (asc_base_head is not None) and ((head_y - asc_base_head) >= RESET_DESCENT)
+                reset_by_descent = (asc_base_head is not None) and (head_y - asc_base_head >= RESET_DESCENT)
                 reset_by_elbow   = (elbow_angle >= ELBOW_RESET_THRESHOLD)
                 if reset_by_descent or reset_by_elbow:
                     allow_new_peak = True
@@ -345,7 +396,7 @@ def run_pullup_analysis(video_path,
                 cur_rt = None
                 if asc_base_head is not None:
                     asc_amount_live = asc_base_head - head_y
-                    if asc_amount_live < HEAD_MIN_ASCENT * 0.7 and head_vel < -HEAD_VEL_UP_TINY:
+                    if asc_amount_live < HEAD_MIN_ASCENT * 0.7 and head_prev is not None and (head_y - head_prev) < -HEAD_VEL_UP_TINY:
                         cur_rt = "Go a bit higher (chin over bar)"
                 if cur_rt:
                     if cur_rt != rt_fb_msg:
@@ -368,9 +419,12 @@ def run_pullup_analysis(video_path,
             if res.pose_landmarks:
                 frame = draw_body_only(frame, res.pose_landmarks.landmark)
             frame = draw_overlay(frame, reps=rep_count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=ascent_live)
+            if out is None:
+                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
             out.write(frame)
 
-            if head_y is not None: head_prev = head_y
+            if head_y is not None:
+                head_prev = head_y
 
     cap.release()
     if out: out.release()
@@ -379,7 +433,6 @@ def run_pullup_analysis(video_path,
     # technique score (counting-only → 10 if any reps)
     avg = np.mean(all_scores) if all_scores else 0.0
     technique_score = round(round(avg * 2) / 2, 2)
-
     session_tip = "Slow down the lowering phase to maximize hypertrophy"
 
     # feedback file
