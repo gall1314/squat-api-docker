@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-# pullup_analysis.py — Ascents-only counting (peaks). Fast like Bulgarian (no random seek).
-# Overlay תואם סקוואט: Reps בפינה, דונאט HEIGHT ימין-עליון (לייב בעלייה/ירידה), פידבק תחתון עם hold 0.8s.
-# בחירת צד דינמית לפי visibility. Gate תנועה גלובלית כדי לא לספור בזמן הליכה למתח/ממנו.
-import os, math, subprocess, collections
+# pullup_analysis.py — Ascents-only (peaks) counting with softened thresholds to count ALL reps.
+# Fast read (no random seek), dynamic side by visibility, squat-style overlay (HEIGHT donut), RT feedback 0.8s.
+
+import os, math, subprocess
 import cv2, numpy as np
 from PIL import ImageFont, ImageDraw, Image
 
-# ===================== STYLE / FONTS (כמו בסקוואט) =====================
+# ===================== STYLE / FONTS (aligned with squat) =====================
 BAR_BG_ALPHA         = 0.55
 REPS_FONT_SIZE       = 28
 FEEDBACK_FONT_SIZE   = 22
@@ -16,7 +16,7 @@ FONT_PATH            = "Roboto-VariableFont_wdth,wght.ttf"
 
 DONUT_RADIUS_SCALE   = 0.72
 DONUT_THICKNESS_FRAC = 0.28
-ASCENT_COLOR         = (40, 200, 80)  # BGR
+ASCENT_COLOR         = (40, 200, 80)   # BGR
 DONUT_RING_BG        = (70, 70, 70)
 
 RT_FB_HOLD_SEC       = 0.8
@@ -40,7 +40,7 @@ try:
 except Exception:
     MP_OK = False
 
-# ===================== ציונים להצגה =====================
+# ===================== score display helpers =====================
 def score_label(s):
     s = float(s)
     if s >= 9.5: return "Excellent"
@@ -53,7 +53,7 @@ def display_half_str(x):
     q = round(float(x) * 2) / 2.0
     return str(int(round(q))) if abs(q - round(q)) < 1e-9 else f"{q:.1f}"
 
-# ===================== BODY-ONLY (ללא פנים) =====================
+# ===================== BODY-ONLY (no face) for drawing =====================
 _FACE_LMS = set()
 _BODY_CONNECTIONS = tuple()
 _BODY_POINTS = tuple()
@@ -82,7 +82,7 @@ def draw_body_only(frame, landmarks, color=(255,255,255)):
         cv2.circle(frame, (x, y), 3, color, -1, cv2.LINE_AA)
     return frame
 
-# ===================== Overlay (Reps, HEIGHT donut, Feedback) =====================
+# ===================== Overlay: Reps, HEIGHT donut, Feedback =====================
 def draw_height_donut(frame, center, radius, thickness, pct):
     pct = float(np.clip(pct, 0.0, 1.0))
     cx, cy = int(center[0]), int(center[1])
@@ -135,14 +135,14 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
 
     pil = Image.fromarray(frame); draw = ImageDraw.Draw(pil)
     label_txt = "HEIGHT"; pct_txt = f"{int(float(np.clip(height_pct,0,1))*100)}%"
-    gap = max(2, int(radius * 0.10))
-    base_y = cy - (DEPTH_LABEL_FONT_SIZE + gap + DEPTH_PCT_FONT_SIZE) // 2
+    gap = max(2, int(radius*0.10))
+    base_y = cy - (DEPTH_LABEL_FONT_SIZE + gap + DEPTH_PCT_FONT_SIZE)//2
     lw = draw.textlength(label_txt, font=DEPTH_LABEL_FONT); pw = draw.textlength(pct_txt, font=DEPTH_PCT_FONT)
     draw.text((cx - int(lw//2), base_y), label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
     draw.text((cx - int(pw//2), base_y + DEPTH_LABEL_FONT_SIZE + gap), pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-    # Feedback תחתון (wrap עד 2 שורות)
+    # Bottom feedback (עד 2 שורות)
     if feedback:
         pil_fb = Image.fromarray(frame); draw_fb = ImageDraw.Draw(pil_fb)
         safe = max(6, int(h*0.02)); padx, pady, gap = 12, 8, 4
@@ -157,30 +157,27 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
         ty = y0 + pady
         for ln in lines:
             tw = draw_fb.textlength(ln, font=FEEDBACK_FONT); tx = max(padx, (w-int(tw))//2)
-            draw_fb.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255,255,255))
-            ty += line_h + gap
+            draw_fb.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255,255,255)); ty += line_h + gap
         frame = np.array(pil_fb)
     return frame
 
-# ===================== עזר/זווית =====================
+# ===================== helpers =====================
 def _ang(a,b,c):
     ba = np.array([a[0]-b[0], a[1]-b[1]]); bc = np.array([c[0]-b[0], c[1]-b[1]])
     den = (np.linalg.norm(ba)*np.linalg.norm(bc))+1e-9
     cosang = float(np.clip(np.dot(ba, bc)/den, -1.0, 1.0))
     return float(np.degrees(np.arccos(cosang)))
 
-# ===================== פרמטרי ספירת "עליות בלבד" =====================
-ELBOW_TOP_THRESHOLD   = 75.0    # טופ כשהמרפק סגור יחסית
-HEAD_MIN_ASCENT       = 0.03    # עלייה מינימלית מה-baseline של העלייה
-RESET_DESCENT         = 0.015   # כמה לרדת (y גדל) כדי לאפשר פסגה נוספת
-RESET_ELBOW           = 150.0   # או לפתוח מרפק מעל ערך זה לריסט
-TOP_HOLD_FRAMES       = 1       # כמה פריימים על הטופ כדי לאשר פסגה
-REFRACTORY_FRAMES     = 5       # דיבאונס בין פסגות
+# ===================== Ascents-only params (SOFTENED) =====================
+ELBOW_TOP_THRESHOLD   = 85.0    # was 75.0 — less strict top
+HEAD_MIN_ASCENT       = 0.018   # was 0.03 — ~1.8% frame height uplift
+RESET_DESCENT         = 0.010   # was 0.015 — faster reset between peaks
+RESET_ELBOW           = 145.0   # was 150.0 — easier reset by elbow opening
+TOP_HOLD_FRAMES       = 1
+REFRACTORY_FRAMES     = 3       # was 5 — allow closer peaks
+HEAD_VEL_UP_TINY      = 0.0003  # was 0.0005 — detect gentle start of ascent
 
-# — אופציונלי: טריגר "מתחיל לעלות" (לעדכן baseline) —
-HEAD_VEL_UP_TINY      = 0.0005
-
-# Gate תנועה גלובלית (כמו בסקוואט/בולגרי): אל תספר כשזזים למתח/ממנו
+# Global motion gate (avoid counting while walking to/from bar)
 HIP_VEL_THRESH_PCT    = 0.014
 ANKLE_VEL_THRESH_PCT  = 0.017
 MOTION_EMA_ALPHA      = 0.65
@@ -188,54 +185,50 @@ MOVEMENT_CLEAR_FRAMES = 2
 
 # ===================== MAIN =====================
 def run_pullup_analysis(video_path,
-                        frame_skip=1,
+                        frame_skip=1,           # 1 to avoid missing short peaks
                         scale=1.0,
                         output_path="pullup_analyzed.mp4",
                         feedback_path="pullup_feedback.txt"):
     if not MP_OK:
-        return {
-            "squat_count": 0, "technique_score": 0.0, "good_reps": 0, "bad_reps": 0,
-            "feedback": ["Mediapipe not available"], "tips": [], "reps": [], "video_path": "", "feedback_path": feedback_path,
-            "technique_score_display": display_half_str(0.0), "technique_label": score_label(0.0)
-        }
+        return {"squat_count":0,"technique_score":0.0,"technique_score_display":display_half_str(0.0),
+                "technique_label":score_label(0.0),"good_reps":0,"bad_reps":0,"feedback":["Mediapipe not available"],
+                "tips":[],"reps":[],"video_path":"","feedback_path":feedback_path}
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return {
-            "squat_count": 0, "technique_score": 0.0, "good_reps": 0, "bad_reps": 0,
-            "feedback": ["Could not open video"], "tips": [], "reps": [], "video_path": "", "feedback_path": feedback_path,
-            "technique_score_display": display_half_str(0.0), "technique_label": score_label(0.0)
-        }
+        return {"squat_count":0,"technique_score":0.0,"technique_score_display":display_half_str(0.0),
+                "technique_label":score_label(0.0),"good_reps":0,"bad_reps":0,"feedback":["Could not open video"],
+                "tips":[],"reps":[],"video_path":"","feedback_path":feedback_path}
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
     frame_no = 0
 
-    # מונים/דוחות
+    # counters/reports
     rep_count = 0
     rep_reports = []
     good_reps = 0
     bad_reps  = 0
     all_scores = []
 
-    # בחירת צד דינמית
+    # dynamic side by visibility
     def _pick_side_dyn(lms):
-        def vis(i):
+        def vis(i): 
             try: return float(lms[i].visibility or 0.0)
             except Exception: return 0.0
         vL = vis(mp_pose.PoseLandmark.LEFT_SHOULDER.value) + vis(mp_pose.PoseLandmark.LEFT_ELBOW.value) + vis(mp_pose.PoseLandmark.LEFT_WRIST.value)
         vR = vis(mp_pose.PoseLandmark.RIGHT_SHOULDER.value) + vis(mp_pose.PoseLandmark.RIGHT_ELBOW.value) + vis(mp_pose.PoseLandmark.RIGHT_WRIST.value)
         return "LEFT" if vL >= vR else "RIGHT"
 
-    # סטייט לפסגות
+    # ascent peak state
     allow_new_peak = True
     peak_hold = 0
     last_peak_frame = -999999
-    asc_base_head = None   # baseline לכל עלייה
+    asc_base_head = None   # per-ascent baseline
     baseline_head_y_global = None
     ascent_live = 0.0
 
-    # פידבק בזמן אמת
+    # RT feedback
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
     dt = 1.0 / float(effective_fps)
@@ -243,7 +236,7 @@ def run_pullup_analysis(video_path,
     rt_fb_msg = None
     rt_fb_hold = 0
 
-    # תנועה גלובלית
+    # motion gate
     prev_hip = prev_la = prev_ra = None
     hip_vel_ema = ankle_vel_ema = 0.0
     movement_free_streak = 0
@@ -273,21 +266,21 @@ def run_pullup_analysis(video_path,
             if res.pose_landmarks:
                 lms = res.pose_landmarks.landmark
 
-                # צד דינמי
+                # best side by visibility
                 side = _pick_side_dyn(lms)
                 S = getattr(mp_pose.PoseLandmark, f"{side}_SHOULDER").value
                 E = getattr(mp_pose.PoseLandmark, f"{side}_ELBOW").value
                 W = getattr(mp_pose.PoseLandmark, f"{side}_WRIST").value
                 NOSE = mp_pose.PoseLandmark.NOSE.value
 
-                vis_ok = min(lms[NOSE].visibility, lms[S].visibility, lms[E].visibility, lms[W].visibility) >= 0.35
+                vis_ok = min(lms[NOSE].visibility, lms[S].visibility, lms[E].visibility, lms[W].visibility) >= 0.30
                 if vis_ok:
                     head_y = float(lms[NOSE].y)  # normalized (0=top)
                     elbow_angle = _ang((lms[S].x, lms[S].y), (lms[E].x, lms[E].y), (lms[W].x, lms[W].y))
                     if baseline_head_y_global is None:
                         baseline_head_y_global = head_y
 
-                # Gate תנועה גלובלית (ירך/קרסוליים)
+                # motion gate (hip/ankles)
                 hip_px    = (lms[getattr(mp_pose.PoseLandmark, f"{side}_HIP").value].x * w,
                              lms[getattr(mp_pose.PoseLandmark, f"{side}_HIP").value].y * h)
                 l_ankle_px= (lms[mp_pose.PoseLandmark.LEFT_ANKLE.value].x * w,
@@ -308,26 +301,26 @@ def run_pullup_analysis(video_path,
                 movement_block = False
                 movement_free_streak = 0
 
-            # מהירות ראש (שלילי=עולה)
+            # head velocity (negative = going up)
             head_vel = 0.0
             if last_head_y is not None and head_y is not None:
                 head_vel = head_y - last_head_y
 
-            # ---- ספירה לפי עליות בלבד (פסגות) ----
+            # ---- Ascents-only counting (peaks) ----
             if (not movement_block) and (head_y is not None) and (elbow_angle is not None):
-                # קביעת baseline לעלייה הנוכחית: כשהראש מתחיל לעלות בעדינות
+                # establish/update ascent baseline when head starts to rise gently
                 if asc_base_head is None:
                     if head_vel < -HEAD_VEL_UP_TINY:
                         asc_base_head = head_y
                 else:
-                    # אם ירדנו הרבה — נעדכן כדי לא לפספס עלייה חדשה
+                    # if descended notably, refresh baseline so a new ascent can form
                     if (head_y - asc_base_head) > RESET_DESCENT * 2:
                         asc_base_head = head_y
 
-                # תנאי טופ (פסגה): מרפק סגור + עלייה יחסית מספקת
+                # top (peak) condition: elbow closed enough + relative ascent achieved
                 top_ok = False
                 if asc_base_head is not None:
-                    asc_amount = (asc_base_head - head_y)  # חיובי כשעולים
+                    asc_amount = (asc_base_head - head_y)  # positive when rising
                     if (elbow_angle <= ELBOW_TOP_THRESHOLD) and (asc_amount >= HEAD_MIN_ASCENT):
                         top_ok = True
 
@@ -336,7 +329,7 @@ def run_pullup_analysis(video_path,
                 if top_ok and allow_new_peak and can_count_again:
                     peak_hold += 1
                     if peak_hold >= TOP_HOLD_FRAMES:
-                        # --- ספר פסגה ---
+                        # count a peak
                         rep_count += 1
                         rep_reports.append({
                             "rep_index": rep_count,
@@ -345,21 +338,21 @@ def run_pullup_analysis(video_path,
                             "top_elbow": float(elbow_angle)
                         })
                         good_reps += 1
-                        all_scores.append(10.0)  # ספירה בלבד — אין ענישת איכות
+                        all_scores.append(10.0)  # counting-only
                         last_peak_frame = frame_no
                         allow_new_peak = False
                         peak_hold = 0
                 else:
                     peak_hold = 0
 
-                # תנאי "ריסט" לשחרור פסגה הבאה (בלי לדרוש ירידה מלאה)
+                # reset condition (without requiring a full descent)
                 reset_by_descent = (asc_base_head is not None) and ((head_y - asc_base_head) >= RESET_DESCENT)
                 reset_by_elbow   = (elbow_angle >= RESET_ELBOW)
                 if reset_by_descent or reset_by_elbow:
                     allow_new_peak = True
-                    asc_base_head = head_y  # עדכן בסיס לעלייה הבאה
+                    asc_base_head = head_y
 
-                # RT feedback עדין (לא משפיע על ספירה)
+                # RT feedback (gentle)
                 cur_rt = None
                 if asc_base_head is not None:
                     asc_amount_live = asc_base_head - head_y
@@ -375,17 +368,19 @@ def run_pullup_analysis(video_path,
             else:
                 if rt_fb_hold > 0: rt_fb_hold -= 1
 
-            # --- דונאט HEIGHT לייב (גם בעלייה וגם בירידה) ---
+            # live HEIGHT donut (both up & down)
             if baseline_head_y_global is not None and head_y is not None:
                 raw = baseline_head_y_global - head_y
                 ascent_live = float(np.clip(raw / max(0.12, HEAD_MIN_ASCENT*1.2), 0.0, 1.0))
             else:
                 ascent_live = 0.0
 
-            # ציור שלד + אוברליי
+            # draw
             if res.pose_landmarks:
                 frame = draw_body_only(frame, res.pose_landmarks.landmark)
             frame = draw_overlay(frame, reps=rep_count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=ascent_live)
+            if out is None:
+                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
             out.write(frame)
 
             if head_y is not None: last_head_y = head_y
@@ -395,23 +390,23 @@ def run_pullup_analysis(video_path,
     if out: out.release()
     cv2.destroyAllWindows()
 
-    # ציון כולל להצגה (ספירה בלבד → 10)
+    # overall technique score for display (counting-only → 10 by default if any reps)
     avg = np.mean(all_scores) if all_scores else 0.0
     technique_score = round(round(avg * 2) / 2, 2)
 
-    # טיפ אחד (לא משפיע על הציון)
+    # one non-scoring session tip
     session_tip = "Slow down the lowering phase to maximize hypertrophy"
 
-    # קובץ תקציר
+    # feedback file
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
-            f.write(f"Total Reps: {rep_count}\n")
+            f.write(f"Total Reps: {int(rep_count)}\n")
             f.write(f"Technique Score: {display_half_str(technique_score)} / 10  ({score_label(technique_score)})\n")
             f.write(f"Tip: {session_tip}\n")
     except Exception:
         pass
 
-    # faststart encode (ffmpeg)
+    # faststart encode
     encoded_path = output_path.replace('.mp4', '_encoded.mp4')
     try:
         subprocess.run([
