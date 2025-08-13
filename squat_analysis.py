@@ -432,4 +432,3 @@ def run_squat_analysis(
 
     # החזרה מנורמלת ובטוחה לפופ-אפ (מונע "מסך אפור")
     return finalize_popup_payload(raw, public_base_url=os.getenv("PUBLIC_BASE_URL", public_base_url))
-
