@@ -385,4 +385,3 @@ if __name__=="__main__":
     result=run_pullup_analysis(input_path=args.input, frame_skip=args.skip, scale=args.scale,
                                output_path=(args.output if args.output else None), overlay_enabled=(not args.no_overlay))
     print(json.dumps(result, ensure_ascii=False, indent=2))
-
