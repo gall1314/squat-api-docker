@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-# pullup_analysis.py — ריצה "כמו סקוואט": אותו effective_fps, אותו frame_skip בלולאה,
-# לוגים מיידיים ותכופים, וידאו יוצא ב-fps האפקטיבי, ו-CAP_PROP_BUFFERSIZE קטן לרספונסיביות.
-# שם ההחזרה: squat_count (גלובלי לכל התרגילים).
+# pullup_analysis.py — שמירת ספירה מקורית 1:1 + אוברליי וטמפלייט תואמים לסקוואט
+# דונאט ASCENT חי (במתח זה מייצג עלייה — כלומר ככל שהראש גבוה יותר כך הפאי מתמלא),
+# RT-feedback עם HOLD ~0.8s רק *בתוך חזרה*, החזרה (return) בפורמט זהה לסקוואט כולל
+# "squat_count" כשם שדה גלובלי לכל התרגילים.
 
 import os
-import sys
 import cv2
 import math
 import time
@@ -14,7 +14,7 @@ import subprocess
 from PIL import ImageFont, ImageDraw, Image
 
 # ==============================
-# ספים/הגדרות (לוגיקת ספירה — כמו המקור שלך)
+# ספים/הגדרות (כמו המקור שלך)
 # ==============================
 ELBOW_START_THRESHOLD = 150.0   # התחלת עליה: מרפק מתחת לסף
 ELBOW_TOP_THRESHOLD   = 65.0    # טופ: מרפק "סגור"
@@ -22,6 +22,12 @@ ELBOW_BOTTOM_THRESHOLD= 160.0   # חזרה לתחתית (היסטורזיס)
 HEAD_MIN_ASCENT       = 0.06    # עליה נטו (0..1 מגובה הפריים)
 HEAD_VEL_UP_THRESH    = 0.0025  # מהירות עליה מינימלית (שלילי)
 HEAD_TOP_STICK_FRAMES = 2
+BOTTOM_STICK_FRAMES   = 2
+
+BASE_FRAME_SKIP_IDLE  = 3       # מנוחה
+BASE_FRAME_SKIP_MOVE  = 1       # תנועה
+EMA_ALPHA_DEPTH       = 0.2
+FPS_FALLBACK          = 25.0
 
 # ===================== STYLE / FONTS (תואם סקוואט) =====================
 BAR_BG_ALPHA         = 0.55
@@ -48,7 +54,7 @@ DONUT_THICKNESS_FRAC = 0.28
 DEPTH_COLOR          = (40, 200, 80)   # ירוק כמו בסקוואט
 DEPTH_RING_BG        = (70, 70, 70)
 
-# ===================== עזר =====================
+# ===================== פונקציות עזר =====================
 def _angle(a, b, c):
     try:
         ba = (a[0]-b[0], a[1]-b[1]); bc = (c[0]-b[0], c[1]-b[1])
@@ -58,6 +64,9 @@ def _angle(a, b, c):
         return math.degrees(math.acos(cosang))
     except Exception:
         return 180.0
+
+def _ema(prev, new, alpha):
+    return new if prev is None else (alpha*new + (1-alpha)*prev)
 
 def _round_score_half(x):
     return round(x*2)/2.0
@@ -85,6 +94,7 @@ except Exception:
 
 if MP_AVAILABLE:
     mp_pose = mp.solutions.pose
+
     _FACE_LMS = {
         mp_pose.PoseLandmark.NOSE.value,
         mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
@@ -106,6 +116,9 @@ POSE_IDXS = {
 }
 
 def _pick_side(lms):
+    """בחירת צד יציבה לכל הסשן (לנעול בצד חזק יותר בפריימים הראשונים).
+    בחרנו לוגיקה עדינה שמעדיפה ימין אם אין הכרעה — כמו במקור שהיה "right" קבוע.
+    """
     rs = lms[POSE_IDXS["right_shoulder"]].visibility
     ls = lms[POSE_IDXS["left_shoulder"]].visibility
     re = lms[POSE_IDXS["right_elbow"]].visibility
@@ -118,11 +131,13 @@ def _get_xy(landmarks, idx, w, h):
     lm = landmarks[idx]
     return (lm.x * w, lm.y * h, lm.visibility)
 
-def _safe_vis(*vals, min_v=0.5):
+def _safe_vis(*vals, min_v=0.4):
     return all(v >= min_v for v in vals)
 
 def draw_body_only(frame, landmarks, color=(255,255,255)):
-    if not MP_AVAILABLE: return frame
+    """שלד גוף בלבד (ללא פנים)."""
+    if not MP_AVAILABLE:
+        return frame
     h, w = frame.shape[:2]
     for a, b in _BODY_CONNECTIONS:
         pa = landmarks[a]; pb = landmarks[b]
@@ -151,40 +166,33 @@ def draw_overlay(frame, reps=0, feedback=None, ascent_pct=0.0):
     """Reps שמאל־עליון; דונאט ASCENT ימין־עליון; פידבק תחתון (עד 2 שורות, עם אליפסות)."""
     h, w = frame.shape[:2]
 
-    # Reps box
-    pil = Image.fromarray(frame); draw = ImageDraw.Draw(pil)
-    reps_text = f"Reps: {reps}"
-    pad_x, pad_y = 10, 6
-    text_w = draw.textlength(reps_text, font=REPS_FONT)
-    text_h = REPS_FONT.size
-    x0, y0 = 0, 0
-    x1 = int(text_w + 2*pad_x); y1 = int(text_h + 2*pad_y)
-    top = frame.copy()
-    cv2.rectangle(top, (x0, y0), (x1, y1), (0, 0, 0), -1)
-    frame = cv2.addWeighted(top, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
-    pil = Image.fromarray(frame)
-    ImageDraw.Draw(pil).text((x0 + pad_x, y0 + pad_y - 1), reps_text, font=REPS_FONT, fill=(255,255,255))
-    frame = np.array(pil)
+    # Reps (שמאל־עליון צמוד לקצה)
+    rep_text = f"Reps: {int(reps)}"
+    (tw, th), _ = cv2.getTextSize(rep_text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+    pad = 8
+    bg = frame.copy()
+    cv2.rectangle(bg, (0, 0), (tw + 2*pad, th + int(1.8*pad)), (0,0,0), -1)
+    frame = cv2.addWeighted(bg, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
+    cv2.putText(frame, rep_text, (pad, th + pad), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255,255,255), 2, cv2.LINE_AA)
 
-    # Donut (ASCENT)
-    ref_h = max(int(h * 0.06), int(REPS_FONT_SIZE * 1.6))
-    radius = int(ref_h * DONUT_RADIUS_SCALE)
-    thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
-    margin = 12
-    cx = w - margin - radius
-    cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
-    frame = draw_ascent_donut(frame, (cx, cy), radius, thick, float(np.clip(ascent_pct,0,1)))
+    # Donut (ימין־עליון)
+    cx = w - int(70)
+    cy = int(60)
+    radius = int(min(80, w*0.09) * DONUT_RADIUS_SCALE)
+    thick  = max(8, int(radius * DONUT_THICKNESS_FRAC))
+    frame = draw_ascent_donut(frame, (cx, cy), radius, thick, ascent_pct)
 
-    pil = Image.fromarray(frame); draw = ImageDraw.Draw(pil)
-    label_txt = "ASCENT"; pct_txt = f"{int(float(np.clip(ascent_pct,0,1))*100)}%"
-    label_w = draw.textlength(label_txt, font=DEPTH_LABEL_FONT)
-    pct_w   = draw.textlength(pct_txt,   font=DEPTH_PCT_FONT)
-    gap     = max(2, int(radius * 0.10))
-    base_y  = cy - (DEPTH_LABEL_FONT.size + gap + DEPTH_PCT_FONT.size) // 2
-    draw.text((cx - int(label_w // 2), base_y), label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
-    draw.text((cx - int(pct_w // 2), base_y + DEPTH_LABEL_FONT.size + gap),
-              pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
-    frame = np.array(pil)
+    # מלל עומק קטן במרכז הדונאט
+    depth_pct = int(round(ascent_pct * 100))
+    lbl = Image.fromarray(frame)
+    d = ImageDraw.Draw(lbl)
+    t1 = "Ascent"
+    t2 = f"{depth_pct}%"
+    t1w = d.textlength(t1, font=DEPTH_LABEL_FONT)
+    t2w = d.textlength(t2, font=DEPTH_PCT_FONT)
+    d.text((cx - t1w/2, cy - 20), t1, font=DEPTH_LABEL_FONT, fill=(255,255,255))
+    d.text((cx - t2w/2, cy + 2),  t2, font=DEPTH_PCT_FONT,   fill=(255,255,255))
+    frame = np.array(lbl)
 
     # Bottom feedback (2 שורות מקס' + אליפסות)
     if feedback:
@@ -228,7 +236,7 @@ def draw_overlay(frame, reps=0, feedback=None, ascent_pct=0.0):
     return frame
 
 # =========================
-# PullUp Analyzer (זרימה מיושרת לסקוואט)
+# PullUp Analyzer (ספירה מקורית + תיקון צד יציב + לוגים)
 # =========================
 class PullUpAnalyzer:
     def __init__(self):
@@ -238,25 +246,41 @@ class PullUpAnalyzer:
         self.rep_count = 0
         self.in_rep = False
         self.seen_top_frames = 0
+        self.seen_bottom_frames = 0
         self.min_head_y_in_rep = None
         self.rep_started_elbow = None
         self.last_head_y = None
         self.last_elbow = None
 
-        # דוחות/ציון
+        # ציון/דוחות
         self.reps_meta = []
         self.all_scores = []
         self.session_best_feedback = ""
 
-        # ASCENT לייב לדונאט
+        # עומק לייב (דונאט)
+        self.depth_ema = None
         self.ascent_live = 0.0
-        self.baseline_head_y_global = None
+
+        # צד נעול לסשן (מונע קפיצות מצד לצד שמחרבות ספירה)
+        self.side_locked = None
 
         # RT-feedback עם HOLD רק בתוך חזרה
         self.rt_fb_msg = None
         self.rt_fb_hold = 0
-        self.RT_FB_HOLD_FRAMES = 20
+        self.RT_FB_HOLD_FRAMES = 20  # ~0.8s ב-25fps (מותאם דינמית בהמשך)
 
+    # === עזר לזיהוי תנועה (כמו במקור)
+    def _movement_detected(self, elbow_angle, head_y):
+        mov = False
+        if self.last_elbow is not None and elbow_angle is not None:
+            if abs(elbow_angle - self.last_elbow) > 1.5:
+                mov = True
+        if self.last_head_y is not None and head_y is not None:
+            if abs(head_y - self.last_head_y) > 0.002:
+                mov = True
+        return mov
+
+    # ===== אימותים =====
     def _confirm_top(self, elbow_angle, head_y, rep_baseline_head_y):
         elbow_ok = elbow_angle is not None and (elbow_angle <= ELBOW_TOP_THRESHOLD)
         head_ok = (rep_baseline_head_y is not None and head_y is not None and
@@ -268,121 +292,139 @@ class PullUpAnalyzer:
         head_speed_ok = head_vel < -HEAD_VEL_UP_THRESH
         return elbow_ok and head_speed_ok
 
+    def _confirm_bottom(self, elbow_angle):
+        return elbow_angle is not None and elbow_angle >= ELBOW_BOTTOM_THRESHOLD
+
+    # =========================
+    # לולאת העיבוד
+    # =========================
     def process(self, input_path, output_path=None, frame_skip=3, scale=0.4, overlay_enabled=True):
-        if not MP_AVAILABLE:
-            raise RuntimeError("mediapipe not available")
-
-        # OpenCV טוויקים לרספונסיביות
-        try:
-            cv2.setUseOptimized(True)
-            cv2.setNumThreads(1)
-        except Exception:
-            pass
-
+        print("[pullup] process start", input_path)
         cap = cv2.VideoCapture(input_path)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)  # כדי שיהיה snappy
         if not cap.isOpened():
             return self._empty_result("Could not open video", output_path)
 
-        fps_in = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        effective_fps = max(1.0, fps_in / max(1, frame_skip))
-        dt = 1.0 / float(effective_fps)
-        self.RT_FB_HOLD_FRAMES = max(2, int(0.8 / dt))
+        # FPS/מידות
+        fps = cap.get(cv2.CAP_PROP_FPS) or FPS_FALLBACK
+        if fps <= 1: fps = FPS_FALLBACK
+        self.RT_FB_HOLD_FRAMES = max(12, int(0.8 * fps))  # ~0.8s
 
-        print(f"[PULLUP] open | fps_in={fps_in:.2f} | frame_skip={frame_skip} | scale={scale} | eff_fps={effective_fps:.2f}", flush=True)
+        ok, first = cap.read()
+        if not ok:
+            cap.release()
+            return self._empty_result("Empty video", output_path)
 
+        h0, w0 = first.shape[:2]
+        out_w = int(w0 * (scale if scale > 0 else 1.0))
+        out_h = int(h0 * (scale if scale > 0 else 1.0))
+
+        # פותחים writer רק אחרי שמוגדרים מימדים
         out = None
-        frame_idx = 0
-        processed_counter = 0
-        last_progress_ts = time.time()
+        if output_path:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(output_path, fourcc, fps, (out_w, out_h))
 
-        # נשמר בין פריימים כשהחזרה רצה
+        # נחזיר את הפריים הראשון אחורה כי כבר קראנו אותו
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+        baseline_head_y_global = None
         rep_baseline_head_y = None
 
-        with mp.solutions.pose.Pose(model_complexity=1, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret: break
+        # Pose
+        if not MP_AVAILABLE:
+            cap.release()
+            if out is not None: out.release()
+            return self._empty_result("MediaPipe is not available", output_path)
+
+        with mp_pose.Pose(model_complexity=1, enable_segmentation=False, smooth_landmarks=True) as pose:
+            base_skip_idle = max(1, frame_skip)
+            base_skip_move = BASE_FRAME_SKIP_MOVE
+
+            frame_idx = 0
+            while True:
+                ok, frame_orig = cap.read()
+                if not ok:
+                    break
                 frame_idx += 1
-                if frame_idx % max(1, frame_skip) != 0:
-                    continue
 
-                if scale != 1.0:
-                    frame = cv2.resize(frame, (0,0), fx=scale, fy=scale)
+                # ריסייז יציב
+                frame = cv2.resize(frame_orig, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
 
-                h, w = frame.shape[:2]
-                if out is None and output_path:
-                    # כמו בסקוואט — הווידאו נכתב ב-effective_fps ולא ב-fps המקורי
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
-
-                image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = pose.process(image)
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                res = pose.process(frame_rgb)
 
                 elbow_angle = None
                 head_y = None
 
-                if not results.pose_landmarks:
-                    self.ascent_live = 0.0
-                    if self.rt_fb_hold > 0: self.rt_fb_hold -= 1
-                    if overlay_enabled:
-                        frame = draw_overlay(frame, reps=self.rep_count, feedback=(self.rt_fb_msg if self.rt_fb_hold>0 else None), ascent_pct=self.ascent_live)
-                    if out is not None: out.write(frame)
-                    processed_counter += 1
-                    # לוג תכוף כל ~0.3 שניות
-                    now = time.time()
-                    if now - last_progress_ts >= 0.3:
-                        print(f"[PULLUP] proc={processed_counter} | reps={self.rep_count} | ascent={self.ascent_live:.2f}", flush=True)
-                        last_progress_ts = now
-                    continue
+                if res.pose_landmarks:
+                    lms = res.pose_landmarks.landmark
+                    # נעל צד פעם אחת בסשן — מונע קפיצות צדדים שמפרקות את התנאים
+                    if self.side_locked is None:
+                        self.side_locked = _pick_side(lms)
+                    side = self.side_locked
 
-                lms = results.pose_landmarks.landmark
-                side = _pick_side(lms)
-                sh_idx = POSE_IDXS["right_shoulder"] if side == "right" else POSE_IDXS["left_shoulder"]
-                el_idx = POSE_IDXS["right_elbow"]    if side == "right" else POSE_IDXS["left_elbow"]
-                wr_idx = POSE_IDXS["right_wrist"]    if side == "right" else POSE_IDXS["left_wrist"]
+                    sh_idx = POSE_IDXS["right_shoulder"] if side == "right" else POSE_IDXS["left_shoulder"]
+                    el_idx = POSE_IDXS["right_elbow"]    if side == "right" else POSE_IDXS["left_elbow"]
+                    wr_idx = POSE_IDXS["right_wrist"]    if side == "right" else POSE_IDXS["left_wrist"]
 
-                nose = _get_xy(lms, POSE_IDXS["nose"], w, h)
-                shld = _get_xy(lms, sh_idx, w, h)
-                elbw = _get_xy(lms, el_idx, w, h)
-                wrst = _get_xy(lms, wr_idx, w, h)
+                    nose = _get_xy(lms, POSE_IDXS["nose"], out_w, out_h)
+                    shld = _get_xy(lms, sh_idx, out_w, out_h)
+                    elbw = _get_xy(lms, el_idx, out_w, out_h)
+                    wrst = _get_xy(lms, wr_idx, out_w, out_h)
 
-                if _safe_vis(nose[2], shld[2], elbw[2], wrst[2], min_v=0.4):
-                    head_y = nose[1] / h
-                    elbow_angle = _angle(shld[:2], elbw[:2], wrst[:2])
-                    if self.baseline_head_y_global is None:
-                        self.baseline_head_y_global = head_y
+                    if _safe_vis(nose[2], shld[2], elbw[2], wrst[2], min_v=0.4):
+                        head_y = nose[1] / out_h  # 0 למעלה, 1 למטה
+                        elbow_angle = _angle(shld[:2], elbw[:2], wrst[:2])
+                        if baseline_head_y_global is None:
+                            baseline_head_y_global = head_y
 
-                # ASCENT לייב
-                if self.baseline_head_y_global is not None and head_y is not None:
-                    self.ascent_live = float(np.clip(self.baseline_head_y_global - head_y, 0.0, 1.0))
+                # ASCENT לייב לדונאט (במתח: ככל שהראש גבוה יותר — ערך גדול יותר)
+                ascent_live = 0.0
+                if baseline_head_y_global is not None and head_y is not None:
+                    ascent_live = float(np.clip(baseline_head_y_global - head_y, 0.0, 1.0))
+                self.ascent_live = ascent_live
+
+                # Adaptive skip (כמו במקור)
+                if elbow_angle is not None and head_y is not None:
+                    moving = self._movement_detected(elbow_angle, head_y)
+                    step_now = base_skip_move if moving else base_skip_idle
                 else:
-                    self.ascent_live = 0.0
+                    step_now = base_skip_idle
 
                 # מהירות ראש
                 head_vel = 0.0
                 if self.last_head_y is not None and head_y is not None:
                     head_vel = head_y - self.last_head_y  # שלילי = עולה
 
-                # ספירה — כמו המקור שלך (ללא חסימת ספירה גלובלית)
+                # ===== לוגיקת ספירה =====
                 if elbow_angle is not None and head_y is not None:
+                    if not self.in_rep and rep_baseline_head_y is None:
+                        rep_baseline_head_y = head_y
+
                     if not self.in_rep:
-                        if rep_baseline_head_y is None:
-                            rep_baseline_head_y = head_y
                         if self._confirm_start(elbow_angle, head_vel):
                             self.in_rep = True
                             self.min_head_y_in_rep = head_y
                             self.seen_top_frames = 0
                             self.rep_started_elbow = elbow_angle
+                            # לוג
+                            print(f"[pullup] start rep at f{frame_idx} elbow={elbow_angle:.1f} head_y={head_y:.3f}")
                     else:
-                        self.min_head_y_in_rep = min(self.min_head_y_in_rep, head_y) if self.min_head_y_in_rep is not None else head_y
+                        # עדכון מינימום ראש בתוך הסט (הכי גבוה — ערך y קטן)
+                        if self.min_head_y_in_rep is None:
+                            self.min_head_y_in_rep = head_y
+                        else:
+                            self.min_head_y_in_rep = min(self.min_head_y_in_rep, head_y)
+
+                        # בדיקת טופ
                         if self._confirm_top(elbow_angle, head_y, rep_baseline_head_y):
                             self.seen_top_frames += 1
                         else:
                             self.seen_top_frames = 0
 
                         if self.seen_top_frames >= HEAD_TOP_STICK_FRAMES:
-                            ascent_peak = max(0.0, (self.baseline_head_y_global or head_y) - (self.min_head_y_in_rep or head_y))
+                            # נספרה חזרה — ניקוד/פידבק כמו בסקוואט (לא משפיע על ספירה)
+                            ascent_peak = max(0.0, (baseline_head_y_global or head_y) - (self.min_head_y_in_rep or head_y))
                             penalty = 0.0
                             fb = None
                             if ascent_peak < 0.08:
@@ -396,6 +438,7 @@ class PullUpAnalyzer:
                             score = _round_score_half(score)
 
                             self.rep_count += 1
+                            print(f"[pullup] REP {self.rep_count} peak_ascent={ascent_peak:.3f} top_elbow={elbow_angle:.1f}")
                             self.reps_meta.append({
                                 "rep_index": self.rep_count,
                                 "score": float(score),
@@ -409,14 +452,15 @@ class PullUpAnalyzer:
                             if fb and not self.session_best_feedback:
                                 self.session_best_feedback = fb
 
-                            # reset לחזרה הבאה
+                            # איפוס לחזרה הבאה
                             self.in_rep = False
+                            rep_baseline_head_y = None
                             self.min_head_y_in_rep = None
                             self.rep_started_elbow = None
                             self.seen_top_frames = 0
-                            rep_baseline_head_y = None
+                            self.seen_bottom_frames = 0
 
-                # RT-feedback — רק בתוך חזרה
+                # RT-feedback — רק בתוך חזרה, לא לפני שהתחילה
                 if self.in_rep:
                     if self.ascent_live < 0.03:
                         if self.rt_fb_msg != "Aim for chin over the bar":
@@ -428,32 +472,60 @@ class PullUpAnalyzer:
                         if self.rt_fb_hold > 0:
                             self.rt_fb_hold -= 1
                 else:
+                    # מחוץ לחזרה אל תציג RT
                     self.rt_fb_msg = None
                     self.rt_fb_hold = 0
 
+                # החלקת עומק (לא חובה לציור)
+                if baseline_head_y_global is not None and head_y is not None:
+                    depth_val = max(0.0, min(1.0, (baseline_head_y_global - head_y)))
+                    self.depth_ema = _ema(self.depth_ema, depth_val, EMA_ALPHA_DEPTH)
+
                 # ציור שלד + אוברליי
-                if results.pose_landmarks is not None:
-                    frame = draw_body_only(frame, results.pose_landmarks.landmark)
+                if res.pose_landmarks is not None:
+                    frame = draw_body_only(frame, res.pose_landmarks.landmark)
                 if overlay_enabled:
-                    frame = draw_overlay(frame, reps=self.rep_count, feedback=(self.rt_fb_msg if self.rt_fb_hold>0 else None), ascent_pct=self.ascent_live)
+                    frame = draw_overlay(
+                        frame,
+                        reps=self.rep_count,
+                        feedback=(self.rt_fb_msg if self.rt_fb_hold > 0 else None),
+                        ascent_pct=self.ascent_live
+                    )
 
                 if out is not None:
                     out.write(frame)
 
-                # עדכונים
+                # עדכוני "אחרון"
                 if elbow_angle is not None: self.last_elbow = elbow_angle
                 if head_y is not None:     self.last_head_y = head_y
 
-                processed_counter += 1
-                now = time.time()
-                if now - last_progress_ts >= 0.3:
-                    print(f"[PULLUP] proc={processed_counter} | frame={frame_idx} | reps={self.rep_count} | ascent={self.ascent_live:.2f}", flush=True)
-                    last_progress_ts = now
+                # קפיצת פריימים אדפטיבית (לא חוסמת ספירה!)
+                if step_now > 1:
+                    cur = cap.get(cv2.CAP_PROP_POS_FRAMES)
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, cur + (step_now - 1))
+
+                # לוג קל כל ~50 פריימים לזמינות
+                if frame_idx % 50 == 0:
+                    eh = f"{elbow_angle:.1f}" if elbow_angle is not None else "NA"
+                    hy = f"{head_y:.3f}" if head_y is not None else "NA"
+                    print(f"[pullup] f{frame_idx} reps={self.rep_count} in_rep={self.in_rep} elbow={eh} head_y={hy} step={step_now}")
 
         cap.release()
-        if out is not None: out.release()
+        if out is not None:
+            out.release()
 
-        # faststart encode (כמו בסקוואט)
+        # ניקוד טכניקה ממוצע (כמו בסקוואט — ממוצע רפ־סקור, עיגול לחצאים)
+        avg = float(np.mean(self.all_scores)) if self.all_scores else 0.0
+        technique_score = round(round(avg * 2) / 2, 2)
+
+        # good/bad לפי ציון הרפ (>=9.5 טוב)
+        good_reps = sum(1 for s in self.all_scores if s >= 9.5)
+        bad_reps  = max(0, self.rep_count - good_reps)
+
+        feedback_list = [self.session_best_feedback] if self.session_best_feedback else ["Great form! Keep it up 💪"]
+        tips = ["Slow down the lowering phase to maximize hypertrophy"]  # טיפ אחד לסשן — לא משפיע על הציון
+
+        # קידוד faststart כמו בסקוואט
         final_video_path = ""
         if output_path:
             encoded_path = output_path.replace(".mp4", "_encoded.mp4")
@@ -469,20 +541,11 @@ class PullUpAnalyzer:
             except Exception:
                 final_video_path = output_path if os.path.exists(output_path) else ""
 
-        avg = float(np.mean(self.all_scores)) if self.all_scores else 0.0
-        technique_score = round(round(avg * 2) / 2, 2)
-        good_reps = sum(1 for s in self.all_scores if s >= 9.5)
-        bad_reps  = max(0, self.rep_count - good_reps)
-        feedback_list = [self.session_best_feedback] if self.session_best_feedback else ["Great form! Keep it up 💪"]
-        tips = ["Slow down the lowering phase to maximize hypertrophy"]
-
-        print(f"[PULLUP] done | reps={self.rep_count} | score={technique_score}", flush=True)
-
         return {
-            "squat_count": int(self.rep_count),
-            "technique_score": float(technique_score),
-            "technique_score_display": display_half_str(technique_score),
-            "technique_label": score_label(technique_score),
+            "squat_count": int(self.rep_count),                                 # שם גלובלי אחיד לכל התרגילים
+            "technique_score": float(technique_score),                          # double לחישובים/גרפים
+            "technique_score_display": display_half_str(technique_score),       # תצוגה (ללא .0 אם שלם)
+            "technique_label": score_label(technique_score),                    # ציון מילולי באותן מדרגות
             "good_reps": int(good_reps),
             "bad_reps": int(bad_reps),
             "feedback": feedback_list,
@@ -517,7 +580,6 @@ def run_pullup_analysis(input_path, frame_skip=3, scale=0.4, output_path=None, o
         pass
 
     t0 = time.time()
-    print(f"[PULLUP] start | input={input_path} | output={output_path} | skip={frame_skip} | scale={scale}", flush=True)
     analyzer = PullUpAnalyzer()
     res = analyzer.process(
         input_path=input_path,
@@ -529,7 +591,7 @@ def run_pullup_analysis(input_path, frame_skip=3, scale=0.4, output_path=None, o
     res["elapsed_sec"] = round(time.time() - t0, 3)
     if output_path and "video_path" not in res:
         res["video_path"] = output_path
-    print(f"[PULLUP] result: reps={res.get('squat_count')} | score={res.get('technique_score_display')} | elapsed={res['elapsed_sec']}s", flush=True)
+    print(f"[pullup] done in {res['elapsed_sec']}s reps={res.get('squat_count')}")
     return res
 
 # ===========================
@@ -554,4 +616,3 @@ if __name__ == "__main__":
         overlay_enabled=(not args.no_overlay)
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
-
