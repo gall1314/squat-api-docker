@@ -439,3 +439,4 @@ def run_pullup_analysis(video_path,
 def run_analysis(*args, **kwargs):
     return run_pullup_analysis(*args, **kwargs)
 
+
