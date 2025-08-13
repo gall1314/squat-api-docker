@@ -589,4 +589,3 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 # תאימות
 run_analysis = run_bulgarian_analysis
 
-
