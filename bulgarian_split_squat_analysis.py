@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
-# Bulgarian Split Squat — Overlay אחיד (כמו בסקוואט) + שדרוגים שביקשת:
-# 1) שדה ציון כפול לתאימות (technique_score = double) + שדה תצוגה (technique_score_display = string ללא .0 אם מספר שלם)
-#    גם בכל חזרה: score (double) + score_display (string)
-# 2) ציון מילולי (technique_label): Excellent / Very good / Good / Fair / Needs work
-# 3) form tip אחד לסשן (לא משפיע על ציון), נבחר חכם לפי הדגלים שנצפו — אם אין, טיפ ברירת מחדל
-# 4) חסימת ספירה בזמן הליכה (soft-start + דרישת שקט לסיום) — כמו בסקוואט, ללא שינוי לוגיקת ספים
-# 5) ייצוב שלד לציור: median-3 + EMA + הגבלת קפיצה (clamp) כדי לצמצם קפיצות
-# 6) Overlay זהה: Reps בפינה שמאל-עליון, Donut DEPTH ימני-עליון לייב דו-כיווני, פידבק תחתון עם HOLD ~0.8s
-# 7) פלט וידאו יציב (ffmpeg faststart), תמיד מחזיר נתיב קיים
+# bulgarian_split_squat_analysis.py
+# Overlay אחיד כמו בסקוואט + תאימות JSON + Freeze-on-drop ליציבות שלד (ללא לג).
+# - לוגיקת ספירה/ספים נשארת כמו קודם.
+# - technique_score (double) לשימוש חישובי + technique_score_display (string) להצגה.
+# - בכל חזרה: score (double) + score_display (string).
+# - technique_label מילולי; form tip אחד לסשן.
+# - חסימת ספירה בזמן הליכה (soft-start + דרישת שקט לסיום) כמו בסקוואט.
+# - פלט וידאו אמין עם ffmpeg (+faststart).
 
 import os, math, subprocess, collections
 import cv2, numpy as np
 from PIL import ImageFont, ImageDraw, Image
 import mediapipe as mp
 
-# ===================== לוגיקת בולגרי (נשארת שלך) =====================
+# ===================== פרמטרים ללוגיקת בולגרי (כמו אצלך) =====================
 ANGLE_DOWN_THRESH   = 95      # כניסה לירידה
 ANGLE_UP_THRESH     = 160     # יציאה לעלייה
 MIN_RANGE_DELTA_DEG = 12      # שינוי מינימלי Top->Bottom כדי לספור
@@ -25,8 +24,8 @@ TORSO_LEAN_MIN      = 135     # גב פחות מזה -> הערה
 VALGUS_X_TOL        = 0.03    # סטייה מותרת X בין ברך לקרסול
 PERFECT_MIN_KNEE    = 70      # יעד לנרמול עומק
 
-# יציבות לוגית
-EMA_ALPHA             = 0.6    # החלקת זוויות (0=הרבה החלקה, 1=בלי)
+# יציבות חישובית (לוגיקה)
+EMA_ALPHA             = 0.6
 TORSO_MARGIN_DEG      = 3
 TORSO_BAD_MIN_FRAMES  = 4
 VALGUS_BAD_MIN_FRAMES = 3
@@ -38,7 +37,7 @@ ANKLE_VEL_THRESH_PCT  = 0.017
 MOTION_EMA_ALPHA      = 0.65
 MOVEMENT_CLEAR_FRAMES = 2
 
-# ===================== סטייל אחיד (כמו בסקוואט) =====================
+# ===================== סטייל אחיד כמו בסקוואט =====================
 BAR_BG_ALPHA         = 0.55
 REPS_FONT_SIZE       = 28
 FEEDBACK_FONT_SIZE   = 22
@@ -66,88 +65,7 @@ FEEDBACK_FONT    = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
 DEPTH_LABEL_FONT = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
 DEPTH_PCT_FONT   = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 
-# ===================== ייצוב שלד לציור בלבד =====================
-class LandmarkStabilizer:
-    """Freeze-on-drop: אין החלקה איטית. כשיש זיהוי איכותי—מציגים מיידית (בלי לג),
-    וכשיש נפילה באיכות—מחזיקים את השלד האחרון לכמה פריימים ואז מסתירים.
-    זה מונע "שיכרות"/פיגור של השלד אבל גם לא מצייר שלד משתולל בזמן נפילות.
-    """
-    def __init__(self, quality_thr=0.55, min_fraction=0.6, jump_thr=0.12, max_hold=6, body_points=_BODY_POINTS):
-        self.quality_thr = float(quality_thr)
-        self.min_fraction = float(min_fraction)
-        self.jump_thr = float(jump_thr)      # ממוצע תזוזה מנורמלת שייחשב כ"קפיצה"
-        self.max_hold = int(max_hold)        # כמה פריימים להחזיק שלד אחרון כשהאיכות ירודה
-        self.body_points = tuple(body_points)
-        self.last_good = None  # רשימת נק' עם x,y בלבד
-        self.hold = 0
-
-    def _quality(self, lms):
-        ok = 0; total = 0
-        for i in self.body_points:
-            if i >= len(lms):
-                continue
-            total += 1
-            vis = getattr(lms[i], 'visibility', 1.0) or 0.0
-            if vis >= self.quality_thr:
-                ok += 1
-        return (ok / max(1, total)) if total else 1.0
-
-    def _avg_disp(self, lms):
-        if not self.last_good:
-            return 0.0
-        n = min(len(self.last_good), len(lms))
-        if n == 0:
-            return 0.0
-        s = 0.0; c = 0
-        for i in self.body_points:
-            if i >= n:
-                continue
-            dx = float(lms[i].x) - float(self.last_good[i].x)
-            dy = float(lms[i].y) - float(self.last_good[i].y)
-            s += (dx*dx + dy*dy) ** 0.5
-            c += 1
-        return (s / max(1, c))
-
-    def _copy_xy(self, lms):
-        out = []
-        for i in range(len(lms)):
-            out.append(type('P', (), {'x': float(lms[i].x), 'y': float(lms[i].y)}))
-        return out
-
-    def stabilize(self, lms):
-        # אין שלד בכלל: נסה להחזיק אחרון טוב לכמה פריימים
-        if lms is None:
-            if self.last_good is not None and self.hold < self.max_hold:
-                self.hold += 1
-                return self.last_good
-            self.hold = 0
-            return None
-
-        # יש שלד: בדוק איכות ונטרול קפיצות
-        frac = self._quality(lms)
-        if frac < self.min_fraction:
-            # איכות ירודה → החזק שלד אחרון אם יש
-            if self.last_good is not None and self.hold < self.max_hold:
-                self.hold += 1
-                return self.last_good
-            self.hold = 0
-            return None
-
-        # איכות טובה: אם יש קפיצה חריגה וגם האיכות רק בינונית, התייחס כגליץ'
-        avg_d = self._avg_disp(lms)
-        if avg_d > self.jump_thr and frac < 0.8 and self.last_good is not None:
-            if self.hold < self.max_hold:
-                self.hold += 1
-                return self.last_good
-            self.hold = 0
-            # אם נגררנו מעבר לאחיזה המותרת—נעדיף להצמיד מידית ולא ליצור לג
-
-        # עדכון מיידי ללא החלקה (אין לג)
-        self.last_good = self._copy_xy(lms)
-        self.hold = 0
-        return self.last_good
-
-# ===================== עזרי ציור =====================
+# ===================== BODY-ONLY (לצייר שלד בלי פנים) =====================
 _FACE_LMS = {
     mp_pose.PoseLandmark.NOSE.value,
     mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
@@ -174,7 +92,86 @@ def draw_body_only(frame, landmarks, color=(255,255,255)):
         cv2.circle(frame, (x, y), 3, color, -1, cv2.LINE_AA)
     return frame
 
-# דונאט DEPTH
+# ===================== LandmarkStabilizer (ללא החלקה/לג) =====================
+class LandmarkStabilizer:
+    """Freeze-on-drop: כשיש זיהוי איכותי מציגים מיד; בעת איבוד איכות מחזיקים שלד אחרון לכמה פריימים ואז מסתירים."""
+    def __init__(self, quality_thr=0.55, min_fraction=0.6, jump_thr=0.12, max_hold=6, body_points=None):
+        # לא נסמוך על _BODY_POINTS חיצוני – נבנה גוף-בלבד מתוך mediapipe אם צריך:
+        if body_points is None:
+            FACE_LMS = _FACE_LMS
+            body_connections = _BODY_CONNECTIONS
+            self.body_points = tuple(sorted({i for (a,b) in body_connections for i in (a,b)}))
+        else:
+            self.body_points = tuple(body_points)
+        self.quality_thr = float(quality_thr)
+        self.min_fraction = float(min_fraction)
+        self.jump_thr = float(jump_thr)
+        self.max_hold = int(max_hold)
+        self.last_good = None  # רשימת נק' עם x,y
+        self.hold = 0
+
+    def _quality(self, lms):
+        ok = 0; total = 0
+        for i in self.body_points:
+            if i >= len(lms): continue
+            total += 1
+            vis = getattr(lms[i], 'visibility', 1.0) or 0.0
+            if vis >= self.quality_thr:
+                ok += 1
+        return (ok / max(1, total)) if total else 1.0
+
+    def _avg_disp(self, lms):
+        if not self.last_good: return 0.0
+        n = min(len(self.last_good), len(lms))
+        if n == 0: return 0.0
+        s = 0.0; c = 0
+        for i in self.body_points:
+            if i >= n: continue
+            dx = float(lms[i].x) - float(self.last_good[i].x)
+            dy = float(lms[i].y) - float(self.last_good[i].y)
+            s += (dx*dx + dy*dy) ** 0.5
+            c += 1
+        return (s / max(1, c))
+
+    def _copy_xy(self, lms):
+        out = []
+        for i in range(len(lms)):
+            out.append(type('P', (), {'x': float(lms[i].x), 'y': float(lms[i].y)}))
+        return out
+
+    def stabilize(self, lms):
+        # אין שלד: החזק אחרון לכמה פריימים ואז הסתר
+        if lms is None:
+            if self.last_good is not None and self.hold < self.max_hold:
+                self.hold += 1
+                return self.last_good
+            self.hold = 0
+            return None
+
+        # בדיקת איכות
+        frac = self._quality(lms)
+        if frac < self.min_fraction:
+            if self.last_good is not None and self.hold < self.max_hold:
+                self.hold += 1
+                return self.last_good
+            self.hold = 0
+            return None
+
+        # נטרול קפיצה חריגה
+        avg_d = self._avg_disp(lms)
+        if avg_d > self.jump_thr and frac < 0.8 and self.last_good is not None:
+            if self.hold < self.max_hold:
+                self.hold += 1
+                return self.last_good
+            self.hold = 0
+            # נצמד מידית מכאן כדי לא ליצור לג
+
+        # הצמדה מידית (ללא החלקה)
+        self.last_good = self._copy_xy(lms)
+        self.hold = 0
+        return self.last_good
+
+# ===================== עזרי ציור לאוברליי =====================
 def draw_depth_donut(frame, center, radius, thickness, pct):
     pct = float(np.clip(pct, 0.0, 1.0))
     cx, cy = int(center[0]), int(center[1])
@@ -186,7 +183,6 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
                 DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
     return frame
 
-# עטיפת טקסט לשתי שורות
 def _wrap_two_lines(draw, text, font, max_width):
     words = text.split()
     if not words: return [""]
@@ -208,7 +204,6 @@ def _wrap_two_lines(draw, text, font, max_width):
         lines[-1] = last
     return lines
 
-# אוברליי אחיד
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     h, w, _ = frame.shape
     # Reps box בפינה (0,0)
@@ -337,6 +332,7 @@ class BulgarianRepCounter:
         self._down_frames = 0
         self._last_depth_for_ui = 0.0
         self._last_rep_end_frame = -10
+
     def _start_rep(self, frame_no, start_knee_angle):
         if frame_no - self._last_rep_end_frame < REP_DEBOUNCE_FRAMES:
             return False
@@ -350,6 +346,7 @@ class BulgarianRepCounter:
         self._valgus_bad_frames = 0
         self._down_frames = 0
         return True
+
     def _finish_rep(self, frame_no, score, feedback, extra=None):
         score_q = round(float(score) * 2) / 2.0  # double
         if score_q >= GOOD_REP_MIN_SCORE: self.good_reps += 1
@@ -358,8 +355,8 @@ class BulgarianRepCounter:
             self.all_feedback[fb] += 1
         report = {
             "rep_index": self.rep_index,
-            "score": float(score_q),               # double לתאימות
-            "score_display": display_half_str(score_q),  # תצוגה
+            "score": float(score_q),                      # double לתאימות
+            "score_display": display_half_str(score_q),   # תצוגה
             "feedback": feedback or [],
             "start_frame": self.rep_start_frame or 0,
             "end_frame": frame_no,
@@ -375,6 +372,7 @@ class BulgarianRepCounter:
         self._start_knee_angle = None
         self._last_depth_for_ui = 0.0
         self._last_rep_end_frame = frame_no
+
     def evaluate_form(self, start_knee_angle, min_knee_angle, min_torso_angle, valgus_bad_frames):
         feedback = []
         score = 10.0
@@ -387,6 +385,7 @@ class BulgarianRepCounter:
         if depth_pct < 0.8:
             feedback.append("Go a bit deeper");         score -= 1
         return score, feedback, float(depth_pct)
+
     def update(self, knee_angle, torso_angle, valgus_ok_flag, frame_no):
         if knee_angle < ANGLE_DOWN_THRESH:
             if self.stage != 'down':
@@ -410,6 +409,7 @@ class BulgarianRepCounter:
                 self.rep_start_frame = None
                 self._start_knee_angle = None
             self.stage = 'up'
+
         if self.stage == 'down' and self.rep_start_frame:
             self._curr_min_knee = min(self._curr_min_knee, knee_angle)
             self._curr_max_knee = max(self._curr_max_knee, knee_angle)
@@ -422,23 +422,25 @@ class BulgarianRepCounter:
                 self._valgus_bad_frames = 0
             denom = max(10.0, (self._start_knee_angle - PERFECT_MIN_KNEE))
             self._last_depth_for_ui = float(np.clip((self._start_knee_angle - self._curr_min_knee) / denom, 0, 1))
+
     def depth_for_overlay(self):
         return float(self._last_depth_for_ui)
+
     def result(self):
         avg = np.mean([float(r["score"]) for r in self.rep_reports]) if self.rep_reports else 0.0
         technique_score = round(float(avg) * 2) / 2.0  # double
         return {
             "squat_count": self.count,
-            "technique_score": float(technique_score),              # double לתאימות
-            "technique_score_display": display_half_str(technique_score),  # string לתצוגה
-            "technique_label": score_label(technique_score),        # מילולי
+            "technique_score": float(technique_score),                 # double לתאימות
+            "technique_score_display": display_half_str(technique_score),  # string להצגה
+            "technique_label": score_label(technique_score),
             "good_reps": self.good_reps,
             "bad_reps": self.bad_reps,
             "feedback": list(self.all_feedback.elements()) if self.bad_reps > 0 else ["Great form! Keep it up 💪"],
             "reps": self.rep_reports
         }
 
-# ===================== טיפים לבולגרי (לא משפיע על ציון) =====================
+# ===================== טיפים לבולגרי (לא משפיע על הציון) =====================
 BULGARIAN_TIPS = [
     "Keep your front shin vertical at the bottom",
     "Drive through the front heel for power",
@@ -449,7 +451,6 @@ BULGARIAN_TIPS = [
 ]
 
 def choose_session_tip(counter: BulgarianRepCounter):
-    # אם נצפה הרבה Valgus → טיפ ברך; אם הרבה גב → טיפ core; אחרת ברירת מחדל עקב/שליטה
     if counter.all_feedback.get("Avoid knee collapse", 0) >= 2:
         return "Track your knee over your toes"
     if counter.all_feedback.get("Keep your back straight", 0) >= 2:
@@ -457,7 +458,6 @@ def choose_session_tip(counter: BulgarianRepCounter):
     return BULGARIAN_TIPS[1]  # Drive through the front heel
 
 # ===================== ריצה =====================
-
 def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
                            output_path="analyzed_output.mp4",
                            feedback_path="feedback_summary.txt"):
@@ -477,7 +477,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
     dt = 1.0 / float(effective_fps)
 
-    # עומק "לייב" דו-כיווני כמו בסקוואט (גם בירידה וגם בעלייה)
+    # עומק "לייב" דו-כיווני (גם בירידה וגם בעלייה)
     stand_knee_ema = None
     STAND_KNEE_ALPHA = 0.30
 
@@ -491,8 +491,8 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
     hip_vel_ema = ankle_vel_ema = 0.0
     movement_free_streak = 0
 
-    def _euclid(a,b):
-        return math.hypot(a[0]-b[0], a[1]-b[1]) / max(1, max(frame.shape[0], frame.shape[1]))
+    def _euclid(a, b, norm):
+        return math.hypot(a[0]-b[0], a[1]-b[1]) / max(1, norm)
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -511,6 +511,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
         depth_live = 0.0
 
         if not results.pose_landmarks:
+            # אין שלד — ריסט עומק, מפחית hold
             if rt_fb_hold > 0: rt_fb_hold -= 1
             stab_lms = lm_stab.stabilize(None)
         else:
@@ -528,8 +529,9 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
                          lms[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y * h)
             if prev_hip is None:
                 prev_hip, prev_la, prev_ra = hip_px, l_ankle_px, r_ankle_px
-            hip_vel = _euclid(hip_px, prev_hip)
-            an_vel  = max(_euclid(l_ankle_px, prev_la), _euclid(r_ankle_px, prev_ra))
+            norm = max(h, w)
+            hip_vel = _euclid(hip_px, prev_hip, norm)
+            an_vel  = max(_euclid(l_ankle_px, prev_la, norm), _euclid(r_ankle_px, prev_ra, norm))
             hip_vel_ema   = MOTION_EMA_ALPHA*hip_vel + (1-MOTION_EMA_ALPHA)*hip_vel_ema
             ankle_vel_ema = MOTION_EMA_ALPHA*an_vel  + (1-MOTION_EMA_ALPHA)*ankle_vel_ema
             prev_hip, prev_la, prev_ra = hip_px, l_ankle_px, r_ankle_px
@@ -537,7 +539,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             if movement_block: movement_free_streak = 0
             else:              movement_free_streak = min(MOVEMENT_CLEAR_FRAMES, movement_free_streak + 1)
 
-            # === חישובי זוויות ===
+            # === זוויות ===
             hip = lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_HIP").value, w, h)
             knee = lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value, w, h)
             ankle= lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value, w, h)
@@ -547,27 +549,27 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             knee_angle, torso_angle = ema.update(knee_angle_raw, torso_angle_raw)
             v_ok = valgus_ok(lms, side)
 
-            # === soft-start כמו בסקוואט ===
+            # === soft-start כמו בסקוואט: מתחילים רק כששקט יחסית ===
             soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.25) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.25)
             if (knee_angle < ANGLE_DOWN_THRESH) and (counter.stage != 'down') and soft_start_ok:
-                pass  # סטארט מתבצע בתוך המחלקה כמו קודם
+                pass  # הסטארט בפועל מתבצע במחלקה; אין שינוי לוגי
 
-            # === עדכון מונה (לוגיקה מקורית) + תנאי שקט בסיום ===
+            # === עדכון מונה (לוגיקה מקורית) + תנאי שקט לסיום ===
             prev_stage = counter.stage
             counter.update(knee_angle, torso_angle, v_ok, frame_no)
             if prev_stage == 'down' and counter.stage == 'up' and movement_free_streak < MOVEMENT_CLEAR_FRAMES:
-                counter.stage = 'down'
+                counter.stage = 'down'  # נחכה לשקט כדי לסיים חזרה
 
             # === עומק "לייב" דו-כיווני ===
             if knee_angle > ANGLE_UP_THRESH - 3 and movement_free_streak >= 1:
-                stand_knee_ema = knee_angle if stand_knee_ema is None else (0.30*knee_angle + 0.70*(stand_knee_ema))
+                stand_knee_ema = knee_angle if stand_knee_ema is None else (STAND_KNEE_ALPHA*knee_angle + (1-STAND_KNEE_ALPHA)*stand_knee_ema)
             if stand_knee_ema is not None:
                 denom_live = max(10.0, (stand_knee_ema - PERFECT_MIN_KNEE))
                 depth_live = float(np.clip((stand_knee_ema - knee_angle) / denom_live, 0, 1))
             else:
                 depth_live = counter.depth_for_overlay()
 
-            # === RT feedback עם HOLD ~0.8s ===
+            # === RT feedback עם HOLD ~0.8s (בלי לשנות לוגיקה בסיסית) ===
             live_msgs = []
             if counter.stage == 'down':
                 if counter._torso_bad_frames >= TORSO_BAD_MIN_FRAMES:
@@ -584,11 +586,11 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
                 if rt_fb_hold > 0: rt_fb_hold -= 1
                 if rt_fb_hold == 0: rt_fb_msg = None
 
-            # === ייצוב שלד לציור בלבד ===
+            # === ייצוב שלד לציור בלבד (ללא לג) ===
             stab_lms = lm_stab.stabilize(lms)
 
         # === ציור ===
-        if stab_lms:
+        if 'stab_lms' in locals() and stab_lms:
             frame = draw_body_only(frame, stab_lms)
         frame = draw_overlay(frame, reps=counter.count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
         out.write(frame)
@@ -599,10 +601,10 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
     result = counter.result()
 
-    # הוספת טיפ אחד לסשן (לא משפיע על ציון)
+    # הוספת form tip אחד (לא משפיע על ציון)
     session_tip = choose_session_tip(counter)
     result["tips"] = [session_tip]
-    result["form_tip"] = session_tip  # אופציונלי למי שצריך מפתח יחיד
+    result["form_tip"] = session_tip
 
     # קובץ תקציר
     try:
@@ -611,12 +613,13 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             f.write(f"Technique Score: {result['technique_score_display']} / 10  ({result['technique_label']})\n")
             f.write(f"Form Tip: {session_tip}\n")
             if result.get("feedback"):
-                f.write("Feedback:\n");
-                for fb in result["feedback"]: f.write(f"- {fb}\n")
+                f.write("Feedback:\n")
+                for fb in result["feedback"]:
+                    f.write(f"- {fb}\n")
     except Exception:
         pass
 
-    # קידוד faststart אמין + נפילה חכמה
+    # קידוד faststart אמין + fallback
     encoded_path = output_path.replace('.mp4', '_encoded.mp4')
     try:
         subprocess.run([
@@ -637,4 +640,3 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
 # תאימות
 run_analysis = run_bulgarian_analysis
-
