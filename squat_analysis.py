@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# squat_analysis.py — בסיס שסופר טוב + Overlay צמוד לפינה + פאי-גרף "לייב" ללא דיליי
-# + פידבק גב מדויק: בודק זקיפות באזור ה-Top, לא נעניש על אלכסון לגיטימי בתחתית.
+# squat_analysis.py — בסיס שסופר טוב + Overlay צמוד לפינה
+# פאי-גרף "לייב" ללא דיליי (עולה/יורד בזמן אמת), פידבק גב מדויק, ו-RT feedback עם Hold.
 import os
 import cv2
 import math
@@ -97,7 +97,6 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     frame = np.array(pil)
 
     # --- Donut (ימין-עליון) ---
-    h, w = frame.shape[:2]
     ref_h = max(int(h * 0.06), int(REPS_FONT_SIZE * 1.6))
     radius = int(ref_h * DONUT_RADIUS_SCALE)
     thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
@@ -118,7 +117,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
               pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-    # --- Bottom feedback (wrap לשתי שורות, לא נחתך) ---
+    # --- Bottom feedback (לא נחתך; עד 2 שורות; עם safe area) ---
     if feedback:
         def wrap_to_two_lines(draw, text, font, max_width):
             words = text.split()
@@ -136,7 +135,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
             leftover = len(words) - sum(len(l.split()) for l in lines)
             if leftover > 0 and len(lines) >= 2:
                 last = lines[-1] + "…"
-                while draw.textlength(last, font=FEEDBACK_FONT) > max_width and len(last) > 1:
+                while draw.textlength(last, font=font) > max_width and len(last) > 1:
                     last = last[:-2] + "…"
                 lines[-1] = last
             return lines
@@ -211,19 +210,6 @@ MOVEMENT_CLEAR_FRAMES = 2   # רצף קצר של שקט כדי לסיים חזר
 def _euclid(a, b):
     return math.hypot(a[0]-b[0], a[1]-b[1])
 
-# ===================== FORM TIPS (לא משפיע על ציון/וידאו) =====================
-FORM_TIPS = [
-    "Pause for 1–2s at the bottom to boost hypertrophy",
-    "Control the eccentric; go down a bit slower",
-    "Brace your core before the descent",
-    "Keep your stance slightly wider for better stability",
-]
-def choose_session_tip(per_rep_tip_candidates):
-    if not per_rep_tip_candidates:
-        return FORM_TIPS[0]
-    c = Counter(per_rep_tip_candidates)
-    return c.most_common(1)[0][0]
-
 # ===================== MAIN =====================
 def run_squat_analysis(video_path,
                        frame_skip=3,
@@ -254,7 +240,7 @@ def run_squat_analysis(video_path,
     hip_vel_ema = ankle_vel_ema = 0.0
     movement_free_streak = 0
 
-    # משתני עומק/ירידה
+    # משתני ירידה/עומק לחישובי ציון
     start_knee_angle = None
     rep_min_knee_angle = 180.0
     rep_max_knee_angle = -999.0
@@ -262,25 +248,32 @@ def run_squat_analysis(video_path,
     rep_start_frame = None
     rep_down_start_idx = None
 
-    # פרופיל גב לפי שלב התנועה (Top vs Bottom)
-    rep_top_torso_min    = 999.0   # מינימום זקיפות בקרבת עמידה
-    rep_bottom_torso_min = 999.0   # מינימום זקיפות בתחתית (לבדיקה רק אם קיצוני)
-
-    # ----- פאי-גרף: "לייב" ללא החלקה -----
+    # עומק "לייב" דו-כיווני (גם בירידה וגם בעלייה) — יחסית לזווית עמידה מוערכת
+    stand_knee_ema = None
+    STAND_KNEE_ALPHA = 0.30
     depth_live = 0.0
-    def set_depth(target):
-        nonlocal depth_live
-        depth_live = float(np.clip(target, 0.0, 1.0))
-        return depth_live
 
-    # איסוף מועמדי טיפ
-    tip_candidates_session = []
+    # פידבק גב — סינון לפי משך ואזור
+    TOP_THR_DEG       = 145.0   # Top: נתריע רק אם נמוך מזה (פחות זקוף)
+    BOTTOM_THR_DEG    = 108.0   # Bottom: נתריע רק אם ממש קיצוני
+    TOP_BAD_MIN_SEC   = 0.25    # צריך לפחות משך זה ב-Top כדי להתריע
+    BOTTOM_BAD_MIN_SEC= 0.35    # ובתחתית אפילו יותר
+    rep_top_bad_frames = 0
+    rep_bottom_bad_frames = 0
+
+    # פידבק בזמן אמת עם hold
+    RT_FB_HOLD_SEC = 0.8
+    rt_fb_msg = None
+    rt_fb_hold = 0
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
     dt = 1.0 / float(effective_fps)
+    TOP_BAD_MIN_FRAMES    = max(2, int(TOP_BAD_MIN_SEC / dt))
+    BOTTOM_BAD_MIN_FRAMES = max(2, int(BOTTOM_BAD_MIN_SEC / dt))
+    RT_FB_HOLD_FRAMES     = max(2, int(RT_FB_HOLD_SEC / dt))
 
     with mp_pose_mod.Pose(model_complexity=1, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
@@ -297,8 +290,9 @@ def run_squat_analysis(video_path,
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
             if not results.pose_landmarks:
-                set_depth(0.0)  # ריסט מיידי כשאין שלד
-                frame = draw_overlay(frame, reps=counter, feedback=None, depth_pct=depth_live)
+                depth_live = 0.0
+                if rt_fb_hold > 0: rt_fb_hold -= 1
+                frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
                 out.write(frame); continue
 
             try:
@@ -311,7 +305,7 @@ def run_squat_analysis(video_path,
                 heel_y   = lm[R.RIGHT_HEEL.value].y
                 l_ankle  = np.array([lm[R.LEFT_ANKLE.value].x,     lm[R.LEFT_ANKLE.value].y])
 
-                # מהירויות גלובליות
+                # --- מהירויות גלובליות ---
                 hip_px = (hip[0]*w, hip[1]*h)
                 la_px  = (l_ankle[0]*w, l_ankle[1]*h)
                 ra_px  = (ankle[0]*w,  ankle[1]*h)
@@ -327,62 +321,75 @@ def run_squat_analysis(video_path,
                 if movement_block: movement_free_streak = 0
                 else:              movement_free_streak = min(MOVEMENT_CLEAR_FRAMES, movement_free_streak + 1)
 
-                # לוגיקה קיימת — עם soft start להתחלה
+                # --- זוויות ---
                 knee_angle   = calculate_angle(hip, knee, ankle)
                 torso_angle  = calculate_angle(shoulder, hip, knee)
 
-                # התחלת ירידה — מתירים "שארית" תנועה קטנה
+                # --- עדכון זווית עמידה מוערכת (כשהוא בעמידה יציבה) ---
+                if (knee_angle > STAND_KNEE_ANGLE - 5) and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
+                    stand_knee_ema = knee_angle if stand_knee_ema is None else (STAND_KNEE_ALPHA*knee_angle + (1-STAND_KNEE_ALPHA)*stand_knee_ema)
+
+                # --- התחלת ירידה (soft start) ---
                 soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.25) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.25)
                 if (knee_angle < 100) and (stage != "down") and soft_start_ok:
                     start_knee_angle = float(knee_angle)
                     rep_min_knee_angle = 180.0
                     rep_max_knee_angle = -999.0
                     rep_min_torso_angle = 999.0
-                    rep_top_torso_min    = 999.0
-                    rep_bottom_torso_min = 999.0
+                    rep_top_bad_frames = 0
+                    rep_bottom_bad_frames = 0
                     rep_start_frame = frame_idx
                     rep_down_start_idx = frame_idx
                     stage = "down"
 
-                # תוך כדי ירידה — עומק "לייב" (ללא החלקה)
-                if stage == "down" and start_knee_angle is not None:
-                    denom = max(10.0, (start_knee_angle - PERFECT_MIN_KNEE_SQ))
-                    inst_depth = float(np.clip((start_knee_angle - knee_angle) / denom, 0, 1))  # עומק נוכחי
-                    set_depth(inst_depth)
+                # --- עומק "לייב" גם בירידה וגם בעלייה ---
+                if stand_knee_ema is not None:
+                    denom_live = max(10.0, (stand_knee_ema - PERFECT_MIN_KNEE_SQ))
+                    depth_live = float(np.clip((stand_knee_ema - knee_angle) / denom_live, 0, 1))
+                elif start_knee_angle is not None:
+                    denom_live = max(10.0, (start_knee_angle - PERFECT_MIN_KNEE_SQ))
+                    depth_live = float(np.clip((start_knee_angle - knee_angle) / denom_live, 0, 1))
+                else:
+                    depth_live = 0.0
 
+                # --- תוך כדי ירידה: מדדי רפ + סיווג גב לפי עומק ---
+                if stage == "down":
                     rep_min_knee_angle   = min(rep_min_knee_angle, knee_angle)
                     rep_max_knee_angle   = max(rep_max_knee_angle, knee_angle)
                     rep_min_torso_angle  = min(rep_min_torso_angle, torso_angle)
 
-                    # סיווג זקיפות לפי שלב (Top / Bottom) כדי להימנע מאזעקות שווא
-                    if inst_depth <= 0.20:
-                        rep_top_torso_min = min(rep_top_torso_min, torso_angle)
-                    elif inst_depth >= 0.60:
-                        rep_bottom_torso_min = min(rep_bottom_torso_min, torso_angle)
-
+                    # Top: עומק קטן → דורש זקיפות יחסית; Bottom: עומק גדול → סלחני יותר
+                    if depth_live <= 0.20 and torso_angle < TOP_THR_DEG:
+                        rep_top_bad_frames += 1
+                        # RT feedback עם hold
+                        if rt_fb_msg != "Try to keep your back a bit straighter":
+                            rt_fb_msg = "Try to keep your back a bit straighter"
+                            rt_fb_hold = RT_FB_HOLD_FRAMES
+                        else:
+                            rt_fb_hold = max(rt_fb_hold, RT_FB_HOLD_FRAMES)
+                    elif depth_live >= 0.60 and torso_angle < BOTTOM_THR_DEG:
+                        rep_bottom_bad_frames += 1
+                        # בזמן אמת לא נצעק בתחתית כדי לא להציק; נשמור לסוף רפ
+                    else:
+                        if rt_fb_hold > 0:
+                            rt_fb_hold -= 1
                 else:
-                    # לא בירידה → ריסט מיידי כדי שהדונאט לא יישאר תלוי
-                    set_depth(0.0)
+                    if rt_fb_hold > 0:
+                        rt_fb_hold -= 1
 
-                # סיום חזרה — דורש רצף קצר של שקט (כמו שעבד)
+                # --- סיום חזרה (כמו שעבד) ---
                 if (knee_angle > STAND_KNEE_ANGLE) and (stage == "down") and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
                     feedbacks = []
                     penalty = 0.0
 
-                    # עומק (כמו קודם)
+                    # עומק
                     hip_to_heel_dist = abs(hip[1] - heel_y)
                     if   hip_to_heel_dist > 0.48: feedbacks.append("Try to squat deeper");            penalty += 3
                     elif hip_to_heel_dist > 0.45: feedbacks.append("Almost there — go a bit lower");  penalty += 2
                     elif hip_to_heel_dist > 0.43: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
 
-                    # גב — יותר חכם: בודקים בעיקר ב-Top; בתחתית מאשרים אלכסון סביר
-                    TOP_THR    = 150.0   # ב-Top נרצה זקיפות טובה
-                    BOTTOM_THR = 112.0   # בתחתית נתריע רק אם ממש קיצוני
-                    back_flag = False
-                    if rep_top_torso_min < TOP_THR:
-                        back_flag = True
-                    elif rep_bottom_torso_min < BOTTOM_THR:
-                        back_flag = True
+                    # גב — מתריעים רק אם נצברה חריגה למשך מינימום
+                    back_flag = (rep_top_bad_frames >= TOP_BAD_MIN_FRAMES) or (rep_bottom_bad_frames >= BOTTOM_BAD_MIN_FRAMES)
                     if back_flag:
                         feedbacks.append("Try to keep your back a bit straighter")
                         penalty += 1.0
@@ -390,39 +397,30 @@ def run_squat_analysis(video_path,
                     # ציון
                     score = 10.0 if not feedbacks else round(max(4, 10 - min(penalty,6)) * 2) / 2
 
-                    # עומק סופי (אינדיקציה לשיא העומק של החזרה)
+                    # עומק סופי (שיא העומק בחזרה)
                     depth_pct = 0.0
                     if start_knee_angle is not None:
                         denom = max(10.0, (start_knee_angle - PERFECT_MIN_KNEE_SQ))
                         depth_pct = float(np.clip((start_knee_angle - rep_min_knee_angle) / denom, 0, 1))
 
-                    # Form Tip per-rep (רק ל-JSON, לא על המסך)
-                    down_frames = (frame_idx - (rep_down_start_idx or frame_idx))
-                    fast_eccentric = down_frames < max(10, int(0.25 / dt))
-                    per_rep_tip = None
-                    if fast_eccentric:
-                        per_rep_tip = "Control the eccentric; go down a bit slower"
-                    elif rep_bottom_torso_min < 130:
-                        per_rep_tip = "Brace your core before the descent"
-                    if per_rep_tip:
-                        tip_candidates_session.append(per_rep_tip)
-
+                    # דוח רפ
                     rep_reports.append({
                         "rep_index": counter + 1,
                         "score": round(float(score), 1),
                         "feedback": ([pick_strongest_feedback(feedbacks)] if feedbacks else []),
-                        "tip": per_rep_tip,
+                        "tip": None,
                         "start_frame": rep_start_frame or 0,
                         "end_frame": frame_idx,
                         "start_knee_angle": round(float(start_knee_angle or knee_angle), 2),
                         "min_knee_angle": round(float(rep_min_knee_angle), 2),
                         "max_knee_angle": round(float(rep_max_knee_angle), 2),
                         "torso_min_angle": round(float(rep_min_torso_angle), 2),
-                        "top_torso_min": round(float(rep_top_torso_min), 2),
-                        "bottom_torso_min": round(float(rep_bottom_torso_min), 2),
-                        "depth_pct": depth_pct
+                        "depth_pct": depth_pct,
+                        "top_bad_frames": int(rep_top_bad_frames),
+                        "bottom_bad_frames": int(rep_bottom_bad_frames)
                     })
 
+                    # פידבק-סשן
                     session_best_feedback = merge_feedback(session_best_feedback, [pick_strongest_feedback(feedbacks)] if feedbacks else [])
 
                     start_knee_angle = None
@@ -437,21 +435,15 @@ def run_squat_analysis(video_path,
                         else: bad_reps += 1
                         all_scores.append(score)
 
-                # ציור שלד + אוברליי
+                # --- ציור שלד + אוברליי ---
                 frame = draw_body_only(frame, lm)
-                # פידבק בזמן אמת: רק ב-Top ואם יש נטייה קדימה משמעותית
-                rt_feedback = None
-                if stage == "down" and start_knee_angle is not None:
-                    denom = max(10.0, (start_knee_angle - PERFECT_MIN_KNEE_SQ))
-                    inst_depth = float(np.clip((start_knee_angle - knee_angle) / denom, 0, 1))
-                    if inst_depth <= 0.20 and torso_angle < 150.0:
-                        rt_feedback = "Try to keep your back a bit straighter"
-                frame = draw_overlay(frame, reps=counter, feedback=rt_feedback, depth_pct=depth_live)
+                frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
                 out.write(frame)
 
             except Exception:
-                set_depth(0.0)
-                frame = draw_overlay(frame, reps=counter, feedback=None, depth_pct=depth_live)
+                if rt_fb_hold > 0: rt_fb_hold -= 1
+                depth_live = 0.0
+                frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
                 if out is not None: out.write(frame)
                 continue
 
@@ -463,10 +455,6 @@ def run_squat_analysis(video_path,
     technique_score = round(round(avg * 2) / 2, 2)
     feedback_list = [session_best_feedback] if session_best_feedback else ["Great form! Keep it up 💪"]
 
-    # טיפ יחיד לסשן (לא מוצג בווידאו)
-    session_tip = choose_session_tip([])  # אפשר לצבור מ-per_rep_tip אם תרצה
-    tips = [session_tip] if session_tip else []
-
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
             f.write(f"Total Reps: {counter}\n")
@@ -474,9 +462,6 @@ def run_squat_analysis(video_path,
             if feedback_list:
                 f.write("Feedback:\n")
                 for fb in feedback_list: f.write(f"- {fb}\n")
-            if tips:
-                f.write("Form Tip:\n")
-                for t in tips: f.write(f"- {t}\n")
     except Exception:
         pass
 
@@ -500,7 +485,6 @@ def run_squat_analysis(video_path,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
         "feedback": feedback_list,
-        "tips": tips,
         "reps": rep_reports,
         "video_path": final_video_path,
         "feedback_path": feedback_path
