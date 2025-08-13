@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
-# pullup_analysis.py — זרימה ותזמון "כמו סקווט": frame-skip דטרמיניסטי, VideoWriter ב‑effective_fps,
-# לוגיקת ספירה המקורית, אוברליי תואם, ושמות החזרה גלובליים (squat_count).
-# נבדק לעומת squat_analysis (6).py כדי ליישר את דפוס הריצה והלוגים.
+# pullup_analysis.py — זרימה כמו סקוואט, תיקון SyntaxError (ללא '\'), לוגים תכופים,
+# ספירה זהה למקור, overlay תואם, והחזרה עם squat_count כשם גלובלי.
 
 import os
 import cv2
@@ -31,14 +30,14 @@ FEEDBACK_FONT    = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
 DEPTH_LABEL_FONT = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
 DEPTH_PCT_FONT   = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 
-# דונאט
+# Donut
 DONUT_RADIUS_SCALE   = 0.72
 DONUT_THICKNESS_FRAC = 0.28
 DEPTH_COLOR          = (40, 200, 80)   # ירוק כמו בסקוואט
 DEPTH_RING_BG        = (70, 70, 70)
 
 # ==============================
-# ספים/הגדרות ספירה (תואם למקור שלך)
+# ספים/הגדרות ספירה (כמו המקור שלך)
 # ==============================
 ELBOW_START_THRESHOLD = 150.0
 ELBOW_TOP_THRESHOLD   = 65.0
@@ -46,7 +45,6 @@ ELBOW_BOTTOM_THRESHOLD= 160.0
 HEAD_MIN_ASCENT       = 0.06
 HEAD_VEL_UP_THRESH    = 0.0025
 HEAD_TOP_STICK_FRAMES = 2
-
 FPS_FALLBACK          = 25.0
 
 # ===================== עזר =====================
@@ -267,7 +265,6 @@ class PullUpAnalyzer:
         if not MP_AVAILABLE:
             raise RuntimeError("mediapipe not available")
 
-        # OpenCV אופטימיזציות קלות
         try:
             cv2.setUseOptimized(True)
             cv2.setNumThreads(1)
@@ -297,7 +294,7 @@ class PullUpAnalyzer:
                 if not ret: break
                 frame_idx += 1
                 if frame_idx % max(1, frame_skip) != 0:
-                    continue  # דילול פריימים דטרמיניסטי — כמו בסקוואט
+                    continue
 
                 if scale != 1.0:
                     frame = cv2.resize(frame, (0,0), fx=scale, fy=scale)
@@ -320,7 +317,7 @@ class PullUpAnalyzer:
                         frame = draw_overlay(frame, reps=self.rep_count, feedback=(self.rt_fb_msg if self.rt_fb_hold>0 else None), ascent_pct=self.ascent_live)
                     if out is not None: out.write(frame)
                     if time.time() - last_log > 0.3:
-                        print(f\"[PULLUP] proc f{frame_idx} reps={self.rep_count} (no landmarks)\", flush=True)
+                        print(f"[PULLUP] proc f{frame_idx} reps={self.rep_count} (no landmarks)", flush=True)
                         last_log = time.time()
                     continue
 
@@ -336,23 +333,20 @@ class PullUpAnalyzer:
                 wrst = _get_xy(lms, wr_idx, w, h)
 
                 if _safe_vis(nose[2], shld[2], elbw[2], wrst[2], min_v=0.4):
-                    head_y = nose[1] / h  # 0 למעלה, 1 למטה
+                    head_y = nose[1] / h
                     elbow_angle = _angle(shld[:2], elbw[:2], wrst[:2])
                     if self.baseline_head_y_global is None:
                         self.baseline_head_y_global = head_y
 
-                # ASCENT לדונאט
                 if self.baseline_head_y_global is not None and head_y is not None:
                     self.ascent_live = float(np.clip(self.baseline_head_y_global - head_y, 0.0, 1.0))
                 else:
                     self.ascent_live = 0.0
 
-                # מהירות ראש
                 head_vel = 0.0
                 if self.last_head_y is not None and head_y is not None:
-                    head_vel = head_y - self.last_head_y  # שלילי = עולה
+                    head_vel = head_y - self.last_head_y
 
-                # ===== ספירה (כמו במקור) =====
                 if elbow_angle is not None and head_y is not None:
                     if not self.in_rep:
                         if rep_baseline_head_y is None:
@@ -362,12 +356,10 @@ class PullUpAnalyzer:
                             self.min_head_y_in_rep = head_y
                             self.seen_top_frames = 0
                             self.rep_started_elbow = elbow_angle
-                            print(f\"[PULLUP] rep start f{frame_idx} elbow={elbow_angle:.1f} head_y={head_y:.3f}\", flush=True)
+                            print(f"[PULLUP] rep start f{frame_idx} elbow={elbow_angle:.1f} head_y={head_y:.3f}", flush=True)
                     else:
-                        # שיא עלייה (head_y מינימלי בתוך הסט)
                         self.min_head_y_in_rep = head_y if self.min_head_y_in_rep is None else min(self.min_head_y_in_rep, head_y)
 
-                        # בדיקת טופ
                         if self._confirm_top(elbow_angle, head_y, rep_baseline_head_y):
                             self.seen_top_frames += 1
                         else:
@@ -388,7 +380,7 @@ class PullUpAnalyzer:
                             score = _round_score_half(score)
 
                             self.rep_count += 1
-                            print(f\"[PULLUP] REP {self.rep_count} peak={ascent_peak:.3f} top_elbow={elbow_angle:.1f}\", flush=True)
+                            print(f"[PULLUP] REP {self.rep_count} peak={ascent_peak:.3f} top_elbow={elbow_angle:.1f}", flush=True)
                             self.reps_meta.append({
                                 "rep_index": self.rep_count,
                                 "score": float(score),
@@ -402,14 +394,12 @@ class PullUpAnalyzer:
                             if fb and not self.session_best_feedback:
                                 self.session_best_feedback = fb
 
-                            # reset לחזרה הבאה
                             self.in_rep = False
                             self.min_head_y_in_rep = None
                             self.rep_started_elbow = None
                             self.seen_top_frames = 0
                             rep_baseline_head_y = None
 
-                # RT-feedback — רק בתוך חזרה
                 if self.in_rep:
                     if self.ascent_live < 0.03:
                         if self.rt_fb_msg != "Aim for chin over the bar":
@@ -424,7 +414,6 @@ class PullUpAnalyzer:
                     self.rt_fb_msg = None
                     self.rt_fb_hold = 0
 
-                # ציור שלד + אוברליי
                 if results.pose_landmarks is not None:
                     frame = draw_body_only(frame, results.pose_landmarks.landmark)
                 if overlay_enabled:
@@ -433,11 +422,9 @@ class PullUpAnalyzer:
                 if out is not None:
                     out.write(frame)
 
-                # עדכונים
                 if elbow_angle is not None: self.last_elbow = elbow_angle
                 if head_y is not None:     self.last_head_y = head_y
 
-                # לוג תקופתי
                 if time.time() - last_log > 0.3:
                     eh = f"{elbow_angle:.1f}" if elbow_angle is not None else "NA"
                     hy = f"{head_y:.3f}" if head_y is not None else "NA"
@@ -447,7 +434,6 @@ class PullUpAnalyzer:
         cap.release()
         if out is not None: out.release()
 
-        # faststart encode (כמו בסקוואט)
         final_video_path = ""
         if output_path:
             encoded_path = output_path.replace(".mp4", "_encoded.mp4")
@@ -548,4 +534,5 @@ if __name__ == "__main__":
         overlay_enabled=(not args.no_overlay)
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
 
