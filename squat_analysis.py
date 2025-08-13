@@ -126,22 +126,69 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
               pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-    # --- Bottom feedback ---
+     # --- Bottom feedback (לא נחתך; עד 2 שורות; עם safe area) ---
     if feedback:
-        line_h = FEEDBACK_FONT.size + 6
-        bottom_h = max(int(h * 0.08), line_h + 14)
-        over = frame.copy()
-        cv2.rectangle(over, (0, h - bottom_h), (w, h), (0,0,0), -1)
-        frame = cv2.addWeighted(over, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
-        pil2 = Image.fromarray(frame)
-        draw2 = ImageDraw.Draw(pil2)
-        tw = draw2.textlength(feedback, font=FEEDBACK_FONT)
-        tx = max(10, (w - int(tw)) // 2)
-        ty = h - bottom_h + (bottom_h - line_h) // 2
-        draw2.text((tx, ty), feedback, font=FEEDBACK_FONT, fill=(255,255,255))
-        frame = np.array(pil2)
+        # עוזר: עטיפת טקסט עד רוחב נתון ולכל היותר 2 שורות
+        def wrap_to_two_lines(draw, text, font, max_width):
+            words = text.split()
+            if not words:
+                return [""]
+            lines = []
+            cur = ""
+            for w in words:
+                trial = (cur + " " + w).strip()
+                if draw.textlength(trial, font=font) <= max_width:
+                    cur = trial
+                else:
+                    if cur:
+                        lines.append(cur)
+                    cur = w
+                if len(lines) == 2:  # לא עוברים 2 שורות
+                    break
+            if cur and len(lines) < 2:
+                lines.append(cur)
 
-    return frame
+            # אם נשארו מילים אחרי 2 שורות — חותכים עם …
+            leftover = len(words) - sum(len(l.split()) for l in lines)
+            if leftover > 0 and len(lines) >= 2:
+                # הוסף אליפסיס לשורה האחרונה, ודא שנכנס לרוחב
+                last = lines[-1] + "…"
+                while draw.textlength(last, font=font) > max_width and len(last) > 1:
+                    last = last[:-2] + "…"
+                lines[-1] = last
+            return lines
+
+        pil_fb = Image.fromarray(frame)
+        draw_fb = ImageDraw.Draw(pil_fb)
+
+        safe_margin = max(6, int(h * 0.02))    # מרים קצת מעל השוליים כדי שלא ייחתך בנגנים
+        pad_x, pad_y = 12, 8                   # פדינג פנימי
+        line_gap = 4
+        max_text_w = int(w - 2*pad_x - 20)     # מרווחי צד
+
+        lines = wrap_to_two_lines(draw_fb, feedback, FEEDBACK_FONT, max_text_w)
+        line_h = FEEDBACK_FONT.size + 6
+        block_h = (2*pad_y) + len(lines)*line_h + (len(lines)-1)*line_gap
+
+        y0 = max(0, h - safe_margin - block_h)
+        y1 = h - safe_margin
+
+        over = frame.copy()
+        cv2.rectangle(over, (0, y0), (w, y1), (0,0,0), -1)
+        frame = cv2.addWeighted(over, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
+
+        pil_fb = Image.fromarray(frame)
+        draw_fb = ImageDraw.Draw(pil_fb)
+
+        ty = y0 + pad_y
+        for ln in lines:
+            tw = draw_fb.textlength(ln, font=FEEDBACK_FONT)
+            tx = max(pad_x, (w - int(tw)) // 2)   # מיושר למרכז, שומר שוליים
+            draw_fb.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255,255,255))
+            ty += line_h + line_gap
+
+        frame = np.array(pil_fb)
+
 
 # ===================== BODY-ONLY SKELETON =====================
 _FACE_LMS = {
