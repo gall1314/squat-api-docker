@@ -435,4 +435,3 @@ def run_analysis(video_path, frame_skip=3, scale=0.4,
         "feedback_path": feedback_path
     }
 
-
