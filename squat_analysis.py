@@ -460,3 +460,4 @@ def run_squat_analysis(video_path,
 # ===== Alias לשמירה על תאימות ל-app.py =====
 def run_analysis(*args, **kwargs):
     return run_squat_analysis(*args, **kwargs)
+
