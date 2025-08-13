@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-# Bulgarian Split Squat — Overlay מאוחד בדיוק כמו בסקוואט + שיפורים שביקשת:
-# 1) אותו אוברליי (פונטים/מיקומים/דונאט "לייב" דו-כיווני, פידבק תחתון עם HOLD ~0.8s, שלד גוף בלבד)
-# 2) חסימת ספירה בהליכה/תנועה גלובלית (soft-start + דרישת שקט לסיום), כמו בסקוואט
-# 3) ייצוב שלד (סmoothing לציור בלבד, לא משנה לוגיקה)
-# 4) ציון מעוגל ל-0.5 — ואם אין .5, מוחזר מספר שלם (ללא .0)
-# 5) פלט וידאו עמיד (faststart, יצירת תיקיות, נפילה חכמה אם ffmpeg נכשל)
+# Bulgarian Split Squat — Overlay מאוחד כמו בסקוואט + תיקון תאימות JSON:
+# ✅ לא משנה לוגיקת ספירה.
+# ✅ טיפוסי JSON תואמים לקודם: ציונים תמיד כ-double (10.0, 9.5 וכו') — אין החזרה של int.
+# ✅ אותו אוברליי (Reps בפינה, דונאט לייב דו-כיווני, פידבק תחתון עם HOLD ~0.8s, שלד גוף בלבד).
+# ✅ חסימת ספירה בזמן הליכה (soft-start + דרישת שקט לסיום), כמו בסקוואט.
+# ✅ ייצוב שלד לציור בלבד כדי למנוע קפיצות.
+# ✅ פלט וידאו עמיד (faststart), תמיד מחזיר נתיב קיים.
 
 import os, math, subprocess
 import cv2, numpy as np
@@ -237,7 +238,7 @@ class AngleEMA:
             self.torso = a * ta + (1.0 - a) * self.torso
         return self.knee, self.torso
 
-# ===================== מונה חזרות (לוגיקה מקורית) =====================
+# ===================== מונה חזרות (לוגיקה מקורית + שמירה על טיפוסי JSON) =====================
 class BulgarianRepCounter:
     def __init__(self):
         self.count = 0
@@ -272,15 +273,15 @@ class BulgarianRepCounter:
         self._down_frames = 0
         return True
     def _finish_rep(self, frame_no, score, feedback, extra=None):
-        # עיגול ל-0.5 ואז המרה לאינט אם אין .5
-        score_q = quantize_half(score)
+        # שמירה על טיפוס כפול (double) כמו קודם
+        score_q = round(float(score) * 2) / 2.0
         if score_q >= GOOD_REP_MIN_SCORE: self.good_reps += 1
         else:
             self.bad_reps += 1
             if feedback: self.all_feedback.update(feedback)
         report = {
             "rep_index": self.rep_index,
-            "score": score_q,
+            "score": float(score_q),  # <-- תמיד double
             "feedback": feedback or [],
             "start_frame": self.rep_start_frame or 0,
             "end_frame": frame_no,
@@ -347,22 +348,15 @@ class BulgarianRepCounter:
         return float(self._last_depth_for_ui)
     def result(self):
         avg = np.mean([float(r["score"]) for r in self.rep_reports]) if self.rep_reports else 0.0
-        technique_score = quantize_half(avg)
+        technique_score = round(float(avg) * 2) / 2.0  # <-- תמיד double
         return {
             "squat_count": self.count,
-            "technique_score": technique_score if self.count else 0,
+            "technique_score": float(technique_score) if self.count else 0.0,
             "good_reps": self.good_reps,
             "bad_reps": self.bad_reps,
             "feedback": list(self.all_feedback) if self.bad_reps > 0 else ["Great form! Keep it up 💪"],
             "reps": self.rep_reports
         }
-
-# עיגול ל-0.5 והסרת .0 כשאפשר
-def quantize_half(x):
-    q = round(float(x) * 2) / 2.0
-    if abs(q - round(q)) < 1e-9:
-        return int(round(q))
-    return q
 
 # ===================== ריצה =====================
 
@@ -459,16 +453,15 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             # === soft-start כמו בסקוואט: מתחילים רק כשהגוף רגוע יחסית ===
             soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.25) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.25)
             if (knee_angle < ANGLE_DOWN_THRESH) and (counter.stage != 'down') and soft_start_ok:
-                # מאפשרים start דרך המחלקה, ההיסטרזיס נשאר זהה
+                # מאפשרים start דרך המחלקה (הלוגיקה הפנימית נשארת כשהייתה)
                 pass
 
             # === עדכון מונה (לוגיקה מקורית) ===
-            # חסימת סיום חזרה: נדרוש גם movement_free_streak לסיום (כמו בסקוואט)
             prev_stage = counter.stage
             counter.update(knee_angle, torso_angle, v_ok, frame_no)
-            # אכיפת חסימת סיום: אם עבר ל-up באותו פריים בלי רצף שקט, נבטל את המעבר (שומר על לוגיקה קיימת ככל האפשר)
+            # אכיפת שקט לסיום — אם עבר ל-up בלי רצף שקט, נחזיר ל-down
             if prev_stage == 'down' and counter.stage == 'up' and movement_free_streak < MOVEMENT_CLEAR_FRAMES:
-                counter.stage = 'down'  # נחכה לשקט כדי לסיים באמת
+                counter.stage = 'down'
 
             # === עומק "לייב" דו-כיווני ===
             if knee_angle > ANGLE_UP_THRESH - 3 and movement_free_streak >= 1:
@@ -479,7 +472,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             else:
                 depth_live = counter.depth_for_overlay()
 
-            # === RT feedback עם HOLD ~0.8s (ללא שינוי לוגיקה בסיסית) ===
+            # === RT feedback עם HOLD ~0.8s ===
             live_msgs = []
             if counter.stage == 'down':
                 if counter._torso_bad_frames >= TORSO_BAD_MIN_FRAMES:
@@ -500,7 +493,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             sm_lms = lm_smoother.smooth(lms)
 
         # === ציור ===
-        if sm_lms:
+        if results.pose_landmarks:
             frame = draw_body_only(frame, sm_lms)
         frame = draw_overlay(frame, reps=counter.count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
         out.write(frame)
@@ -534,7 +527,6 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
     except Exception:
         final_path = output_path
 
-    # אם משום מה אין אף קובץ (נדיר) — נוודא שהמקור קיים
     if not os.path.isfile(final_path) and os.path.isfile(output_path):
         final_path = output_path
 
@@ -546,3 +538,4 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
 # תאימות
 run_analysis = run_bulgarian_analysis
+
