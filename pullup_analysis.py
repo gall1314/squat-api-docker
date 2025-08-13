@@ -90,6 +90,22 @@ try:
 except Exception:
     MP_AVAILABLE = False
 
+if MP_AVAILABLE:
+    mp_pose = mp.solutions.pose
+
+    _FACE_LMS = {
+        mp_pose.PoseLandmark.NOSE.value,
+        mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
+        mp_pose.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose.PoseLandmark.RIGHT_EYE.value, mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
+        mp_pose.PoseLandmark.LEFT_EAR.value, mp_pose.PoseLandmark.RIGHT_EAR.value,
+        mp_pose.PoseLandmark.MOUTH_LEFT.value, mp_pose.PoseLandmark.MOUTH_RIGHT.value,
+    }
+    _BODY_CONNECTIONS = tuple(
+        (a, b) for (a, b) in mp_pose.POSE_CONNECTIONS
+        if a not in _FACE_LMS and b not in _FACE_LMS
+    )
+    _BODY_POINTS = tuple(sorted({i for conn in _BODY_CONNECTIONS for i in conn}))
+
 POSE_IDXS = {
     "nose": 0,
     "left_shoulder": 11, "right_shoulder": 12,
@@ -113,6 +129,22 @@ def _get_xy(landmarks, idx, w, h):
 
 def _safe_vis(*vals, min_v=0.5):
     return all(v >= min_v for v in vals)
+
+def draw_body_only(frame, landmarks, color=(255,255,255)):
+    """שלד גוף בלבד (ללא פנים)."""
+    if not MP_AVAILABLE:
+        return frame
+    h, w = frame.shape[:2]
+    for a, b in _BODY_CONNECTIONS:
+        pa = landmarks[a]; pb = landmarks[b]
+        ax, ay = int(pa.x * w), int(pa.y * h)
+        bx, by = int(pb.x * w), int(pb.y * h)
+        cv2.line(frame, (ax, ay), (bx, by), color, 2, cv2.LINE_AA)
+    for i in _BODY_POINTS:
+        p = landmarks[i]
+        x, y = int(p.x * w), int(p.y * h)
+        cv2.circle(frame, (x, y), 3, color, -1, cv2.LINE_AA)
+    return frame
 
 # ===================== Overlay (תואם סקוואט) =====================
 def draw_ascent_donut(frame, center, radius, thickness, pct):
@@ -263,7 +295,7 @@ class PullUpAnalyzer:
                 mov = True
         return mov
 
-    def process(self, input_path, output_path=None, frame_skip=3, scale=0.4, draw_overlay=True):
+    def process(self, input_path, output_path=None, frame_skip=3, scale=0.4, overlay_enabled=True):
         if not MP_AVAILABLE:
             raise RuntimeError("mediapipe not available")
 
@@ -447,8 +479,10 @@ class PullUpAnalyzer:
                     depth_val = max(0.0, min(1.0, (baseline_head_y_global - head_y)))
                     self.depth_ema = _ema(self.depth_ema, depth_val, EMA_ALPHA_DEPTH)
 
-                # ציור אוברליי
-                if draw_overlay:
+                # ציור שלד + אוברליי
+                if res.pose_landmarks is not None:
+                    frame = draw_body_only(frame, res.pose_landmarks.landmark)
+                if overlay_enabled:
                     frame = draw_overlay(
                         frame,
                         reps=self.rep_count,
@@ -531,7 +565,7 @@ class PullUpAnalyzer:
 # ===========================
 # API
 # ===========================
-def run_pullup_analysis(input_path, frame_skip=3, scale=0.4, output_path=None, overlay=True):
+def run_pullup_analysis(input_path, frame_skip=3, scale=0.4, output_path=None, overlay_enabled=True):
     try:
         cv2.setNumThreads(1)
     except Exception:
@@ -544,7 +578,7 @@ def run_pullup_analysis(input_path, frame_skip=3, scale=0.4, output_path=None, o
         output_path=output_path,
         frame_skip=frame_skip,
         scale=scale,
-        draw_overlay=overlay
+        overlay_enabled=overlay_enabled
     )
     res["elapsed_sec"] = round(time.time() - t0, 3)
     if output_path and "video_path" not in res:
@@ -570,6 +604,6 @@ if __name__ == "__main__":
         frame_skip=args.skip,
         scale=args.scale,
         output_path=out_path,
-        overlay=(not args.no_overlay)
+        overlay_enabled=(not args.no_overlay)
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
