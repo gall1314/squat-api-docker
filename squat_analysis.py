@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# squat_analysis.py  (אפשר גם לשמור כ-combined_analysis.py)
+# squat_analysis.py
 import os
 import cv2
 import math
@@ -10,8 +10,8 @@ import mediapipe as mp
 
 # ===================== STYLE / FONTS =====================
 BAR_BG_ALPHA         = 0.55
-TOP_PAD              = 0    # צמוד לפינה
-LEFT_PAD             = 0    # צמוד לפינה
+TOP_PAD              = 0   # צמוד לפינה
+LEFT_PAD             = 0   # צמוד לפינה
 
 # Donut (מוקטן ומונמך שלא ייחתך)
 DONUT_RADIUS_SCALE   = 0.72
@@ -60,52 +60,40 @@ def merge_feedback(global_best, new_list):
     if not global_best: return cand
     return cand if FB_SEVERITY.get(cand,1) >= FB_SEVERITY.get(global_best,1) else global_best
 
-# ===================== HELPERS =====================
-def _text_height(font):
-    # חישוב גובה טקסט מדויק
+# ===================== TEXT HELPERS =====================
+def _text_height(font: ImageFont.FreeTypeFont) -> int:
     try:
         bbox = font.getbbox("Ag")
         return bbox[3] - bbox[1]
     except Exception:
         return font.size
 
-def wrap_to_n_lines(draw, text, font, max_width, max_lines=2, ellipsis="…"):
-    """
-    עוטף טקסט עד max_lines שורות. אם חורג — מוסיף …
-    """
+def wrap_to_n_lines(draw: ImageDraw.ImageDraw, text: str, font, max_width: int, max_lines: int = 2, ellipsis="…"):
     words = (text or "").split()
-    lines = []
-    curr = []
+    lines, cur = [], []
     for w in words:
-        test = (" ".join(curr + [w])).strip()
+        test = (" ".join(cur + [w])).strip()
         if draw.textlength(test, font=font) <= max_width:
-            curr.append(w)
+            cur.append(w)
         else:
-            if curr:
-                lines.append(" ".join(curr))
-            curr = [w]
-            if len(lines) == max_lines - 1:  # השורה הבאה תהיה האחרונה
+            if cur:
+                lines.append(" ".join(cur))
+            cur = [w]
+            if len(lines) >= max_lines - 1:
                 break
-
-    # הוסף את השארית
-    remainder = " ".join(curr).strip()
-    if remainder:
-        lines.append(remainder)
+    if cur:
+        lines.append(" ".join(cur))
 
     if len(lines) > max_lines:
         lines = lines[:max_lines]
 
-    # אם עדיין יש מילים שלא נכנסו — קצץ אחרונה והוסף …
-    if len(words) > 0:
-        joined = " ".join(words)
-        rebuilt = " ".join(lines)
-        if joined != rebuilt:
-            # יש חיתוך — ודא שהשורה האחרונה נגישה …
-            last = lines[-1]
-            while last and draw.textlength(last + ellipsis, font=font) > max_width:
-                last = last[:-1].rstrip()
-            lines[-1] = (last + ellipsis) if last else ellipsis
-
+    joined = " ".join(words)
+    rebuilt = " ".join(lines)
+    if joined != rebuilt and lines:
+        last = lines[-1]
+        while last and draw.textlength(last + ellipsis, font=font) > max_width:
+            last = last[:-1].rstrip()
+        lines[-1] = (last + ellipsis) if last else ellipsis
     return lines
 
 # ===================== OVERLAY =====================
@@ -122,37 +110,44 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
     return frame
 
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Reps צמוד לפינת שמאל־עליון, דונאט קטן ומונמך, פידבק בתחתית עד 2 שורות ללא חיתוך."""
+    """
+    • Reps: ריבוע שחור שקוף קטן, צמוד לפינת שמאל־עליון (לא מכסה רוחב).
+    • Donut: ימני־עליון לא נחתך.
+    • Feedback: בתחתית, נשבר עד 2 שורות בלי חיתוך.
+    """
     h, w, _ = frame.shape
 
-    # --- Reps box (צמוד לפינה) ---
+    # --- Reps box (צמוד לפינה, לא "צף") ---
     pil = Image.fromarray(frame)
     draw = ImageDraw.Draw(pil)
     reps_text = f"Reps: {reps}"
     text_w = draw.textlength(reps_text, font=REPS_FONT)
     text_h = _text_height(REPS_FONT)
-    pad_x, pad_y = 10, 6
+    inner_pad_x, inner_pad_y = 10, 6
     x0, y0 = LEFT_PAD, TOP_PAD
-    x1 = min(int(x0 + text_w + 2*pad_x), w-1)
-    y1 = int(y0 + text_h + 2*pad_y)
+    x1 = min(int(x0 + text_w + 2*inner_pad_x), w-1)
+    y1 = int(y0 + text_h + 2*inner_pad_y)
 
     top = frame.copy()
     cv2.rectangle(top, (x0, y0), (x1, y1), (0,0,0), -1)
     frame = cv2.addWeighted(top, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
 
     pil = Image.fromarray(frame)
-    ImageDraw.Draw(pil).text((x0 + pad_x, y0 + pad_y - 1), reps_text, font=REPS_FONT, fill=(255,255,255))
+    ImageDraw.Draw(pil).text((x0 + inner_pad_x, y0 + inner_pad_y - 1),
+                             reps_text, font=REPS_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
     # --- Donut (ימין-עליון) ---
-    ref_h = max(int(h * 0.06), int(REPS_FONT.size * 1.6))
+    ref_h = max(int(h * 0.065), int(REPS_FONT.size * 1.7))
     radius = int(ref_h * DONUT_RADIUS_SCALE)
     thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
     margin = 12
     cx = w - margin - radius
-    cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
+    cy = max(radius + thick + 6, int(0.10 * h))  # מספיק מרחק מהחלק העליון
+
     frame = draw_depth_donut(frame, (cx, cy), radius, thick, float(np.clip(depth_pct,0,1)))
 
+    # טקסטים של הדונאט
     pil  = Image.fromarray(frame)
     draw = ImageDraw.Draw(pil)
     label_txt = "DEPTH"
@@ -171,10 +166,10 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     if feedback:
         pil2 = Image.fromarray(frame)
         draw2 = ImageDraw.Draw(pil2)
-
         side_pad = 16
-        max_text_w = max(20, w - side_pad * 2)
+        max_text_w = max(24, w - side_pad * 2)
         lines = wrap_to_n_lines(draw2, feedback, FEEDBACK_FONT, max_text_w, max_lines=2)
+
         line_h = _text_height(FEEDBACK_FONT) + 4
         text_block_h = len(lines) * line_h
         bottom_pad = 12
@@ -186,11 +181,10 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
         pil2 = Image.fromarray(frame)
         draw2 = ImageDraw.Draw(pil2)
-
         y = h - bottom_h + bottom_pad
         for ln in lines:
             tw = draw2.textlength(ln, font=FEEDBACK_FONT)
-            tx = max(side_pad, (w - int(tw)) // 2)  # מרכז + שוליים כדי לא לגעת בקצה
+            tx = max(side_pad, (w - int(tw)) // 2)  # מרכז + שוליים
             draw2.text((tx, y), ln, font=FEEDBACK_FONT, fill=(255,255,255))
             y += line_h
 
@@ -202,8 +196,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 _FACE_LMS = {
     mp_pose.PoseLandmark.NOSE.value,
     mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
-    mp_pose.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose.PoseLandmark.RIGHT_EE.value if hasattr(mp_pose.PoseLandmark, "RIGHT_EE") else mp_pose.PoseLandmark.RIGHT_EYE.value,
-    mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
+    mp_pose.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose.PoseLandmark.RIGHT_EYE.value, mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
     mp_pose.PoseLandmark.LEFT_EAR.value, mp_pose.PoseLandmark.RIGHT_EAR.value,
     mp_pose.PoseLandmark.MOUTH_LEFT.value, mp_pose.PoseLandmark.MOUTH_RIGHT.value,
 }
@@ -350,7 +343,7 @@ def run_squat_analysis(video_path,
                     if torso_angle < 140:
                         feedbacks.append("Try to keep your back a bit straighter"); penalty += 1.0
 
-                    # נעילה (הערה משנית, לא מציגים כטקסט בזמן אמת)
+                    # נעילה (לא מוצג בטקסט בזמן אמת)
                     if knee_angle < 160:
                         penalty += 0.5
 
@@ -396,7 +389,7 @@ def run_squat_analysis(video_path,
                 # שלד – גוף בלבד
                 frame = draw_body_only(frame, lm)
 
-                # פידבק בזמן אמת על המסך – מציגים רק החמור ביותר מבין המועמדים
+                # פידבק בזמן אמת על המסך – רק החמור מבין המועמדים
                 rt_candidates = []
                 if stage == "down" and rep_min_torso_angle < 140:
                     rt_candidates.append("Try to keep your back a bit straighter")
@@ -451,7 +444,7 @@ def run_squat_analysis(video_path,
         "technique_score": technique_score,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
-        "feedback": feedback_list,  # ← פריט יחיד, החמור ביותר
+        "feedback": feedback_list,  # פריט יחיד, החמור ביותר
         "reps": rep_reports,
         "video_path": final_video_path,
         "feedback_path": feedback_path
@@ -460,4 +453,5 @@ def run_squat_analysis(video_path,
 # ===== Alias לשמירה על תאימות ל-app.py =====
 def run_analysis(*args, **kwargs):
     return run_squat_analysis(*args, **kwargs)
+
 
