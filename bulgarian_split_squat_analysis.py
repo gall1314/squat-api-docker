@@ -67,36 +67,85 @@ DEPTH_LABEL_FONT = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
 DEPTH_PCT_FONT   = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 
 # ===================== ייצוב שלד לציור בלבד =====================
-class LandmarkSmoother:
-    def __init__(self, alpha=0.55, n=33, max_jump=0.04):
-        self.alpha = float(alpha)
-        self.max_jump = float(max_jump)  # בקואורד' מנורמלות (0..1)
-        self.x = [None]*n
-        self.y = [None]*n
-        self.hist_x = [collections.deque(maxlen=3) for _ in range(n)]
-        self.hist_y = [collections.deque(maxlen=3) for _ in range(n)]
-    def smooth(self, lms):
-        n = min(len(lms), len(self.x))
+class LandmarkStabilizer:
+    """Freeze-on-drop: אין החלקה איטית. כשיש זיהוי איכותי—מציגים מיידית (בלי לג),
+    וכשיש נפילה באיכות—מחזיקים את השלד האחרון לכמה פריימים ואז מסתירים.
+    זה מונע "שיכרות"/פיגור של השלד אבל גם לא מצייר שלד משתולל בזמן נפילות.
+    """
+    def __init__(self, quality_thr=0.55, min_fraction=0.6, jump_thr=0.12, max_hold=6, body_points=_BODY_POINTS):
+        self.quality_thr = float(quality_thr)
+        self.min_fraction = float(min_fraction)
+        self.jump_thr = float(jump_thr)      # ממוצע תזוזה מנורמלת שייחשב כ"קפיצה"
+        self.max_hold = int(max_hold)        # כמה פריימים להחזיק שלד אחרון כשהאיכות ירודה
+        self.body_points = tuple(body_points)
+        self.last_good = None  # רשימת נק' עם x,y בלבד
+        self.hold = 0
+
+    def _quality(self, lms):
+        ok = 0; total = 0
+        for i in self.body_points:
+            if i >= len(lms):
+                continue
+            total += 1
+            vis = getattr(lms[i], 'visibility', 1.0) or 0.0
+            if vis >= self.quality_thr:
+                ok += 1
+        return (ok / max(1, total)) if total else 1.0
+
+    def _avg_disp(self, lms):
+        if not self.last_good:
+            return 0.0
+        n = min(len(self.last_good), len(lms))
+        if n == 0:
+            return 0.0
+        s = 0.0; c = 0
+        for i in self.body_points:
+            if i >= n:
+                continue
+            dx = float(lms[i].x) - float(self.last_good[i].x)
+            dy = float(lms[i].y) - float(self.last_good[i].y)
+            s += (dx*dx + dy*dy) ** 0.5
+            c += 1
+        return (s / max(1, c))
+
+    def _copy_xy(self, lms):
         out = []
-        a = self.alpha
-        for i in range(n):
-            xi, yi = float(lms[i].x), float(lms[i].y)
-            self.hist_x[i].append(xi); self.hist_y[i].append(yi)
-            med_x = float(np.median(self.hist_x[i]))
-            med_y = float(np.median(self.hist_y[i]))
-            if self.x[i] is None:
-                self.x[i], self.y[i] = med_x, med_y
-            else:
-                # EMA לקראת המדיאן
-                nx = a*med_x + (1-a)*self.x[i]
-                ny = a*med_y + (1-a)*self.y[i]
-                # Clamp קפיצות
-                dx = np.clip(nx - self.x[i], -self.max_jump, self.max_jump)
-                dy = np.clip(ny - self.y[i], -self.max_jump, self.max_jump)
-                self.x[i] += dx
-                self.y[i] += dy
-            out.append(type("P", (), {"x": self.x[i], "y": self.y[i]}))
+        for i in range(len(lms)):
+            out.append(type('P', (), {'x': float(lms[i].x), 'y': float(lms[i].y)}))
         return out
+
+    def stabilize(self, lms):
+        # אין שלד בכלל: נסה להחזיק אחרון טוב לכמה פריימים
+        if lms is None:
+            if self.last_good is not None and self.hold < self.max_hold:
+                self.hold += 1
+                return self.last_good
+            self.hold = 0
+            return None
+
+        # יש שלד: בדוק איכות ונטרול קפיצות
+        frac = self._quality(lms)
+        if frac < self.min_fraction:
+            # איכות ירודה → החזק שלד אחרון אם יש
+            if self.last_good is not None and self.hold < self.max_hold:
+                self.hold += 1
+                return self.last_good
+            self.hold = 0
+            return None
+
+        # איכות טובה: אם יש קפיצה חריגה וגם האיכות רק בינונית, התייחס כגליץ'
+        avg_d = self._avg_disp(lms)
+        if avg_d > self.jump_thr and frac < 0.8 and self.last_good is not None:
+            if self.hold < self.max_hold:
+                self.hold += 1
+                return self.last_good
+            self.hold = 0
+            # אם נגררנו מעבר לאחיזה המותרת—נעדיף להצמיד מידית ולא ליצור לג
+
+        # עדכון מיידי ללא החלקה (אין לג)
+        self.last_good = self._copy_xy(lms)
+        self.hold = 0
+        return self.last_good
 
 # ===================== עזרי ציור =====================
 _FACE_LMS = {
@@ -422,7 +471,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     pose = mp_pose.Pose(model_complexity=1, min_detection_confidence=0.6, min_tracking_confidence=0.6)
     ema = AngleEMA(alpha=EMA_ALPHA)
-    lm_smoother = LandmarkSmoother(alpha=0.55, max_jump=0.03)
+    lm_stab = LandmarkStabilizer()
 
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
@@ -463,7 +512,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
         if not results.pose_landmarks:
             if rt_fb_hold > 0: rt_fb_hold -= 1
-            sm_lms = None
+            stab_lms = lm_stab.stabilize(None)
         else:
             lms = results.pose_landmarks.landmark
             if active_leg is None:
@@ -536,11 +585,11 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
                 if rt_fb_hold == 0: rt_fb_msg = None
 
             # === ייצוב שלד לציור בלבד ===
-            sm_lms = lm_smoother.smooth(lms)
+            stab_lms = lm_stab.stabilize(lms)
 
         # === ציור ===
-        if results.pose_landmarks:
-            frame = draw_body_only(frame, sm_lms)
+        if stab_lms:
+            frame = draw_body_only(frame, stab_lms)
         frame = draw_overlay(frame, reps=counter.count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
         out.write(frame)
 
