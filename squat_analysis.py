@@ -444,3 +444,4 @@ def run_squat_analysis(video_path,
 def run_analysis(*args, **kwargs):
     return run_squat_analysis(*args, **kwargs)
 
+
