@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 # squat_analysis.py — גרסת בסיס שעבדה + soft-start לחזרה הראשונה + חסימת ספירה בזמן תנועה
 # Overlay צמוד לפינה + דונאט תגובתי (דיליי מינימלי) + ריסט מהיר בעלייה + Form Tip לא פולשני
+# + תיקון פידבק תחתון: לעולם לא נחתך, עד 2 שורות עם עטיפה ו-ellipsis
+
 import os
 import cv2
 import math
@@ -23,7 +25,6 @@ DEPTH_RING_BG        = (70, 70, 70)
 # תגובתיות הדונאט (דיליי מינימלי)
 DEPTH_ALPHA_UP   = 0.92   # התכנסות מהירה כלפי מעלה
 DEPTH_ALPHA_DOWN = 0.65   # ירידה מהירה יחסית (אבל רכה מספיק)
-# אין hold: נעדכן ישירות לפי alpha כדי להיות הכי תגובתיים
 
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
 REPS_FONT_SIZE = 28
@@ -52,6 +53,7 @@ FB_SEVERITY = {
     "Almost there — go a bit lower": 2,
     "Looking good — just a bit more depth": 1,
 }
+
 def pick_strongest_feedback(feedback_list):
     best, score = "", -1
     for f in feedback_list or []:
@@ -79,8 +81,9 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
                 DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
     return frame
 
+
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Reps בפינת שמאל-עליון (0,0) בלי פאדינג חיצוני; דונאט ימני-עליון; פידבק שורה אחת בתחתית."""
+    """Reps בפינת שמאל-עליון (0,0) בלי פאדינג חיצוני; דונאט ימני-עליון; פידבק תחתון שלא נחתך (עד 2 שורות)."""
     h, w, _ = frame.shape
 
     # --- Reps box: צמוד לפינה ---
@@ -126,9 +129,8 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
               pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-     # --- Bottom feedback (לא נחתך; עד 2 שורות; עם safe area) ---
+    # --- Bottom feedback (לא נחתך; עד 2 שורות; עם safe area) ---
     if feedback:
-        # עוזר: עטיפת טקסט עד רוחב נתון ולכל היותר 2 שורות
         def wrap_to_two_lines(draw, text, font, max_width):
             words = text.split()
             if not words:
@@ -151,7 +153,6 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
             # אם נשארו מילים אחרי 2 שורות — חותכים עם …
             leftover = len(words) - sum(len(l.split()) for l in lines)
             if leftover > 0 and len(lines) >= 2:
-                # הוסף אליפסיס לשורה האחרונה, ודא שנכנס לרוחב
                 last = lines[-1] + "…"
                 while draw.textlength(last, font=font) > max_width and len(last) > 1:
                     last = last[:-2] + "…"
@@ -161,7 +162,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
         pil_fb = Image.fromarray(frame)
         draw_fb = ImageDraw.Draw(pil_fb)
 
-        safe_margin = max(6, int(h * 0.02))    # מרים קצת מעל השוליים כדי שלא ייחתך בנגנים
+        safe_margin = max(6, int(h * 0.02))    # מרים קצת מעל השוליים כדי שלא ייחתך
         pad_x, pad_y = 12, 8                   # פדינג פנימי
         line_gap = 4
         max_text_w = int(w - 2*pad_x - 20)     # מרווחי צד
@@ -189,6 +190,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
         frame = np.array(pil_fb)
 
+    return frame
 
 # ===================== BODY-ONLY SKELETON =====================
 _FACE_LMS = {
@@ -218,6 +220,7 @@ def draw_body_only(frame, landmarks, color=(255,255,255)):
     return frame
 
 # ===================== GEOMETRY =====================
+
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
     radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
@@ -235,6 +238,7 @@ ANKLE_VEL_THRESH_PCT  = 0.017
 EMA_ALPHA             = 0.65
 MOVEMENT_CLEAR_FRAMES = 2   # רצף קצר של שקט כדי לסיים חזרה
 
+
 def _euclid(a, b):
     return math.hypot(a[0]-b[0], a[1]-b[1])
 
@@ -245,6 +249,7 @@ FORM_TIPS = [
     "Brace your core before the descent",
     "Keep your stance slightly wider for better stability",
 ]
+
 def choose_session_tip(per_rep_tip_candidates):
     if not per_rep_tip_candidates:
         return FORM_TIPS[0]
@@ -252,6 +257,7 @@ def choose_session_tip(per_rep_tip_candidates):
     return c.most_common(1)[0][0]
 
 # ===================== MAIN =====================
+
 def run_squat_analysis(video_path,
                        frame_skip=3,
                        scale=0.4,
@@ -513,6 +519,7 @@ def run_squat_analysis(video_path,
     }
 
 # תאימות
+
 def run_analysis(*args, **kwargs):
     return run_squat_analysis(*args, **kwargs)
 
