@@ -533,3 +533,4 @@ def run_deadlift_analysis(video_path,
         "video_path": final_video_path,
         "feedback_path": feedback_path
     }
+
