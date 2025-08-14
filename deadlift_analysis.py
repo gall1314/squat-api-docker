@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — דו־כיווני לדונאט (קרבה לעמידה), מיושר לסטנדרט של squat_analysis
+# deadlift_analysis.py — דדליפט מיושר סטנדרט + דונאט דו־כיווני + החלקת לנדמרקים (EMA + hold-last)
 import os
 import cv2
 import math
@@ -46,7 +46,7 @@ def display_half_str(x):
     if abs(q - round(q)) < 1e-9: return str(int(round(q)))
     return f"{q:.1f}"
 
-# ===================== שלד גוף בלבד (כמו בסקוואט) =====================
+# ===================== שלד גוף בלבד (ללא פנים) =====================
 _FACE_LMS = {
     mp_pose.PoseLandmark.NOSE.value,
     mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
@@ -60,17 +60,18 @@ _BODY_CONNECTIONS = tuple(
 )
 _BODY_POINTS = tuple(sorted({i for conn in _BODY_CONNECTIONS for i in conn}))
 
-def draw_body_only(frame, landmarks, color=(255,255,255)):
+def draw_body_only_from_dict(frame, pts_norm, color=(255,255,255)):
+    """pts_norm: dict[idx] = (x_norm, y_norm) — מצייר רק חיבורים/נקודות שקיימים במפה."""
     h, w = frame.shape[:2]
     for a, b in _BODY_CONNECTIONS:
-        pa = landmarks[a]; pb = landmarks[b]
-        ax, ay = int(pa.x * w), int(pa.y * h)
-        bx, by = int(pb.x * w), int(pb.y * h)
-        cv2.line(frame, (ax, ay), (bx, by), color, 2, cv2.LINE_AA)
+        if a in pts_norm and b in pts_norm:
+            ax, ay = int(pts_norm[a][0] * w), int(pts_norm[a][1] * h)
+            bx, by = int(pts_norm[b][0] * w), int(pts_norm[b][1] * h)
+            cv2.line(frame, (ax, ay), (bx, by), color, 2, cv2.LINE_AA)
     for i in _BODY_POINTS:
-        p = landmarks[i]
-        x, y = int(p.x * w), int(p.y * h)
-        cv2.circle(frame, (x, y), 3, color, -1, cv2.LINE_AA)
+        if i in pts_norm:
+            x, y = int(pts_norm[i][0] * w), int(pts_norm[i][1] * h)
+            cv2.circle(frame, (x, y), 3, color, -1, cv2.LINE_AA)
     return frame
 
 # ===================== גיאומטריה =====================
@@ -81,18 +82,56 @@ def calculate_angle(a, b, c):
     return 360 - angle if angle > 180 else angle
 
 # ===================== פרמטרים לדדליפט =====================
-# דלתא אופקית בין כתף לירך = פרוקסי לעומק הינג’
-HINGE_START_THRESH = 0.08      # התחלת חזרה
-STAND_DELTA_TARGET = 0.025     # דלתא אופקית ב"עמידה" (קטן)
-END_THRESH         = 0.035     # סף חזרה ל"עמידה" לסיום רפ
+HINGE_START_THRESH = 0.08      # התחלת חזרה (delta_x)
+STAND_DELTA_TARGET = 0.025     # דלתא אופקית בעמידה (קטנה)
+END_THRESH         = 0.035     # סיום חזרה (חזרה לעמידה)
 MIN_FRAMES_BETWEEN_REPS = 10
 
 # גב
 BACK_ROUND_CURV_THR = 0.04
-# החלקת דונאט (EMA)
+
+# דונאט דו־כיווני (קרבה לעמידה)
 PROG_ALPHA = 0.35
 
-# ===================== Overlay (כמו בסקוואט; הטקסט נשאר DEPTH לצורך אחידות) =====================
+# ===================== החלקת לנדמרקים =====================
+SMOOTH_ALPHA   = 0.55      # EMA — משקל לערך הנוכחי
+VIS_THRESH     = 0.50      # אם visibility מתחת — מתעלמים מהתצפית
+MAX_JUMP_NORM  = 0.06      # "קפיצה" מקס' (נורמליזציה על אלכסון הפריים)
+
+class LandmarkSmoother:
+    def __init__(self, alpha=SMOOTH_ALPHA, vis_thr=VIS_THRESH, max_jump=MAX_JUMP_NORM):
+        self.alpha = float(alpha)
+        self.vis_thr = float(vis_thr)
+        self.max_jump = float(max_jump)
+        self.prev = {}  # idx -> (x,y)
+
+    @staticmethod
+    def _dist_norm(a, b):
+        return math.hypot(a[0]-b[0], a[1]-b[1])  # כבר בנורמליזציה [0..1]
+
+    def get(self, lm_list, idx):
+        """מחזיר נקודה מוחלקת/מחוזקת: אם אין/חלש/קופץ חזק → מחזיק ערך אחרון."""
+        p = lm_list[idx]
+        has_prev = idx in self.prev
+        if (p.visibility or 0.0) < self.vis_thr:
+            # לא יציב → חזור לערך קודם אם יש
+            return self.prev.get(idx, None)
+
+        cur = (float(p.x), float(p.y))
+        if has_prev:
+            if self._dist_norm(cur, self.prev[idx]) > self.max_jump:
+                # קפיצה לא סבירה (למשל ברבל מסתיר) → החזק הקודם
+                return self.prev[idx]
+            # EMA
+            sm = (self.alpha * cur[0] + (1-self.alpha) * self.prev[idx][0],
+                  self.alpha * cur[1] + (1-self.alpha) * self.prev[idx][1])
+            self.prev[idx] = sm
+            return sm
+        else:
+            self.prev[idx] = cur
+            return cur
+
+# ===================== Overlay (כמו בסקוואט; “DEPTH” נשאר לאחידות) =====================
 def _wrap_to_two_lines(draw, text, font, max_width):
     words = text.split()
     if not words: return [""]
@@ -128,7 +167,7 @@ def _draw_depth_donut(frame, center, radius, thickness, pct):
 
 def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
     h, w, _ = frame.shape
-    # Reps box (שמאלה־למעלה)
+    # Reps box
     pil = Image.fromarray(frame); draw = ImageDraw.Draw(pil)
     reps_text = f"Reps: {reps}"
     inner_pad_x, inner_pad_y = 10, 6
@@ -144,7 +183,7 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
                              reps_text, font=REPS_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-    # Donut (ימין־עליון) — מציג "קרבה לעמידה" (100% = עמידה)
+    # Donut (ימין־עליון) — "קרבה לעמידה" (100% = עמידה)
     ref_h = max(int(h * 0.06), int(REPS_FONT_SIZE * 1.6))
     radius = int(ref_h * DONUT_RADIUS_SCALE)
     thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
@@ -231,12 +270,16 @@ def run_deadlift_analysis(video_path,
     last_rep_frame = -999
     frame_idx = 0
 
-    # דינמיקת דונאט — "קרבה לעמידה" דו־כיוונית
-    top_ref = STAND_DELTA_TARGET   # דלתא אופקית משוערת בסטנד
-    bottom_est = None              # תתעדכן לכל חזרה עד למקסימום
-    progress_ema = 1.0             # נתחיל מעמידה
+    # דונאט — קרבה לעמידה דו־כיווני
+    top_ref = STAND_DELTA_TARGET
+    bottom_est = None
+    progress_ema = 1.0
+
+    # גב: דרישה למינימום פריימים לפני התרעה
     BACK_WARN_FRAMES_MIN = max(2, int(0.25 / dt))
     back_warn_frames = 0
+
+    smoother = LandmarkSmoother()
 
     with mp_pose_mod.Pose(model_complexity=1, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
@@ -255,35 +298,49 @@ def run_deadlift_analysis(video_path,
 
             rt_feedback = None
             if not results.pose_landmarks:
-                # אין שלד – שמור על החלקה, אל תקפוץ ל-0
+                # אין שלד — שמור החלקה קיימת, אל תקפוץ
                 frame = draw_overlay(frame, reps=counter, feedback=None, progress_pct=progress_ema)
                 out.write(frame); continue
 
             try:
                 lm = results.pose_landmarks.landmark
                 R = mp_pose_mod.PoseLandmark
-                shoulder = np.array([lm[R.RIGHT_SHOULDER.value].x, lm[R.RIGHT_SHOULDER.value].y])
-                hip      = np.array([lm[R.RIGHT_HIP.value].x,      lm[R.RIGHT_HIP.value].y])
-                knee     = np.array([lm[R.RIGHT_KNEE.value].x,     lm[R.RIGHT_KNEE.value].y])
-                ankle    = np.array([lm[R.RIGHT_ANKLE.value].x,    lm[R.RIGHT_ANKLE.value].y])
 
-                head_candidates = [lm[R.RIGHT_EAR.value], lm[R.LEFT_EAR.value], lm[R.NOSE.value]]
+                # --- נקודות מוחלקות (EMA + hold-last) ---
+                idxs = {
+                    "RS": R.RIGHT_SHOULDER.value,
+                    "RH": R.RIGHT_HIP.value,
+                    "RK": R.RIGHT_KNEE.value,
+                    "RA": R.RIGHT_ANKLE.value,
+                    "LE": R.LEFT_EAR.value,
+                    "RE": R.RIGHT_EAR.value,
+                    "NO": R.NOSE.value,
+                }
+                pts = {k: smoother.get(lm, idxs[k]) for k in idxs}
+                # בחר "ראש" מהנקודות עם ערך קיים
                 head_point = None
-                for c in head_candidates:
-                    if c.visibility > 0.5:
-                        head_point = np.array([c.x, c.y]); break
-                if head_point is None:
+                for k in ("RE","LE","NO"):
+                    if pts[k] is not None:
+                        head_point = np.array(pts[k], dtype=float)
+                        break
+                if (pts["RS"] is None) or (pts["RH"] is None) or (head_point is None):
                     frame = draw_overlay(frame, reps=counter, feedback=None, progress_pct=progress_ema)
                     out.write(frame); continue
 
-                # פרוקסי עומק ההינג’ — דלתא אופקית כתף-ירך (בנורמליזציה לרוחב)
+                shoulder = np.array(pts["RS"])
+                hip      = np.array(pts["RH"])
+                # לברך/קרסול ניקח מוחלק — ואם חסר, לא נכשיל את הלוגיקה (דדליפט: רגליים כמעט קבועות)
+                knee     = np.array(pts["RK"]) if pts["RK"] is not None else None
+                ankle    = np.array(pts["RA"]) if pts["RA"] is not None else None
+
+                # פרוקסי עומק הינג’ — דלתא אופקית כתף-ירך
                 delta_x = abs(hip[0] - shoulder[0])
 
-                # נעדכן top_ref מעט כשברור שמדובר בעמידה (כמעט אין הינג’)
+                # עדכון top_ref כשברור שמדובר בעמידה
                 if delta_x < (STAND_DELTA_TARGET * 1.4):
                     top_ref = 0.9*top_ref + 0.1*delta_x
 
-                # עקמומיות גב
+                # עקמומיות גב (עם נק’ מוחלקות)
                 mid_spine = (shoulder + hip) * 0.5 * 0.4 + head_point * 0.6
                 _, is_rounded = analyze_back_curvature(shoulder, hip, mid_spine)
                 if is_rounded: back_warn_frames += 1
@@ -292,54 +349,44 @@ def run_deadlift_analysis(video_path,
                 # התחלת חזרה
                 if (not rep_in_progress) and (delta_x > HINGE_START_THRESH) and (frame_idx - last_rep_frame > MIN_FRAMES_BETWEEN_REPS):
                     rep_in_progress = True
-                    bottom_est = delta_x   # יעמיק לאורך הירידה
+                    bottom_est = delta_x
                     back_warn_frames = 0
 
-                # תוך כדי חזרה — עדכון תחתית דינמית + חישוב "קרבה לעמידה"
+                # תוך כדי חזרה — עדכון תחתית דינמית + קרבה לעמידה דו־כיוונית
                 if rep_in_progress:
                     bottom_est = max(bottom_est or delta_x, delta_x)
-                    denom = max(1e-4, (bottom_est - top_ref))  # טווח תנועה בתוך הרפ
-                    # קרבה לעמידה: 1 בעמידה (delta_x≈top_ref), 0 בתחתית (delta_x≈bottom_est)
-                    progress_raw = 1.0 - ((delta_x - top_ref) / denom)
+                    denom = max(1e-4, (bottom_est - top_ref))
+                    progress_raw = 1.0 - ((delta_x - top_ref) / denom)  # 1=עמידה, 0=תחתית
                     progress_raw = float(np.clip(progress_raw, 0.0, 1.0))
                     progress_ema = PROG_ALPHA*progress_raw + (1-PROG_ALPHA)*progress_ema
 
                     if is_rounded:
                         rt_feedback = "Keep your back straighter"
-
                 else:
-                    # בין חזרות — זרימה עדינה לכיוון 1.0
+                    # בין חזרות — חזרה עדינה ל-100%
                     progress_ema = PROG_ALPHA*1.0 + (1-PROG_ALPHA)*progress_ema
 
-                # סיום חזרה — כשחזרנו כמעט לעמידה
+                # סיום חזרה
                 if rep_in_progress and (delta_x < END_THRESH):
                     if frame_idx - last_rep_frame > MIN_FRAMES_BETWEEN_REPS:
                         penalty = 0.0
                         fb = []
-
-                        # אם נשארנו רחוקים מעמידה בסוף
                         if delta_x > (top_ref + 0.02):
                             fb.append("Try to finish more upright"); penalty += 1.0
-
-                        # ברכיים/סינכרון פשוט: אם לא הייתה תנועה משמעותית, לא נחשב
-                        moved_enough = (bottom_est - delta_x) > 0.05
-
-                        # גב
-                        if back_warn_frames >= BACK_WARN_FRAMES_MIN:
-                            fb.append("Try to keep your back a bit straighter")
-                            penalty += 1.5
+                        if back_warn_frames >= max(2, int(0.25/dt)):
+                            fb.append("Try to keep your back a bit straighter"); penalty += 1.5
 
                         score = round(max(4, 10 - penalty) * 2) / 2
                         if fb:
                             for f in fb:
                                 if f not in overall_feedback: overall_feedback.append(f)
 
+                        moved_enough = (bottom_est - delta_x) > 0.05
                         if moved_enough:
                             counter += 1
                             if score >= 9.5: good_reps += 1
                             else: bad_reps += 1
                             all_scores.append(score)
-
                             reps_report.append({
                                 "rep_index": counter,
                                 "score": float(score),
@@ -350,13 +397,19 @@ def run_deadlift_analysis(video_path,
 
                         last_rep_frame = frame_idx
 
-                    # reset חזרה
+                    # reset
                     rep_in_progress = False
                     bottom_est = None
                     back_warn_frames = 0
 
-                # ציור
-                frame = draw_body_only(frame, lm)
+                # ציור שלד: רק מה שיש לנו במפה המוחלקת
+                # נרכיב dict של אינדקסים מוחלקים כדי לצייר גוף
+                sm_dict = {}
+                for idx in _BODY_POINTS:
+                    p = smoother.prev.get(idx, None)
+                    if p is not None:
+                        sm_dict[idx] = p
+                frame = draw_body_only_from_dict(frame, sm_dict)
                 frame = draw_overlay(frame, reps=counter, feedback=rt_feedback, progress_pct=progress_ema)
                 out.write(frame)
 
@@ -410,4 +463,5 @@ def run_deadlift_analysis(video_path,
         "video_path": final_video_path,
         "feedback_path": feedback_path
     }
+
 
