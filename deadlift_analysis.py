@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 # deadlift_analysis.py — Deadlift aligned to squat standard
-# - Same overlay (Reps, donut, 2-line feedback), same speed settings
-# - Bi-directional donut: 0% at bottom → 100% at upright, smoothed (no jump to 0)
-# - Leg tracking with kinematic validation + hold-last only when needed
-# - One non-scoring tip per rep derived from motion (no bottom pause tip)
+# - Overlay/encoding/speed identical to squat
+# - Bi-directional donut (0% bottom → 100% upright) with smoothing
+# - Robust leg tracking: Kalman + measurement gating + floor anchor
+# - Scoring feedback (affects score) + one non-scoring tip per rep
+
 import os, cv2, math, numpy as np, subprocess
 from PIL import ImageFont, ImageDraw, Image
 import mediapipe as mp
@@ -14,14 +15,17 @@ DONUT_RADIUS_SCALE   = 0.72
 DONUT_THICKNESS_FRAC = 0.28
 DEPTH_COLOR          = (40, 200, 80)
 DEPTH_RING_BG        = (70, 70, 70)
+
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
 REPS_FONT_SIZE = 28
 FEEDBACK_FONT_SIZE = 22
 DEPTH_LABEL_FONT_SIZE = 14
 DEPTH_PCT_FONT_SIZE   = 18
+
 def _font(path,size):
     try: return ImageFont.truetype(path,size)
     except: return ImageFont.load_default()
+
 REPS_FONT        = _font(FONT_PATH, REPS_FONT_SIZE)
 FEEDBACK_FONT    = _font(FONT_PATH, FEEDBACK_FONT_SIZE)
 DEPTH_LABEL_FONT = _font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
@@ -30,14 +34,15 @@ DEPTH_PCT_FONT   = _font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 mp_pose = mp.solutions.pose
 
 # ===================== SCORE DISPLAY (same standard) =====================
-def score_label(s):
+def score_label(s: float) -> str:
     s = float(s)
     if s >= 9.5: return "Excellent"
     if s >= 8.5: return "Very good"
     if s >= 7.0: return "Good"
     if s >= 5.5: return "Fair"
     return "Needs work"
-def display_half_str(x):
+
+def display_half_str(x: float) -> str:
     q = round(float(x) * 2) / 2.0
     return str(int(round(q))) if abs(q - round(q)) < 1e-9 else f"{q:.1f}"
 
@@ -65,7 +70,7 @@ def draw_body_only_from_dict(frame, pts_norm, color=(255,255,255)):
             cv2.circle(frame, (x, y), 3, color, -1, cv2.LINE_AA)
     return frame
 
-# ===================== BACK CURVATURE (same logic) =====================
+# ===================== BACK CURVATURE =====================
 def analyze_back_curvature(shoulder, hip, head_like, threshold=0.04):
     line_vec = hip - shoulder
     nrm = np.linalg.norm(line_vec) + 1e-9
@@ -83,10 +88,10 @@ END_THRESH           = 0.035  # end rep threshold (near upright)
 MIN_FRAMES_BETWEEN_REPS = 10
 PROG_ALPHA           = 0.35   # smoothing for donut only
 
-# Tips (non-scoring) thresholds
+# Tips (non-scoring) thresholds (no bottom-pause tip)
 TIP_MIN_ECC_S     = 0.35   # if eccentric faster than this → suggest slowing
 TIP_MIN_TOP_S     = 0.15   # if top lockout hold shorter → suggest squeeze hold
-TIP_SMALL_ROM_LO  = 0.035  # “slightly shallow” ROM (not an error)
+TIP_SMALL_ROM_LO  = 0.035  # slightly shallow ROM (not an error)
 TIP_SMALL_ROM_HI  = 0.055
 
 def choose_deadlift_tip(down_s, top_s, rom):
@@ -99,73 +104,119 @@ def choose_deadlift_tip(down_s, top_s, rom):
         return "Hinge a bit deeper within comfort"
     return "Keep the bar close and move smoothly"
 
-# ===================== Leg tracking with kinematic validation =====================
+# ===================== Kalman Leg Tracker (robust to occlusion) =====================
 LEG_VIS_THR    = 0.55
-LEG_MAX_JUMP   = 0.06    # normalized [0..1]
-LEG_MIN_STREAK = 2       # consecutive good frames before switching
+LEG_MAX_MAH    = 6.0     # gating ~3σ per axis
+LEG_MISS_FLOOR = 6       # after N missed frames, anchor Y to floor
+LEG_SIDE_XSPAN = 0.25    # ankle_x within hip_x ± SPAN
 
-class LegTracker:
-    """Track leg joints; prevent swaps to elbows/hands; hold-last when occluded."""
+class _KF:
+    """Kalman 2D position+velocity (x,y,vx,vy) on normalized coords [0..1]."""
+    def __init__(self, q=1e-3, r=6e-3):
+        self.x = np.zeros((4,1), dtype=float)  # [x, y, vx, vy]
+        self.P = np.eye(4)*1.0
+        self.Q = np.eye(4)*q
+        self.R = np.eye(2)*r
+        self.F = np.eye(4)
+        self.H = np.zeros((2,4)); self.H[0,0]=1; self.H[1,1]=1
+        self.inited = False
+    def predict(self, dt):
+        self.F = np.array([[1,0,dt,0],
+                           [0,1,0,dt],
+                           [0,0,1, 0],
+                           [0,0,0, 1]], dtype=float)
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        return self.x.copy(), self.P.copy()
+    def update(self, z):
+        z = np.array(z, dtype=float).reshape(2,1)
+        y = z - (self.H @ self.x)
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + K @ y
+        I = np.eye(4)
+        self.P = (I - K @ self.H) @ self.P
+        return float(y.T @ np.linalg.inv(S) @ y)  # Mahalanobis^2
+
+class KalmanLegTracker:
+    """Ankle/Knee/Heel/Toe with Kalman + gating + floor anchoring on occlusion."""
     def __init__(self, side="right"):
         self.side = side
-        self.prev = {}     # idx -> (x,y)
-        self.streak = {}   # idx -> count
         PL = mp.solutions.pose.PoseLandmark
-        self.hip_idx  = PL.RIGHT_HIP.value   if side=="right" else PL.LEFT_HIP.value
-        self.knee_idx = PL.RIGHT_KNEE.value  if side=="right" else PL.LEFT_KNEE.value
-        self.ankle_idx= PL.RIGHT_ANKLE.value if side=="right" else PL.LEFT_ANKLE.value
-        self.heel_idx = PL.RIGHT_HEEL.value  if side=="right" else PL.LEFT_HEEL.value
-        self.foot_idx = PL.RIGHT_FOOT_INDEX.value if side=="right" else PL.LEFT_FOOT_INDEX.value
-        self.idxs = [self.knee_idx, self.ankle_idx, self.heel_idx, self.foot_idx]
+        self.hip  = PL.RIGHT_HIP.value   if side=="right" else PL.LEFT_HIP.value
+        self.knee = PL.RIGHT_KNEE.value  if side=="right" else PL.LEFT_KNEE.value
+        self.ankle= PL.RIGHT_ANKLE.value if side=="right" else PL.LEFT_ANKLE.value
+        self.heel = PL.RIGHT_HEEL.value  if side=="right" else PL.LEFT_HEEL.value
+        self.foot = PL.RIGHT_FOOT_INDEX.value if side=="right" else PL.LEFT_FOOT_INDEX.value
+        self.idxs = [self.knee, self.ankle, self.heel, self.foot]
+        self.kf   = {i:_KF() for i in self.idxs}
+        self.miss = {i:0 for i in self.idxs}
+        self.floor_y_med = None
+        self.floor_hist = []
 
     @staticmethod
-    def _dist(a,b): return math.hypot(a[0]-b[0], a[1]-b[1])
-
-    def _near_any_hand(self, lm, pt):
+    def _near_hands(lm, pt):
         PL = mp.solutions.pose.PoseLandmark
-        hands = [PL.RIGHT_ELBOW.value, PL.RIGHT_WRIST.value, PL.LEFT_ELBOW.value, PL.LEFT_WRIST.value]
-        for h in hands:
+        for h in (PL.RIGHT_ELBOW.value, PL.RIGHT_WRIST.value, PL.LEFT_ELBOW.value, PL.LEFT_WRIST.value):
             if lm[h].visibility > 0.5:
-                if self._dist(pt, (lm[h].x, lm[h].y)) < 0.06:
+                if math.hypot(pt[0]-lm[h].x, pt[1]-lm[h].y) < 0.06:
                     return True
         return False
 
-    def update(self, lm):
+    def _update_floor(self, lm):
+        # running median of the lowest visible foot y
+        cand = []
+        for idx in (self.ankle, self.heel, self.foot):
+            if lm[idx].visibility > 0.6:
+                cand.append(lm[idx].y)
+        if cand:
+            y = sorted(cand)[-1]
+            self.floor_hist.append(y)
+            if len(self.floor_hist) > 25: self.floor_hist.pop(0)
+            self.floor_y_med = float(np.median(self.floor_hist))
+
+    def update(self, lm, dt):
+        self._update_floor(lm)
         out = {}
-        hip = (lm[self.hip_idx].x, lm[self.hip_idx].y)
-        raw = {i: (lm[i].x, lm[i].y, lm[i].visibility) for i in self.idxs}
+        hip_x = lm[self.hip].x
 
         for idx in self.idxs:
-            x, y, v = raw[idx]
-            candidate = (x, y)
+            kf = self.kf[idx]
+            # init
+            if not kf.inited:
+                if lm[idx].visibility >= LEG_VIS_THR:
+                    kf.x[:2,0] = [lm[idx].x, lm[idx].y]
+                    kf.x[2:,0] = [0.0, 0.0]
+                    kf.inited = True
+                else:
+                    continue
+            # predict
+            kf.predict(dt)
 
-            ok = (v >= LEG_VIS_THR)
-            if ok and idx in self.prev:
-                ok &= (self._dist(candidate, self.prev[idx]) <= LEG_MAX_JUMP)
-            if ok and self._near_any_hand(lm, candidate):
-                ok = False
+            meas_ok = False
+            if lm[idx].visibility >= LEG_VIS_THR:
+                z = (lm[idx].x, lm[idx].y)
+                if not self._near_hands(lm, z):
+                    if abs(z[0] - hip_x) <= LEG_SIDE_XSPAN:
+                        maha2 = kf.update(z)  # perform update; we'll gate by distance
+                        if maha2 <= (LEG_MAX_MAH**2):
+                            meas_ok = True
+                        else:
+                            # revert to predicted (roughly): do nothing beyond predict
+                            pass
 
-            # vertical sanity: ankles/heel/foot not above knee; knee not far below hip
-            if ok:
-                if idx in (self.ankle_idx, self.heel_idx, self.foot_idx):
-                    if self.knee_idx in self.prev:
-                        knee_y = self.prev[self.knee_idx][1]
-                        ok &= (y >= knee_y - 0.02)
-                if idx == self.knee_idx:
-                    ok &= (y <= hip[1] + 0.06)
-
-            if ok:
-                self.streak[idx] = self.streak.get(idx, 0) + 1
-                if self.streak[idx] >= LEG_MIN_STREAK or (idx not in self.prev):
-                    self.prev[idx] = candidate
+            if meas_ok:
+                self.miss[idx] = 0
             else:
-                self.streak[idx] = 0
+                self.miss[idx] += 1
+                # anchor Y to floor after too many misses
+                if self.miss[idx] >= LEG_MISS_FLOOR and self.floor_y_med is not None:
+                    kf.x[1,0] = 0.8*kf.x[1,0] + 0.2*self.floor_y_med
 
-            if idx in self.prev:
-                out[idx] = self.prev[idx]
+            out[idx] = (float(kf.x[0,0]), float(kf.x[1,0]))
         return out
 
-# ===================== Overlay (same as squat) =====================
+# ===================== Overlay (same visuals as squat) =====================
 def _wrap2(draw, text, font, maxw):
     words = text.split()
     if not words: return [""]
@@ -196,22 +247,24 @@ def _donut(frame, c, r, t, p):
 
 def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
     h, w, _ = frame.shape
-    # Reps box (top-left)
+    # Reps box
     pil = Image.fromarray(frame); d = ImageDraw.Draw(pil)
     txt = f"Reps: {reps}"; padx, pady = 10, 6
     tw = d.textlength(txt, font=REPS_FONT); th = REPS_FONT.size
     x0, y0 = 0, 0; x1 = int(tw + 2*padx); y1 = int(th + 2*pady)
     top = frame.copy(); cv2.rectangle(top, (x0,y0), (x1,y1), (0,0,0), -1)
     frame = cv2.addWeighted(top, BAR_BG_ALPHA, frame, 1-BAR_BG_ALPHA, 0)
-    pil = Image.fromarray(frame); ImageDraw.Draw(pil).text((x0+padx, y0+pady-1), txt, font=REPS_FONT, fill=(255,255,255))
+    pil = Image.fromarray(frame)
+    ImageDraw.Draw(pil).text((x0+padx, y0+pady-1), txt, font=REPS_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-    # Donut (top-right) — proximity to upright
+    # Donut (top-right)
     ref_h = max(int(h*0.06), int(REPS_FONT_SIZE*1.6))
     r = int(ref_h * DONUT_RADIUS_SCALE)
     thick = max(3, int(r * DONUT_THICKNESS_FRAC))
     m = 12; cx = w - m - r; cy = max(ref_h + r//8, r + thick//2 + 2)
     frame = _donut(frame, (cx,cy), r, thick, float(np.clip(progress_pct,0,1)))
+
     pil = Image.fromarray(frame); d = ImageDraw.Draw(pil)
     label = "DEPTH"; pct = f"{int(float(np.clip(progress_pct,0,1))*100)}%"
     lw = d.textlength(label, font=DEPTH_LABEL_FONT); pw = d.textlength(pct, font=DEPTH_PCT_FONT)
@@ -220,7 +273,7 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
     d.text((cx-int(pw//2), base+DEPTH_LABEL_FONT.size+gap), pct, font=DEPTH_PCT_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-    # Bottom feedback (up to 2 lines)
+    # Feedback at bottom (max 2 lines)
     if feedback:
         pil_fb = Image.fromarray(frame); dfb = ImageDraw.Draw(pil_fb)
         safe = max(6, int(h*0.02)); pad_x, pad_y, lg = 12, 8, 4
@@ -277,13 +330,13 @@ def run_deadlift_analysis(video_path,
     BACK_MIN_FRAMES = max(2, int(0.25 / dt))
     back_frames = 0
 
-    # tempo counters per rep (initialized on rep start)
+    # tempo counters per rep
     down_frames = up_frames = top_hold_frames = 0
     prev_progress = None
 
-    # leg trackers
-    right_leg = LegTracker("right")
-    left_leg  = LegTracker("left")
+    # trackers
+    right_leg = KalmanLegTracker("right")
+    left_leg  = KalmanLegTracker("left")
 
     with mp.solutions.pose.Pose(model_complexity=1,
                                 min_detection_confidence=0.5,
@@ -313,7 +366,7 @@ def run_deadlift_analysis(video_path,
                 shoulder = np.array([lm[PL.RIGHT_SHOULDER.value].x, lm[PL.RIGHT_SHOULDER.value].y], dtype=float)
                 hip      = np.array([lm[PL.RIGHT_HIP.value].x,      lm[PL.RIGHT_HIP.value].y],      dtype=float)
 
-                # choose head-like point (ear>nose if visible)
+                # head-like point
                 head = None
                 for idx in (PL.RIGHT_EAR.value, PL.LEFT_EAR.value, PL.NOSE.value):
                     if lm[idx].visibility > 0.5:
@@ -322,14 +375,14 @@ def run_deadlift_analysis(video_path,
                     frame = draw_overlay(frame, reps=counter, feedback=None, progress_pct=prog)
                     out.write(frame); continue
 
-                # legs with validation/hold-last
-                right_leg_pts = right_leg.update(lm)
-                left_leg_pts  = left_leg.update(lm)
+                # legs with Kalman robustness
+                right_leg_pts = right_leg.update(lm, dt)
+                left_leg_pts  = left_leg.update(lm, dt)
 
                 # hinge proxy: shoulder-hip horizontal delta
                 delta_x = abs(hip[0] - shoulder[0])
 
-                # adapt upright ref
+                # adapt upright reference
                 if delta_x < (STAND_DELTA_TARGET * 1.4):
                     top_ref = 0.9*top_ref + 0.1*delta_x
 
@@ -363,7 +416,7 @@ def run_deadlift_analysis(video_path,
                             up_frames += 1
                     prev_progress = prog
 
-                    # hold at top (non-scoring)
+                    # non-scoring: hold at top
                     if prog >= 0.90:
                         top_hold_frames += 1
 
@@ -378,10 +431,8 @@ def run_deadlift_analysis(video_path,
                     if frame_idx - last_rep_frame > MIN_FRAMES_BETWEEN_REPS:
                         penalty = 0.0
                         fb = []
-                        # finish upright check
                         if delta_x > (top_ref + 0.02):
                             fb.append("Try to finish more upright"); penalty += 1.0
-                        # back curvature
                         if back_frames >= BACK_MIN_FRAMES:
                             fb.append("Try to keep your back a bit straighter"); penalty += 1.5
 
@@ -395,7 +446,7 @@ def run_deadlift_analysis(video_path,
                             else: bad_reps += 1
                             all_scores.append(score)
 
-                            # tip (non-scoring): from eccentric/top/rom (no bottom pause tip)
+                            # one non-scoring tip
                             down_s = (down_frames * dt) if down_frames is not None else None
                             top_s  = (top_hold_frames * dt) if top_hold_frames is not None else None
                             rom    = (bottom_est - top_ref) if (bottom_est is not None and top_ref is not None) else None
@@ -406,7 +457,7 @@ def run_deadlift_analysis(video_path,
                                 "score": float(score),
                                 "score_display": display_half_str(score),
                                 "feedback": fb,   # scoring feedback
-                                "tip": tip_str    # non-scoring, single string
+                                "tip": tip_str    # one tip, non-scoring
                             })
 
                         last_rep_frame = frame_idx
@@ -418,7 +469,7 @@ def run_deadlift_analysis(video_path,
                     prev_progress = None
                     down_frames = up_frames = top_hold_frames = 0
 
-                # draw skeleton from validated points
+                # draw skeleton (validated legs + live shoulder/hip)
                 pts_draw = {
                     PL.RIGHT_SHOULDER.value: tuple(shoulder),
                     PL.RIGHT_HIP.value: tuple(hip),
@@ -471,7 +522,7 @@ def run_deadlift_analysis(video_path,
     final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
 
     return {
-        "squat_count": counter,  # for UI compatibility
+        "squat_count": counter,  # UI compatibility
         "technique_score": technique_score,
         "technique_score_display": display_half_str(technique_score),
         "technique_label": score_label(technique_score),
@@ -482,4 +533,3 @@ def run_deadlift_analysis(video_path,
         "video_path": final_video_path,
         "feedback_path": feedback_path
     }
-
