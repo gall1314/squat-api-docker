@@ -202,7 +202,6 @@ class KalmanLegTracker:
                         if maha2 <= (LEG_MAX_MAH**2):
                             meas_ok = True
                         else:
-                            # revert to predicted (roughly): do nothing beyond predict
                             pass
 
             if meas_ok:
