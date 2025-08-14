@@ -1,6 +1,8 @@
-flask
-flask_cors
-opencv-python
+Flask
+Flask-Cors
+opencv-python-headless
 mediapipe
 numpy
+Pillow
 requests
+onnxruntime
