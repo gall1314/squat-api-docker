@@ -2,14 +2,21 @@
 # deadlift_analysis.py — Deadlift aligned to squat standard
 # - Overlay/encoding/speed identical to squat
 # - Bi-directional donut (0% bottom → 100% upright) with smoothing
-# - Robust leg tracking: Kalman + measurement gating + floor anchor
-# - Scoring feedback (affects score) + one non-scoring tip per rep
+# - Robust legs: Kalman + gating + floor anchor (+ optional YOLOv8n-ONNX occlusion detector)
+# - Scoring feedback + one non-scoring tip per rep
 
 import os, cv2, math, numpy as np, subprocess
 from PIL import ImageFont, ImageDraw, Image
 import mediapipe as mp
 
-# ===================== STYLE / FONTS (match squat) =====================
+# ===================== Optional ONNX Runtime (YOLO detector) =====================
+try:
+    import onnxruntime as ort
+    _ORT_AVAILABLE = True
+except Exception:
+    _ORT_AVAILABLE = False
+
+# ===================== STYLE / FONTS =====================
 BAR_BG_ALPHA         = 0.55
 DONUT_RADIUS_SCALE   = 0.72
 DONUT_THICKNESS_FRAC = 0.28
@@ -33,7 +40,7 @@ DEPTH_PCT_FONT   = _font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 
 mp_pose = mp.solutions.pose
 
-# ===================== SCORE DISPLAY (same standard) =====================
+# ===================== SCORE DISPLAY =====================
 def score_label(s: float) -> str:
     s = float(s)
     if s >= 9.5: return "Excellent"
@@ -82,20 +89,19 @@ def analyze_back_curvature(shoulder, hip, head_like, threshold=0.04):
     return signed, signed < -threshold
 
 # ===================== Deadlift thresholds =====================
-HINGE_START_THRESH    = 0.08   # start rep (shoulder-hip horizontal delta)
-STAND_DELTA_TARGET   = 0.025  # upright horizontal delta
-END_THRESH           = 0.035  # end rep threshold (near upright)
+HINGE_START_THRESH    = 0.08
+STAND_DELTA_TARGET   = 0.025
+END_THRESH           = 0.035
 MIN_FRAMES_BETWEEN_REPS = 10
-PROG_ALPHA           = 0.35   # smoothing for donut only
+PROG_ALPHA           = 0.35  # smoothing for donut only
 
 # Tips (non-scoring) thresholds (no bottom-pause tip)
-TIP_MIN_ECC_S     = 0.35   # if eccentric faster than this → suggest slowing
-TIP_MIN_TOP_S     = 0.15   # if top lockout hold shorter → suggest squeeze hold
-TIP_SMALL_ROM_LO  = 0.035  # slightly shallow ROM (not an error)
+TIP_MIN_ECC_S     = 0.35
+TIP_MIN_TOP_S     = 0.15
+TIP_SMALL_ROM_LO  = 0.035
 TIP_SMALL_ROM_HI  = 0.055
 
 def choose_deadlift_tip(down_s, top_s, rom):
-    # Priority: slow eccentric → glute squeeze at top → gentle ROM → generic
     if down_s is not None and down_s < TIP_MIN_ECC_S:
         return "Slow the lowering to ~2–3s for more hypertrophy"
     if top_s is not None and top_s < TIP_MIN_TOP_S:
@@ -127,7 +133,6 @@ class _KF:
                            [0,0,0, 1]], dtype=float)
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
-        return self.x.copy(), self.P.copy()
     def update(self, z):
         z = np.array(z, dtype=float).reshape(2,1)
         y = z - (self.H @ self.x)
@@ -136,7 +141,8 @@ class _KF:
         self.x = self.x + K @ y
         I = np.eye(4)
         self.P = (I - K @ self.H) @ self.P
-        return float(y.T @ np.linalg.inv(S) @ y)  # Mahalanobis^2
+        maha2 = float(y.T @ np.linalg.inv(S) @ y)  # Mahalanobis^2
+        return maha2
 
 class KalmanLegTracker:
     """Ankle/Knee/Heel/Toe with Kalman + gating + floor anchoring on occlusion."""
@@ -175,10 +181,20 @@ class KalmanLegTracker:
             if len(self.floor_hist) > 25: self.floor_hist.pop(0)
             self.floor_y_med = float(np.median(self.floor_hist))
 
-    def update(self, lm, dt):
+    def update(self, lm, dt, occlusion_boxes_norm=None):
         self._update_floor(lm)
         out = {}
         hip_x = lm[self.hip].x
+
+        def _inside_any_bbox(p):
+            if not occlusion_boxes_norm: return False
+            x, y = p
+            for (x1, y1, x2, y2) in occlusion_boxes_norm:
+                # מעט הרחבה כדי להיות שמרני
+                dx = (x2 - x1) * 0.08; dy = (y2 - y1) * 0.08
+                if (x1-dx) <= x <= (x2+dx) and (y1-dy) <= y <= (y2+dy):
+                    return True
+            return False
 
         for idx in self.idxs:
             kf = self.kf[idx]
@@ -196,13 +212,11 @@ class KalmanLegTracker:
             meas_ok = False
             if lm[idx].visibility >= LEG_VIS_THR:
                 z = (lm[idx].x, lm[idx].y)
-                if not self._near_hands(lm, z):
-                    if abs(z[0] - hip_x) <= LEG_SIDE_XSPAN:
-                        maha2 = kf.update(z)  # perform update; we'll gate by distance
-                        if maha2 <= (LEG_MAX_MAH**2):
-                            meas_ok = True
-                        else:
-                            pass
+                # reject: near hands, wrong side, inside occluder, too far by Mahalanobis
+                if (not self._near_hands(lm, z)) and (abs(z[0]-hip_x) <= LEG_SIDE_XSPAN) and (not _inside_any_bbox(z)):
+                    maha2 = kf.update(z)
+                    if maha2 <= (LEG_MAX_MAH**2):
+                        meas_ok = True
 
             if meas_ok:
                 self.miss[idx] = 0
@@ -215,7 +229,124 @@ class KalmanLegTracker:
             out[idx] = (float(kf.x[0,0]), float(kf.x[1,0]))
         return out
 
-# ===================== Overlay (same visuals as squat) =====================
+# ===================== YOLOv8n-ONNX Detector (optional) =====================
+class YoloOccluderDetector:
+    """
+    Minimal YOLOv8-ONNX runner. Treats all detections as potential occluders,
+    or use occluder_class_ids to filter (e.g., {0,1} if your model maps 0=barbell,1=plate).
+    """
+    def __init__(self, onnx_path, providers=None, input_size=640, conf_thres=0.25, iou_thres=0.45, occluder_class_ids=None):
+        if not _ORT_AVAILABLE:
+            raise RuntimeError("onnxruntime not available")
+        if not os.path.exists(onnx_path):
+            raise FileNotFoundError(onnx_path)
+        self.sess = ort.InferenceSession(onnx_path, providers=providers or ort.get_available_providers())
+        self.inp_name = self.sess.get_inputs()[0].name
+        self.out_name = self.sess.get_outputs()[0].name
+        self.imgsz = int(input_size)
+        self.conf_thres = float(conf_thres)
+        self.iou_thres = float(iou_thres)
+        self.occluder_class_ids = occluder_class_ids  # None => all classes
+    @staticmethod
+    def _letterbox(img, new_shape=640, color=(114,114,114)):
+        shape = img.shape[:2]  # h,w
+        if isinstance(new_shape, int):
+            new_shape = (new_shape, new_shape)
+        r = min(new_shape[0]/shape[0], new_shape[1]/shape[1])
+        new_unpad = (int(round(shape[1]*r)), int(round(shape[0]*r)))
+        dw, dh = new_shape[1]-new_unpad[0], new_shape[0]-new_unpad[1]
+        dw, dh = dw//2, dh//2
+        img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+        img = cv2.copyMakeBorder(img, dh, dh, dw, dw, cv2.BORDER_CONSTANT, value=color)
+        return img, r, (dw, dh)
+    @staticmethod
+    def _nms(boxes, scores, iou_thres=0.45):
+        if len(boxes) == 0: return []
+        boxes = boxes.astype(np.float32)
+        x1,y1,x2,y2 = boxes[:,0], boxes[:,1], boxes[:,2], boxes[:,3]
+        areas = (x2-x1+1)*(y2-y1+1)
+        order = scores.argsort()[::-1]
+        keep = []
+        while order.size > 0:
+            i = order[0]; keep.append(i)
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
+            w = np.maximum(0, xx2-xx1+1); h = np.maximum(0, yy2-yy1+1)
+            inter = w*h
+            iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-9)
+            inds = np.where(iou <= iou_thres)[0]
+            order = order[inds+1]
+        return keep
+    def infer(self, frame_bgr):
+        h0, w0 = frame_bgr.shape[:2]
+        img, r, (dw, dh) = self._letterbox(frame_bgr, self.imgsz)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        img_rgb = np.transpose(img_rgb, (2,0,1))[None]  # 1x3xHxW
+        out = self.sess.run([self.out_name], {self.inp_name: img_rgb})[0]
+        # handle two common YOLOv8 export shapes:
+        # (1,84,N)  OR  (1,N,84/85)
+        if out.ndim == 3 and out.shape[0] == 1:
+            o = out[0]
+            if o.shape[0] in (84,85):  # (84,N) or (85,N)
+                # Ultralytics default: (84,N) with 4 box, 1 obj, 80 cls => 85; sometimes 84 (no obj)
+                num = o.shape[1]
+                xywh = o[0:4, :].T
+                if o.shape[0] >= 85:
+                    obj = o[4, :].reshape(num,1)
+                    cls = o[5:, :].T
+                    cls_id = np.argmax(cls, axis=1)
+                    conf = (obj * cls.max(axis=1)).flatten()
+                else:
+                    cls = o[4:, :].T
+                    cls_id = np.argmax(cls, axis=1)
+                    conf = cls.max(axis=1).flatten()
+            else:  # (N,84/85)
+                xywh = o[:, 0:4]
+                if o.shape[1] >= 85:
+                    obj = o[:, 4:5]
+                    cls = o[:, 5:]
+                    cls_id = np.argmax(cls, axis=1)
+                    conf = (obj[:,0] * cls.max(axis=1)).flatten()
+                else:
+                    cls = o[:, 4:]
+                    cls_id = np.argmax(cls, axis=1)
+                    conf = cls.max(axis=1).flatten()
+        else:
+            return []  # unknown layout
+        # filter conf
+        m = conf >= self.conf_thres
+        if not np.any(m): return []
+        xywh = xywh[m]; conf = conf[m]; cls_id = cls_id[m]
+        # class allowlist
+        if self.occluder_class_ids is not None:
+            sel = np.isin(cls_id, list(self.occluder_class_ids))
+            xywh, conf, cls_id = xywh[sel], conf[sel], cls_id[sel]
+            if len(xywh) == 0: return []
+        # xywh → xyxy on letterboxed image
+        xyxy = np.zeros_like(xywh)
+        xyxy[:,0] = xywh[:,0] - xywh[:,2]/2
+        xyxy[:,1] = xywh[:,1] - xywh[:,3]/2
+        xyxy[:,2] = xywh[:,0] + xywh[:,2]/2
+        xyxy[:,3] = xywh[:,1] + xywh[:,3]/2
+        # NMS
+        keep = self._nms(xyxy, conf, self.iou_thres)
+        xyxy = xyxy[keep]; conf = conf[keep]
+        # map back to original image
+        xyxy[:,[0,2]] -= dw; xyxy[:,[1,3]] -= dh
+        xyxy /= r
+        # clip and to normalized
+        xyxy[:,0] = np.clip(xyxy[:,0], 0, w0-1)
+        xyxy[:,2] = np.clip(xyxy[:,2], 0, w0-1)
+        xyxy[:,1] = np.clip(xyxy[:,1], 0, h0-1)
+        xyxy[:,3] = np.clip(xyxy[:,3], 0, h0-1)
+        boxes_norm = []
+        for x1,y1,x2,y2 in xyxy:
+            boxes_norm.append((float(x1)/w0, float(y1)/h0, float(x2)/w0, float(y2)/h0))
+        return boxes_norm
+
+# ===================== Overlay =====================
 def _wrap2(draw, text, font, maxw):
     words = text.split()
     if not words: return [""]
@@ -272,7 +403,7 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
     d.text((cx-int(pw//2), base+DEPTH_LABEL_FONT.size+gap), pct, font=DEPTH_PCT_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-    # Feedback at bottom (max 2 lines)
+    # Feedback (bottom)
     if feedback:
         pil_fb = Image.fromarray(frame); dfb = ImageDraw.Draw(pil_fb)
         safe = max(6, int(h*0.02)); pad_x, pad_y, lg = 12, 8, 4
@@ -295,7 +426,13 @@ def run_deadlift_analysis(video_path,
                           frame_skip=3,
                           scale=0.4,
                           output_path="deadlift_analyzed.mp4",
-                          feedback_path="deadlift_feedback.txt"):
+                          feedback_path="deadlift_feedback.txt",
+                          detector_onnx_path="barbell_plates_yolov8n.onnx",
+                          detector_input_size=640,
+                          detector_conf_thres=0.25,
+                          detector_iou_thres=0.45,
+                          detector_class_ids=None  # e.g., {0,1}; None = treat all as occluders
+                          ):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {
@@ -305,6 +442,20 @@ def run_deadlift_analysis(video_path,
             "good_reps": 0, "bad_reps": 0, "feedback": ["Could not open video"],
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
+
+    # Optional YOLO occluder detector
+    detector = None
+    if detector_onnx_path and _ORT_AVAILABLE and os.path.exists(detector_onnx_path):
+        try:
+            detector = YoloOccluderDetector(
+                detector_onnx_path,
+                input_size=detector_input_size,
+                conf_thres=detector_conf_thres,
+                iou_thres=detector_iou_thres,
+                occluder_class_ids=detector_class_ids
+            )
+        except Exception:
+            detector = None  # fallback silently
 
     PL = mp.solutions.pose.PoseLandmark
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -351,6 +502,14 @@ def run_deadlift_analysis(video_path,
             if out is None:
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
 
+            # optional occluder boxes (normalized xyxy)
+            occl_boxes = []
+            if detector is not None:
+                try:
+                    occl_boxes = detector.infer(frame)
+                except Exception:
+                    occl_boxes = []
+
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             res = pose.process(rgb)
 
@@ -374,9 +533,9 @@ def run_deadlift_analysis(video_path,
                     frame = draw_overlay(frame, reps=counter, feedback=None, progress_pct=prog)
                     out.write(frame); continue
 
-                # legs with Kalman robustness
-                right_leg_pts = right_leg.update(lm, dt)
-                left_leg_pts  = left_leg.update(lm, dt)
+                # legs with Kalman robustness + occlusion gating
+                right_leg_pts = right_leg.update(lm, dt, occlusion_boxes_norm=occl_boxes)
+                left_leg_pts  = left_leg.update(lm, dt, occlusion_boxes_norm=occl_boxes)
 
                 # hinge proxy: shoulder-hip horizontal delta
                 delta_x = abs(hip[0] - shoulder[0])
@@ -475,6 +634,14 @@ def run_deadlift_analysis(video_path,
                 }
                 for d in (right_leg_pts, left_leg_pts):
                     for idx, pt in d.items():
+                        # אל תצייר שוק/כף-רגל אם הנקודה בתוך תיבת אוקלוזיה (נראות נקייה)
+                        if occl_boxes:
+                            x,y = pt
+                            skip = False
+                            for (x1,y1,x2,y2) in occl_boxes:
+                                if x1<=x<=x2 and y1<=y<=y2:
+                                    skip=True; break
+                            if skip: continue
                         pts_draw[idx] = pt
 
                 frame = draw_body_only_from_dict(frame, pts_draw)
