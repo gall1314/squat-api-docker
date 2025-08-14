@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-# pullup_analysis.py — Pull-ups counter (ascents-only) with AND-condition:
-# (A) head ascent from per-ascent baseline  AND  (B) elbow flexion <= 90° (configurable).
-# Anti-jump: require brief hang (straight arms) before counting first reps.
-# Fast path: sequential read, no random seek; MediaPipe model_complexity=0 (like Bulgarian).
-# UI aligned to squat: Reps (top-left), HEIGHT donut (top-right), RT feedback hold=0.8s.
+# Pull-ups counter — AND condition:
+#  (A) head ascent from per-ascent baseline  AND  (B) elbow flexion <= TOP_ANGLE (default 100°).
+# Fast, no frame skipping, no random seek. Startup anti-jump kept minimal.
+# Overlay aligned to squat. Returns squat-style keys.
 
 import os, math, subprocess
 import cv2, numpy as np
@@ -17,7 +16,7 @@ FONT_PATH="Roboto-VariableFont_wdth,wght.ttf"
 DONUT_RADIUS_SCALE=0.72; DONUT_THICKNESS_FRAC=0.28
 ASCENT_COLOR=(40,200,80); DONUT_RING_BG=(70,70,70)
 RT_FB_HOLD_SEC=0.8
-DRAW_SKELETON = True  # הפוך ל-False כדי להאיץ
+DRAW_SKELETON=False  # הדלק ל-True רק אם חייבים ויזואליזציה של שלד
 
 def _load_font(p,s):
     try: return ImageFont.truetype(p,s)
@@ -98,7 +97,7 @@ def _donut(frame,c,r,t,pct):
 
 def draw_overlay(frame,reps=0,feedback=None,height_pct=0.0):
     h,w,_=frame.shape
-    # Reps box
+    # Reps
     pil=Image.fromarray(frame); draw=ImageDraw.Draw(pil)
     txt=f"Reps: {reps}"; pad_x,pad_y=10,6
     tw=draw.textlength(txt,font=REPS_FONT); th=REPS_FONT.size
@@ -106,7 +105,7 @@ def draw_overlay(frame,reps=0,feedback=None,height_pct=0.0):
     frame=cv2.addWeighted(over,BAR_BG_ALPHA,frame,1-BAR_BG_ALPHA,0)
     pil=Image.fromarray(frame); ImageDraw.Draw(pil).text((pad_x,pad_y-1),txt,font=REPS_FONT,fill=(255,255,255))
     frame=np.array(pil)
-    # HEIGHT donut
+    # Donut
     ref_h=max(int(h*0.06), int(REPS_FONT_SIZE*1.6))
     radius=int(ref_h*DONUT_RADIUS_SCALE); thick=max(3,int(radius*DONUT_THICKNESS_FRAC))
     m=12; cx=w-m-radius; cy=max(ref_h+radius//8, radius+thick//2+2)
@@ -143,29 +142,31 @@ def _ang(a,b,c):
 def _ema(prev,new,alpha): return float(new) if prev is None else (alpha*float(new)+(1-alpha)*float(prev))
 
 # ============== logic params (tunable) ==============
-# AND-condition (top)
-ELBOW_TOP_ANGLE        = 90.0   # <=90° נחשב "כיפוף משמעותי" — אפשר להקל ל-95° אם צריך
-HEAD_MIN_ASCENT        = 0.010  # עלייה מינ' (~1.0% גובה פריים) מה-baseline של אותה עלייה
-TOP_HOLD_FRAMES        = 1      # כמה פריימים רצופים שצריך להישאר בטופ כדי לאשר
+# AND condition at top
+ELBOW_TOP_ANGLE        = 100.0  # <=100° נספר (פחות מחמיר מה-90°)
+HEAD_MIN_ASCENT        = 0.0075 # ~0.75% גובה פריים
+TOP_HOLD_FRAMES        = 1
 
-# Reset between peaks (בלי לדרוש ירידה מלאה)
-RESET_DESCENT          = 0.007  # ירידה קטנה כדי "לשחרר" לספירה הבאה
-RESET_ELBOW            = 145.0  # או פתיחת מרפק מעל ערך זה
+# Reset (מהיר יותר בתחילת סט)
+RESET_DESCENT          = 0.0045 # ירידה קטנה יותר לשחרור
+RESET_ELBOW            = 135.0  # פתיחה קלה יותר לשחרור
 
-# התחלת עלייה ועדכון baseline
-HEAD_VEL_UP_TINY       = 0.00025
-ELBOW_DROP_MIN         = 4.0    # ירידת מרפק מינ' (במעלות) כדי לזהות התחלת עלייה
+# Debounce
+REFRACTORY_FRAMES      = 2      # דיבאונס קצר כדי לא לפספס רצפים
+
+# Timeout re-arm (אם נתקענו נעולים)
+REARM_TIMEOUT_SEC      = 0.6
+
+# Smoothing / detection
+HEAD_VEL_UP_TINY       = 0.0002
 ELBOW_EMA_ALPHA        = 0.35
 HEAD_EMA_ALPHA         = 0.30
 
-# Anti-jump / hang prerequisite (מונע ספירות בקפיצה למתח)
-HANG_EXTENDED_ANGLE    = 150.0  # "ידיים ישרות"
-HANG_MIN_FRAMES        = 2      # כמה פריימים רצופים של hang לפני שמותר לספור לראשונה
-TORSO_X_THR            = 0.010  # תזוזה אופקית מותרת בזמן hang (אחוז מרוחב פריים)
-
-# זיהוי שלד
-VIS_THR_RELAX          = 0.22   # לעיבוד/בייסליין
-VIS_THR_STRICT         = 0.30   # לספירה (ודאי שלד)
+# Anti-jump (עדין)
+HANG_EXTENDED_ANGLE    = 150.0
+HANG_MIN_FRAMES        = 1      # פריים אחד מספיק כדי לא לחסום
+VIS_THR_RELAX          = 0.22
+VIS_THR_STRICT         = 0.28   # מעט רך יותר כדי לא להפיל פריימים בהתחלה
 
 def run_pullup_analysis(video_path, frame_skip=1, scale=1.0,
                         output_path="pullup_analyzed.mp4",
@@ -175,7 +176,6 @@ def run_pullup_analysis(video_path, frame_skip=1, scale=1.0,
                 "technique_label":score_label(0.0),"good_reps":0,"bad_reps":0,"feedback":["Mediapipe not available"],
                 "tips":[],"reps":[],"video_path":"","feedback_path":feedback_path}
 
-    # לקרוא רציף, בלי seek
     cap=cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {"squat_count":0,"technique_score":0.0,"technique_score_display":display_half_str(0.0),
@@ -201,25 +201,23 @@ def run_pullup_analysis(video_path, frame_skip=1, scale=1.0,
     allow_new_peak=True; last_peak_frame=-999999
     asc_base_head=None; baseline_head_y_global=None; ascent_live=0.0
     elbow_ema=None; head_ema=None; head_prev=None
-
-    # anti-jump hang prerequisite
-    hang_ok=False
-    hang_frames=0
-    torso_cx_prev=None
+    hang_ok=False; hang_frames=0
 
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
+    # אל תדלג על פריימים בזמן ביצוע
+    frame_skip = 1
     effective_fps=max(1.0, fps_in/max(1,frame_skip))
     dt=1.0/effective_fps
     RT_FB_HOLD_FRAMES=max(2,int(RT_FB_HOLD_SEC/dt))
+    REARM_TIMEOUT_FRAMES=max(2,int(REARM_TIMEOUT_SEC*effective_fps))
     rt_fb_msg=None; rt_fb_hold=0
 
-    # MediaPipe - מהיר (כמו בבולגרי)
     with mp_pose.Pose(model_complexity=0, min_detection_confidence=0.6, min_tracking_confidence=0.6) as pose:
         while cap.isOpened():
             ok,frame=cap.read()
             if not ok: break
             frame_no+=1
-            if frame_skip>1 and (frame_no%frame_skip)!=0: continue
+            # אין דילוג פריימים
             if scale!=1.0: frame=cv2.resize(frame,(0,0),fx=scale,fy=scale)
 
             h,w=frame.shape[:2]
@@ -229,7 +227,6 @@ def run_pullup_analysis(video_path, frame_skip=1, scale=1.0,
 
             elbow_angle=None; head_y=None; lms=None
             vis_relaxed_ok=False; vis_strict_ok=False
-            torso_cx=None
 
             if res.pose_landmarks:
                 lms=res.pose_landmarks.landmark
@@ -244,80 +241,67 @@ def run_pullup_analysis(video_path, frame_skip=1, scale=1.0,
                 vis_strict_ok =(min_vis>=VIS_THR_STRICT)
 
                 if vis_relaxed_ok:
-                    head_raw=float(lms[NOSE].y)   # normalized (0=top)
+                    head_raw=float(lms[NOSE].y)
                     raw_elbow=_ang((lms[S].x,lms[S].y),(lms[E].x,lms[E].y),(lms[W].x,lms[W].y))
                     elbow_ema=_ema(elbow_ema,raw_elbow,ELBOW_EMA_ALPHA)
                     head_ema=_ema(head_ema,head_raw,HEAD_EMA_ALPHA)
                     head_y=head_ema; elbow_angle=elbow_ema
                     if baseline_head_y_global is None: baseline_head_y_global=head_y
 
-                # מרכז טורסו (כתפיים+ירכיים) בציר X — לשימוש ב-hang prerequisite
-                LSH=mp_pose.PoseLandmark.LEFT_SHOULDER.value; RSH=mp_pose.PoseLandmark.RIGHT_SHOULDER.value
-                LHIP=mp_pose.PoseLandmark.LEFT_HIP.value; RHIP=mp_pose.PoseLandmark.RIGHT_HIP.value
-                torso_cx = np.mean([lms[LSH].x,lms[RSH].x,lms[LHIP].x,lms[RHIP].x])*w
+                # Anti-jump קטן: דרוש רגע קצר של ידיים ישרות לפני ספירה ראשונה בלבד
+                if not hang_ok and vis_strict_ok and elbow_angle is not None:
+                    if elbow_angle >= HANG_EXTENDED_ANGLE:
+                        hang_frames += 1
+                        if hang_frames >= HANG_MIN_FRAMES:
+                            hang_ok = True
+                    else:
+                        hang_frames = 0
 
-            # מהירות ראש (שלילי = עולה)
+            # מהירות ראש
             head_vel = 0.0 if (head_y is None or head_prev is None) else (head_y - head_prev)
 
-            # -------- Anti-jump: דרישת Hang קצרה לפני ספירה ראשונה --------
-            if not hang_ok and vis_strict_ok and elbow_angle is not None and head_y is not None and torso_cx is not None:
-                # ידיים ישרות + ראש די יציב + כמעט אין תזוזה אופקית
-                arm_straight = (elbow_angle >= HANG_EXTENDED_ANGLE)
-                head_stable  = abs(head_vel) < 0.0012
-                torso_stable = True
-                if torso_cx_prev is not None:
-                    torso_stable = (abs(torso_cx - torso_cx_prev)/max(1.0,w) <= TORSO_X_THR)
-                if arm_straight and head_stable and torso_stable:
-                    hang_frames += 1
-                    if hang_frames >= HANG_MIN_FRAMES:
-                        hang_ok = True
-                else:
-                    hang_frames = 0
-                torso_cx_prev = torso_cx
-            elif hang_ok and torso_cx is not None:
-                torso_cx_prev = torso_cx  # תחזוקה
-
-            # -------- קביעת baseline לעלייה --------
+            # קביעת baseline לעלייה
             if head_y is not None and elbow_angle is not None:
                 if asc_base_head is None:
-                    # מתחילים בסיס כשיש סימן לעלייה (או כיפוף מרפק התחיל)
-                    elbow_drop = (elbow_ema is not None and raw_elbow is not None and (raw_elbow - elbow_ema) < 0)  # already smoothed; keep simple
-                    if (head_vel < -HEAD_VEL_UP_TINY) or elbow_drop:
+                    if head_vel < -HEAD_VEL_UP_TINY:
                         asc_base_head = head_y
                 else:
-                    # אם ירדנו די הרבה — רענן בסיס כדי לא לפספס עלייה חדשה
                     if (head_y - asc_base_head) > RESET_DESCENT*2:
                         asc_base_head = head_y
 
-            # -------- ספירה: AND( elbow<=90  ,  ascent>=min ) --------
-            count_gate_ok = (vis_strict_ok and (hang_ok or rep_count>0))  # חייבים קודם Hang, לאחר מכן חופשי
+            # פולבאק אם ננעלנו יותר מדי זמן אחרי פסגה
+            if not allow_new_peak and (frame_no - last_peak_frame) >= REARM_TIMEOUT_FRAMES:
+                # דורשים סימן קל שלא בטופ: או ראש לא ממשיך לעלות או מרפק לא סגור לחלוטין
+                if (head_vel >= 0) or (elbow_angle is not None and elbow_angle >= ELBOW_TOP_ANGLE+5):
+                    allow_new_peak = True
+                    if head_y is not None:
+                        asc_base_head = head_y  # אתחל בסיס לעלייה הבאה
+
+            # ספירה: שני תנאים יחד
+            count_gate_ok = (vis_strict_ok and (hang_ok or rep_count>0))
             if count_gate_ok and head_y is not None and elbow_angle is not None and asc_base_head is not None:
                 ascent_amt = (asc_base_head - head_y)  # חיובי כשעולים
                 at_top = (elbow_angle <= ELBOW_TOP_ANGLE) and (ascent_amt >= HEAD_MIN_ASCENT)
-                # החזקת טופ קצרה כדי למנוע רעש
-                can_count = (frame_no - last_peak_frame) >= 3  # debounce מינימלי
+                can_count = (frame_no - last_peak_frame) >= REFRACTORY_FRAMES
                 if at_top and allow_new_peak and can_count:
-                    # אופציונלי: דרוש TOP_HOLD_FRAMES
-                    # (אם צריך החזקה אמיתית, אפשר לצבור מונה; כאן 1 פריים מספיק)
                     rep_count += 1; good_reps += 1; all_scores.append(10.0)
                     rep_reports.append({
                         "rep_index":rep_count,
                         "top_elbow":float(elbow_angle),
                         "ascent_from":float(asc_base_head),
-                        "peak_head_y":float(head_y),
-                        "hang_ok":bool(hang_ok)
+                        "peak_head_y":float(head_y)
                     })
                     last_peak_frame = frame_no
                     allow_new_peak = False
 
                 # reset בין פסגות
                 reset_by_descent = (head_y - asc_base_head) >= RESET_DESCENT
-                reset_by_elbow   = (elbow_angle >= RESET_ELBOW)
+                reset_by_elbow   = (elbow_angle >= RESET_ELBOW) if elbow_angle is not None else False
                 if reset_by_descent or reset_by_elbow:
                     allow_new_peak = True
                     asc_base_head = head_y
 
-                # RT feedback (לא משפיע על ציון)
+                # RT feedback
                 cur_rt=None
                 if ascent_amt < HEAD_MIN_ASCENT*0.7 and head_vel < -HEAD_VEL_UP_TINY:
                     cur_rt="Go a bit higher (chin over bar)"
@@ -329,7 +313,7 @@ def run_pullup_analysis(video_path, frame_skip=1, scale=1.0,
             else:
                 if rt_fb_hold>0: rt_fb_hold-=1
 
-            # HEIGHT donut חי (עולה/יורד)
+            # Donut HEIGHT
             ascent_live=0.0 if (baseline_head_y_global is None or head_y is None) \
                 else float(np.clip((baseline_head_y_global - head_y)/max(0.12, HEAD_MIN_ASCENT*1.2), 0.0, 1.0))
 
@@ -382,9 +366,7 @@ def run_pullup_analysis(video_path, frame_skip=1, scale=1.0,
         "feedback_path":feedback_path
     }
 
-# תאימות
 def run_analysis(*args,**kwargs): return run_pullup_analysis(*args,**kwargs)
-
 
 
 
