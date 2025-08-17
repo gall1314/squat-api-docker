@@ -11,6 +11,7 @@ from deadlift_analysis import run_deadlift_analysis
 from bulgarian_split_squat_analysis import run_bulgarian_analysis
 from pullup_analysis import run_pullup_analysis
 from barbell_bicep_curl import run_barbell_bicep_curl_analysis
+from bent_over_row_analysis import run_row_analysis  # NEW
 
 app = Flask(__name__)
 CORS(app)
@@ -28,7 +29,22 @@ EXERCISE_MAP = {
     "pull-up": "pullup",
     "pull up": "pullup",
     "barbell bicep curl": "bicep_curl",
+
+    # NEW: Bent-Over Row aliases
+    "bent-over row": "bent_row",
+    "barbell bent-over row": "bent_row",
+    "barbell bent over row": "bent_row",
+    "bent over row": "bent_row",
+    "barbell row": "bent_row",
+    "row": "bent_row",
 }
+
+def _standardize_video_path(result_dict):
+    """Normalize result to always contain result['video_path']."""
+    if isinstance(result_dict, dict):
+        if "video_path" not in result_dict and "analyzed_video_path" in result_dict:
+            result_dict["video_path"] = result_dict["analyzed_video_path"]
+    return result_dict
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
@@ -59,7 +75,7 @@ def analyze():
     shutil.copyfile(temp.name, raw_video_path)
     os.remove(temp.name)
 
-    # עיבוד לפי סוג התרגיל – כולם מחזירים video_path
+    # עיבוד לפי סוג התרגיל – כולם מחזירים video_path (או analyzed_video_path שנמפה ל-video_path)
     if resolved_type == 'squat':
         result = run_analysis(
             raw_video_path, frame_skip=3, scale=0.4,
@@ -85,8 +101,21 @@ def analyze():
             raw_video_path, frame_skip=3, scale=0.4,
             output_path=os.path.join(MEDIA_DIR, base_filename + "_analyzed.mp4")
         )
+    elif resolved_type == 'bent_row':
+        # NEW: bent-over row — הפונקציה מחזירה analyzed_video_path,
+        # ולכן ננרמל לשדה video_path לאחר הקריאה.
+        result = run_row_analysis(
+            raw_video_path, output_dir=MEDIA_DIR  # overlay/params פנימיים זהים לסקוואט
+        )
+        result = _standardize_video_path(result)
+    else:
+        return jsonify({"error": f"Unhandled exercise type: {resolved_type}"}), 400
 
-    output_path = result["video_path"]
+    # ודאות לשדה video_path לתשובה אחידה
+    result = _standardize_video_path(result)
+    output_path = result.get("video_path")
+    if not output_path:
+        return jsonify({"error": "Analyzer did not return a video path"}), 500
 
     # החזרת כתובת URL מלאה
     full_url = request.host_url.rstrip('/') + '/media/' + os.path.basename(output_path)
@@ -102,3 +131,4 @@ def media(filename):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
