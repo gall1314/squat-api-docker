@@ -210,6 +210,8 @@ SWING_MIN_STREAK     = 3       # כמה פריימים רצופים כדי לי�
 
 # Bottom extension check
 BOTTOM_EXT_MIN_ANGLE = 155.0   # כיפוף קטן מזה = לא פתיחה מלאה בתחתית
+BOTTOM_HYST_DEG      = 3.0     # היסטרזיס לספיגת דילוג פריימים/רעש
+BOTTOM_FAIL_MIN_REPS = 2       # נדרשות לפחות N חזרות לא טובות כדי להוסיף הערה סשן
 
 # ===================== MAIN =====================
 def run_pullup_analysis(video_path,
@@ -278,6 +280,10 @@ def run_pullup_analysis(video_path,
     swing_already_reported=False
     bottom_already_reported=False
 
+    # ---- NEW: track bottom-phase maximum elbow extension (raw, both arms) ----
+    bottom_phase_max_elbow = None
+    bottom_fail_count = 0
+
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
     sec_to_frames = lambda s: max(1, int(s * effective_fps))
@@ -317,9 +323,13 @@ def run_pullup_analysis(video_path,
             min_vis = min(lms[NOSE].visibility, lms[S].visibility, lms[E].visibility, lms[W].visibility)
             vis_strict_ok = (min_vis >= VIS_THR_STRICT)
 
-            # Kinematics
+            # Z-angles — raw for both arms
             head_raw = float(lms[NOSE].y)
-            raw_elbow = _ang((lms[S].x, lms[S].y), (lms[E].x, lms[E].y), (lms[W].x, lms[W].y))
+            raw_elbow_L = _ang((lms[LSH].x, lms[LSH].y), (lms[LE].x, lms[LE].y), (lms[LW].x, lms[LW].y))
+            raw_elbow_R = _ang((lms[RSH].x, lms[RSH].y), (lms[RE].x, lms[RE].y), (lms[RW].x, lms[RW].y))
+            # maintain existing behavior for counting side (EMA on the chosen side)
+            raw_elbow = raw_elbow_L if side == "LEFT" else raw_elbow_R
+
             elbow_ema = _ema(elbow_ema, raw_elbow, ELBOW_EMA_ALPHA)
             head_ema  = _ema(head_ema,  head_raw,  HEAD_EMA_ALPHA)
             head_y = head_ema; elbow_angle = elbow_ema
@@ -381,26 +391,42 @@ def run_pullup_analysis(video_path,
                     })
                     last_peak_frame = frame_idx
                     allow_new_peak = False
-                    bottom_already_reported = False  # נאפס להערת תחתית עבור החזרה הבאה
+                    bottom_already_reported = False
+                    # start tracking bottom-phase max elbow extension (raw), both arms
+                    bottom_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
+
+                # ---- Track maximum elbow extension while descending / until reset (both arms) ----
+                if (allow_new_peak is False):
+                    cand = max(raw_elbow_L, raw_elbow_R)
+                    bottom_phase_max_elbow = cand if bottom_phase_max_elbow is None else max(bottom_phase_max_elbow, cand)
 
                 # Re-arm quickly
                 reset_by_desc = (asc_base_head is not None) and ((head_y - asc_base_head) >= RESET_DESCENT)
                 reset_by_elb  = (elbow_angle >= RESET_ELBOW)
                 if reset_by_desc or reset_by_elb:
-                    # בדיקת פתיחה מלאה בתחתית
-                    if (not bottom_already_reported) and (elbow_angle < BOTTOM_EXT_MIN_ANGLE):
-                        session_feedback.add(FB_CUE_BOTTOM)
-                        cur_rt = cur_rt or FB_CUE_BOTTOM
+                    # Bottom extension check based on tracked maximum (raw)
+                    if not bottom_already_reported:
+                        effective_max = bottom_phase_max_elbow if bottom_phase_max_elbow is not None else max(raw_elbow_L, raw_elbow_R)
+                        if effective_max < (BOTTOM_EXT_MIN_ANGLE - BOTTOM_HYST_DEG):
+                            bottom_fail_count += 1
+                            if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS:
+                                session_feedback.add(FB_CUE_BOTTOM)
+                                cur_rt = cur_rt or FB_CUE_BOTTOM
+                        else:
+                            # חזרה טובה מפחיתה את הספירה (עם רצפה 0) כדי לא "לנ鎖ל" הערה אם רוב החזרות טובות
+                            bottom_fail_count = max(0, bottom_fail_count - 1)
                         bottom_already_reported = True
+
                     allow_new_peak = True
                     asc_base_head = head_y
+                    bottom_phase_max_elbow = None  # reset for next rep
 
                 # RT: need higher
                 if (cur_rt is None) and (asc_base_head is not None) and (ascent_amt < HEAD_MIN_ASCENT*0.7) and (head_vel < -HEAD_VEL_UP_TINY):
                     session_feedback.add(FB_CUE_HIGHER)
                     cur_rt = FB_CUE_HIGHER
 
-                # RT: swing (kipping) — לפי תנועת טורסו אופקית גבוהה כמה פריימים ברצף
+                # RT: swing (kipping)
                 if torso_dx_norm > SWING_THR:
                     swing_streak += 1
                 else:
@@ -413,6 +439,8 @@ def run_pullup_analysis(video_path,
             else:
                 asc_base_head = None; allow_new_peak = True
                 swing_streak = 0
+                # אם יצאנו מהבר – אפס את מעקב התחתית כדי לא לטנף לחזרה הבאה
+                bottom_phase_max_elbow = None
 
             # Handle RT feedback hold
             if cur_rt:
@@ -508,3 +536,4 @@ def _ret_err(msg, feedback_path):
 # תאימות
 def run_analysis(*args, **kwargs):
     return run_pullup_analysis(*args, **kwargs)
+
