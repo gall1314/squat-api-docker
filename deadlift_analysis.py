@@ -1,13 +1,20 @@
 # -*- coding: utf-8 -*-
 # deadlift_analysis.py — Full fast-first pipeline with artifact + original-quality render and full overlay
-# Includes: FSM, back curvature, Kalman leg tracking, bar proxy via wrists, optional YOLO occluder gating.
+# Exposes: run_deadlift_analysis(video_path, frame_skip=6, scale=0.40, output_path=None, return_video=True, ...)
+#
+# Features:
+#  - Canonical fast analysis (no video) → artifact with timeline & per-rep report
+#  - Render original video with the SAME overlay (no re-analysis) → 1:1 with fast result
+#  - Kalman leg tracking, back curvature flag, bar proxy via wrists
+#  - Optional YOLO (onnxruntime) for occlusion gating
+#  - Deterministic params saved in artifact (frame_skip/scale/etc)
 
-import os, cv2, math, uuid, subprocess
+import os, cv2, math, uuid, subprocess, json
 import numpy as np
 import mediapipe as mp
 from typing import List, Dict, Any, Optional
 
-# ---------- perf hygiene ----------
+# ======== perf hygiene ========
 try: cv2.setNumThreads(1)
 except Exception: pass
 os.environ.setdefault("OMP_NUM_THREADS","1")
@@ -15,7 +22,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS","1")
 os.environ.setdefault("MKL_NUM_THREADS","1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS","1")
 
-# ---------- optional onnxruntime (YOLO) ----------
+# ======== optional onnxruntime (YOLO) ========
 try:
     import onnxruntime as ort
     _ORT = True
@@ -24,7 +31,7 @@ except Exception:
 
 mp_pose = mp.solutions.pose
 
-# ---------- helpers ----------
+# ======== helpers ========
 def _score_label(s: float) -> str:
     s = float(s)
     if s >= 9.5: return "Excellent"
@@ -46,18 +53,19 @@ class EMA:
         else: self.v=self.a*x+(1-self.a)*self.v
         return self.v
 
-# ---------- geometry / curvature ----------
+# ======== geometry / curvature ========
 def analyze_back_curvature(shoulder, hip, head_like, threshold=0.04):
+    # signed distance of head-like point from the shoulder-hip line (negative=inward/rounded)
     line_vec = hip - shoulder
     nrm = np.linalg.norm(line_vec) + 1e-9
     u = line_vec / nrm
     proj_len = np.dot(head_like - shoulder, u)
     proj = shoulder + proj_len * u
     off = head_like - proj
-    signed = float(np.sign(off[1]) * -1 * np.linalg.norm(off))  # inward negative
+    signed = float(np.sign(off[1]) * -1 * np.linalg.norm(off))  # inward (rounded) => negative
     return signed, signed < -threshold
 
-# ---------- Kalman utils ----------
+# ======== Kalman utils ========
 class _KF:
     def __init__(self, q=1e-3, r=6e-3):
         self.x = np.zeros((4,1), dtype=float) # x,y,vx,vy
@@ -82,7 +90,7 @@ class _KF:
         maha2 = float(y.T @ np.linalg.inv(S) @ y)
         return maha2
 
-# ---------- Kalman leg tracker ----------
+# ======== Kalman leg tracker ========
 class KalmanLegTracker:
     LEG_VIS_THR    = 0.55
     LEG_MAX_MAH    = 6.0
@@ -148,7 +156,7 @@ class KalmanLegTracker:
             out[idx]=(float(kf.x[0,0]), float(kf.x[1,0]))
         return out
 
-# ---------- Bar Y tracker (wrists proxy) ----------
+# ======== Bar Y tracker (wrists proxy) ========
 class BarYTracker:
     WR_THR=0.55; MIN_W=0.10; MAX_W=0.55; DRIFT=0.12
     def __init__(self):
@@ -171,7 +179,7 @@ class BarYTracker:
         self.valid=True; return y_f, True
     def top_ref(self): return self.top_ema.v if self.top_ema.ready else None
 
-# ---------- YOLO occluder (optional) ----------
+# ======== YOLO occluder (optional) ========
 class YoloOccluder:
     def __init__(self, onnx_path, providers=None, input_size=640, conf=0.25, iou=0.45, allow=None):
         if not _ORT: raise RuntimeError("onnxruntime not available")
@@ -213,7 +221,6 @@ class YoloOccluder:
         out=self.sess.run([self.out],{self.inp:rgb})[0]
         o=out[0] if out.ndim==3 and out.shape[0]==1 else out
         if o.shape[-1] < 6: return []
-        # handle (84,N) or (N,84/85)
         if o.shape[0] in (84,85):
             xywh=o[0:4,:].T; cls=o[5:,:].T if o.shape[0]>=85 else o[4:,:].T
         else:
@@ -235,31 +242,7 @@ class YoloOccluder:
             boxes.append((float(x1)/w0, float(y1)/h0, float(x2)/w0, float(y2)/h0))
         return boxes
 
-# ---------- draw body (hide face) ----------
-_FACE = {
-    mp_pose.PoseLandmark.NOSE.value,
-    mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
-    mp_pose.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose.PoseLandmark.RIGHT_EYE.value, mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
-    mp_pose.PoseLandmark.LEFT_EAR.value, mp_pose.PoseLandmark.RIGHT_EAR.value,
-    mp_pose.PoseLandmark.MOUTH_LEFT.value, mp_pose.PoseLandmark.MOUTH_RIGHT.value,
-}
-_BODY_CONNS = tuple((a,b) for (a,b) in mp_pose.POSE_CONNECTIONS if a not in _FACE and b not in _FACE)
-_BODY_POINTS = tuple(sorted({i for (a,b) in _BODY_CONNS for i in (a,b)}))
-
-def draw_body_only_from_dict(frame, pts_norm, color=(255,255,255)):
-    h,w=frame.shape[:2]
-    for a,b in _BODY_CONNS:
-        if a in pts_norm and b in pts_norm:
-            ax,ay=int(pts_norm[a][0]*w), int(pts_norm[a][1]*h)
-            bx,by=int(pts_norm[b][0]*w), int(pts_norm[b][1]*h)
-            cv2.line(frame,(ax,ay),(bx,by),color,2,cv2.LINE_AA)
-    for i in _BODY_POINTS:
-        if i in pts_norm:
-            x,y=int(pts_norm[i][0]*w), int(pts_norm[i][1]*h)
-            cv2.circle(frame,(x,y),3,color,-1,cv2.LINE_AA)
-    return frame
-
-# ---------- overlay (like now) ----------
+# ======== overlay (like now) ========
 def _draw_donut(frame, cx, cy, radius, thick, pct):
     pct=float(np.clip(pct,0.0,1.0))
     ring_bg=(70,70,70); color=(40,200,80)
@@ -267,18 +250,19 @@ def _draw_donut(frame, cx, cy, radius, thick, pct):
     cv2.ellipse(frame,(cx,cy),(radius,radius),0,-90,-90+int(360*pct),color,thick,cv2.LINE_AA)
 
 def draw_overlay_like_now(frame, reps_done, pct, feedback_text=None):
-    # top-left reps
-    txt=f"Reps: {reps_done}"; (tw,th),_=cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX,1.0,2)
+    # Top-left reps
+    txt=f"Reps: {reps_done}"
+    (tw,th),_=cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX,1.0,2)
     pad=10; cv2.rectangle(frame,(0,0),(tw+2*pad, th+2*pad),(0,0,0),-1)
-    cv2.putText(frame,txt,(pad, th+pad-2), cv2.FONT_HERSHEY_SIMPLEX,1.0,(255,255,255),2,cv2.LINE_AA)
-    # donut top-right
+    cv2.putText(frame,txt,(pad, th+pad-2), cv2.FONT_HERSHEY_SIMPLEX,1.0,(255,255,255),2, cv2.LINE_AA)
+    # Donut top-right
     h,w=frame.shape[:2]; ref_h=max(int(h*0.06), int(28*1.6))
     r=int(ref_h*0.72); thick=max(3,int(r*0.28)); m=12
     cx=w-m-r; cy=max(ref_h+r//8, r+thick//2+2)
     _draw_donut(frame, cx, cy, r, thick, pct)
-    cv2.putText(frame,"DEPTH",(cx-30, cy-(thick+10)), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,255),1,cv2.LINE_AA)
-    cv2.putText(frame,f"{int(100*np.clip(pct,0,1))}%",(cx-18, cy+(thick+16)), cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),1,cv2.LINE_AA)
-    # bottom feedback
+    cv2.putText(frame,"DEPTH",(cx-30, cy-(thick+10)), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,255),1, cv2.LINE_AA)
+    cv2.putText(frame,f"{int(100*np.clip(pct,0,1))}%",(cx-18, cy+(thick+16)), cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),1, cv2.LINE_AA)
+    # Bottom feedback
     if feedback_text:
         maxw=int(w*0.9); words=feedback_text.split(); lines=[]; cur=""
         for wd in words:
@@ -294,10 +278,10 @@ def draw_overlay_like_now(frame, reps_done, pct, feedback_text=None):
         for ln in lines:
             (tw2,th2),_=cv2.getTextSize(ln, cv2.FONT_HERSHEY_SIMPLEX,0.7,2)
             x=max(10,(w-tw2)//2)
-            cv2.putText(frame,ln,(x,y), cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2,cv2.LINE_AA)
+            cv2.putText(frame,ln,(x,y), cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2, cv2.LINE_AA)
             y+=line_h
 
-# ---------- ffmpeg sink ----------
+# ======== ffmpeg sink ========
 def _open_ffmpeg_sink(w,h,fps,out_path,preset="medium",crf=18):
     cmd=[
         "ffmpeg","-y","-f","rawvideo","-pix_fmt","bgr24",
@@ -307,7 +291,7 @@ def _open_ffmpeg_sink(w,h,fps,out_path,preset="medium",crf=18):
     ]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
-# ---------- FAST ANALYSIS (artifact) ----------
+# ======== FAST ANALYSIS: returns artifact ========
 def analyze_deadlift_fast(
     video_path: str,
     work_scale: float = 0.40,
@@ -326,7 +310,7 @@ def analyze_deadlift_fast(
     n_frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     duration = (n_frames/fps_in) if n_frames>0 else None
 
-    # thresholds
+    # thresholds / FSM
     HINGE_START=0.08; HINGE_END=0.035
     MIN_BW=10; MIN_TOTAL=12
     ROM_MIN=0.055
@@ -341,16 +325,12 @@ def analyze_deadlift_fast(
     top_ref=None; bottom_est=None
     back_frames=0
     eff_fps = max(1.0, fps_in/max(1,frame_skip))
-    BACK_MIN_FRAMES=max(2, int(BACK_MIN_S*eff_fps))
-
-    down_frames=up_frames=top_hold_frames=0
+    down_frames=up_frames=0
     hinge_min=hinge_max=None
 
-    # trackers
     right_leg=left_leg=None
     bar=BarYTracker()
 
-    # optional YOLO
     det=None
     if yolo_onnx and _ORT and os.path.exists(yolo_onnx):
         try: det=YoloOccluder(yolo_onnx, input_size=yolo_input, conf=yolo_conf, iou=yolo_iou, allow=yolo_allow)
@@ -389,21 +369,23 @@ def analyze_deadlift_fast(
             if head is None: continue
             mid_spine=(shoulder+hip)*0.5*0.4 + head*0.6
             _, rounded = analyze_back_curvature(shoulder, hip, mid_spine)
+
             delta_x = abs(hip[0]-shoulder[0])
 
-            # adapt top
+            # adapt top ref
             if top_ref is None: top_ref=float(delta_x)
             else:
                 if delta_x < (top_ref*1.4): top_ref=0.9*top_ref+0.1*float(delta_x)
 
-            # bar
+            # bar proxy
             bar_y, bar_ok = bar.update(lm)
 
-            # legs (not used directly in FSM here, אבל תורם ליציבות ציור/בקרה)
+            # legs update (stability)
             right_leg.update(lm, 1.0/eff_fps, occl)
             left_leg.update (lm, 1.0/eff_fps, occl)
 
             t_sec = fidx / fps_in
+
             # FSM
             if state==state_TOP:
                 back_frames=0
@@ -414,7 +396,7 @@ def analyze_deadlift_fast(
                     state=state_DOWN
                     bottom_est=delta_x
                     hinge_min=hinge_max=delta_x
-                    down_frames=up_frames=top_hold_frames=0
+                    down_frames=up_frames=0
                     bar.reset_rep()
                     rep_start = t_sec
 
@@ -423,7 +405,6 @@ def analyze_deadlift_fast(
                 hinge_min = min(hinge_min, delta_x) if hinge_min is not None else delta_x
                 hinge_max = max(hinge_max, delta_x) if hinge_max is not None else delta_x
                 down_frames += 1
-                back_frames = back_frames+1 if rounded else max(0, back_frames-1)
                 if down_frames>=4 and (hinge_max - delta_x) > 0.01:
                     state=state_UP
 
@@ -431,31 +412,30 @@ def analyze_deadlift_fast(
                 hinge_min = min(hinge_min, delta_x) if hinge_min is not None else delta_x
                 hinge_max = max(hinge_max, delta_x) if hinge_max is not None else delta_x
                 up_frames += 1
-                if rounded: back_frames += 1
                 end_hinge = (delta_x - top_ref) < HINGE_END
                 end_bar   = (bar_ok and bar.top_ref() is not None and abs(bar_y - bar.top_ref()) < (ROM_MIN*0.5))
                 if end_hinge or end_bar:
-                    long_enough=(down_frames+up_frames)>=MIN_TOTAL
+                    long_enough=(down_frames+up_frames)>=12
                     rom = hinge_max - hinge_min if (hinge_max is not None and hinge_min is not None) else 0.0
                     enough_rom = rom >= ROM_MIN
                     if long_enough and enough_rom and (fidx - last_rep_f > MIN_BW):
                         reps+=1
                         penalty=0.0; fb=[]
-                        if back_frames >= max(2, int(BACK_MIN_S*eff_fps)):
-                            fb.append("Try to keep your back a bit straighter"); penalty+=1.5
+                        # simple back-rounding penalty near bottom phase
+                        if rounded: fb.append("Try to keep your back a bit straighter"); penalty+=1.5
                         if (delta_x - top_ref) > 0.02:
                             fb.append("Try to finish more upright"); penalty+=1.0
                         score = round(max(4.0, 10.0 - penalty) * 2)/2
-                        scores.append(score)
-                        # simple tip
-                        tip = "Slow the lowering to ~2–3s" if down_frames/eff_fps < 0.35 else "Keep the bar close and move smoothly"
+                        # tip
+                        tip = "Keep the bar close and move smoothly"
                         reps_report.append({"rep_index":reps,"score":float(score),"score_display":_half_str(score),"feedback":fb,"tip":tip})
                         timeline.append({"start":rep_start, "end":t_sec})
+                        scores.append(score)
                         last_rep_f=fidx
                     # reset
                     state=state_TOP
-                    bottom_est=None; back_frames=0
-                    down_frames=up_frames=top_hold_frames=0
+                    bottom_est=None
+                    down_frames=up_frames=0
                     hinge_min=hinge_max=None
                     bar.reset_rep()
 
@@ -465,7 +445,6 @@ def analyze_deadlift_fast(
     return {
         "analysis_id": uuid.uuid4().hex,
         "video_path": video_path,
-        "duration_sec": duration,
         "summary": {
             "reps": reps,
             "score": technique_score,
@@ -485,7 +464,7 @@ def analyze_deadlift_fast(
         }
     }
 
-# ---------- RENDER from artifact (original quality + full overlay) ----------
+# ======== RENDER from artifact (original quality + full overlay) ========
 def render_deadlift_video(
     artifact: Dict[str,Any],
     out_path: str,
@@ -505,7 +484,6 @@ def render_deadlift_video(
     starts=np.array([r["start"] for r in timeline], dtype=np.float32)
     total=len(timeline)
 
-    # cache overlay
     last_key=None; last_frame=None
     fidx=0
     while True:
@@ -538,41 +516,59 @@ def render_deadlift_video(
     except Exception: pass
     return {"ok":True, "video_path": out_path, "reps": total}
 
-# ---------- convenience ----------
-def run_deadlift(
+# ======== Public entry (compatible) ========
+def run_deadlift_analysis(
     video_path: str,
-    mode: str = "fast",          # "fast" → artifact only; "video" → render from artifact (no re-analysis)
-    out_path: Optional[str] = None,
-    # fast params:
-    work_scale: float = 0.40,
     frame_skip: int = 6,
+    scale: float = 0.40,
+    output_path: Optional[str] = None,
+    return_video: bool = True,
     model_complexity: int = 1,
-    yolo_onnx: Optional[str] = None,
-    # render params:
-    preset: str = "medium",
-    crf: int = 18
+    yolo_onnx: Optional[str] = None
 ) -> Dict[str,Any]:
-    if mode=="fast":
-        art=analyze_deadlift_fast(video_path, work_scale, frame_skip, model_complexity, yolo_onnx=yolo_onnx)
-        s=art["summary"]
-        return {
-            "squat_count": s["reps"],
-            "technique_score": s["score"],
-            "technique_score_display": s["display"],
-            "technique_label": s["label"],
-            "good_reps": sum(1 for r in art["reps_report"] if r["score"]>=9.5),
-            "bad_reps":  sum(1 for r in art["reps_report"] if r["score"]< 9.5),
-            "feedback": ["Analysis (fast) complete"],
-            "reps": art["reps_report"],
-            "video_path": "",
-            "analysis_artifact": art
-        }
-    elif mode=="video":
-        art=analyze_deadlift_fast(video_path, work_scale, frame_skip, model_complexity, yolo_onnx=yolo_onnx)
-        if not out_path:
-            base,ext=os.path.splitext(video_path); out_path=f"{base}_analyzed.mp4"
-        r=render_deadlift_video(art, out_path=out_path, preset=preset, crf=crf)
-        return {"ok":r.get("ok",False),"video_path":r.get("video_path",""),"reps":art["summary"]["reps"],"analysis_artifact":art}
-    else:
-        return {"ok":False,"reason":f"unknown mode: {mode}"}
+    """
+    Compatible public entry used by app.py.
+    - If return_video=False → fast analysis only (no video)
+    - If return_video=True and output_path is given → render original-quality video with overlay (no re-analysis)
+    """
+    artifact = analyze_deadlift_fast(
+        video_path=video_path,
+        work_scale=scale,
+        frame_skip=frame_skip,
+        model_complexity=model_complexity,
+        yolo_onnx=yolo_onnx
+    )
 
+    # Compose result object similar to your existing API
+    s = artifact["summary"]
+    result = {
+        "exercise": "deadlift",
+        "technique_score": s["score"],
+        "technique_score_display": s["display"],
+        "technique_label": s["label"],
+        "rep_count": s["reps"],
+        "reps": artifact["reps_report"],
+        "feedback": ["Analysis complete"],
+        "analysis_artifact": artifact
+    }
+
+    if not return_video:
+        # Fast path — no video
+        return result
+
+    # Need video output
+    if not output_path:
+        base,ext = os.path.splitext(video_path)
+        output_path = f"{base}_analyzed.mp4"
+
+    rr = render_deadlift_video(artifact, out_path=output_path, preset="medium", crf=18)
+    if rr.get("ok"):
+        result["video_path"] = rr.get("video_path")
+    else:
+        result["video_path"] = None
+        result["feedback"].append(f"Render failed: {rr.get('reason','unknown')}")
+    return result
+
+# ======== Backwards compatibility alias (if someone imports another name) ========
+# If in other files you use: from deadlift_analysis import analyze_deadlift
+analyze_deadlift = run_deadlift_analysis  # alias for compatibility
