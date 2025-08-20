@@ -1,34 +1,33 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — Full fast-first pipeline with artifact + original-quality render and full overlay
+# deadlift_analysis.py — Fast-first pipeline + original-quality overlay render
 #
-# Public entry (what app.py imports):
+# Public entry (imported by app.py):
 #   run_deadlift_analysis(
 #       video_path, frame_skip=6, scale=0.40,
 #       output_path=None, return_video=True, model_complexity=1, yolo_onnx=None
-#   ) -> dict with keys your FE expects:
-#       exercise, squat_count, rep_count, technique_score, technique_score_display,
-#       technique_label, good_reps, bad_reps, reps, feedback, video_path
+#   )
+# Returns dict with FE-expected keys:
+#   exercise, squat_count, rep_count, technique_score, technique_score_display,
+#   technique_label, good_reps, bad_reps, reps, feedback, video_path
 #
 # Internal:
-#   analyze_deadlift_fast(...) -> artifact (timeline+per-rep report)
-#   render_deadlift_video(artifact, out_path, preset="medium", crf=18) -> original-quality mp4 with overlay
+#   analyze_deadlift_fast(...) -> artifact (timeline + per-rep report)
+#   render_deadlift_video(artifact, out_path, preset="medium", crf=18)
 
 import os, cv2, math, uuid, subprocess
 import numpy as np
 import mediapipe as mp
 from typing import List, Dict, Any, Optional
 
-# ---------- perf hygiene ----------
-try:
-    cv2.setNumThreads(1)
-except Exception:
-    pass
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+# -------- Perf hygiene --------
+try: cv2.setNumThreads(1)
+except Exception: pass
+os.environ.setdefault("OMP_NUM_THREADS","1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS","1")
+os.environ.setdefault("MKL_NUM_THREADS","1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS","1")
 
-# ---------- optional onnxruntime (YOLO) ----------
+# -------- Optional onnxruntime (YOLO) --------
 try:
     import onnxruntime as ort
     _ORT = True
@@ -61,7 +60,7 @@ class EMA:
 
 # ====================== geometry / back curvature ====================
 def analyze_back_curvature(shoulder, hip, head_like, threshold=0.04):
-    # signed distance of head-like point from the shoulder-hip line (negative=inward/rounded)
+    # signed distance of head-like point from shoulder-hip line (negative=inward/rounded)
     line_vec = hip - shoulder
     nrm = np.linalg.norm(line_vec) + 1e-9
     u = line_vec / nrm
@@ -292,8 +291,7 @@ def _open_ffmpeg_sink(w,h,fps,out_path,preset="medium",crf=18):
         "ffmpeg","-y",
         "-f","rawvideo","-pix_fmt","bgr24","-s",f"{w}x{h}","-r",str(fps),"-i","pipe:0",
         "-an","-c:v","libx264","-preset",preset,"-crf",str(crf),
-        "-movflags","+faststart","-vf","format=yuv420p",
-        out_path
+        "-movflags","+faststart","-vf","format=yuv420p", out_path
     ]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
@@ -314,12 +312,14 @@ def analyze_deadlift_fast(
         return {"analysis_id": uuid.uuid4().hex,"video_path":video_path,"summary":{"reps":0,"score":0.0,"display":"0","label":"Needs work"},"reps_report":[],"timeline":[],"meta":{"ok":False,"reason":"Could not open video"}}
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25.0
     n_frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    duration = (n_frames/fps_in) if n_frames>0 else None
+    # duration = (n_frames/fps_in) if n_frames>0 else None  # (optional)
 
-    # FSM/thresholds
-    HINGE_START=0.08; HINGE_END=0.035
-    MIN_BW=10; MIN_TOTAL=12
-    ROM_MIN=0.055
+    # ---- Updated thresholds (robust for your clips) ----
+    HINGE_START = 0.045   # easier start
+    HINGE_END   = 0.020   # easier end
+    ROM_MIN     = 0.035   # min ROM
+    MIN_TOTAL   = 8       # min frames per rep (after skipping)
+    MIN_BW      = 8       # min frames between reps
 
     PL=mp_pose.PoseLandmark
     state_TOP, state_DOWN, state_UP = 0,1,2
@@ -332,15 +332,17 @@ def analyze_deadlift_fast(
     down_frames=up_frames=0
     hinge_min=hinge_max=None
 
+    # trackers
     right_leg=left_leg=None
     bar=BarYTracker()
+    hip_top_ema = EMA(0.10)  # dynamic top anchor for hip Y
+    bar_top_ref = None
 
+    # optional YOLO
     det=None
     if yolo_onnx and _ORT and os.path.exists(yolo_onnx):
-        try:
-            det=YoloOccluder(yolo_onnx, input_size=yolo_input, conf=yolo_conf, iou=yolo_iou, allow=yolo_allow)
-        except Exception:
-            det=None
+        try: det=YoloOccluder(yolo_onnx, input_size=yolo_input, conf=yolo_conf, iou=yolo_iou, allow=yolo_allow)
+        except Exception: det=None
 
     with mp_pose.Pose(model_complexity=model_complexity, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while True:
@@ -369,32 +371,54 @@ def analyze_deadlift_fast(
             shoulder=np.array([lm[PL.RIGHT_SHOULDER.value].x, lm[PL.RIGHT_SHOULDER.value].y], dtype=float)
             hip     =np.array([lm[PL.RIGHT_HIP.value].x,      lm[PL.RIGHT_HIP.value].y],      dtype=float)
 
-            # back curvature quick proxy (head/ear or nose)
+            # back curvature with fallback (no early-continue)
             head=None
             for idx in (PL.RIGHT_EAR.value, PL.LEFT_EAR.value, PL.NOSE.value):
                 if lm[idx].visibility>0.5:
                     head=np.array([lm[idx].x, lm[idx].y], dtype=float); break
-            if head is None: continue
-            mid_spine=(shoulder+hip)*0.5*0.4 + head*0.6
-            _, rounded = analyze_back_curvature(shoulder, hip, mid_spine)
+            if head is not None:
+                mid_spine=(shoulder+hip)*0.5*0.4 + head*0.6
+                _, rounded = analyze_back_curvature(shoulder, hip, mid_spine)
+            else:
+                rounded = False
 
+            # hinge signal (legacy support for oblique angles)
             delta_x = abs(hip[0]-shoulder[0])
             if top_ref is None: top_ref=float(delta_x)
             else:
                 if delta_x < (top_ref*1.4): top_ref=0.9*top_ref+0.1*float(delta_x)
 
-            # bar proxy and legs (for robustness; not used directly for count decisions except end/start heuristics)
+            # hip top anchor (Y): smaller y == higher point
+            hip_y = float(hip[1])
+            if not hip_top_ema.ready:
+                hip_top_ema.update(hip_y)
+            else:
+                if hip_y < hip_top_ema.v:   # you went higher
+                    hip_top_ema.v = 0.7*hip_top_ema.v + 0.3*hip_y
+                else:                        # went lower, relax slowly
+                    hip_top_ema.v = 0.9*hip_top_ema.v + 0.1*hip_y
+
+            # bar proxy & top ref
             bar_y, bar_ok = bar.update(lm)
+            if bar_ok and bar.top_ref() is not None:
+                bar_top_ref = bar.top_ref()
+
+            # ROM signals
+            rom_bar = (bar_y - bar_top_ref) if (bar_ok and bar_top_ref is not None) else 0.0
+            rom_hip = (hip_y - hip_top_ema.v) if hip_top_ema.ready else 0.0
+            rom_sig = max(rom_bar, rom_hip, 0.0)
+
+            # legs (stability; not used directly for counting now)
             right_leg.update(lm, 1.0/eff_fps, occl)
             left_leg.update (lm, 1.0/eff_fps, occl)
 
             t_sec = fidx / fps_in
 
-            # FSM
+            # ---------------- FSM ----------------
             if state==state_TOP:
                 start = (delta_x - top_ref) > HINGE_START
-                if (not start) and bar_ok and bar.top_ref() is not None:
-                    start = (bar_y - bar.top_ref()) > (ROM_MIN*0.5)
+                if not start:
+                    start = rom_sig > (ROM_MIN * 0.6)
                 if start and (fidx - last_rep_f > MIN_BW):
                     state=state_DOWN
                     bottom_est=delta_x
@@ -415,29 +439,34 @@ def analyze_deadlift_fast(
                 hinge_min = min(hinge_min, delta_x) if hinge_min is not None else delta_x
                 hinge_max = max(hinge_max, delta_x) if hinge_max is not None else delta_x
                 up_frames += 1
+
                 end_hinge = (delta_x - top_ref) < HINGE_END
-                end_bar   = (bar_ok and bar.top_ref() is not None and abs(bar_y - bar.top_ref()) < (ROM_MIN*0.5))
-                if end_hinge or end_bar:
+                end_rom   = rom_sig < (ROM_MIN * 0.4)
+
+                if end_hinge or end_rom:
                     long_enough=(down_frames+up_frames)>=MIN_TOTAL
-                    rom = hinge_max - hinge_min if (hinge_max is not None and hinge_min is not None) else 0.0
+                    rom_hinge = (hinge_max - hinge_min) if (hinge_max is not None and hinge_min is not None) else 0.0
+                    rom = max(rom_hinge, rom_sig)
                     enough_rom = rom >= ROM_MIN
                     if long_enough and enough_rom and (fidx - last_rep_f > MIN_BW):
                         reps+=1
                         penalty=0.0; fb=[]
-                        if rounded: fb.append("Try to keep your back a bit straighter"); penalty+=1.5
+                        if rounded: fb.append("Try to keep your back a bit straighter"); penalty+=1.2
                         if (delta_x - top_ref) > 0.02:
-                            fb.append("Try to finish more upright"); penalty+=1.0
+                            fb.append("Try to finish more upright"); penalty+=0.8
                         score = round(max(4.0, 10.0 - penalty) * 2)/2
                         tip = "Keep the bar close and move smoothly"
                         reps_report.append({"rep_index":reps,"score":float(score),"score_display":_half_str(score),"feedback":fb,"tip":tip})
                         timeline.append({"start":rep_start, "end":t_sec})
                         scores.append(score)
                         last_rep_f=fidx
+
                     state=state_TOP
                     bottom_est=None
                     down_frames=up_frames=0
                     hinge_min=hinge_max=None
                     bar.reset_rep()
+            # -------------------------------------
 
     cap.release()
     avg=float(np.mean(scores)) if scores else 0.0
@@ -455,7 +484,7 @@ def analyze_deadlift_fast(
         "timeline": timeline,
         "meta": {
             "ok": True,
-            "version": "deadlift_fsm_full_2.0",
+            "version": "deadlift_fsm_full_2.1",
             "fps_in": fps_in,
             "work_scale": work_scale,
             "frame_skip": frame_skip,
@@ -512,10 +541,8 @@ def render_deadlift_video(
         fidx+=1
 
     cap.release()
-    try:
-        sink.stdin.close(); sink.wait()
-    except Exception:
-        pass
+    try: sink.stdin.close(); sink.wait()
+    except Exception: pass
     return {"ok":True, "video_path": out_path, "reps": total}
 
 # ============================== public API ===========================
@@ -555,21 +582,21 @@ def run_deadlift_analysis(
     result = {
         "exercise": "deadlift",
         "squat_count": reps_total,                 # FE expects this key
-        "rep_count": reps_total,                   # also keep rep_count for safety
+        "rep_count": reps_total,                   # keep also rep_count
         "technique_score": score_avg,
         "technique_score_display": score_display,
         "technique_label": score_label,
         "good_reps": int(good_reps),
         "bad_reps": int(bad_reps),
         "reps": reps_report,                       # [{rep_index, score, score_display, feedback[], tip}]
-        "feedback": ["Analysis complete"],         # always a non-empty list
+        "feedback": ["Analysis complete"],         # always non-empty
         "video_path": ""                           # filled only when rendering
     }
 
     if not return_video:
         return result
 
-    # produce original-quality video + overlay (no re-analysis)
+    # render original-quality video + overlay (no re-analysis)
     if not output_path:
         base, _ = os.path.splitext(video_path)
         output_path = f"{base}_analyzed.mp4"
@@ -583,5 +610,6 @@ def run_deadlift_analysis(
 
     return result
 
-# Old name compatibility if someone imports analyze_deadlift:
+# Old-name compatibility if someone imports analyze_deadlift
 analyze_deadlift = run_deadlift_analysis
+
