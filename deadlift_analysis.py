@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — Deadlift aligned to squat standard (fixed feedback aggregation)
-# - Overlay/encoding/speed identical to squat
-# - Bi-directional donut (0% bottom → 100% upright) with smoothing
-# - Robust legs: Kalman + gating + floor anchor (+ optional YOLOv8n-ONNX occlusion detector)
-# - Scoring feedback per-rep + one non-scoring tip per rep
-# - TOP-LEVEL feedback now aggregates ONLY problems (score < 10). No generic “Analysis complete/Great form”.
+# deadlift_analysis.py — Deadlift aligned to squat standard (occlusion-hardened)
+# שיפורים:
+# - בחירת צד אוטומטית (או ידנית) + איחוד כתף/ירך עם משקל לפי visibility
+# - EMA + "freeze on occlusion" לגו כדי למנוע קפיצות כשברבל מסתיר
+# - תואם API קיים: return_video/fast_mode, שדות החזרה זהים
 
 import os, cv2, math, numpy as np, subprocess
 from PIL import ImageFont, ImageDraw, Image
@@ -90,13 +89,13 @@ def analyze_back_curvature(shoulder, hip, head_like, threshold=0.04):
     return signed, signed < -threshold
 
 # ===================== Deadlift thresholds =====================
-HINGE_START_THRESH    = 0.08
-STAND_DELTA_TARGET   = 0.025
-END_THRESH           = 0.035
+HINGE_START_THRESH      = 0.08
+STAND_DELTA_TARGET     = 0.025
+END_THRESH             = 0.035
 MIN_FRAMES_BETWEEN_REPS = 10
-PROG_ALPHA           = 0.35  # smoothing for donut only
+PROG_ALPHA             = 0.35  # smoothing for donut only
 
-# Tips (non-scoring) thresholds (no bottom-pause tip)
+# Tips (non-scoring)
 TIP_MIN_ECC_S     = 0.35
 TIP_MIN_TOP_S     = 0.15
 TIP_SMALL_ROM_LO  = 0.035
@@ -259,6 +258,7 @@ class YoloOccluderDetector:
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         img_rgb = np.transpose(img_rgb, (2,0,1))[None]
         out = self.sess.run([self.out_name], {self.inp_name: img_rgb})[0]
+        # פענוח גנרי (ידידותי למודלים שונים)
         if out.ndim == 3 and out.shape[0] == 1:
             o = out[0]
             if o.shape[0] in (84,85):
@@ -311,6 +311,95 @@ class YoloOccluderDetector:
             boxes_norm.append((float(x1)/w0, float(y1)/h0, float(x2)/w0, float(y2)/h0))
         return boxes_norm
 
+# ===================== Side selection + torso stabilizer =====================
+def _vis(lm, idx): 
+    try: return float(lm[idx].visibility)
+    except: return 0.0
+
+def _p(lm, idx):
+    return np.array([lm[idx].x, lm[idx].y], dtype=float)
+
+def _weighted_point(lm, left_idx, right_idx, pref=None):
+    # pref: 'left'|'right'|None
+    lv, rv = _vis(lm,left_idx), _vis(lm,right_idx)
+    lp, rp = _p(lm,left_idx), _p(lm,right_idx)
+    if pref == 'left' and lv>0: return lp
+    if pref == 'right' and rv>0: return rp
+    # otherwise weighted by visibility
+    if (lv+rv) > 1e-6:
+        wL = lv/(lv+rv); wR = rv/(lv+rv)
+        return wL*lp + wR*rp
+    # fallback: average
+    return 0.5*(lp+rp)
+
+class SideSelector:
+    def __init__(self, refresh_s=1.0):
+        self.side='auto'
+        self.refresh_s=refresh_s
+        self._acc_t=0.0
+    def set_preference(self, side_pref):
+        self.side = side_pref if side_pref in ('left','right','auto',None) else 'auto'
+    def pick(self, lm, dt):
+        if self.side in ('left','right'):
+            return self.side
+        # auto: every refresh_s, recompute
+        self._acc_t += dt
+        if self._acc_t < self.refresh_s:
+            return getattr(self,'_cached','right')
+        self._acc_t = 0.0
+        PL = mp_pose.PoseLandmark
+        L = [PL.LEFT_HIP.value, PL.LEFT_KNEE.value, PL.LEFT_ANKLE.value]
+        R = [PL.RIGHT_HIP.value, PL.RIGHT_KNEE.value, PL.RIGHT_ANKLE.value]
+        vL = sum(_vis(lm,i) for i in L)/len(L)
+        vR = sum(_vis(lm,i) for i in R)/len(R)
+        self._cached = 'left' if vL >= vR else 'right'
+        return self._cached
+
+class TorsoStabilizer:
+    def __init__(self, ema_alpha=0.35, freeze_frames=6):
+        self.alpha = float(ema_alpha)
+        self.freeze_frames = int(freeze_frames)
+        self._s = None  # shoulder EMA
+        self._h = None  # hip EMA
+        self._freeze = 0
+    def _ema(self, prev, cur):
+        return cur if prev is None else (self.alpha*cur + (1.0-self.alpha)*prev)
+    @staticmethod
+    def _intersect(aabb, boxes):
+        if not boxes: return False
+        (x1,y1,x2,y2) = aabb
+        for (bx1,by1,bx2,by2) in boxes:
+            if (x1<=bx2 and x2>=bx1 and y1<=by2 and y2>=by1):
+                return True
+        return False
+    def update(self, raw_shoulder, raw_hip, occl_boxes, wrist_mid=None):
+        # trunk box (מרובע סביב הכתף-ירך)
+        v = raw_hip - raw_shoulder
+        cen = 0.5*(raw_hip + raw_shoulder)
+        # רוחב/גובה יחסיים — מעט נדיב כדי לתפוס בר שמסתיר
+        w = max(0.12, abs(v[0])*1.6)
+        h = max(0.18, abs(v[1])*1.8)
+        aabb = (cen[0]-w/2, cen[1]-h/2, cen[0]+w/2, cen[1]+h/2)
+
+        occluded = self._intersect(aabb, occl_boxes)
+        # אם אין YOLO, ננסה ברמז "מוט" = אמצע פרקי כף היד עובר בריבוע הגו
+        if (not occluded) and wrist_mid is not None:
+            x,y = wrist_mid
+            if (aabb[0]<=x<=aabb[2]) and (aabb[1]<=y<=aabb[3]):
+                occluded = True
+
+        if occluded:
+            self._freeze = max(self._freeze, self.freeze_frames)
+
+        if self._freeze > 0 and (self._s is not None and self._h is not None):
+            self._freeze -= 1
+            # מחזירים את ה־EMA הקודם (מונע "שבירה" כשמסתירים את הגו)
+            return self._s, self._h, True
+
+        self._s = self._ema(self._s, raw_shoulder)
+        self._h = self._ema(self._h, raw_hip)
+        return self._s, self._h, False
+
 # ===================== Overlay =====================
 def _wrap2(draw, text, font, maxw):
     words = text.split()
@@ -340,11 +429,12 @@ def _donut(frame, c, r, t, p):
     cv2.ellipse(frame, (cx,cy), (r,r), 0, -90, -90 + int(360*p), DEPTH_COLOR, t, cv2.LINE_AA)
     return frame
 
-def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
+def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0, occ=False):
     h, w, _ = frame.shape
-    # Reps box
+    # Reps box (+ OCC flag קטן אם פעיל)
     pil = Image.fromarray(frame); d = ImageDraw.Draw(pil)
-    txt = f"Reps: {reps}"; padx, pady = 10, 6
+    occ_txt = "  OCC" if occ else ""
+    txt = f"Reps: {reps}{occ_txt}"; padx, pady = 10, 6
     tw = d.textlength(txt, font=REPS_FONT); th = REPS_FONT.size
     x0, y0 = 0, 0; x1 = int(tw + 2*padx); y1 = int(th + 2*pady)
     top = frame.copy(); cv2.rectangle(top, (x0,y0), (x1,y1), (0,0,0), -1)
@@ -399,13 +489,17 @@ def run_deadlift_analysis(video_path,
                           detector_class_ids=None,
                           # NEW: API-compat flags
                           return_video=True,
-                          fast_mode=None  # alias: if True -> no video
-                          ):
+                          fast_mode=None,  # alias: if True -> no video
+                          # NEW: occlusion/side prefs
+                          side_preference='auto',   # 'auto'|'left'|'right'
+                          ema_alpha=0.35,
+                          freeze_on_occlusion_frames=6):
     """
     API-compat:
       - return_video=False  => מסלול מהיר בלי החזרת וידאו (ניתוח בלבד)
-      - return_video=True   => מסלול עם וידאו באיכות מקורית + אוברליי
-      - fast_mode=True      => זהה ל-return_video=False (כינוי רך לא לשבור קריאות)
+      - return_video=True   => מסלול עם וידאו ואוברליי
+      - fast_mode=True      => זהה ל-return_video=False
+    שדות החזרה: זהים לגרסה הקודמת.
     """
     if fast_mode is True:
         return_video = False
@@ -420,7 +514,7 @@ def run_deadlift_analysis(video_path,
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
 
-    # Optional YOLO occluder detector (נריץ גם במסלול מהיר, אבל זה לא חובה; אפשר לכבות אם תרצה)
+    # Optional YOLO
     detector = None
     if detector_onnx_path and _ORT_AVAILABLE and os.path.exists(detector_onnx_path):
         try:
@@ -432,7 +526,7 @@ def run_deadlift_analysis(video_path,
                 occluder_class_ids=detector_class_ids
             )
         except Exception:
-            detector = None  # fallback silently
+            detector = None  # fallback
 
     PL = mp.solutions.pose.PoseLandmark
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -462,6 +556,10 @@ def run_deadlift_analysis(video_path,
     prev_progress = None
 
     # trackers
+    side_sel = SideSelector(refresh_s=1.0)
+    side_sel.set_preference(side_preference)
+    torso = TorsoStabilizer(ema_alpha=ema_alpha, freeze_frames=freeze_on_occlusion_frames)
+
     right_leg = KalmanLegTracker("right")
     left_leg  = KalmanLegTracker("left")
 
@@ -474,10 +572,8 @@ def run_deadlift_analysis(video_path,
             frame_idx += 1
             if frame_idx % frame_skip != 0: continue
 
-            # מסלול מהיר עובד על scale (כמו קודם); במסלול וידאו זה גם הפריים שנכתוב
             work = cv2.resize(frame, (0,0), fx=scale, fy=scale) if scale != 1.0 else frame
 
-            # פותחים VideoWriter רק אם רוצים וידאו חזרה
             if return_video and out is None:
                 h0, w0 = work.shape[:2]
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w0, h0))
@@ -493,33 +589,47 @@ def run_deadlift_analysis(video_path,
             res = pose.process(rgb)
 
             rt_fb = None
+            occ_active = False
             if not res.pose_landmarks:
                 if return_video:
-                    frame_drawn = draw_overlay(work.copy(), reps=counter, feedback=None, progress_pct=prog)
+                    frame_drawn = draw_overlay(work.copy(), reps=counter, feedback=None, progress_pct=prog, occ=False)
                     out.write(frame_drawn)
                 continue
 
             try:
                 lm = res.pose_landmarks.landmark
-                shoulder = np.array([lm[PL.RIGHT_SHOULDER.value].x, lm[PL.RIGHT_SHOULDER.value].y], dtype=float)
-                hip      = np.array([lm[PL.RIGHT_HIP.value].x,      lm[PL.RIGHT_HIP.value].y],      dtype=float)
 
-                # head-like point (fallback: לא נעצור ניתוח אם אין)
-                head = None
-                for idx in (PL.RIGHT_EAR.value, PL.LEFT_EAR.value, PL.NOSE.value):
-                    if lm[idx].visibility > 0.5:
-                        head = np.array([lm[idx].x, lm[idx].y], dtype=float); break
+                # wrist midpoint — אמדן "קו המוט" אם YOLO לא קיים
+                wrist_mid = None
+                if _vis(lm, PL.LEFT_WRIST.value) > 0.4 and _vis(lm, PL.RIGHT_WRIST.value) > 0.4:
+                    wrist_mid = (_p(lm,PL.LEFT_WRIST.value) + _p(lm,PL.RIGHT_WRIST.value))*0.5
 
-                # legs trackers
+                # בחירת צד
+                side = side_sel.pick(lm, dt)
+                # איחוד כתף/ירך משני הצדדים עם משקל לפי visibility (או צד מועדף)
+                shoulder_raw = _weighted_point(lm, PL.LEFT_SHOULDER.value, PL.RIGHT_SHOULDER.value, 
+                                               pref=('left' if side=='left' else ('right' if side=='right' else None)))
+                hip_raw      = _weighted_point(lm, PL.LEFT_HIP.value,      PL.RIGHT_HIP.value, 
+                                               pref=('left' if side=='left' else ('right' if side=='right' else None)))
+
+                # ייצוב גו + freeze כשיש הסתרה
+                shoulder, hip, occ = torso.update(shoulder_raw, hip_raw, occl_boxes, wrist_mid=wrist_mid)
+                occ_active = occ
+
+                # legs trackers מקבלים גם occlusion boxes
                 right_leg_pts = right_leg.update(lm, dt, occlusion_boxes_norm=occl_boxes)
                 left_leg_pts  = left_leg.update(lm, dt, occlusion_boxes_norm=occl_boxes)
 
-                # hinge proxy: shoulder-hip horizontal delta
+                # hinge metric: horizontal delta (כמו אצלך) אך עם כתף/ירך יציבים
                 delta_x = abs(hip[0] - shoulder[0])
                 if delta_x < (STAND_DELTA_TARGET * 1.4):
                     top_ref = 0.9*top_ref + 0.1*delta_x
 
-                # back curvature (אם אין ראש — לא מפילים חזרה)
+                # back curvature עם "head-like"
+                head = None
+                for idx in (PL.RIGHT_EAR.value, PL.LEFT_EAR.value, PL.NOSE.value):
+                    if _vis(lm, idx) > 0.5:
+                        head = _p(lm, idx); break
                 if head is not None:
                     mid_spine = (shoulder + hip) * 0.5 * 0.4 + head * 0.6
                     _, rounded = analyze_back_curvature(shoulder, hip, mid_spine)
@@ -573,7 +683,6 @@ def run_deadlift_analysis(video_path,
                             top_s  = (top_hold_frames * dt) if top_hold_frames is not None else None
                             rom    = (bottom_est - top_ref) if (bottom_est is not None and top_ref is not None) else None
                             tip_str = choose_deadlift_tip(down_s, top_s, rom)
-                            # שמים feedback רק כשיש הורדת ציון
                             rep_fb = fb if score < 10.0 else []
                             reps_report.append({
                                 "rep_index": counter,
@@ -597,6 +706,8 @@ def run_deadlift_analysis(video_path,
                     pts_draw = {
                         PL.RIGHT_SHOULDER.value: tuple(shoulder),
                         PL.RIGHT_HIP.value: tuple(hip),
+                        PL.LEFT_SHOULDER.value: tuple(shoulder),  # לציור גוף סימטרי
+                        PL.LEFT_HIP.value: tuple(hip),
                     }
                     for d in (right_leg_pts, left_leg_pts):
                         for idx, pt in d.items():
@@ -606,12 +717,12 @@ def run_deadlift_analysis(video_path,
                                     continue
                             pts_draw[idx] = pt
                     work_drawn = draw_body_only_from_dict(work.copy(), pts_draw)
-                    work_drawn = draw_overlay(work_drawn, reps=counter, feedback=rt_fb, progress_pct=prog)
+                    work_drawn = draw_overlay(work_drawn, reps=counter, feedback=rt_fb, progress_pct=prog, occ=occ_active)
                     out.write(work_drawn)
 
             except Exception:
                 if return_video and out is not None:
-                    out.write(draw_overlay(work.copy(), reps=counter, feedback=None, progress_pct=prog))
+                    out.write(draw_overlay(work.copy(), reps=counter, feedback=None, progress_pct=prog, occ=False))
                 continue
 
     cap.release()
@@ -631,7 +742,6 @@ def run_deadlift_analysis(video_path,
 
     final_video_path = ""
     if return_video:
-        # encode H.264 faststart
         encoded_path = output_path.replace(".mp4", "_encoded.mp4")
         try:
             subprocess.run([
@@ -657,6 +767,5 @@ def run_deadlift_analysis(video_path,
         "video_path": final_video_path,
         "feedback_path": feedback_path
     }
-
 
 
