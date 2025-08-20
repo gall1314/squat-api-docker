@@ -1,28 +1,34 @@
 # -*- coding: utf-8 -*-
 # deadlift_analysis.py — Full fast-first pipeline with artifact + original-quality render and full overlay
-# Exposes: run_deadlift_analysis(video_path, frame_skip=6, scale=0.40, output_path=None, return_video=True, ...)
 #
-# Features:
-#  - Canonical fast analysis (no video) → artifact with timeline & per-rep report
-#  - Render original video with the SAME overlay (no re-analysis) → 1:1 with fast result
-#  - Kalman leg tracking, back curvature flag, bar proxy via wrists
-#  - Optional YOLO (onnxruntime) for occlusion gating
-#  - Deterministic params saved in artifact (frame_skip/scale/etc)
+# Public entry (what app.py imports):
+#   run_deadlift_analysis(
+#       video_path, frame_skip=6, scale=0.40,
+#       output_path=None, return_video=True, model_complexity=1, yolo_onnx=None
+#   ) -> dict with keys your FE expects:
+#       exercise, squat_count, rep_count, technique_score, technique_score_display,
+#       technique_label, good_reps, bad_reps, reps, feedback, video_path
+#
+# Internal:
+#   analyze_deadlift_fast(...) -> artifact (timeline+per-rep report)
+#   render_deadlift_video(artifact, out_path, preset="medium", crf=18) -> original-quality mp4 with overlay
 
-import os, cv2, math, uuid, subprocess, json
+import os, cv2, math, uuid, subprocess
 import numpy as np
 import mediapipe as mp
 from typing import List, Dict, Any, Optional
 
-# ======== perf hygiene ========
-try: cv2.setNumThreads(1)
-except Exception: pass
-os.environ.setdefault("OMP_NUM_THREADS","1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS","1")
-os.environ.setdefault("MKL_NUM_THREADS","1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS","1")
+# ---------- perf hygiene ----------
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-# ======== optional onnxruntime (YOLO) ========
+# ---------- optional onnxruntime (YOLO) ----------
 try:
     import onnxruntime as ort
     _ORT = True
@@ -31,7 +37,7 @@ except Exception:
 
 mp_pose = mp.solutions.pose
 
-# ======== helpers ========
+# ============================== helpers ==============================
 def _score_label(s: float) -> str:
     s = float(s)
     if s >= 9.5: return "Excellent"
@@ -53,7 +59,7 @@ class EMA:
         else: self.v=self.a*x+(1-self.a)*self.v
         return self.v
 
-# ======== geometry / curvature ========
+# ====================== geometry / back curvature ====================
 def analyze_back_curvature(shoulder, hip, head_like, threshold=0.04):
     # signed distance of head-like point from the shoulder-hip line (negative=inward/rounded)
     line_vec = hip - shoulder
@@ -65,7 +71,7 @@ def analyze_back_curvature(shoulder, hip, head_like, threshold=0.04):
     signed = float(np.sign(off[1]) * -1 * np.linalg.norm(off))  # inward (rounded) => negative
     return signed, signed < -threshold
 
-# ======== Kalman utils ========
+# ============================== Kalman ===============================
 class _KF:
     def __init__(self, q=1e-3, r=6e-3):
         self.x = np.zeros((4,1), dtype=float) # x,y,vx,vy
@@ -90,7 +96,6 @@ class _KF:
         maha2 = float(y.T @ np.linalg.inv(S) @ y)
         return maha2
 
-# ======== Kalman leg tracker ========
 class KalmanLegTracker:
     LEG_VIS_THR    = 0.55
     LEG_MAX_MAH    = 6.0
@@ -156,7 +161,7 @@ class KalmanLegTracker:
             out[idx]=(float(kf.x[0,0]), float(kf.x[1,0]))
         return out
 
-# ======== Bar Y tracker (wrists proxy) ========
+# ========================= bar proxy via wrists ======================
 class BarYTracker:
     WR_THR=0.55; MIN_W=0.10; MAX_W=0.55; DRIFT=0.12
     def __init__(self):
@@ -179,7 +184,7 @@ class BarYTracker:
         self.valid=True; return y_f, True
     def top_ref(self): return self.top_ema.v if self.top_ema.ready else None
 
-# ======== YOLO occluder (optional) ========
+# ============================== YOLO opt =============================
 class YoloOccluder:
     def __init__(self, onnx_path, providers=None, input_size=640, conf=0.25, iou=0.45, allow=None):
         if not _ORT: raise RuntimeError("onnxruntime not available")
@@ -242,7 +247,7 @@ class YoloOccluder:
             boxes.append((float(x1)/w0, float(y1)/h0, float(x2)/w0, float(y2)/h0))
         return boxes
 
-# ======== overlay (like now) ========
+# ============================== overlay ==============================
 def _draw_donut(frame, cx, cy, radius, thick, pct):
     pct=float(np.clip(pct,0.0,1.0))
     ring_bg=(70,70,70); color=(40,200,80)
@@ -250,19 +255,19 @@ def _draw_donut(frame, cx, cy, radius, thick, pct):
     cv2.ellipse(frame,(cx,cy),(radius,radius),0,-90,-90+int(360*pct),color,thick,cv2.LINE_AA)
 
 def draw_overlay_like_now(frame, reps_done, pct, feedback_text=None):
-    # Top-left reps
+    # Reps (top-left)
     txt=f"Reps: {reps_done}"
     (tw,th),_=cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX,1.0,2)
     pad=10; cv2.rectangle(frame,(0,0),(tw+2*pad, th+2*pad),(0,0,0),-1)
     cv2.putText(frame,txt,(pad, th+pad-2), cv2.FONT_HERSHEY_SIMPLEX,1.0,(255,255,255),2, cv2.LINE_AA)
-    # Donut top-right
+    # Donut (top-right)
     h,w=frame.shape[:2]; ref_h=max(int(h*0.06), int(28*1.6))
     r=int(ref_h*0.72); thick=max(3,int(r*0.28)); m=12
     cx=w-m-r; cy=max(ref_h+r//8, r+thick//2+2)
     _draw_donut(frame, cx, cy, r, thick, pct)
     cv2.putText(frame,"DEPTH",(cx-30, cy-(thick+10)), cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,255),1, cv2.LINE_AA)
     cv2.putText(frame,f"{int(100*np.clip(pct,0,1))}%",(cx-18, cy+(thick+16)), cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,255),1, cv2.LINE_AA)
-    # Bottom feedback
+    # Feedback bottom
     if feedback_text:
         maxw=int(w*0.9); words=feedback_text.split(); lines=[]; cur=""
         for wd in words:
@@ -281,17 +286,18 @@ def draw_overlay_like_now(frame, reps_done, pct, feedback_text=None):
             cv2.putText(frame,ln,(x,y), cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2, cv2.LINE_AA)
             y+=line_h
 
-# ======== ffmpeg sink ========
+# ============================== ffmpeg ===============================
 def _open_ffmpeg_sink(w,h,fps,out_path,preset="medium",crf=18):
     cmd=[
-        "ffmpeg","-y","-f","rawvideo","-pix_fmt","bgr24",
-        "-s",f"{w}x{h}","-r",str(fps),"-i","pipe:0",
+        "ffmpeg","-y",
+        "-f","rawvideo","-pix_fmt","bgr24","-s",f"{w}x{h}","-r",str(fps),"-i","pipe:0",
         "-an","-c:v","libx264","-preset",preset,"-crf",str(crf),
-        "-movflags","+faststart","-vf","format=yuv420p", out_path
+        "-movflags","+faststart","-vf","format=yuv420p",
+        out_path
     ]
     return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
-# ======== FAST ANALYSIS: returns artifact ========
+# ========================== fast analysis ============================
 def analyze_deadlift_fast(
     video_path: str,
     work_scale: float = 0.40,
@@ -310,11 +316,10 @@ def analyze_deadlift_fast(
     n_frames=int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     duration = (n_frames/fps_in) if n_frames>0 else None
 
-    # thresholds / FSM
+    # FSM/thresholds
     HINGE_START=0.08; HINGE_END=0.035
     MIN_BW=10; MIN_TOTAL=12
     ROM_MIN=0.055
-    BACK_MIN_S=0.25
 
     PL=mp_pose.PoseLandmark
     state_TOP, state_DOWN, state_UP = 0,1,2
@@ -323,7 +328,6 @@ def analyze_deadlift_fast(
 
     reps=0; reps_report=[]; timeline=[]; scores=[]
     top_ref=None; bottom_est=None
-    back_frames=0
     eff_fps = max(1.0, fps_in/max(1,frame_skip))
     down_frames=up_frames=0
     hinge_min=hinge_max=None
@@ -333,8 +337,10 @@ def analyze_deadlift_fast(
 
     det=None
     if yolo_onnx and _ORT and os.path.exists(yolo_onnx):
-        try: det=YoloOccluder(yolo_onnx, input_size=yolo_input, conf=yolo_conf, iou=yolo_iou, allow=yolo_allow)
-        except Exception: det=None
+        try:
+            det=YoloOccluder(yolo_onnx, input_size=yolo_input, conf=yolo_conf, iou=yolo_iou, allow=yolo_allow)
+        except Exception:
+            det=None
 
     with mp_pose.Pose(model_complexity=model_complexity, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while True:
@@ -342,16 +348,18 @@ def analyze_deadlift_fast(
             if not ret: break
             fidx+=1
             if fidx % frame_skip != 0: continue
+
             small = cv2.resize(frame,(0,0), fx=work_scale, fy=work_scale) if work_scale!=1.0 else frame
             occl=[]
             if det is not None:
                 try: occl=det.infer(small)
                 except Exception: occl=[]
+
             rgb=cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
             res=pose.process(rgb)
             if not res.pose_landmarks: continue
-
             lm=res.pose_landmarks.landmark
+
             if right_leg is None or left_leg is None:
                 L=lm[PL.LEFT_ANKLE.value].visibility; R=lm[PL.RIGHT_ANKLE.value].visibility
                 prefer="left" if L>R else "right"
@@ -361,7 +369,7 @@ def analyze_deadlift_fast(
             shoulder=np.array([lm[PL.RIGHT_SHOULDER.value].x, lm[PL.RIGHT_SHOULDER.value].y], dtype=float)
             hip     =np.array([lm[PL.RIGHT_HIP.value].x,      lm[PL.RIGHT_HIP.value].y],      dtype=float)
 
-            # back curvature
+            # back curvature quick proxy (head/ear or nose)
             head=None
             for idx in (PL.RIGHT_EAR.value, PL.LEFT_EAR.value, PL.NOSE.value):
                 if lm[idx].visibility>0.5:
@@ -371,16 +379,12 @@ def analyze_deadlift_fast(
             _, rounded = analyze_back_curvature(shoulder, hip, mid_spine)
 
             delta_x = abs(hip[0]-shoulder[0])
-
-            # adapt top ref
             if top_ref is None: top_ref=float(delta_x)
             else:
                 if delta_x < (top_ref*1.4): top_ref=0.9*top_ref+0.1*float(delta_x)
 
-            # bar proxy
+            # bar proxy and legs (for robustness; not used directly for count decisions except end/start heuristics)
             bar_y, bar_ok = bar.update(lm)
-
-            # legs update (stability)
             right_leg.update(lm, 1.0/eff_fps, occl)
             left_leg.update (lm, 1.0/eff_fps, occl)
 
@@ -388,7 +392,6 @@ def analyze_deadlift_fast(
 
             # FSM
             if state==state_TOP:
-                back_frames=0
                 start = (delta_x - top_ref) > HINGE_START
                 if (not start) and bar_ok and bar.top_ref() is not None:
                     start = (bar_y - bar.top_ref()) > (ROM_MIN*0.5)
@@ -415,24 +418,21 @@ def analyze_deadlift_fast(
                 end_hinge = (delta_x - top_ref) < HINGE_END
                 end_bar   = (bar_ok and bar.top_ref() is not None and abs(bar_y - bar.top_ref()) < (ROM_MIN*0.5))
                 if end_hinge or end_bar:
-                    long_enough=(down_frames+up_frames)>=12
+                    long_enough=(down_frames+up_frames)>=MIN_TOTAL
                     rom = hinge_max - hinge_min if (hinge_max is not None and hinge_min is not None) else 0.0
                     enough_rom = rom >= ROM_MIN
                     if long_enough and enough_rom and (fidx - last_rep_f > MIN_BW):
                         reps+=1
                         penalty=0.0; fb=[]
-                        # simple back-rounding penalty near bottom phase
                         if rounded: fb.append("Try to keep your back a bit straighter"); penalty+=1.5
                         if (delta_x - top_ref) > 0.02:
                             fb.append("Try to finish more upright"); penalty+=1.0
                         score = round(max(4.0, 10.0 - penalty) * 2)/2
-                        # tip
                         tip = "Keep the bar close and move smoothly"
                         reps_report.append({"rep_index":reps,"score":float(score),"score_display":_half_str(score),"feedback":fb,"tip":tip})
                         timeline.append({"start":rep_start, "end":t_sec})
                         scores.append(score)
                         last_rep_f=fidx
-                    # reset
                     state=state_TOP
                     bottom_est=None
                     down_frames=up_frames=0
@@ -464,7 +464,7 @@ def analyze_deadlift_fast(
         }
     }
 
-# ======== RENDER from artifact (original quality + full overlay) ========
+# ============================ video render ===========================
 def render_deadlift_video(
     artifact: Dict[str,Any],
     out_path: str,
@@ -512,11 +512,13 @@ def render_deadlift_video(
         fidx+=1
 
     cap.release()
-    try: sink.stdin.close(); sink.wait()
-    except Exception: pass
+    try:
+        sink.stdin.close(); sink.wait()
+    except Exception:
+        pass
     return {"ok":True, "video_path": out_path, "reps": total}
 
-# ======== Public entry (compatible) ========
+# ============================== public API ===========================
 def run_deadlift_analysis(
     video_path: str,
     frame_skip: int = 6,
@@ -527,9 +529,9 @@ def run_deadlift_analysis(
     yolo_onnx: Optional[str] = None
 ) -> Dict[str,Any]:
     """
-    Compatible public entry used by app.py.
-    - If return_video=False → fast analysis only (no video)
-    - If return_video=True and output_path is given → render original-quality video with overlay (no re-analysis)
+    Public entry used by app.py.
+    - return_video=False → fast analysis only (no video)
+    - return_video=True  → render original-quality video with overlay (no re-analysis)
     """
     artifact = analyze_deadlift_fast(
         video_path=video_path,
@@ -539,36 +541,47 @@ def run_deadlift_analysis(
         yolo_onnx=yolo_onnx
     )
 
-    # Compose result object similar to your existing API
-    s = artifact["summary"]
+    # defensive fetch
+    summary = artifact.get("summary") or {}
+    reps_report = artifact.get("reps_report") or []
+    reps_total = int(summary.get("reps") or 0)
+    score_avg = float(summary.get("score") or 0.0)
+    score_display = str(summary.get("display") or "0")
+    score_label = str(summary.get("label") or "Needs work")
+
+    good_reps = sum(1 for r in reps_report if float(r.get("score") or 0.0) >= 9.5)
+    bad_reps  = sum(1 for r in reps_report if float(r.get("score") or 0.0)  < 9.5)
+
     result = {
         "exercise": "deadlift",
-        "technique_score": s["score"],
-        "technique_score_display": s["display"],
-        "technique_label": s["label"],
-        "rep_count": s["reps"],
-        "reps": artifact["reps_report"],
-        "feedback": ["Analysis complete"],
-        "analysis_artifact": artifact
+        "squat_count": reps_total,                 # FE expects this key
+        "rep_count": reps_total,                   # also keep rep_count for safety
+        "technique_score": score_avg,
+        "technique_score_display": score_display,
+        "technique_label": score_label,
+        "good_reps": int(good_reps),
+        "bad_reps": int(bad_reps),
+        "reps": reps_report,                       # [{rep_index, score, score_display, feedback[], tip}]
+        "feedback": ["Analysis complete"],         # always a non-empty list
+        "video_path": ""                           # filled only when rendering
     }
 
     if not return_video:
-        # Fast path — no video
         return result
 
-    # Need video output
+    # produce original-quality video + overlay (no re-analysis)
     if not output_path:
-        base,ext = os.path.splitext(video_path)
+        base, _ = os.path.splitext(video_path)
         output_path = f"{base}_analyzed.mp4"
 
     rr = render_deadlift_video(artifact, out_path=output_path, preset="medium", crf=18)
     if rr.get("ok"):
-        result["video_path"] = rr.get("video_path")
+        result["video_path"] = rr.get("video_path") or output_path
     else:
-        result["video_path"] = None
+        result["video_path"] = ""
         result["feedback"].append(f"Render failed: {rr.get('reason','unknown')}")
+
     return result
 
-# ======== Backwards compatibility alias (if someone imports another name) ========
-# If in other files you use: from deadlift_analysis import analyze_deadlift
-analyze_deadlift = run_deadlift_analysis  # alias for compatibility
+# Old name compatibility if someone imports analyze_deadlift:
+analyze_deadlift = run_deadlift_analysis
