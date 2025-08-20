@@ -4,6 +4,7 @@ import tempfile
 import os
 import uuid
 import shutil
+import inspect
 
 # ייבוא פונקציות ניתוח
 from squat_analysis import run_analysis
@@ -46,6 +47,53 @@ def _standardize_video_path(result_dict):
             result_dict["video_path"] = result_dict["analyzed_video_path"]
     return result_dict
 
+def _supports_arg(func, name: str) -> bool:
+    try:
+        return name in inspect.signature(func).parameters
+    except Exception:
+        return False
+
+def _run_with_tracks(func, src_path, out_video_path, fast: bool, *, frame_skip=3, scale=0.4, extra=None):
+    """
+    מריץ אנלייזר עם תמיכה בשני מסלולים:
+    - fast=True  -> בלי וידאו (אם אפשר), לא מעבירים output_path / או None
+    - fast=False -> עם וידאו ל-out_video_path (אם אפשר)
+    מפעיל רק פרמטרים שהפונקציה תומכת בהם בפועל.
+    """
+    extra = extra or {}
+
+    kwargs = {}
+    # בסיס:
+    if _supports_arg(func, "frame_skip"): kwargs["frame_skip"] = frame_skip
+    if _supports_arg(func, "scale"): kwargs["scale"] = scale
+
+    # מסלול וידאו/פאסט:
+    if _supports_arg(func, "return_video"):
+        kwargs["return_video"] = (not fast)
+    if _supports_arg(func, "fast_mode"):
+        kwargs["fast_mode"] = bool(fast)
+
+    # יעד קובץ וידאו / תיקייה
+    if not fast:
+        # עם וידאו — נעדיף output_path אם קיים; אחרת output_dir אם קיים
+        if _supports_arg(func, "output_path") and out_video_path:
+            kwargs["output_path"] = out_video_path
+        elif _supports_arg(func, "output_dir"):
+            kwargs["output_dir"] = os.path.dirname(out_video_path) if out_video_path else MEDIA_DIR
+    else:
+        # פאסט — אם יש output_path, ננסה לא לכפות יצירה; יש אנליזרים שמקבלים None
+        if _supports_arg(func, "output_path"):
+            kwargs["output_path"] = None
+        # ואם יש output_dir בלבד – לא נעביר אותו בכלל כדי לא לרנדר וידאו
+        # (אם הפונקציה ממילא מייצרת וידאו – אין לנו איך למנוע בלי לשנותה)
+
+    # פרמטרים ייעודיים נוספים אם ביקשת
+    for k, v in (extra.items()):
+        if _supports_arg(func, k):
+            kwargs[k] = v
+
+    return func(src_path, **kwargs)
+
 @app.route('/analyze', methods=['POST'])
 def analyze():
     print("==== POST RECEIVED ====")
@@ -68,6 +116,7 @@ def analyze():
     # בוליאן fast
     fast_flag = request.form.get('fast', 'false').lower() == 'true'
 
+    # שמירת קלט זמני
     temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
     video_file.save(temp.name)
 
@@ -78,57 +127,77 @@ def analyze():
     shutil.copyfile(temp.name, raw_video_path)
     os.remove(temp.name)
 
-    # עיבוד לפי סוג התרגיל
-    if resolved_type == 'squat':
-        result = run_analysis(
-            raw_video_path, frame_skip=3, scale=0.4,
-            output_path=os.path.join(MEDIA_DIR, base_filename + "_analyzed.mp4")
-        )
-    elif resolved_type == 'deadlift':
-        if fast_flag:
-            # מצב FAST – בלי סרטון
-            result = run_deadlift_analysis(
+    # יעד ברירת־מחדל לסרטון פלט
+    analyzed_path = os.path.join(MEDIA_DIR, base_filename + "_analyzed.mp4")
+
+    # מיפוי טיפוסים לפונקציות
+    try:
+        if resolved_type == 'squat':
+            result = _run_with_tracks(
+                run_analysis,
                 raw_video_path,
-                frame_skip=3,
-                scale=0.4,
-                output_path=None,
-                return_video=False
+                analyzed_path,
+                fast_flag,
+                frame_skip=3, scale=0.4
             )
+
+        elif resolved_type == 'deadlift':
+            result = _run_with_tracks(
+                run_deadlift_analysis,
+                raw_video_path,
+                analyzed_path,
+                fast_flag,
+                frame_skip=3, scale=0.4
+            )
+
+        elif resolved_type == 'bulgarian':
+            result = _run_with_tracks(
+                run_bulgarian_analysis,
+                raw_video_path,
+                analyzed_path,
+                fast_flag,
+                frame_skip=3, scale=0.4
+            )
+
+        elif resolved_type == 'pullup':
+            result = _run_with_tracks(
+                run_pullup_analysis,
+                raw_video_path,
+                analyzed_path,
+                fast_flag,
+                frame_skip=3, scale=0.4
+            )
+
+        elif resolved_type == 'bicep_curl':
+            result = _run_with_tracks(
+                run_barbell_bicep_curl_analysis,
+                raw_video_path,
+                analyzed_path,
+                fast_flag,
+                frame_skip=3, scale=0.4
+            )
+
+        elif resolved_type == 'bent_row':
+            # אנלייזר של ה־Row משתמש לעיתים ב-output_dir — העזר דואג לזה.
+            result = _run_with_tracks(
+                run_row_analysis,
+                raw_video_path,
+                analyzed_path,  # ישמש ל-output_dir או path לפי התמיכה
+                fast_flag,
+                frame_skip=3, scale=0.4,
+                extra={"output_dir": MEDIA_DIR}  # אם הפונקציה תומכת — יעבור
+            )
+            result = _standardize_video_path(result)
+
         else:
-            # מצב רגיל – עם סרטון
-            result = run_deadlift_analysis(
-                raw_video_path,
-                frame_skip=3,
-                scale=0.4,
-                output_path=os.path.join(MEDIA_DIR, base_filename + "_analyzed.mp4"),
-                return_video=True
-            )
-    elif resolved_type == 'bulgarian':
-        result = run_bulgarian_analysis(
-            raw_video_path, frame_skip=3, scale=0.4,
-            output_path=os.path.join(MEDIA_DIR, base_filename + "_analyzed.mp4")
-        )
-    elif resolved_type == 'pullup':
-        result = run_pullup_analysis(
-            raw_video_path, frame_skip=3, scale=0.4,
-            output_path=os.path.join(MEDIA_DIR, base_filename + "_analyzed.mp4")
-        )
-    elif resolved_type == 'bicep_curl':
-        result = run_barbell_bicep_curl_analysis(
-            raw_video_path, frame_skip=3, scale=0.4,
-            output_path=os.path.join(MEDIA_DIR, base_filename + "_analyzed.mp4")
-        )
-    elif resolved_type == 'bent_row':
-        result = run_row_analysis(
-            raw_video_path, output_dir=MEDIA_DIR
-        )
-        result = _standardize_video_path(result)
-    else:
-        return jsonify({"error": f"Unhandled exercise type: {resolved_type}"}), 400
+            return jsonify({"error": f"Unhandled exercise type: {resolved_type}"}), 400
+
+    except Exception as e:
+        return jsonify({"error": f"Analysis failed: {str(e)}"}), 500
 
     result = _standardize_video_path(result)
 
-    # במצב FAST לא תהיה החזרת סרטון
+    # לייצר URL מלא אם יש וידאו בפלט
     output_path = result.get("video_path")
     full_url = None
     if output_path:
