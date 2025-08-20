@@ -1,160 +1,255 @@
-# app.py
-import os
-import traceback
-from flask import Flask, request, jsonify
-from werkzeug.utils import secure_filename
+# -*- coding: utf-8 -*-
+# app.py — unified API with fast/regular modes for all exercises
+# - Soft loader for analyzer functions (doesn't crash if a name changed)
+# - Robust logging + JSON errors
+# - Fast path (no video) / Regular path (with video) for all analyzers
 
-# אופציונלי: אפשר לאפשר CORS אם נדרש מהפרונט:
-try:
-    from flask_cors import CORS
-except Exception:
-    CORS = None
-
-APP_NAME = "XLift-Analysis API"
-APP_VERSION = "v1.0-fast-path"
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+import tempfile, os, uuid, shutil, inspect, importlib, sys, traceback
 
 app = Flask(__name__)
-if CORS:
-    CORS(app)
+CORS(app)
 
-# ---------- Utilities ----------
+MEDIA_DIR = "media"
+os.makedirs(MEDIA_DIR, exist_ok=True)
 
-def _as_bool(v, default=False):
-    """Parse truthy strings/bools/ints safely."""
-    if v is None:
-        return default
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return v != 0
-    s = str(v).strip().lower()
-    return s in ("1", "true", "t", "yes", "y", "on")
+# Aliases → internal type
+EXERCISE_MAP = {
+    "barbell squat": "squat",
+    "barbell back squat": "squat",
+    "squat": "squat",
 
-def _json_error(message, status=400, **extra):
-    payload = {"error": message}
-    if extra:
-        payload.update(extra)
-    return jsonify(payload), status
+    "deadlift": "deadlift",
 
+    "bulgarian split squat": "bulgarian",
+    "split squat": "bulgarian",
 
-# ---------- Health & Info ----------
+    "pull-up": "pullup",
+    "pull up": "pullup",
+    "pullups": "pullup",
 
-@app.get("/")
-def root():
-    return jsonify(name=APP_NAME, version=APP_VERSION, ok=True), 200
+    "barbell bicep curl": "bicep_curl",
+    "bicep curl": "bicep_curl",
 
-@app.get("/healthz")
-def healthz():
-    return "ok", 200
+    "bent-over row": "bent_row",
+    "barbell bent-over row": "bent_row",
+    "barbell bent over row": "bent_row",
+    "bent over row": "bent_row",
+    "barbell row": "bent_row",
+    "row": "bent_row",
+}
 
+# -------- Logging & error handling --------
+@app.errorhandler(Exception)
+def handle_exception(e):
+    tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+    print("\n=== UNCAUGHT EXCEPTION ===\n", tb, file=sys.stderr, flush=True)
+    return jsonify({"error": "internal_error", "detail": str(e)}), 500
 
-# ---------- Main Analysis Endpoint ----------
+@app.before_request
+def log_entry():
+    # אל תיגעו ב-request.form כאן כדי לא לגרום ל־Werkzeug לפרסר multipart מוקדם
+    print(f"--> {request.method} {request.path}", file=sys.stderr, flush=True)
 
-@app.post("/analyze")
-def analyze():
-    """
-    Body/Query params:
-      - exercise: "pullup" | "deadlift"  (default: "pullup")
-      - video_path: absolute/relative path on disk (optional if multipart 'file' sent)
-      - file: multipart uploaded video (optional alternative to video_path)
-      - return_video: bool (default: false)  -> fast path by default
-      - preserve_quality: bool (default: false)
-      - fast_mode: bool (default: None). If true => forces return_video=False.
+# -------- Utilities --------
+def _standardize_video_path(result_dict):
+    """Normalize result to always contain result['video_path'] if analyzer returned 'analyzed_video_path'."""
+    if isinstance(result_dict, dict):
+        if "video_path" not in result_dict and "analyzed_video_path" in result_dict:
+            result_dict["video_path"] = result_dict["analyzed_video_path"]
+    return result_dict
 
-    Response: JSON returned from the respective analysis function (+ error JSON on failure).
-    """
-    body = request.get_json(silent=True) or {}
-
-    # Which exercise to run (default pullup so שלא ינסה לייבא deadlift סתם)
-    exercise = (request.args.get("exercise") or body.get("exercise") or "pullup").strip().lower()
-
-    # Where is the video coming from?
-    video_path = body.get("video_path") or request.args.get("video_path")
-
-    if "file" in request.files:
-        f = request.files["file"]
-        if not f.filename:
-            return _json_error("uploaded file has no name")
-        # save to /tmp
-        fname = secure_filename(f.filename)
-        save_path = os.path.join("/tmp", fname)
-        try:
-            f.save(save_path)
-        except Exception as e:
-            return _json_error("failed to save uploaded file", 500, detail=str(e))
-        video_path = save_path
-
-    if not video_path:
-        return _json_error("provide 'video_path' or multipart 'file'")
-
-    # Flags (fast path by default: no video rendering)
-    return_video = _as_bool(request.args.get("return_video") or body.get("return_video"), default=False)
-    preserve_quality = _as_bool(request.args.get("preserve_quality") or body.get("preserve_quality"), default=False)
-    fast_mode = request.args.get("fast_mode", body.get("fast_mode", None))
-    fast_mode = None if fast_mode is None else _as_bool(fast_mode, default=None)
-
-    if fast_mode is True:
-        return_video = False
-
-    # Optional passthroughs (only if you want to override defaults in analyzers)
-    # If not present, analyzers will use their own defaults.
-    extra_kwargs = {}
-    for key in ("frame_skip", "scale", "output_path", "feedback_path", "encode_crf"):
-        if key in body:
-            extra_kwargs[key] = body[key]
-        elif request.args.get(key) is not None:
-            # parse numerics when relevant
-            val = request.args.get(key)
-            if key in ("frame_skip", "encode_crf"):
-                try:
-                    val = int(val)
-                except Exception:
-                    pass
-            elif key in ("scale",):
-                try:
-                    val = float(val)
-                except Exception:
-                    pass
-            extra_kwargs[key] = val
-
-    # Dispatch per exercise with lazy import so שהשרת לא יקרוס בזמן עלייה
+def _supports_arg(func, name: str) -> bool:
     try:
-        if exercise == "pullup":
-            from pullup_analysis import run_pullup_analysis
-            res = run_pullup_analysis(
-                video_path,
-                preserve_quality=preserve_quality,
-                return_video=return_video,
-                fast_mode=fast_mode,
-                **extra_kwargs
-            )
-        elif exercise == "deadlift":
-            from deadlift_analysis import run_deadlift_analysis
-            res = run_deadlift_analysis(
-                video_path,
-                preserve_quality=preserve_quality,
-                return_video=return_video,
-                fast_mode=fast_mode,
-                **extra_kwargs
-            )
-        else:
-            return _json_error("unknown exercise (use 'pullup' or 'deadlift')")
-    except ImportError as ie:
-        # מודול חסר/שם פונקציה לא תואם – מחזירים JSON ולא מפילים שרת
-        return _json_error("module_import_failed", 500, detail=str(ie))
+        return name in inspect.signature(func).parameters
+    except Exception:
+        return False
+
+def _run_with_tracks(func, src_path, out_video_path, fast: bool, *, frame_skip=3, scale=0.4, extra=None):
+    """
+    מריץ אנלייזר עם תמיכה בשני מסלולים:
+      fast=True  -> בלי וידאו (return_video=False / fast_mode=True / output_path=None אם נתמך)
+      fast=False -> עם וידאו (output_path=out_video_path או output_dir)
+    מעביר רק פרמטרים שהפונקציה תומכת בהם בפועל.
+    """
+    extra = extra or {}
+
+    kwargs = {}
+    if _supports_arg(func, "frame_skip"): kwargs["frame_skip"] = frame_skip
+    if _supports_arg(func, "scale"): kwargs["scale"] = scale
+
+    if _supports_arg(func, "return_video"):
+        kwargs["return_video"] = (not fast)
+    if _supports_arg(func, "fast_mode"):
+        kwargs["fast_mode"] = bool(fast)
+
+    if not fast:
+        if _supports_arg(func, "output_path") and out_video_path:
+            kwargs["output_path"] = out_video_path
+        elif _supports_arg(func, "output_dir"):
+            kwargs["output_dir"] = os.path.dirname(out_video_path) if out_video_path else MEDIA_DIR
+    else:
+        if _supports_arg(func, "output_path"):
+            kwargs["output_path"] = None
+        # אם יש רק output_dir — לא נעביר כדי לא לרנדר וידאו
+
+    for k, v in (extra.items()):
+        if _supports_arg(func, k):
+            kwargs[k] = v
+
+    return func(src_path, **kwargs)
+
+# -------- Soft loader for analyzers --------
+def _missing_stub(mod_name, fn_names):
+    def _stub(*args, **kwargs):
+        return {
+            "error": "analyzer_unavailable",
+            "detail": f"Module '{mod_name}' is missing or none of these functions exist: {', '.join(fn_names)}",
+            "video_path": ""
+        }
+    return _stub
+
+def load_func_soft(module_name, *func_names):
+    """
+    Import module and return the first existing attribute from func_names.
+    If module/function missing — returns a stub that yields a clear JSON error instead of crashing.
+    """
+    try:
+        mod = importlib.import_module(module_name)
     except Exception as e:
-        # כל שגיאה בזמן ניתוח – להחזיר JSON ולא סטאק לוג ללקוח
-        tb = traceback.format_exc()
-        return _json_error("analysis_failed", 500, detail=str(e), traceback=tb)
+        print(f"[loader] FAILED import {module_name}: {e}", file=sys.stderr, flush=True)
+        return _missing_stub(module_name, func_names)
 
-    # Success
-    return jsonify(res), 200
+    for fn in func_names:
+        if hasattr(mod, fn):
+            f = getattr(mod, fn)
+            print(f"[loader] {module_name}.{fn} resolved", file=sys.stderr, flush=True)
+            return f
 
+    print(f"[loader] {module_name}: none of {func_names} found", file=sys.stderr, flush=True)
+    return _missing_stub(module_name, func_names)
 
-# ---------- Entrypoint ----------
+# ---- Resolve analyzers (לא מפיל אם חסר משהו) ----
+run_squat       = load_func_soft('squat_analysis', 'run_analysis')
+run_deadlift    = load_func_soft('deadlift_analysis', 'run_deadlift_analysis', 'run_analysis')
+run_bulgarian   = load_func_soft('bulgarian_split_squat_analysis', 'run_bulgarian_analysis', 'run_analysis')
+run_pullup      = load_func_soft('pullup_analysis', 'run_pullup_analysis', 'run_analysis')
+run_bicep_curl  = load_func_soft('barbell_bicep_curl', 'run_barbell_bicep_curl_analysis', 'run_analysis')
+run_bent_row    = load_func_soft('bent_over_row_analysis', 'run_row_analysis', 'run_analysis')
+
+# -------- API --------
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    try:
+        print("==== POST RECEIVED ====", file=sys.stderr, flush=True)
+        print("Content-Type:", request.content_type, file=sys.stderr, flush=True)
+
+        # multipart guard
+        if not (request.content_type and "multipart/form-data" in request.content_type.lower()):
+            return jsonify({"error": "Bad request", "detail": "Expected multipart/form-data with field 'video'"}), 400
+
+        video_file = request.files.get('video')
+        if not video_file:
+            print("NO 'video' FILE FIELD", file=sys.stderr, flush=True)
+            return jsonify({"error": "No video uploaded", "detail": "form-data field name must be 'video'"}), 400
+
+        # עכשיו בטוח לגשת ל-form
+        print("FORM KEYS:", list(request.form.keys()), file=sys.stderr, flush=True)
+        print("FILES KEYS:", list(request.files.keys()), file=sys.stderr, flush=True)
+
+        exercise_type = request.form.get('exercise_type')
+        if not exercise_type:
+            return jsonify({"error": "Missing exercise_type"}), 400
+
+        exercise_type = exercise_type.lower().strip()
+        resolved_type = EXERCISE_MAP.get(exercise_type)
+        if not resolved_type:
+            return jsonify({"error": f"Unsupported exercise type: {exercise_type}"}), 400
+
+        fast_flag = request.form.get('fast', 'false').lower() == 'true'
+        print(f"Resolved: {resolved_type} | fast={fast_flag}", file=sys.stderr, flush=True)
+
+        # --- שמירת קלט זמני ---
+        temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        video_file.save(temp.name)
+
+        unique_id = str(uuid.uuid4())[:8]
+        base_filename = f"{resolved_type}_{unique_id}"
+        raw_video_path = os.path.join(MEDIA_DIR, base_filename + ".mp4")
+        shutil.copyfile(temp.name, raw_video_path)
+        os.remove(temp.name)
+
+        analyzed_path = os.path.join(MEDIA_DIR, base_filename + "_analyzed.mp4")
+
+        # --- ריצה לפי סוג ---
+        if resolved_type == 'squat':
+            result = _run_with_tracks(
+                run_squat, raw_video_path, analyzed_path, fast_flag,
+                frame_skip=3, scale=0.4
+            )
+
+        elif resolved_type == 'deadlift':
+            result = _run_with_tracks(
+                run_deadlift, raw_video_path, analyzed_path, fast_flag,
+                frame_skip=3, scale=0.4
+            )
+
+        elif resolved_type == 'bulgarian':
+            result = _run_with_tracks(
+                run_bulgarian, raw_video_path, analyzed_path, fast_flag,
+                frame_skip=3, scale=0.4
+            )
+
+        elif resolved_type == 'pullup':
+            result = _run_with_tracks(
+                run_pullup, raw_video_path, analyzed_path, fast_flag,
+                frame_skip=3, scale=0.4
+            )
+
+        elif resolved_type == 'bicep_curl':
+            result = _run_with_tracks(
+                run_bicep_curl, raw_video_path, analyzed_path, fast_flag,
+                frame_skip=3, scale=0.4
+            )
+
+        elif resolved_type == 'bent_row':
+            # יש אנלייזרים של Row שעובדים עם output_dir — העזר דואג לזה,
+            # ונעביר גם extra כדי שיהיה נתיב תקין אם הוא תומך.
+            result = _run_with_tracks(
+                run_bent_row, raw_video_path, analyzed_path, fast_flag,
+                frame_skip=3, scale=0.4, extra={"output_dir": MEDIA_DIR}
+            )
+            result = _standardize_video_path(result)
+
+        else:
+            return jsonify({"error": f"Unhandled exercise type: {resolved_type}"}), 400
+
+        if not isinstance(result, dict):
+            # הגנה — כל האנלייזרים אמורים להחזיר dict
+            result = {"error": "invalid_result", "detail": "Analyzer did not return a dict", "video_path": ""}
+
+        result = _standardize_video_path(result)
+
+        # לייצר URL מלא אם יש וידאו בפלט
+        output_path = result.get("video_path")
+        full_url = None
+        if output_path:
+            full_url = request.host_url.rstrip('/') + '/media/' + os.path.basename(output_path)
+
+        resp = {"result": result, "video_url": full_url}
+        print("OK ->", full_url, file=sys.stderr, flush=True)
+        return jsonify(resp)
+
+    except Exception as e:
+        tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        print("\n*** analyze() EXCEPTION ***\n", tb, file=sys.stderr, flush=True)
+        return jsonify({"error": "internal_error_in_analyze", "detail": str(e)}), 500
+
+@app.route('/media/<filename>')
+def media(filename):
+    return send_from_directory(MEDIA_DIR, filename)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))
-    print(f"[{APP_NAME}] {APP_VERSION} listening on 0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
-
+    # Fly.io expects 0.0.0.0:8080
+    app.run(host="0.0.0.0", port=8080)
