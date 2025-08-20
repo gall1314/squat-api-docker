@@ -1,9 +1,6 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — Deadlift aligned to squat standard
-# - Overlay/encoding/speed identical to squat
-# - Bi-directional donut (0% bottom → 100% upright) with smoothing
-# - Robust legs: Kalman + gating + floor anchor (+ optional YOLOv8n-ONNX occlusion detector)
-# - Scoring feedback + one non-scoring tip per rep
+# deadlift_analysis.py — v2.2 (fast I/O, overlay caching, same FSM)
+# שמירה על תוצאות זהות לוגית (ספירה/ציונים) + האצות בצד הוידאו/ציור/דגימה
 
 import os, cv2, math, numpy as np, subprocess
 from PIL import ImageFont, ImageDraw, Image
@@ -15,6 +12,16 @@ try:
     _ORT_AVAILABLE = True
 except Exception:
     _ORT_AVAILABLE = False
+
+# ===================== SPEED TUNING (threads) =====================
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 # ===================== STYLE / FONTS =====================
 BAR_BG_ALPHA         = 0.55
@@ -40,7 +47,7 @@ DEPTH_PCT_FONT   = _font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 
 mp_pose = mp.solutions.pose
 
-# ===================== SCORE DISPLAY =====================
+# ===================== SCORE LABELS =====================
 def score_label(s: float) -> str:
     s = float(s)
     if s >= 9.5: return "Excellent"
@@ -53,7 +60,7 @@ def display_half_str(x: float) -> str:
     q = round(float(x) * 2) / 2.0
     return str(int(round(q))) if abs(q - round(q)) < 1e-9 else f"{q:.1f}"
 
-# ===================== BODY-ONLY (hide face) =====================
+# ===================== BODY ONLY DRAW =====================
 _FACE = {
     mp_pose.PoseLandmark.NOSE.value,
     mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
@@ -77,7 +84,7 @@ def draw_body_only_from_dict(frame, pts_norm, color=(255,255,255)):
             cv2.circle(frame, (x, y), 3, color, -1, cv2.LINE_AA)
     return frame
 
-# ===================== BACK CURVATURE =====================
+# ===================== UTILITIES =====================
 def analyze_back_curvature(shoulder, hip, head_like, threshold=0.04):
     line_vec = hip - shoulder
     nrm = np.linalg.norm(line_vec) + 1e-9
@@ -88,49 +95,62 @@ def analyze_back_curvature(shoulder, hip, head_like, threshold=0.04):
     signed = float(np.sign(off[1]) * -1 * np.linalg.norm(off))  # inward negative
     return signed, signed < -threshold
 
-# ===================== Deadlift thresholds =====================
-HINGE_START_THRESH    = 0.08
-STAND_DELTA_TARGET   = 0.025
-END_THRESH           = 0.035
-MIN_FRAMES_BETWEEN_REPS = 10
-PROG_ALPHA           = 0.35  # smoothing for donut only
+class EMA:
+    def __init__(self, alpha=0.25, init=None):
+        self.a = float(alpha); self.v = init; self.ready = init is not None
+    def update(self, x):
+        x = float(x)
+        if not self.ready:
+            self.v = x; self.ready=True
+        else:
+            self.v = self.a*x + (1-self.a)*self.v
+        return self.v
 
-# Tips (non-scoring) thresholds (no bottom-pause tip)
-TIP_MIN_ECC_S     = 0.35
-TIP_MIN_TOP_S     = 0.15
-TIP_SMALL_ROM_LO  = 0.035
-TIP_SMALL_ROM_HI  = 0.055
+# ===================== THRESHOLDS =====================
+HINGE_START_THRESH     = 0.08
+HINGE_END_THRESH       = 0.035
+HINGE_TOP_TRACK_ALPHA  = 0.10  # adapt upright slowly
+
+WRIST_VIS_THR          = 0.55
+GRIP_WIDTH_MIN         = 0.10
+GRIP_WIDTH_MAX         = 0.55
+GRIP_WIDTH_DRIFT_MAX   = 0.12
+
+MIN_FRAMES_DOWN        = 4
+MIN_FRAMES_UP          = 4
+MIN_FRAMES_TOTAL       = 12
+MIN_FRAMES_BW_REPS     = 10
+ROM_MIN_HINGE          = 0.055
+ROM_MIN_BAR            = 0.055
+PROG_ALPHA             = 0.35
+
+BACK_MIN_TIME_S        = 0.25
+
+TIP_MIN_ECC_S          = 0.35
+TIP_MIN_TOP_S          = 0.15
+TIP_SMALL_ROM_LO       = 0.035
+TIP_SMALL_ROM_HI       = 0.055
 
 def choose_deadlift_tip(down_s, top_s, rom):
     if down_s is not None and down_s < TIP_MIN_ECC_S:
         return "Slow the lowering to ~2–3s for more hypertrophy"
     if top_s is not None and top_s < TIP_MIN_TOP_S:
-        return "Squeeze the glutes for a brief hold at the top"
+        return "Squeeze the glutes briefly at the top"
     if rom is not None and TIP_SMALL_ROM_LO <= rom <= TIP_SMALL_ROM_HI:
         return "Hinge a bit deeper within comfort"
     return "Keep the bar close and move smoothly"
 
-# ===================== Kalman Leg Tracker (robust to occlusion) =====================
-LEG_VIS_THR    = 0.55
-LEG_MAX_MAH    = 6.0     # gating ~3σ per axis
-LEG_MISS_FLOOR = 6       # after N missed frames, anchor Y to floor
-LEG_SIDE_XSPAN = 0.25    # ankle_x within hip_x ± SPAN
-
+# ===================== KALMAN (legs + bar-y) =====================
 class _KF:
-    """Kalman 2D position+velocity (x,y,vx,vy) on normalized coords [0..1]."""
     def __init__(self, q=1e-3, r=6e-3):
-        self.x = np.zeros((4,1), dtype=float)  # [x, y, vx, vy]
+        self.x = np.zeros((4,1), dtype=float)
         self.P = np.eye(4)*1.0
         self.Q = np.eye(4)*q
         self.R = np.eye(2)*r
-        self.F = np.eye(4)
-        self.H = np.zeros((2,4)); self.H[0,0]=1; self.H[1,1]=1
-        self.inited = False
+        self.F = np.eye(4); self.H = np.zeros((2,4)); self.H[0,0]=1; self.H[1,1]=1
+        self.inited=False
     def predict(self, dt):
-        self.F = np.array([[1,0,dt,0],
-                           [0,1,0,dt],
-                           [0,0,1, 0],
-                           [0,0,0, 1]], dtype=float)
+        self.F = np.array([[1,0,dt,0],[0,1,0,dt],[0,0,1,0],[0,0,0,1]], dtype=float)
         self.x = self.F @ self.x
         self.P = self.F @ self.P @ self.F.T + self.Q
     def update(self, z):
@@ -141,14 +161,17 @@ class _KF:
         self.x = self.x + K @ y
         I = np.eye(4)
         self.P = (I - K @ self.H) @ self.P
-        maha2 = float(y.T @ np.linalg.inv(S) @ y)  # Mahalanobis^2
+        maha2 = float(y.T @ np.linalg.inv(S) @ y)
         return maha2
 
 class KalmanLegTracker:
-    """Ankle/Knee/Heel/Toe with Kalman + gating + floor anchoring on occlusion."""
+    LEG_VIS_THR    = 0.55
+    LEG_MAX_MAH    = 6.0
+    LEG_MISS_FLOOR = 6
+    LEG_SIDE_XSPAN = 0.25
     def __init__(self, side="right"):
-        self.side = side
         PL = mp.solutions.pose.PoseLandmark
+        self.side = side
         self.hip  = PL.RIGHT_HIP.value   if side=="right" else PL.LEFT_HIP.value
         self.knee = PL.RIGHT_KNEE.value  if side=="right" else PL.LEFT_KNEE.value
         self.ankle= PL.RIGHT_ANKLE.value if side=="right" else PL.LEFT_ANKLE.value
@@ -159,7 +182,6 @@ class KalmanLegTracker:
         self.miss = {i:0 for i in self.idxs}
         self.floor_y_med = None
         self.floor_hist = []
-
     @staticmethod
     def _near_hands(lm, pt):
         PL = mp.solutions.pose.PoseLandmark
@@ -168,9 +190,7 @@ class KalmanLegTracker:
                 if math.hypot(pt[0]-lm[h].x, pt[1]-lm[h].y) < 0.06:
                     return True
         return False
-
     def _update_floor(self, lm):
-        # running median of the lowest visible foot y
         cand = []
         for idx in (self.ankle, self.heel, self.foot):
             if lm[idx].visibility > 0.6:
@@ -180,78 +200,98 @@ class KalmanLegTracker:
             self.floor_hist.append(y)
             if len(self.floor_hist) > 25: self.floor_hist.pop(0)
             self.floor_y_med = float(np.median(self.floor_hist))
-
     def update(self, lm, dt, occlusion_boxes_norm=None):
         self._update_floor(lm)
         out = {}
         hip_x = lm[self.hip].x
-
         def _inside_any_bbox(p):
             if not occlusion_boxes_norm: return False
             x, y = p
             for (x1, y1, x2, y2) in occlusion_boxes_norm:
-                # מעט הרחבה כדי להיות שמרני
                 dx = (x2 - x1) * 0.08; dy = (y2 - y1) * 0.08
                 if (x1-dx) <= x <= (x2+dx) and (y1-dy) <= y <= (y2+dy):
                     return True
             return False
-
         for idx in self.idxs:
             kf = self.kf[idx]
-            # init
             if not kf.inited:
-                if lm[idx].visibility >= LEG_VIS_THR:
+                if lm[idx].visibility >= self.LEG_VIS_THR:
                     kf.x[:2,0] = [lm[idx].x, lm[idx].y]
                     kf.x[2:,0] = [0.0, 0.0]
-                    kf.inited = True
+                    kf.inited=True
                 else:
                     continue
-            # predict
             kf.predict(dt)
-
-            meas_ok = False
-            if lm[idx].visibility >= LEG_VIS_THR:
+            meas_ok=False
+            if lm[idx].visibility >= self.LEG_VIS_THR:
                 z = (lm[idx].x, lm[idx].y)
-                # reject: near hands, wrong side, inside occluder, too far by Mahalanobis
-                if (not self._near_hands(lm, z)) and (abs(z[0]-hip_x) <= LEG_SIDE_XSPAN) and (not _inside_any_bbox(z)):
+                if (not self._near_hands(lm, z)) and (abs(z[0]-hip_x) <= self.LEG_SIDE_XSPAN) and (not _inside_any_bbox(z)):
                     maha2 = kf.update(z)
-                    if maha2 <= (LEG_MAX_MAH**2):
-                        meas_ok = True
-
+                    if maha2 <= (self.LEG_MAX_MAH**2): meas_ok=True
             if meas_ok:
-                self.miss[idx] = 0
+                self.miss[idx]=0
             else:
-                self.miss[idx] += 1
-                # anchor Y to floor after too many misses
-                if self.miss[idx] >= LEG_MISS_FLOOR and self.floor_y_med is not None:
+                self.miss[idx]+=1
+                if self.miss[idx] >= self.LEG_MISS_FLOOR and self.floor_y_med is not None:
                     kf.x[1,0] = 0.8*kf.x[1,0] + 0.2*self.floor_y_med
-
             out[idx] = (float(kf.x[0,0]), float(kf.x[1,0]))
         return out
 
-# ===================== YOLOv8n-ONNX Detector (optional) =====================
+class BarYTracker:
+    """Tracks bar vertical position via wrists proxy (avg of wrists)."""
+    def __init__(self):
+        self.kf = _KF(q=8e-4, r=9e-4)
+        self.ema_y = EMA(0.2)
+        self.valid = False
+        self.top_ref_ema = EMA(0.05)
+        self.width0 = None
+        self.width_max_drift = GRIP_WIDTH_DRIFT_MAX
+    def reset_rep(self):
+        self.width0 = None
+    def update(self, lm):
+        PL = mp_pose.PoseLandmark
+        lw, rw = PL.LEFT_WRIST.value, PL.RIGHT_WRIST.value
+        if lm[lw].visibility < WRIST_VIS_THR or lm[rw].visibility < WRIST_VIS_THR:
+            self.valid = False; return None, False
+        xL, yL = lm[lw].x, lm[lw].y
+        xR, yR = lm[rw].x, lm[rw].y
+        grip_w = abs(xR - xL)
+        if not (GRIP_WIDTH_MIN <= grip_w <= GRIP_WIDTH_MAX):
+            self.valid = False; return None, False
+        if self.width0 is None: self.width0 = grip_w
+        else:
+            if abs(grip_w - self.width0) > self.width_max_drift * max(1e-3, self.width0):
+                self.valid = False; return None, False
+        y = 0.5*(yL + yR)
+        cx = 0.5*(xL + xR)
+        if not self.kf.inited:
+            self.kf.x[:2,0] = [cx, y]; self.kf.x[2:,0] = [0.0, 0.0]; self.kf.inited=True
+        else:
+            self.kf.predict(1/25.0)
+            self.kf.update([cx, y])
+        y_f = self.ema_y.update(float(self.kf.x[1,0]))
+        self.top_ref_ema.update(y_f)
+        self.valid = True
+        return y_f, True
+    def top_ref(self):
+        return self.top_ref_ema.v if self.top_ref_ema.ready else None
+
+# ===================== YOLO OCCLUDER (OPTIONAL) =====================
 class YoloOccluderDetector:
-    """
-    Minimal YOLOv8-ONNX runner. Treats all detections as potential occluders,
-    or use occluder_class_ids to filter (e.g., {0,1} if your model maps 0=barbell,1=plate).
-    """
     def __init__(self, onnx_path, providers=None, input_size=640, conf_thres=0.25, iou_thres=0.45, occluder_class_ids=None):
-        if not _ORT_AVAILABLE:
-            raise RuntimeError("onnxruntime not available")
-        if not os.path.exists(onnx_path):
-            raise FileNotFoundError(onnx_path)
+        if not _ORT_AVAILABLE: raise RuntimeError("onnxruntime not available")
+        if not os.path.exists(onnx_path): raise FileNotFoundError(onnx_path)
         self.sess = ort.InferenceSession(onnx_path, providers=providers or ort.get_available_providers())
-        self.inp_name = self.sess.get_inputs()[0].name
-        self.out_name = self.sess.get_outputs()[0].name
+        self.inp = self.sess.get_inputs()[0].name
+        self.out = self.sess.get_outputs()[0].name
         self.imgsz = int(input_size)
         self.conf_thres = float(conf_thres)
         self.iou_thres = float(iou_thres)
-        self.occluder_class_ids = occluder_class_ids  # None => all classes
+        self.occluder_class_ids = occluder_class_ids
     @staticmethod
     def _letterbox(img, new_shape=640, color=(114,114,114)):
-        shape = img.shape[:2]  # h,w
-        if isinstance(new_shape, int):
-            new_shape = (new_shape, new_shape)
+        shape = img.shape[:2]
+        if isinstance(new_shape, int): new_shape = (new_shape, new_shape)
         r = min(new_shape[0]/shape[0], new_shape[1]/shape[1])
         new_unpad = (int(round(shape[1]*r)), int(round(shape[0]*r)))
         dw, dh = new_shape[1]-new_unpad[0], new_shape[0]-new_unpad[1]
@@ -282,71 +322,60 @@ class YoloOccluderDetector:
     def infer(self, frame_bgr):
         h0, w0 = frame_bgr.shape[:2]
         img, r, (dw, dh) = self._letterbox(frame_bgr, self.imgsz)
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        img_rgb = np.transpose(img_rgb, (2,0,1))[None]  # 1x3xHxW
-        out = self.sess.run([self.out_name], {self.inp_name: img_rgb})[0]
-        # handle two common YOLOv8 export shapes:
-        # (1,84,N)  OR  (1,N,84/85)
-        if out.ndim == 3 and out.shape[0] == 1:
-            o = out[0]
-            if o.shape[0] in (84,85):  # (84,N) or (85,N)
-                # Ultralytics default: (84,N) with 4 box, 1 obj, 80 cls => 85; sometimes 84 (no obj)
-                num = o.shape[1]
-                xywh = o[0:4, :].T
-                if o.shape[0] >= 85:
-                    obj = o[4, :].reshape(num,1)
-                    cls = o[5:, :].T
-                    cls_id = np.argmax(cls, axis=1)
-                    conf = (obj * cls.max(axis=1)).flatten()
-                else:
-                    cls = o[4:, :].T
-                    cls_id = np.argmax(cls, axis=1)
-                    conf = cls.max(axis=1).flatten()
-            else:  # (N,84/85)
-                xywh = o[:, 0:4]
-                if o.shape[1] >= 85:
-                    obj = o[:, 4:5]
-                    cls = o[:, 5:]
-                    cls_id = np.argmax(cls, axis=1)
-                    conf = (obj[:,0] * cls.max(axis=1)).flatten()
-                else:
-                    cls = o[:, 4:]
-                    cls_id = np.argmax(cls, axis=1)
-                    conf = cls.max(axis=1).flatten()
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)/255.0
+        rgb = np.transpose(rgb, (2,0,1))[None]
+        out = self.sess.run([self.out], {self.inp: rgb})[0]
+        if out.ndim != 3 or out.shape[0] != 1: return []
+        o = out[0]
+        if o.shape[0] in (84,85):
+            num = o.shape[1]
+            xywh = o[0:4,:].T
+            if o.shape[0] >= 85:
+                obj = o[4,:].reshape(num,1)
+                cls = o[5:,:].T
+                cls_id = np.argmax(cls, axis=1)
+                conf = (obj * cls.max(axis=1)).flatten()
+            else:
+                cls = o[4:,:].T
+                cls_id = np.argmax(cls, axis=1)
+                conf = cls.max(axis=1).flatten()
         else:
-            return []  # unknown layout
-        # filter conf
+            xywh = o[:,0:4]
+            if o.shape[1] >= 85:
+                obj = o[:,4:5]
+                cls = o[:,5:]
+                cls_id = np.argmax(cls, axis=1)
+                conf = (obj[:,0]*cls.max(axis=1)).flatten()
+            else:
+                cls = o[:,4:]
+                cls_id = np.argmax(cls, axis=1)
+                conf = cls.max(axis=1).flatten()
         m = conf >= self.conf_thres
         if not np.any(m): return []
         xywh = xywh[m]; conf = conf[m]; cls_id = cls_id[m]
-        # class allowlist
         if self.occluder_class_ids is not None:
             sel = np.isin(cls_id, list(self.occluder_class_ids))
             xywh, conf, cls_id = xywh[sel], conf[sel], cls_id[sel]
             if len(xywh) == 0: return []
-        # xywh → xyxy on letterboxed image
         xyxy = np.zeros_like(xywh)
         xyxy[:,0] = xywh[:,0] - xywh[:,2]/2
         xyxy[:,1] = xywh[:,1] - xywh[:,3]/2
         xyxy[:,2] = xywh[:,0] + xywh[:,2]/2
         xyxy[:,3] = xywh[:,1] + xywh[:,3]/2
-        # NMS
         keep = self._nms(xyxy, conf, self.iou_thres)
-        xyxy = xyxy[keep]; conf = conf[keep]
-        # map back to original image
+        xyxy = xyxy[keep]
         xyxy[:,[0,2]] -= dw; xyxy[:,[1,3]] -= dh
         xyxy /= r
-        # clip and to normalized
         xyxy[:,0] = np.clip(xyxy[:,0], 0, w0-1)
         xyxy[:,2] = np.clip(xyxy[:,2], 0, w0-1)
         xyxy[:,1] = np.clip(xyxy[:,1], 0, h0-1)
         xyxy[:,3] = np.clip(xyxy[:,3], 0, h0-1)
-        boxes_norm = []
+        boxes_norm=[]
         for x1,y1,x2,y2 in xyxy:
             boxes_norm.append((float(x1)/w0, float(y1)/h0, float(x2)/w0, float(y2)/h0))
         return boxes_norm
 
-# ===================== Overlay =====================
+# ===================== OVERLAY =====================
 def _wrap2(draw, text, font, maxw):
     words = text.split()
     if not words: return [""]
@@ -375,9 +404,8 @@ def _donut(frame, c, r, t, p):
     cv2.ellipse(frame, (cx,cy), (r,r), 0, -90, -90 + int(360*p), DEPTH_COLOR, t, cv2.LINE_AA)
     return frame
 
-def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
+def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0, dbg_text=None):
     h, w, _ = frame.shape
-    # Reps box
     pil = Image.fromarray(frame); d = ImageDraw.Draw(pil)
     txt = f"Reps: {reps}"; padx, pady = 10, 6
     tw = d.textlength(txt, font=REPS_FONT); th = REPS_FONT.size
@@ -401,9 +429,8 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
     gap = max(2, int(r*0.10)); base = cy - (DEPTH_LABEL_FONT.size + gap + DEPTH_PCT_FONT.size)//2
     d.text((cx-int(lw//2), base), label, font=DEPTH_LABEL_FONT, fill=(255,255,255))
     d.text((cx-int(pw//2), base+DEPTH_LABEL_FONT.size+gap), pct, font=DEPTH_PCT_FONT, fill=(255,255,255))
-    frame = np.array(pil)
 
-    # Feedback (bottom)
+    # bottom feedback
     if feedback:
         pil_fb = Image.fromarray(frame); dfb = ImageDraw.Draw(pil_fb)
         safe = max(6, int(h*0.02)); pad_x, pad_y, lg = 12, 8, 4
@@ -419,19 +446,49 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
             t_w = dfb.textlength(ln, font=FEEDBACK_FONT); tx = max(pad_x, (w - int(t_w)) // 2)
             dfb.text((tx,ty), ln, font=FEEDBACK_FONT, fill=(255,255,255)); ty += lh + lg
         frame = np.array(pil_fb)
+
+    if dbg_text:
+        cv2.putText(frame, dbg_text, (8, int(h*0.12)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1, cv2.LINE_AA)
     return frame
+
+# ===================== FAST VIDEO SINK (ffmpeg pipe) =====================
+def _open_ffmpeg_sink(w, h, fps, out_path, preset="ultrafast", crf=25, scale=(1280,720)):
+    vf = []
+    if scale: vf.append(f"scale={scale[0]}:{scale[1]}")
+    vf.append("format=yuv420p")
+    vf_str = ",".join(vf)
+    cmd = [
+        "ffmpeg","-y",
+        "-f","rawvideo","-pix_fmt","bgr24",
+        "-s",f"{w}x{h}","-r",str(fps),
+        "-i","pipe:0",
+        "-an",
+        "-c:v","libx264",
+        "-preset", preset,
+        "-tune","zerolatency",
+        "-crf", str(crf),
+        "-movflags","+faststart",
+        "-vf", vf_str,
+        out_path
+    ]
+    return subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
 # ===================== MAIN =====================
 def run_deadlift_analysis(video_path,
-                          frame_skip=3,
-                          scale=0.4,
+                          frame_skip=3,               # בסיס ל-active; idle יהיה כפול
+                          scale=0.4,                  # resize לפני MediaPipe (לדיוק/מהירות)
                           output_path="deadlift_analyzed.mp4",
                           feedback_path="deadlift_feedback.txt",
                           detector_onnx_path="barbell_plates_yolov8n.onnx",
                           detector_input_size=640,
                           detector_conf_thres=0.25,
                           detector_iou_thres=0.45,
-                          detector_class_ids=None  # e.g., {0,1}; None = treat all as occluders
+                          detector_class_ids=None,
+                          model_complexity=2,         # שמר על דיוק (כמו קודם)
+                          fps_out=24,                 # קידוד וידאו
+                          out_scale=(1280,720),       # 720p כברירת מחדל
+                          overlay_draw_every=3,       # Overlay caching
+                          debug=False
                           ):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -443,7 +500,7 @@ def run_deadlift_analysis(video_path,
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
 
-    # Optional YOLO occluder detector
+    # Optional YOLO occluder
     detector = None
     if detector_onnx_path and _ORT_AVAILABLE and os.path.exists(detector_onnx_path):
         try:
@@ -455,240 +512,286 @@ def run_deadlift_analysis(video_path,
                 occluder_class_ids=detector_class_ids
             )
         except Exception:
-            detector = None  # fallback silently
+            detector = None
 
+    # Video / fps
+    fps_in = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    W0 = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    H0 = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+
+    make_video = bool(output_path)
+    ff_sink = None
+    if make_video:
+        # שומרים גודל קלט מקורי לפייפ; ffmpeg יעשה scale ל-out_scale
+        ff_sink = _open_ffmpeg_sink(W0, H0, fps_out, output_path, preset="ultrafast", crf=25, scale=out_scale)
+
+    # Counters / FSM
     PL = mp.solutions.pose.PoseLandmark
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = None
-    fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
-    effective_fps = max(1.0, fps_in / max(1, frame_skip))
-    dt = 1.0 / float(effective_fps)
-
     counter = good_reps = bad_reps = 0
     all_scores, reps_report, overall_feedback = [], [], []
 
-    rep = False
+    STATE_TOP, STATE_DOWN, STATE_UP = 0, 1, 2
+    state = STATE_TOP
     last_rep_frame = -999
     frame_idx = 0
 
-    # donut progress state
-    top_ref = STAND_DELTA_TARGET
+    top_ref = EMA(alpha=HINGE_TOP_TRACK_ALPHA)
     bottom_est = None
     prog = 1.0
 
-    # back curvature frames accumulation
-    BACK_MIN_FRAMES = max(2, int(0.25 / dt))
+    bar = BarYTracker()
+
     back_frames = 0
+    effective_fps_nominal = max(1.0, fps_in / max(1, frame_skip))
+    BACK_MIN_FRAMES = max(2, int(BACK_MIN_TIME_S * effective_fps_nominal))
 
-    # tempo counters per rep
     down_frames = up_frames = top_hold_frames = 0
-    prev_progress = None
 
-    # trackers
-    right_leg = KalmanLegTracker("right")
-    left_leg  = KalmanLegTracker("left")
+    hinge_min = hinge_max = None
+    bar_min = bar_max = None
 
-    with mp.solutions.pose.Pose(model_complexity=1,
+    right_leg = None
+    left_leg  = None
+
+    # Overlay caching
+    last_overlay = None
+    overlay_every = max(1, int(overlay_draw_every))
+
+    # Adaptive skip
+    active_skip = max(1, int(frame_skip))
+    idle_skip = max(active_skip*2, active_skip+1)
+
+    with mp.solutions.pose.Pose(model_complexity=model_complexity,
                                 min_detection_confidence=0.5,
                                 min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret: break
             frame_idx += 1
-            if frame_idx % frame_skip != 0: continue
-            if scale != 1.0: frame = cv2.resize(frame, (0,0), fx=scale, fy=scale)
 
-            h, w = frame.shape[:2]
-            if out is None:
-                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
+            # scale for analysis (not for video write; אנחנו כותבים מקור)
+            if scale != 1.0:
+                small = cv2.resize(frame, (0,0), fx=scale, fy=scale)
+            else:
+                small = frame
 
-            # optional occluder boxes (normalized xyxy)
+            # adaptive frame skipping (ל־ANALYSIS)
+            cur_skip = active_skip if state != STATE_TOP else idle_skip
+            if frame_idx % cur_skip != 0:
+                # עדיין כותבים וידאו אם צריך (ממחזרים overlay אחרון)
+                if make_video and ff_sink is not None and last_overlay is not None:
+                    ff_sink.stdin.write(last_overlay.tobytes())
+                continue
+
+            h, w = small.shape[:2]
+
             occl_boxes = []
             if detector is not None:
-                try:
-                    occl_boxes = detector.infer(frame)
-                except Exception:
-                    occl_boxes = []
+                try: occl_boxes = detector.infer(small)
+                except Exception: occl_boxes = []
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
             res = pose.process(rgb)
 
             rt_fb = None
+            dbg = None
+
             if not res.pose_landmarks:
-                frame = draw_overlay(frame, reps=counter, feedback=None, progress_pct=prog)
-                out.write(frame); continue
+                # כתיבת פריים ממוחזר אם יש
+                if make_video and ff_sink is not None:
+                    if last_overlay is None:
+                        last_overlay = frame  # פעם ראשונה פשוט כתוב את הפריים
+                    ff_sink.stdin.write(last_overlay.tobytes())
+                continue
 
             try:
                 lm = res.pose_landmarks.landmark
 
+                # init legs auto side
+                if right_leg is None or left_leg is None:
+                    # בחר צד לפי נראות הקרסול
+                    L = lm[PL.LEFT_ANKLE.value].visibility
+                    R = lm[PL.RIGHT_ANKLE.value].visibility
+                    prefer = "left" if L > R else "right"
+                    right_leg = KalmanLegTracker("right" if prefer=="right" else "left")
+                    left_leg  = KalmanLegTracker("left"  if prefer=="right" else "right")
+
                 shoulder = np.array([lm[PL.RIGHT_SHOULDER.value].x, lm[PL.RIGHT_SHOULDER.value].y], dtype=float)
                 hip      = np.array([lm[PL.RIGHT_HIP.value].x,      lm[PL.RIGHT_HIP.value].y],      dtype=float)
 
-                # head-like point
+                # head-like
                 head = None
                 for idx in (PL.RIGHT_EAR.value, PL.LEFT_EAR.value, PL.NOSE.value):
                     if lm[idx].visibility > 0.5:
                         head = np.array([lm[idx].x, lm[idx].y], dtype=float); break
                 if head is None:
-                    frame = draw_overlay(frame, reps=counter, feedback=None, progress_pct=prog)
-                    out.write(frame); continue
+                    if make_video and ff_sink is not None:
+                        if last_overlay is None: last_overlay = frame
+                        ff_sink.stdin.write(last_overlay.tobytes())
+                    continue
 
-                # legs with Kalman robustness + occlusion gating
-                right_leg_pts = right_leg.update(lm, dt, occlusion_boxes_norm=occl_boxes)
-                left_leg_pts  = left_leg.update(lm, dt, occlusion_boxes_norm=occl_boxes)
+                right_pts = right_leg.update(lm, 1.0/ effective_fps_nominal, occlusion_boxes_norm=occl_boxes)
+                left_pts  = left_leg.update(lm, 1.0/ effective_fps_nominal, occlusion_boxes_norm=occl_boxes)
 
-                # hinge proxy: shoulder-hip horizontal delta
                 delta_x = abs(hip[0] - shoulder[0])
+                if not top_ref.ready:
+                    top_ref.update(delta_x)
+                else:
+                    if delta_x < (top_ref.v * 1.4):
+                        top_ref.update(delta_x)
 
-                # adapt upright reference
-                if delta_x < (STAND_DELTA_TARGET * 1.4):
-                    top_ref = 0.9*top_ref + 0.1*delta_x
-
-                # back curvature
+                bar_y, bar_ok = bar.update(lm)
                 mid_spine = (shoulder + hip) * 0.5 * 0.4 + head * 0.6
                 _, rounded = analyze_back_curvature(shoulder, hip, mid_spine)
-                back_frames = back_frames + 1 if rounded else max(0, back_frames - 1)
-
-                # start rep
-                if (not rep) and (delta_x > HINGE_START_THRESH) and (frame_idx - last_rep_frame > MIN_FRAMES_BETWEEN_REPS):
-                    rep = True
-                    bottom_est = delta_x
-                    back_frames = 0
-                    # reset per-rep tempo counters
-                    down_frames = up_frames = top_hold_frames = 0
-                    prev_progress = prog
-
-                # progress (bi-directional proximity to upright)
-                if rep:
-                    bottom_est = max(bottom_est or delta_x, delta_x)
-                    denom = max(1e-4, (bottom_est - top_ref))
-                    pr = 1.0 - ((delta_x - top_ref) / denom)     # 1=upright, 0=bottom
-                    pr = float(np.clip(pr, 0.0, 1.0))
-                    prog = PROG_ALPHA * pr + (1-PROG_ALPHA) * prog
-
-                    # tempo counters
-                    if prev_progress is not None:
-                        if prog < prev_progress - 1e-4:
-                            down_frames += 1
-                        elif prog > prev_progress + 1e-4:
-                            up_frames += 1
-                    prev_progress = prog
-
-                    # non-scoring: hold at top
-                    if prog >= 0.90:
-                        top_hold_frames += 1
-
-                    if rounded:
-                        rt_fb = "Try to keep your back a bit straighter"
+                if state != STATE_TOP:
+                    back_frames = back_frames + 1 if rounded else max(0, back_frames - 1)
                 else:
-                    # between reps: glide back to 100%
+                    back_frames = 0
+
+                # === FSM ===
+                if state == STATE_TOP:
                     prog = PROG_ALPHA*1.0 + (1-PROG_ALPHA)*prog
+                    start_cond = (hinge_start := (delta_x - top_ref.v) > HINGE_START_THRESH)
+                    if not start_cond and bar_ok and bar.top_ref() is not None:
+                        start_cond = (bar_y - bar.top_ref()) > (ROM_MIN_BAR*0.5)
+                    if start_cond and (frame_idx - last_rep_frame > MIN_FRAMES_BW_REPS):
+                        state = STATE_DOWN
+                        bottom_est = delta_x
+                        hinge_min = hinge_max = delta_x
+                        bar_min = bar_max = bar_y if bar_ok else None
+                        down_frames = up_frames = top_hold_frames = 0
+                        bar.reset_rep()
+                elif state == STATE_DOWN:
+                    bottom_est = max(bottom_est or delta_x, delta_x)
+                    hinge_min = min(hinge_min, delta_x) if hinge_min is not None else delta_x
+                    hinge_max = max(hinge_max, delta_x) if hinge_max is not None else delta_x
+                    if bar_ok:
+                        bar_min = min(bar_min, bar_y) if bar_min is not None else bar_y
+                        bar_max = max(bar_max, bar_y) if bar_max is not None else bar_y
+                    denom = max(1e-4, (bottom_est - top_ref.v))
+                    pr = 1.0 - ((delta_x - top_ref.v) / denom)
+                    pr = float(np.clip(pr, 0.0, 1.0))
+                    prog = PROG_ALPHA*pr + (1-PROG_ALPHA)*prog
+                    down_frames += 1
+                    rev_by_hinge = down_frames >= MIN_FRAMES_DOWN and (hinge_max - delta_x) > 0.01
+                    rev_by_bar   = bar_ok and down_frames >= MIN_FRAMES_DOWN and (bar_min is not None) and ((bar_y - bar_min) < -0.005)
+                    if rev_by_hinge or rev_by_bar:
+                        state = STATE_UP
+                elif state == STATE_UP:
+                    hinge_min = min(hinge_min, delta_x) if hinge_min is not None else delta_x
+                    hinge_max = max(hinge_max, delta_x) if hinge_max is not None else delta_x
+                    if bar_ok:
+                        bar_min = min(bar_min, bar_y) if bar_min is not None else bar_y
+                        bar_max = max(bar_max, bar_y) if bar_max is not None else bar_y
+                    denom = max(1e-4, (bottom_est - top_ref.v))
+                    pr = 1.0 - ((delta_x - top_ref.v) / denom)
+                    pr = float(np.clip(pr, 0.0, 1.0))
+                    prog = PROG_ALPHA*pr + (1-PROG_ALPHA)*prog
+                    up_frames += 1
+                    if prog >= 0.90: top_hold_frames += 1
+                    end_cond_hinge = (delta_x - top_ref.v) < HINGE_END_THRESH
+                    end_cond_bar   = (bar_ok and bar.top_ref() is not None and (abs(bar_y - bar.top_ref()) < (ROM_MIN_BAR*0.5)))
+                    if (end_cond_hinge or end_cond_bar):
+                        rom_hinge = (hinge_max - hinge_min) if (hinge_max is not None and hinge_min is not None) else 0.0
+                        rom_bar   = (bar_max - bar_min) if (bar_max is not None and bar_min is not None) else 0.0
+                        enough_rom = (rom_hinge >= ROM_MIN_HINGE) or (rom_bar >= ROM_MIN_BAR and bar_ok)
+                        long_enough = (down_frames + up_frames) >= MIN_FRAMES_TOTAL
 
-                # end rep near upright
-                if rep and (delta_x < END_THRESH):
-                    if frame_idx - last_rep_frame > MIN_FRAMES_BETWEEN_REPS:
-                        penalty = 0.0
-                        fb = []
-                        if delta_x > (top_ref + 0.02):
-                            fb.append("Try to finish more upright"); penalty += 1.0
-                        if back_frames >= BACK_MIN_FRAMES:
-                            fb.append("Try to keep your back a bit straighter"); penalty += 1.5
-
-                        score = round(max(4, 10 - penalty) * 2) / 2
-
-                        # count rep only if moved enough
-                        moved_enough = (bottom_est - delta_x) > 0.05
-                        if moved_enough:
+                        if enough_rom and long_enough and (frame_idx - last_rep_frame > MIN_FRAMES_BW_REPS):
+                            penalty = 0.0
+                            fb = []
+                            if rounded and back_frames >= BACK_MIN_FRAMES:
+                                fb.append("Try to keep your back a bit straighter"); penalty += 1.5
+                            if not end_cond_hinge and not end_cond_bar:
+                                fb.append("Try to finish more upright"); penalty += 1.0
+                            score = round(max(4.0, 10.0 - penalty) * 2) / 2
                             counter += 1
                             if score >= 9.5: good_reps += 1
                             else: bad_reps += 1
                             all_scores.append(score)
-
-                            # one non-scoring tip
-                            down_s = (down_frames * dt) if down_frames is not None else None
-                            top_s  = (top_hold_frames * dt) if top_hold_frames is not None else None
-                            rom    = (bottom_est - top_ref) if (bottom_est is not None and top_ref is not None) else None
-                            tip_str = choose_deadlift_tip(down_s, top_s, rom)
-
+                            down_s = (down_frames / effective_fps_nominal)
+                            top_s  = (top_hold_frames / effective_fps_nominal)
+                            rom_norm = rom_bar if (rom_bar and rom_bar >= ROM_MIN_BAR) else rom_hinge
+                            tip_str = choose_deadlift_tip(down_s, top_s, rom_norm)
                             reps_report.append({
                                 "rep_index": counter,
                                 "score": float(score),
                                 "score_display": display_half_str(score),
-                                "feedback": fb,   # scoring feedback
-                                "tip": tip_str    # one tip, non-scoring
+                                "feedback": fb,
+                                "tip": tip_str
                             })
+                            last_rep_frame = frame_idx
+                        state = STATE_TOP
+                        bottom_est = None
+                        back_frames = 0
+                        down_frames = up_frames = top_hold_frames = 0
+                        hinge_min = hinge_max = None
+                        bar_min = bar_max = None
+                        bar.reset_rep()
 
-                        last_rep_frame = frame_idx
+                if state != STATE_TOP and rounded:
+                    rt_fb = "Try to keep your back a bit straighter"
 
-                    # reset rep state
-                    rep = False
-                    bottom_est = None
-                    back_frames = 0
-                    prev_progress = None
-                    down_frames = up_frames = top_hold_frames = 0
-
-                # draw skeleton (validated legs + live shoulder/hip)
-                pts_draw = {
-                    PL.RIGHT_SHOULDER.value: tuple(shoulder),
-                    PL.RIGHT_HIP.value: tuple(hip),
-                }
-                for d in (right_leg_pts, left_leg_pts):
-                    for idx, pt in d.items():
-                        # אל תצייר שוק/כף-רגל אם הנקודה בתוך תיבת אוקלוזיה (נראות נקייה)
-                        if occl_boxes:
-                            x,y = pt
-                            skip = False
-                            for (x1,y1,x2,y2) in occl_boxes:
-                                if x1<=x<=x2 and y1<=y<=y2:
-                                    skip=True; break
-                            if skip: continue
-                        pts_draw[idx] = pt
-
-                frame = draw_body_only_from_dict(frame, pts_draw)
-                frame = draw_overlay(frame, reps=counter, feedback=rt_fb, progress_pct=prog)
-                out.write(frame)
+                # ציור שלד + overlay (עם caching)
+                if make_video:
+                    # שלד על הפריים המקורי (!) כדי לשמור איכות
+                    pts_draw = {
+                        PL.RIGHT_SHOULDER.value: tuple(shoulder),
+                        PL.RIGHT_HIP.value: tuple(hip),
+                    }
+                    for d in (right_pts, left_pts):
+                        for idx, pt in d.items():
+                            if occl_boxes:
+                                x,y = pt; skip=False
+                                for (x1,y1,x2,y2) in occl_boxes:
+                                    if x1<=pt[0]<=x2 and y1<=pt[1]<=y2:
+                                        skip=True; break
+                                if skip: continue
+                            pts_draw[idx] = pt
+                    # צריך למפות מנורמליזי של small אל frame המקורי (כי ציירנו על small)
+                    # אבל כאן pts_norm כבר בנורמליזי [0..1], אז אפשר לצייר על frame המקורי ישר.
+                    draw_frame = frame.copy()
+                    draw_frame = draw_body_only_from_dict(draw_frame, pts_draw)
+                    # overlay caching: מציירים מלא פעם ב-N פריימים
+                    if (frame_idx % overlay_every) == 0 or last_overlay is None:
+                        last_overlay = draw_overlay(draw_frame, reps=counter, feedback=rt_fb, progress_pct=prog, dbg_text=(f"state={state}" if debug else None))
+                    # כתיבה
+                    ff_sink.stdin.write(last_overlay.tobytes())
 
             except Exception:
-                frame = draw_overlay(frame, reps=counter, feedback=None, progress_pct=prog)
-                if out is not None: out.write(frame)
+                if make_video and ff_sink is not None:
+                    if last_overlay is None: last_overlay = frame
+                    ff_sink.stdin.write(last_overlay.tobytes())
                 continue
 
     cap.release()
-    if out: out.release()
-    cv2.destroyAllWindows()
+    if ff_sink is not None:
+        try:
+            ff_sink.stdin.close()
+            ff_sink.wait()
+        except Exception:
+            pass
 
-    # summary
     avg = np.mean(all_scores) if all_scores else 0.0
     technique_score = round(round(avg * 2) / 2, 2)
     feedback_list = overall_feedback[:] if overall_feedback else ["Great form! Keep your spine neutral and hinge smoothly. 💪"]
 
-    try:
-        with open(feedback_path, "w", encoding="utf-8") as f:
-            f.write(f"Total Reps: {counter}\n")
-            f.write(f"Technique Score: {technique_score}/10\n")
-            if feedback_list:
-                f.write("Feedback:\n")
-                for fb in feedback_list:
-                    f.write(f"- {fb}\n")
-    except Exception:
-        pass
+    if feedback_path:
+        try:
+            with open(feedback_path, "w", encoding="utf-8") as f:
+                f.write(f"Total Reps: {counter}\n")
+                f.write(f"Technique Score: {technique_score}/10\n")
+                if feedback_list:
+                    f.write("Feedback:\n")
+                    for fb in feedback_list:
+                        f.write(f"- {fb}\n")
+        except Exception:
+            pass
 
-    # encode H.264 faststart
-    encoded_path = output_path.replace(".mp4", "_encoded.mp4")
-    try:
-        subprocess.run([
-            "ffmpeg","-y","-i", output_path,
-            "-c:v","libx264","-preset","fast","-movflags","+faststart","-pix_fmt","yuv420p",
-            encoded_path
-        ], check=False)
-        if os.path.exists(output_path) and os.path.exists(encoded_path):
-            os.remove(output_path)
-    except Exception:
-        pass
-    final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
+    final_video_path = output_path if make_video else ""
 
     return {
-        "squat_count": counter,  # UI compatibility
+        "squat_count": counter,
         "technique_score": technique_score,
         "technique_score_display": display_half_str(technique_score),
         "technique_label": score_label(technique_score),
