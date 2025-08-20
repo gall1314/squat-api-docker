@@ -396,18 +396,31 @@ def run_deadlift_analysis(video_path,
                           detector_input_size=640,
                           detector_conf_thres=0.25,
                           detector_iou_thres=0.45,
-                          detector_class_ids=None  # e.g., {0,1}; None = treat all as occluders
+                          detector_class_ids=None,
+                          # NEW: API-compat flags
+                          return_video=True,
+                          fast_mode=None  # alias: if True -> no video
                           ):
+    """
+    API-compat:
+      - return_video=False  => מסלול מהיר בלי החזרת וידאו (ניתוח בלבד)
+      - return_video=True   => מסלול עם וידאו באיכות מקורית + אוברליי
+      - fast_mode=True      => זהה ל-return_video=False (כינוי רך לא לשבור קריאות)
+    """
+    if fast_mode is True:
+        return_video = False
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {
             "squat_count": 0, "technique_score": 0.0,
             "technique_score_display": display_half_str(0.0),
             "technique_label": score_label(0.0),
-            "good_reps": 0, "bad_reps": 0, "feedback": [],
+            "good_reps": 0, "bad_reps": 0, "feedback": ["Could not open video"],
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
 
+    # Optional YOLO occluder detector (נריץ גם במסלול מהיר, אבל זה לא חובה; אפשר לכבות אם תרצה)
     detector = None
     if detector_onnx_path and _ORT_AVAILABLE and os.path.exists(detector_onnx_path):
         try:
@@ -419,7 +432,7 @@ def run_deadlift_analysis(video_path,
                 occluder_class_ids=detector_class_ids
             )
         except Exception:
-            detector = None
+            detector = None  # fallback silently
 
     PL = mp.solutions.pose.PoseLandmark
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -460,52 +473,61 @@ def run_deadlift_analysis(video_path,
             if not ret: break
             frame_idx += 1
             if frame_idx % frame_skip != 0: continue
-            if scale != 1.0: frame = cv2.resize(frame, (0,0), fx=scale, fy=scale)
 
-            h, w = frame.shape[:2]
-            if out is None:
-                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
+            # מסלול מהיר עובד על scale (כמו קודם); במסלול וידאו זה גם הפריים שנכתוב
+            work = cv2.resize(frame, (0,0), fx=scale, fy=scale) if scale != 1.0 else frame
+
+            # פותחים VideoWriter רק אם רוצים וידאו חזרה
+            if return_video and out is None:
+                h0, w0 = work.shape[:2]
+                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w0, h0))
 
             occl_boxes = []
             if detector is not None:
                 try:
-                    occl_boxes = detector.infer(frame)
+                    occl_boxes = detector.infer(work)
                 except Exception:
                     occl_boxes = []
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(work, cv2.COLOR_BGR2RGB)
             res = pose.process(rgb)
 
             rt_fb = None
             if not res.pose_landmarks:
-                frame = draw_overlay(frame, reps=counter, feedback=None, progress_pct=prog)
-                out.write(frame); continue
+                if return_video:
+                    frame_drawn = draw_overlay(work.copy(), reps=counter, feedback=None, progress_pct=prog)
+                    out.write(frame_drawn)
+                continue
 
             try:
                 lm = res.pose_landmarks.landmark
                 shoulder = np.array([lm[PL.RIGHT_SHOULDER.value].x, lm[PL.RIGHT_SHOULDER.value].y], dtype=float)
                 hip      = np.array([lm[PL.RIGHT_HIP.value].x,      lm[PL.RIGHT_HIP.value].y],      dtype=float)
 
-                # head-like point
+                # head-like point (fallback: לא נעצור ניתוח אם אין)
                 head = None
                 for idx in (PL.RIGHT_EAR.value, PL.LEFT_EAR.value, PL.NOSE.value):
                     if lm[idx].visibility > 0.5:
                         head = np.array([lm[idx].x, lm[idx].y], dtype=float); break
-                if head is None:
-                    frame = draw_overlay(frame, reps=counter, feedback=None, progress_pct=prog)
-                    out.write(frame); continue
 
+                # legs trackers
                 right_leg_pts = right_leg.update(lm, dt, occlusion_boxes_norm=occl_boxes)
                 left_leg_pts  = left_leg.update(lm, dt, occlusion_boxes_norm=occl_boxes)
 
+                # hinge proxy: shoulder-hip horizontal delta
                 delta_x = abs(hip[0] - shoulder[0])
                 if delta_x < (STAND_DELTA_TARGET * 1.4):
                     top_ref = 0.9*top_ref + 0.1*delta_x
 
-                mid_spine = (shoulder + hip) * 0.5 * 0.4 + head * 0.6
-                _, rounded = analyze_back_curvature(shoulder, hip, mid_spine)
+                # back curvature (אם אין ראש — לא מפילים חזרה)
+                if head is not None:
+                    mid_spine = (shoulder + hip) * 0.5 * 0.4 + head * 0.6
+                    _, rounded = analyze_back_curvature(shoulder, hip, mid_spine)
+                else:
+                    rounded = False
                 back_frames = back_frames + 1 if rounded else max(0, back_frames - 1)
 
+                # start rep
                 if (not rep) and (delta_x > HINGE_START_THRESH) and (frame_idx - last_rep_frame > MIN_FRAMES_BETWEEN_REPS):
                     rep = True
                     bottom_est = delta_x
@@ -513,28 +535,25 @@ def run_deadlift_analysis(video_path,
                     down_frames = up_frames = top_hold_frames = 0
                     prev_progress = prog
 
+                # progress (bi-directional proximity to upright)
                 if rep:
                     bottom_est = max(bottom_est or delta_x, delta_x)
                     denom = max(1e-4, (bottom_est - top_ref))
-                    pr = 1.0 - ((delta_x - top_ref) / denom)
+                    pr = 1.0 - ((delta_x - top_ref) / denom)     # 1=upright, 0=bottom
                     pr = float(np.clip(pr, 0.0, 1.0))
                     prog = PROG_ALPHA * pr + (1-PROG_ALPHA) * prog
 
                     if prev_progress is not None:
-                        if prog < prev_progress - 1e-4:
-                            down_frames += 1
-                        elif prog > prev_progress + 1e-4:
-                            up_frames += 1
+                        if prog < prev_progress - 1e-4:   down_frames += 1
+                        elif prog > prev_progress + 1e-4: up_frames += 1
                     prev_progress = prog
 
-                    if prog >= 0.90:
-                        top_hold_frames += 1
-
-                    if rounded:
-                        rt_fb = "Try to keep your back a bit straighter"
+                    if prog >= 0.90: top_hold_frames += 1
+                    if rounded: rt_fb = "Try to keep your back a bit straighter"
                 else:
                     prog = PROG_ALPHA*1.0 + (1-PROG_ALPHA)*prog
 
+                # end rep near upright
                 if rep and (delta_x < END_THRESH):
                     if frame_idx - last_rep_frame > MIN_FRAMES_BETWEEN_REPS:
                         penalty = 0.0
@@ -544,119 +563,100 @@ def run_deadlift_analysis(video_path,
                         if back_frames >= BACK_MIN_FRAMES:
                             fb.append("Try to keep your back a bit straighter"); penalty += 1.5
 
-                        score = round(max(4, 10 - penalty) * 2) / 2  # perfect → 10.0
-
+                        score = round(max(4, 10 - penalty) * 2) / 2
                         moved_enough = (bottom_est - delta_x) > 0.05
                         if moved_enough:
                             counter += 1
                             if score >= 9.5: good_reps += 1
                             else: bad_reps += 1
-                            # keep feedback ONLY if score < 10
-                            rep_fb = fb if score < 10.0 else []
-                            # one non-scoring tip
                             down_s = (down_frames * dt) if down_frames is not None else None
                             top_s  = (top_hold_frames * dt) if top_hold_frames is not None else None
                             rom    = (bottom_est - top_ref) if (bottom_est is not None and top_ref is not None) else None
                             tip_str = choose_deadlift_tip(down_s, top_s, rom)
+                            # שמים feedback רק כשיש הורדת ציון
+                            rep_fb = fb if score < 10.0 else []
                             reps_report.append({
                                 "rep_index": counter,
                                 "score": float(score),
                                 "score_display": display_half_str(score),
-                                "feedback": rep_fb,   # only issues
+                                "feedback": rep_fb,
                                 "tip": tip_str
                             })
                             all_scores.append(score)
-
                         last_rep_frame = frame_idx
 
+                    # reset
                     rep = False
                     bottom_est = None
                     back_frames = 0
                     prev_progress = None
                     down_frames = up_frames = top_hold_frames = 0
 
-                # draw skeleton & overlay
-                pts_draw = {
-                    PL.RIGHT_SHOULDER.value: tuple(shoulder),
-                    PL.RIGHT_HIP.value: tuple(hip),
-                }
-                for d in (right_leg_pts, left_leg_pts):
-                    for idx, pt in d.items():
-                        if occl_boxes:
-                            x,y = pt
-                            skip=False
-                            for (x1,y1,x2,y2) in occl_boxes:
-                                if x1<=x<=x2 and y1<=y<=y2:
-                                    skip=True; break
-                            if skip: continue
-                        pts_draw[idx] = pt
-
-                frame = draw_body_only_from_dict(frame, pts_draw)
-                frame = draw_overlay(frame, reps=counter, feedback=rt_fb, progress_pct=prog)
-                out.write(frame)
+                # ציור רק אם return_video=True
+                if return_video:
+                    pts_draw = {
+                        PL.RIGHT_SHOULDER.value: tuple(shoulder),
+                        PL.RIGHT_HIP.value: tuple(hip),
+                    }
+                    for d in (right_leg_pts, left_leg_pts):
+                        for idx, pt in d.items():
+                            if occl_boxes:
+                                x,y = pt
+                                if any(x1<=x<=x2 and y1<=y<=y2 for (x1,y1,x2,y2) in occl_boxes):
+                                    continue
+                            pts_draw[idx] = pt
+                    work_drawn = draw_body_only_from_dict(work.copy(), pts_draw)
+                    work_drawn = draw_overlay(work_drawn, reps=counter, feedback=rt_fb, progress_pct=prog)
+                    out.write(work_drawn)
 
             except Exception:
-                frame = draw_overlay(frame, reps=counter, feedback=None, progress_pct=prog)
-                if out is not None: out.write(frame)
+                if return_video and out is not None:
+                    out.write(draw_overlay(work.copy(), reps=counter, feedback=None, progress_pct=prog))
                 continue
 
     cap.release()
-    if out: out.release()
+    if return_video and out: out.release()
     cv2.destroyAllWindows()
 
-    # summary score (perfect form can be 10.0)
     avg = np.mean(all_scores) if all_scores else 0.0
     technique_score = round(round(avg * 2) / 2, 2)
 
-    # ---- NEW: aggregate only problems from reps (score < 10), unique & ordered ----
-    seen = set()
-    feedback_list = []
+    # Aggregate ONLY issues from reps (score<10), unique+ordered
+    seen = set(); feedback_list = []
     for r in reps_report:
-        if float(r.get("score") or 0.0) >= 10.0:
-            continue
+        if float(r.get("score") or 0.0) >= 10.0: continue
         for msg in (r.get("feedback") or []):
             if msg and msg not in seen:
-                seen.add(msg)
-                feedback_list.append(msg)
-    # no generic fallback — leave [] if הכל מושלם
+                seen.add(msg); feedback_list.append(msg)
 
-    # write text file (optional)
-    try:
-        with open(feedback_path, "w", encoding="utf-8") as f:
-            f.write(f"Total Reps: {counter}\n")
-            f.write(f"Technique Score: {technique_score}/10\n")
-            if feedback_list:
-                f.write("Feedback:\n")
-                for fb in feedback_list:
-                    f.write(f"- {fb}\n")
-    except Exception:
-        pass
-
-    # encode H.264 faststart
-    encoded_path = output_path.replace(".mp4", "_encoded.mp4")
-    try:
-        subprocess.run([
-            "ffmpeg","-y","-i", output_path,
-            "-c:v","libx264","-preset","fast","-movflags","+faststart","-pix_fmt","yuv420p",
-            encoded_path
-        ], check=False)
-        if os.path.exists(output_path) and os.path.exists(encoded_path):
-            os.remove(output_path)
-    except Exception:
-        pass
-    final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
+    final_video_path = ""
+    if return_video:
+        # encode H.264 faststart
+        encoded_path = output_path.replace(".mp4", "_encoded.mp4")
+        try:
+            subprocess.run([
+                "ffmpeg","-y","-i", output_path,
+                "-c:v","libx264","-preset","fast","-movflags","+faststart","-pix_fmt","yuv420p",
+                encoded_path
+            ], check=False)
+            if os.path.exists(output_path) and os.path.exists(encoded_path):
+                os.remove(output_path)
+        except Exception:
+            pass
+        final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
 
     return {
-        "squat_count": counter,  # UI compatibility
+        "squat_count": counter,
         "technique_score": technique_score,
         "technique_score_display": display_half_str(technique_score),
         "technique_label": score_label(technique_score),
         "good_reps": good_reps,
         "bad_reps": bad_reps,
-        "feedback": feedback_list,   # ONLY issues (may be [])
-        "reps": reps_report,         # per-rep: issues only when score<10 + a non-scoring tip
+        "feedback": feedback_list,   # רק בעיות; אם מושלם – []
+        "reps": reps_report,
         "video_path": final_video_path,
         "feedback_path": feedback_path
     }
+
 
 
