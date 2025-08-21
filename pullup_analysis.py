@@ -167,31 +167,32 @@ def score_label(s):
 # ===================== Thresholds / Params (base) =====================
 CHIN_RELAX = float(os.getenv("CHIN_RELAX", "0.85"))  # 15% ריכוך
 
-VIS_THR_STRICT = 0.55
-HEAD_EMA_ALPHA = 0.35
-ELBOW_EMA_ALPHA = 0.35
-
-HEAD_MIN_ASCENT = 0.06          # יחסית לגובה הפריים
+# ספים (גמישים, כמו שעבד לך קודם)
+ELBOW_TOP_ANGLE = 100.0          # ≤100° מספיק כפוף לטופ
+HEAD_MIN_ASCENT = 0.06           # יחסית לגובה הפריים
 HEAD_VEL_UP_TINY = -0.0008
 
-ELBOW_TOP_ANGLE = 72.0
-RESET_ELBOW = 158.0
+VIS_THR_STRICT = 0.55
+ELBOW_EMA_ALPHA = 0.35
+HEAD_EMA_ALPHA  = 0.35
+
+RESET_ELBOW   = 158.0
 RESET_DESCENT = 0.04
+
+WRIST_VIS_THR = 0.45
+WRIST_ABOVE_HEAD_MARGIN = 0.04
+TORSO_X_THR   = 0.012
 
 ONBAR_MIN_FRAMES = 2
 OFFBAR_MIN_FRAMES = 3
 
-WRIST_VIS_THR = 0.45
-WRIST_ABOVE_HEAD_MARGIN = 0.04
-
-TORSO_X_THR = 0.012
 SWING_THR = 0.012
 SWING_MIN_STREAK = 6
 
 REFRACTORY_FRAMES = 8
 
 AUTO_STOP_AFTER_EXIT_SEC = 1.5
-TAIL_NOPOSE_STOP_SEC = 1.2
+TAIL_NOPOSE_STOP_SEC     = 1.2
 
 # Bottom extension
 BOTTOM_EXT_MIN_ANGLE = 168.0
@@ -210,6 +211,9 @@ FB_WEIGHTS = {
 }
 FB_DEFAULT_WEIGHT   = 0.5
 PENALTY_MIN_IF_ANY  = 0.5
+
+# Debug
+DEBUG_ONBAR = bool(int(os.getenv("DEBUG_ONBAR", "0")))
 
 # ===================== MAIN =====================
 def run_pullup_analysis(video_path,
@@ -251,32 +255,29 @@ def run_pullup_analysis(video_path,
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
     sec_to_frames = lambda s: max(1, int(s * effective_fps))
 
-    # --- התאמות אפקטיביות לדילוג פריימים/fast ---
+    # --- התאמות לדילוג פריימים/fast ---
     FS = max(1, int(frame_skip))
-
-    HEAD_MIN_ASCENT_EFF = HEAD_MIN_ASCENT * CHIN_RELAX
-    if FS >= 3:
-        HEAD_MIN_ASCENT_EFF *= 0.75
-
+    HEAD_MIN_ASCENT_EFF = HEAD_MIN_ASCENT * CHIN_RELAX * (0.75 if FS >= 3 else 1.0)
     REFR_EFF = max(1, int(round(REFRACTORY_FRAMES / FS)))
-    if fast_mode:
-        REFR_EFF = 1
-
+    if fast_mode: REFR_EFF = 1
     RESET_DESCENT_EFF = max(RESET_DESCENT * 0.35, RESET_DESCENT / max(1.0, FS*0.8))
 
-    # שער on-bar “רך” יותר ב-fast כדי לא ליפול ל-0 חזרות
+    # on-bar רך יותר ב-fast
     if fast_mode:
-        VIS_EFF = min(VIS_THR_STRICT, 0.40)
+        VIS_EFF   = min(VIS_THR_STRICT, 0.35)
+        WRIST_VIS_EFF = 0.25
         WRIST_MARGIN_EFF = WRIST_ABOVE_HEAD_MARGIN * 0.7
         TORSO_X_EFF = TORSO_X_THR * 1.6
     else:
-        VIS_EFF = VIS_THR_STRICT
+        VIS_EFF   = VIS_THR_STRICT
+        WRIST_VIS_EFF = WRIST_VIS_THR
         WRIST_MARGIN_EFF = WRIST_ABOVE_HEAD_MARGIN
         TORSO_X_EFF = TORSO_X_THR
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
     frame_idx = 0
+    eff_idx = 0  # מספר הפריימים "המעובדים" אחרי הדילוג
 
     # Counters
     rep_count=0; good_reps=0; bad_reps=0
@@ -324,11 +325,18 @@ def run_pullup_analysis(video_path,
     with mp_pose.Pose(model_complexity=model_complexity,
                       min_detection_confidence=0.5,
                       min_tracking_confidence=0.5) as pose:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret: break
+        while True:
+            grabbed = cap.grab()
+            if not grabbed: break
             frame_idx += 1
-            if frame_idx % frame_skip != 0: continue
+
+            if frame_idx % FS != 0:
+                # לא מפענחים פריימים שלא נשתמש בהם → חיסכון בזמן
+                continue
+
+            ret, frame = cap.retrieve()
+            if not ret: break
+            eff_idx += 1
 
             if scale != 1.0:
                 frame = cv2.resize(frame, (0,0), fx=scale, fy=scale)
@@ -342,7 +350,7 @@ def run_pullup_analysis(video_path,
 
             if not res.pose_landmarks:
                 nopose_frames_since_any_rep = (nopose_frames_since_any_rep + 1) if rep_count>0 else 0
-                if rep_count>0 and nopose_frames_since_any_rep >= NOPOSE_STOP_FRAMES:
+                if rep_count>0 and nopose_frames_since_any_rep >= sec_to_frames(TAIL_NOPOSE_STOP_SEC):
                     break
                 if return_video and out is not None:
                     frame = draw_overlay(frame, reps=rep_count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=0.0)
@@ -354,7 +362,7 @@ def run_pullup_analysis(video_path,
             lms = res.pose_landmarks.landmark
             side, S,E,W = _pick_side_dyn(lms)
 
-            # strict visibility (יעבור ל-VIS_EFF)
+            # strict visibility (עם VIS_EFF)
             min_vis = min(lms[NOSE].visibility, lms[S].visibility, lms[E].visibility, lms[W].visibility)
             vis_strict_ok = (min_vis >= VIS_EFF)
 
@@ -377,14 +385,18 @@ def run_pullup_analysis(video_path,
 
             # On/Off-bar gating (עם ריכוך ב-fast)
             lw_vis = lms[LW].visibility; rw_vis = lms[RW].visibility
-            lw_above = (lw_vis >= WRIST_VIS_THR) and (lms[LW].y < lms[NOSE].y - WRIST_MARGIN_EFF)
-            rw_above = (rw_vis >= WRIST_VIS_THR) and (lms[RW].y < lms[NOSE].y - WRIST_MARGIN_EFF)
+            lw_above = (lw_vis >= WRIST_VIS_EFF) and (lms[LW].y < lms[NOSE].y - WRIST_MARGIN_EFF)
+            rw_above = (rw_vis >= WRIST_VIS_EFF) and (lms[RW].y < lms[NOSE].y - WRIST_MARGIN_EFF)
             grip = (lw_above or rw_above)
 
             if vis_strict_ok and grip and (torso_dx_norm <= TORSO_X_EFF):
                 onbar_streak += 1; offbar_streak = 0
             else:
                 offbar_streak += 1; onbar_streak = 0
+
+            if DEBUG_ONBAR and eff_idx % 10 == 0:
+                print(f"[DBG] eff={eff_idx} onbar={onbar} visMin={min_vis:.2f} lwVis={lw_vis:.2f} rwVis={rw_vis:.2f} "
+                      f"lwAbove={lw_above} rwAbove={rw_above} torsoDx={torso_dx_norm:.4f}")
 
             if not onbar and onbar_streak >= ONBAR_MIN_FRAMES:
                 onbar = True; asc_base_head = None; allow_new_peak = True
@@ -396,7 +408,7 @@ def run_pullup_analysis(video_path,
 
             if not onbar and rep_count>0:
                 offbar_frames_since_any_rep += 1
-                if offbar_frames_since_any_rep >= OFFBAR_STOP_FRAMES:
+                if offbar_frames_since_any_rep >= sec_to_frames(AUTO_STOP_AFTER_EXIT_SEC):
                     break
 
             # Counting (ON-BAR)
@@ -405,7 +417,7 @@ def run_pullup_analysis(video_path,
 
             if onbar and vis_strict_ok:
                 if asc_base_head is None:
-                    if head_vel < -abs(HEAD_VEL_UP_TINY):   # עלייה (y יורד)
+                    if head_vel < -abs(HEAD_VEL_UP_TINY):
                         asc_base_head = head_y
                         rep_penalty_current = 0.0
                 else:
