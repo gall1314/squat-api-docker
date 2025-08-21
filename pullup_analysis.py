@@ -13,6 +13,20 @@
 import os, cv2, math, numpy as np, subprocess
 from PIL import ImageFont, ImageDraw, Image
 
+# ---- Feedback cues & scoring (restored) ----
+FB_CUE_HIGHER = "Try to pull a little higher"
+FB_CUE_BOTTOM = "Fully extend arms at the bottom"
+FB_CUE_SWING  = "Try to reduce momentum"
+
+FB_WEIGHTS = {
+    FB_CUE_HIGHER: 0.5,
+    FB_CUE_BOTTOM: 0.7,
+    FB_CUE_SWING:  0.7,
+}
+FB_DEFAULT_WEIGHT = 0.5         # אם תתווסף הערה שלא ברשימה
+PENALTY_MIN_IF_ANY = 0.5        # עונש מינימלי אם יש בכלל פידבק
+
+
 # ===================== STYLE / FONTS (like squat) =====================
 BAR_BG_ALPHA         = 0.55
 DONUT_RADIUS_SCALE   = 0.72
