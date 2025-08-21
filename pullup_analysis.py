@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-# pullup_analysis.py — keep original rep counting (27/27) + face-only "higher" feedback
-# Rep counting logic unchanged (elbow+ascent, refractory, post-hoc).
-# ONLY the "not high enough" feedback cue uses face-vs-bar (chin/eyes vs wrists).
+# pullup_analysis.py — keep original rep counting (27/27) + softened "higher" feedback
+# ספירה נשארת 1:1 כמו אצלך; רק הפידבק "Go a bit higher" רוכך.
+# "חזרה טובה" = חזרה בלי שום טיפ במחזור.
 
 import os, cv2, math, numpy as np, subprocess
 from PIL import ImageFont, ImageDraw, Image
@@ -62,7 +62,7 @@ def _wrap_two_lines(draw, text, font, max_width):
         lines[-1]=last
     return lines
 
-# ---------- Draw body-only ----------
+# ---------- Draw body-only (ללא פנים) ----------
 _FACE_LMS=set(); _BODY_CONNECTIONS=tuple(); _BODY_POINTS=tuple()
 if mp_pose:
     _FACE_LMS={
@@ -128,7 +128,7 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
             draw.text((tx,ty),ln,font=FEEDBACK_FONT,fill=(255,255,255)); ty+=line_h+4
     return cv2.cvtColor(np.array(pil),cv2.COLOR_RGB2BGR)
 
-# ---------- Params (rep counting stays as original) ----------
+# ---------- Params (ספירה מקורית) ----------
 ELBOW_TOP_ANGLE=100.0
 HEAD_MIN_ASCENT=0.0075
 RESET_DESCENT=0.0045
@@ -154,8 +154,11 @@ BOTTOM_EXT_MIN_ANGLE=155.0; BOTTOM_HYST_DEG=3.0; BOTTOM_FAIL_MIN_REPS=2
 DEBUG_ONBAR=bool(int(os.getenv("DEBUG_ONBAR","0")))
 
 # ---- Face-vs-bar ONLY for the HIGHER feedback (does NOT affect counting) ----
-CHIN_BAR_MARGIN   = float(os.getenv("CHIN_BAR_MARGIN", "0.006"))  # רך לסנטר/פה
-EYE_BAR_MARGIN    = float(os.getenv("EYE_BAR_MARGIN",  "0.012"))  # קשוח יותר לעיניים
+CHIN_BAR_MARGIN   = float(os.getenv("CHIN_BAR_MARGIN", "0.006"))  # סף "עבר" לסנטר/פה
+EYE_BAR_MARGIN    = float(os.getenv("EYE_BAR_MARGIN",  "0.012"))  # סף "עבר" לעיניים (קשוח יותר)
+# "קרוב מספיק" כדי לא לתת טיפ (מרכך):
+CHIN_NEAR_EXTRA   = float(os.getenv("CHIN_NEAR_EXTRA","0.004"))   # מרווח נוסף לסנטר לא לקבל טיפ
+EYE_NEAR_RELAX    = float(os.getenv("EYE_NEAR_RELAX","0.003"))    # הקלה לעיניים לא לקבל טיפ
 BAR_EMA_ALPHA     = float(os.getenv("BAR_EMA_ALPHA",   "0.30"))
 MOUTH_VIS_THR     = float(os.getenv("MOUTH_VIS_THR",   "0.50"))
 EYE_VIS_THR       = float(os.getenv("EYE_VIS_THR",     "0.50"))
@@ -215,9 +218,12 @@ def run_pullup_analysis(video_path,
     onbar=False; onbar_streak=0; offbar_streak=0; prev_torso_cx=None
     offbar_frames_since_any_rep=0; nopose_frames_since_any_rep=0
 
-    session_feedback=set(); rt_fb_msg=None; rt_fb_hold=0; rep_penalty_current=0.0
+    session_feedback=set(); rt_fb_msg=None; rt_fb_hold=0
     swing_streak=0; swing_already_reported=False
     bottom_already_reported=False; bottom_phase_max_elbow=None; bottom_fail_count=0
+
+    # per-cycle tips
+    cycle_tip_higher=False; cycle_tip_swing=False; cycle_tip_bottom=False
 
     OFFBAR_STOP_FRAMES=sec_to_frames(AUTO_STOP_AFTER_EXIT_SEC)
     NOPOSE_STOP_FRAMES=sec_to_frames(TAIL_NOPOSE_STOP_SEC)
@@ -225,9 +231,10 @@ def run_pullup_analysis(video_path,
 
     REARM_DESCENT_EFF=max(RESET_DESCENT*0.60, 0.012)
 
-    # face vs bar (ONLY for feedback)
+    # face vs bar (feedback only)
     bar_y_ema=None
-    cycle_face_over_bar=False   # נצבר פר מחזור לצורך פידבק בלבד
+    cycle_face_pass=False        # עבר קו־מוט (מחמיר)
+    cycle_face_near=False        # קרוב מספיק → לא נותנים טיפ
 
     with mp_pose.Pose(model_complexity=model_complexity, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while True:
@@ -291,23 +298,26 @@ def run_pullup_analysis(video_path,
             if (not onbar) and onbar_streak>=ONBAR_MIN_FRAMES:
                 onbar=True
                 asc_base_head=None; allow_new_peak=True; swing_streak=0
-                rep_penalty_current=0.0
+                # reset cycle
                 cycle_peak_ascent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
-                cycle_face_over_bar=False  # reset per-cycle (feedback only)
+                cycle_tip_higher=False; cycle_tip_swing=False; cycle_tip_bottom=False
+                cycle_face_pass=False;  cycle_face_near=False
 
             if onbar and offbar_streak>=OFFBAR_MIN_FRAMES:
+                # פוסט-הוק ספירה (מקורי)
                 if (not counted_this_cycle) and (cycle_peak_ascent>=HEAD_MIN_ASCENT) and (cycle_min_elbow<=ELBOW_TOP_ANGLE):
-                    _count_rep(rep_reports,rep_count,rep_penalty_current,cycle_min_elbow,
+                    # קובעים האם היה טיפ במחזור (חזרה טובה = בלי טיפ)
+                    rep_has_tip = cycle_tip_higher or cycle_tip_swing or cycle_tip_bottom
+                    rep_penalty = 0.5 if rep_has_tip else 0.0
+                    _count_rep(rep_reports,rep_count,rep_penalty,cycle_min_elbow,
                                asc_base_head if asc_base_head is not None else head_y,
                                baseline_head_y_global-cycle_peak_ascent if baseline_head_y_global is not None else head_y,
-                               all_scores); rep_count+=1
-                    good_reps,bad_reps=_mark_good_bad(all_scores[-1],good_reps,bad_reps)
-                    # אם במהלך המחזור לא ראינו פנים מעל המוט → פידבק בלבד (לא משפיע על הספירה)
-                    if not cycle_face_over_bar:
-                        session_feedback.add(FB_CUE_HIGHER)
+                               all_scores, rep_has_tip)
+                    rep_count+=1
+                    if rep_has_tip: bad_reps+=1
+                    else: good_reps+=1
                 onbar=False; offbar_frames_since_any_rep=0
                 asc_base_head=None; cycle_peak_ascent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
-                cycle_face_over_bar=False
 
             if (not onbar) and rep_count>0:
                 offbar_frames_since_any_rep+=1
@@ -320,7 +330,7 @@ def run_pullup_analysis(video_path,
                 # --------- REP COUNTING (מקורי) ----------
                 if asc_base_head is None:
                     if head_vel<-abs(HEAD_VEL_UP_TINY):
-                        asc_base_head=head_y; rep_penalty_current=0.0
+                        asc_base_head=head_y
                         cycle_peak_ascent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
                 else:
                     cycle_peak_ascent=max(cycle_peak_ascent,(asc_base_head-head_y))
@@ -330,17 +340,21 @@ def run_pullup_analysis(video_path,
                     reset_by_elb =(elbow_angle>=RESET_ELBOW)
                     if reset_by_desc or reset_by_elb:
                         if (not counted_this_cycle) and (cycle_peak_ascent>=HEAD_MIN_ASCENT) and (cycle_min_elbow<=ELBOW_TOP_ANGLE):
-                            _count_rep(rep_reports,rep_count,rep_penalty_current,cycle_min_elbow,
+                            rep_has_tip = cycle_tip_higher or cycle_tip_swing or cycle_tip_bottom
+                            rep_penalty = 0.5 if rep_has_tip else 0.0
+                            _count_rep(rep_reports,rep_count,rep_penalty,cycle_min_elbow,
                                        asc_base_head,
                                        baseline_head_y_global-cycle_peak_ascent if baseline_head_y_global is not None else head_y,
-                                       all_scores); rep_count+=1
-                            good_reps,bad_reps=_mark_good_bad(all_scores[-1],good_reps,bad_reps)
-                            # פידבק "גבוה יותר" אם לאורך המחזור לא היה מעבר פנים מעל המוט
-                            if not cycle_face_over_bar:
-                                session_feedback.add(FB_CUE_HIGHER)
-                        asc_base_head=head_y; rep_penalty_current=0.0
+                                       all_scores, rep_has_tip)
+                            rep_count+=1
+                            if rep_has_tip: bad_reps+=1
+                            else: good_reps+=1
+                        asc_base_head=head_y
                         cycle_peak_ascent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
                         allow_new_peak=True; bottom_already_reported=False; bottom_phase_max_elbow=None
+                        # reset tips per תנועה חדשה
+                        cycle_tip_higher=False; cycle_tip_swing=False; cycle_tip_bottom=False
+                        cycle_face_pass=False;  cycle_face_near=False
 
                 ascent_amt=0.0 if asc_base_head is None else (asc_base_head-head_y)
 
@@ -350,14 +364,16 @@ def run_pullup_analysis(video_path,
                 can_cnt=(frame_idx - last_peak_frame) >= REFRACTORY_FRAMES
 
                 if at_top and allow_new_peak and can_cnt and (not counted_this_cycle):
-                    _count_rep(rep_reports,rep_count,rep_penalty_current,elbow_angle,
-                               asc_base_head if asc_base_head is not None else head_y, head_y, all_scores); rep_count+=1
-                    good_reps,bad_reps=_mark_good_bad(all_scores[-1],good_reps,bad_reps)
+                    rep_has_tip = cycle_tip_higher or cycle_tip_swing or cycle_tip_bottom
+                    rep_penalty = 0.5 if rep_has_tip else 0.0
+                    _count_rep(rep_reports,rep_count,rep_penalty,elbow_angle,
+                               asc_base_head if asc_base_head is not None else head_y, head_y,
+                               all_scores, rep_has_tip)
+                    rep_count+=1
+                    if rep_has_tip: bad_reps+=1
+                    else: good_reps+=1
                     last_peak_frame=frame_idx; allow_new_peak=False; counted_this_cycle=True
                     bottom_already_reported=False; bottom_phase_max_elbow=max(raw_elbow_L,raw_elbow_R)
-                    # גם כאן: אם לא עברנו בפנים מעל המוט במחזור → פידבק (הספירה כבר נעשתה)
-                    if not cycle_face_over_bar:
-                        session_feedback.add(FB_CUE_HIGHER)
 
                 if (allow_new_peak is False) and (last_peak_frame>0):
                     if head_prev is not None and (head_y - head_prev) > 0 and (asc_base_head is not None):
@@ -366,8 +382,8 @@ def run_pullup_analysis(video_path,
                             bottom_already_reported=False
                             bottom_phase_max_elbow=None
 
-                # --------- FEEDBACK ONLY: face-over-bar detection ----------
-                # קו-מוט מהמפרקים (y קטן = גבוה)
+                # --------- FEEDBACK ONLY: פנים מול קו-מוט (מרוכך) ----------
+                # קו-המוט מהפרקים (y קטן = גבוה)
                 cur_bar_y = min(lms[LW].y, lms[RW].y)
                 bar_y_ema = cur_bar_y if bar_y_ema is None else (BAR_EMA_ALPHA*cur_bar_y + (1 - BAR_EMA_ALPHA)*bar_y_ema)
                 bar_y_eff = bar_y_ema if bar_y_ema is not None else cur_bar_y
@@ -378,27 +394,33 @@ def run_pullup_analysis(video_path,
                 mouth_y = (lms[MOUTH_L].y + lms[MOUTH_R].y)*0.5 if mouth_ok else None
                 eye_min_y = min(lms[LEFT_EYE].y, lms[RIGHT_EYE].y) if eyes_ok else None
 
-                # עיניים חייבות לעבור יותר מסנטר
                 eye_margin = max(EYE_BAR_MARGIN, CHIN_BAR_MARGIN + 0.002)
 
                 passed_by_chin = (mouth_y is not None) and (mouth_y <= bar_y_eff + CHIN_BAR_MARGIN)
                 passed_by_eyes = (mouth_y is None) and (eye_min_y is not None) and (eye_min_y <= bar_y_eff - eye_margin)
+                # "קרוב מספיק" → לא נותנים טיפ:
+                near_by_chin  = (mouth_y is not None) and (mouth_y <= bar_y_eff + (CHIN_BAR_MARGIN + CHIN_NEAR_EXTRA))
+                # לעיניים מקלים קצת:
+                near_by_eyes  = (mouth_y is None) and (eye_min_y is not None) and (eye_min_y <= bar_y_eff - max(0.001, eye_margin - EYE_NEAR_RELAX))
 
-                # אם באחד הפריימים במחזור הייתה חציה → ייחשב ל"עבר" לצורך פידבק
                 if passed_by_chin or passed_by_eyes:
-                    cycle_face_over_bar = True
+                    cycle_face_pass = True
+                if near_by_chin or near_by_eyes:
+                    cycle_face_near = True
 
-                # פידבק בזמן אמת (רק להצגה; הספירה לא משתנה מזה)
-                if (asc_base_head is not None) and (ascent_amt < HEAD_MIN_ASCENT*0.7) and (head_vel < -abs(HEAD_VEL_UP_TINY)):
-                    # עדיין עולים, ועדיין לא עברנו בפנים → הצג טיפ
-                    if not cycle_face_over_bar:
-                        session_feedback.add(FB_CUE_HIGHER); cur_rt=FB_CUE_HIGHER
+                # טיפ "higher" מרוכך: מציגים/מסמנים רק אם לא עברנו וגם לא היינו "קרובים מספיק"
+                if (asc_base_head is not None) and (ascent_amt >= HEAD_MIN_ASCENT*0.50) and (head_vel < -abs(HEAD_VEL_UP_TINY)):
+                    if (not cycle_face_pass) and (not cycle_face_near):
+                        if not cycle_tip_higher:
+                            session_feedback.add(FB_CUE_HIGHER)
+                            cycle_tip_higher=True
+                            cur_rt = FB_CUE_HIGHER  # להצגה מידית
 
-                # Swing tip כבעבר
+                # Swing כרגיל
                 if torso_dx_norm>SWING_THR: swing_streak+=1
                 else: swing_streak=max(0,swing_streak-1)
-                if (cur_rt is None) and (swing_streak>=SWING_MIN_STREAK) and (not swing_already_reported):
-                    session_feedback.add(FB_CUE_SWING); cur_rt=FB_CUE_SWING; swing_already_reported=True
+                if (cur_rt is None) and (swing_streak>=SWING_MIN_STREAK) and (not cycle_tip_swing):
+                    session_feedback.add(FB_CUE_SWING); cur_rt=FB_CUE_SWING; cycle_tip_swing=True
 
             else:
                 asc_base_head=None; allow_new_peak=True
@@ -419,21 +441,23 @@ def run_pullup_analysis(video_path,
 
             if head_y is not None: head_prev=head_y
 
-    # EOF post-hoc כבעבר
+    # EOF post-hoc (כמו במקור, עם דירוג per-rep טוב/לא-טוב)
     if onbar and (not counted_this_cycle) and (cycle_peak_ascent>=HEAD_MIN_ASCENT) and (cycle_min_elbow<=ELBOW_TOP_ANGLE):
-        _count_rep(rep_reports,rep_count,rep_penalty_current,cycle_min_elbow,
+        rep_has_tip = cycle_tip_higher or cycle_tip_swing or cycle_tip_bottom
+        rep_penalty = 0.5 if rep_has_tip else 0.0
+        _count_rep(rep_reports,rep_count,rep_penalty,cycle_min_elbow,
                    asc_base_head if asc_base_head is not None else (baseline_head_y_global or 0.0),
                    (baseline_head_y_global - cycle_peak_ascent) if baseline_head_y_global is not None else (baseline_head_y_global or 0.0),
-                   all_scores); rep_count+=1
-        good_reps,bad_reps=_mark_good_bad(all_scores[-1],good_reps,bad_reps)
-        if not cycle_face_over_bar:
-            session_feedback.add(FB_CUE_HIGHER)
+                   all_scores, rep_has_tip)
+        rep_count+=1
+        if rep_has_tip: bad_reps+=1
+        else: good_reps+=1
 
     cap.release()
     if return_video and out: out.release()
     cv2.destroyAllWindows()
 
-    # Session score (לא נוגעים בהיגיון שלך)
+    # Session score כמו קודם
     if rep_count==0: technique_score=0.0
     else:
         penalty = max(PENALTY_MIN_IF_ANY, sum(FB_WEIGHTS.get(m,FB_DEFAULT_WEIGHT) for m in session_feedback)) if session_feedback else 0.0
@@ -478,20 +502,18 @@ def run_pullup_analysis(video_path,
     }
 
 # ---------- helpers ----------
-def _count_rep(rep_reports, rep_count, rep_penalty_current, top_elbow, ascent_from, peak_head_y, all_scores):
-    rep_score=max(0.0, 10.0 - rep_penalty_current)
+def _count_rep(rep_reports, rep_count, rep_penalty, top_elbow, ascent_from, peak_head_y, all_scores, rep_has_tip):
+    # ציון חזרה: 10 אם אין טיפ במחזור, אחרת 9.5 (חצי נקודה)
+    rep_score = 10.0 if not rep_has_tip else 9.5
     all_scores.append(rep_score)
     rep_reports.append({
         "rep_index": int(rep_count+1),
         "score": float(rep_score),
-        "good": bool(rep_score >= 10.0 - 1e-6),
+        "good": bool(not rep_has_tip),
         "top_elbow": float(top_elbow),
         "ascent_from": float(ascent_from),
         "peak_head_y": float(peak_head_y)
     })
-
-def _mark_good_bad(score, good, bad):
-    return (good+1, bad) if score >= 10.0 - 1e-6 else (good, bad+1)
 
 def _ret_err(msg, feedback_path):
     try:
@@ -508,3 +530,4 @@ def _ret_err(msg, feedback_path):
 
 def run_analysis(*args, **kwargs):
     return run_pullup_analysis(*args, **kwargs)
+
