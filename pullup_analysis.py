@@ -33,27 +33,19 @@ try:
 except Exception:
     mp_pose = None
 
-# ===================== Helpers =====================
-def _wrap_two_lines(draw, text, font, max_width):
-    words=text.split()
-    if not words: return [""]
-    lines, cur = [], ""
-    for w in words:
-        trial=(cur+" "+w).strip()
-        if draw.textlength(trial, font=font) <= max_width: cur=trial
-        else:
-            if cur: lines.append(cur)
-            cur=w
-    if cur: lines.append(cur)
-    if len(lines)<=1: return lines
-    # חתך עד שתי שורות
-    last = " ".join(lines[1:])
-    while last and draw.textlength(last+"…", font=font) > max_width:
-        last = last[:-2]
-    if last and last != lines[-1]:
-        lines[-1] = last + "…"
-    return lines
+def score_label(s):
+    s=float(s)
+    if s>=9.5: return "Excellent"
+    if s>=8.5: return "Very good"
+    if s>=7.0: return "Good"
+    if s>=5.5: return "Fair"
+    return "Needs work"
 
+def display_half_str(x):
+    q=round(float(x)*2)/2.0
+    return str(int(round(q))) if abs(q-round(q))<1e-9 else f"{q:.1f}"
+
+# ===================== BODY-ONLY skeleton (like squat) =====================
 _FACE_LMS = set()
 _BODY_CONNECTIONS = tuple()
 _BODY_POINTS = tuple()
@@ -86,6 +78,25 @@ def draw_body_only(frame, landmarks, color=(255,255,255)):
     return frame
 
 # ===================== Overlay (ללא כותרת "Pull-ups") =====================
+def _wrap_two_lines(draw, text, font, max_width):
+    words=text.split()
+    if not words: return [""]
+    lines, cur = [], ""
+    for w in words:
+        trial=(cur+" "+w).strip()
+        if draw.textlength(trial, font=font) <= max_width: cur=trial
+        else:
+            if cur: lines.append(cur)
+            cur=w
+        if len(lines)==2: break
+    if cur and len(lines)<2: lines.append(cur)
+    if len(lines)>=2 and draw.textlength(lines[-1], font=font) > max_width:
+        last = lines[-1]+"…"
+        while draw.textlength(last, font=font) > max_width and len(last)>1:
+            last = last[:-2]+"…"
+        lines[-1] = last
+    return lines
+
 def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
     h, w, _ = frame.shape
 
@@ -99,10 +110,8 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
     start_ang = -90; end_ang = start_ang + int(360 * pct)
     cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang, DEPTH_COLOR, thick, lineType=cv2.LINE_AA)
 
-    # ONE PIL pass
+    # ONE PIL pass (רק Reps, בלי טייטל)
     pil = Image.fromarray(frame); draw = ImageDraw.Draw(pil)
-
-    # Reps — פס שקוף + טקסט (ללא "Pull-ups")
     reps_text = f"Reps: {int(reps)}"
     pad_x, pad_y = 10, 6
     tw = draw.textlength(reps_text, font=REPS_FONT); th = REPS_FONT.size
@@ -136,93 +145,78 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
             tw2 = draw.textlength(ln, font=FEEDBACK_FONT); tx = max(12, (w-int(tw2))//2)
             draw.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255,255,255)); ty += line_h + 4
 
-    # חשוב: להחזיר BGR כדי למנוע "פילטר" צבעוני
+    # תיקון צבעים: להחזיר BGR (לא RGB)
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
+# ===================== Helpers =====================
 def _ang(a,b,c):
-    ax, ay = a; bx, by = b; cx, cy = c
-    v1x, v1y = ax-bx, ay-by
-    v2x, v2y = cx-bx, cy-by
-    d1 = math.hypot(v1x, v1y); d2 = math.hypot(v2x, v2y)
-    if d1<1e-6 or d2<1e-6: return 180.0
-    v1x /= d1; v1y /= d1; v2x /= d2; v2y /= d2
-    dot = max(-1.0, min(1.0, v1x*v2x + v1y*v2y))
-    return math.degrees(math.acos(dot))
+    ba=np.array([a[0]-b[0], a[1]-b[1]]); bc=np.array([c[0]-b[0], c[1]-b[1]])
+    den=(np.linalg.norm(ba)*np.linalg.norm(bc))+1e-9
+    cos=float(np.clip(np.dot(ba,bc)/den, -1, 1))
+    return float(np.degrees(np.arccos(cos)))
 
-def _ema(prev, x, alpha):
-    return x if prev is None else (alpha * x + (1.0 - alpha) * prev)
+def _ema(prev,new,alpha):
+    return float(new) if prev is None else (alpha*float(new) + (1-alpha)*float(prev))
 
-def _half_floor(x):
-    q = math.floor(float(x) * 2.0) / 2.0
-    return max(0.0, min(10.0, q))
+# ===================== Logic params =====================
+ELBOW_TOP_ANGLE      = 100.0   # ≤100° = מספיק כפוף
+HEAD_MIN_ASCENT      = 0.0075  # ~0.75% מגובה הפריים
+RESET_DESCENT        = 0.0045
+RESET_ELBOW          = 135.0
+REFRACTORY_FRAMES    = 2
+HEAD_VEL_UP_TINY     = 0.0002
+ELBOW_EMA_ALPHA      = 0.35
+HEAD_EMA_ALPHA       = 0.30
 
-def display_half_str(x):
-    q=round(float(x)*2)/2.0
-    return str(int(round(q))) if abs(q-round(q))<1e-9 else f"{q:.1f}"
+# On/Off-bar gating
+VIS_THR_STRICT       = 0.30
+WRIST_VIS_THR        = 0.20
+WRIST_ABOVE_HEAD_MARGIN = 0.02
+TORSO_X_THR          = 0.010
+ONBAR_MIN_FRAMES     = 2
+OFFBAR_MIN_FRAMES    = 6
+AUTO_STOP_AFTER_EXIT_SEC = 1.2
+TAIL_NOPOSE_STOP_SEC     = 1.0
 
-def score_label(s):
-    s = float(s)
-    if s>=9.0: return "Excellent"
-    if s>=7.0: return "Good"
-    if s>=5.5: return "Fair"
-    return "Needs work"
-
-# ===================== Thresholds / Params (ערכי המקור) =====================
-VIS_THR_STRICT = 0.55
-HEAD_EMA_ALPHA = 0.35
-ELBOW_EMA_ALPHA = 0.35
-
-HEAD_MIN_ASCENT = 0.06
-HEAD_VEL_UP_TINY = -0.0008
-
-ELBOW_TOP_ANGLE = 72.0
-RESET_ELBOW = 158.0
-RESET_DESCENT = 0.04
-
-ONBAR_MIN_FRAMES = 2
-OFFBAR_MIN_FRAMES = 3
-
-WRIST_VIS_THR = 0.45
-WRIST_ABOVE_HEAD_MARGIN = 0.04
-
-TORSO_X_THR = 0.012
-SWING_THR = 0.012
-SWING_MIN_STREAK = 6
-
-REFRACTORY_FRAMES = 8
-
-AUTO_STOP_AFTER_EXIT_SEC = 1.5
-TAIL_NOPOSE_STOP_SEC = 1.2
-
-# Bottom extension (מקורי)
-BOTTOM_EXT_MIN_ANGLE = 168.0
-BOTTOM_HYST_DEG      = 2.0
-BOTTOM_FAIL_MIN_REPS = 2
-
-# ===================== Feedback cues & scoring =====================
-FB_CUE_HIGHER = "Try to pull a little higher"
-FB_CUE_BOTTOM = "Fully extend arms at the bottom"
-FB_CUE_SWING  = "Try to reduce momentum"
+# ======= Feedback cues & weights =======
+FB_CUE_HIGHER   = "Go a bit higher (chin over bar)"
+FB_CUE_SWING    = "Reduce body swing (no kipping)"
+FB_CUE_BOTTOM   = "Fully extend arms at bottom"
 
 FB_WEIGHTS = {
     FB_CUE_HIGHER: 0.5,
-    FB_CUE_BOTTOM: 0.7,
-    FB_CUE_SWING:  0.7,
+    FB_CUE_SWING:  0.5,
+    FB_CUE_BOTTOM: 0.5,
 }
-FB_DEFAULT_WEIGHT = 0.5
-PENALTY_MIN_IF_ANY = 0.5
+FB_DEFAULT_WEIGHT   = 0.5
+PENALTY_MIN_IF_ANY  = 0.5
+def _half_floor(x: float) -> float:
+    return math.floor(x * 2.0) / 2.0
+
+# Swing detection
+SWING_THR            = 0.012
+SWING_MIN_STREAK     = 3
+
+# Bottom extension check
+BOTTOM_EXT_MIN_ANGLE = 155.0
+BOTTOM_HYST_DEG      = 3.0
+BOTTOM_FAIL_MIN_REPS = 2
 
 # ===================== MAIN =====================
 def run_pullup_analysis(video_path,
-                        frame_skip=3,
-                        scale=0.4,
+                        frame_skip=3,   # כמו סקווט
+                        scale=0.4,      # כמו סקווט
                         output_path="pullup_analyzed.mp4",
                         feedback_path="pullup_feedback.txt",
                         preserve_quality=False,
                         encode_crf=None,
+                        # ↓↓↓ הוספה לצורך "פיצול"
                         return_video=True,
                         fast_mode=None):
-    """preserve_quality=True => scale=1.0, frame_skip=1, encode CRF=18 (אם encode_crf לא סופק)."""
+    """
+    preserve_quality=True  =>  scale=1.0, frame_skip=1, encode CRF=18 (אם encode_crf לא סופק).
+    fast_mode=True         =>  עיבוד מהיר בלי ליצור וידאו (return_video=False).
+    """
     if fast_mode is True:
         return_video = False
 
@@ -306,6 +300,8 @@ def run_pullup_analysis(video_path,
             if scale != 1.0:
                 frame = cv2.resize(frame, (0,0), fx=scale, fy=scale)
             h, w = frame.shape[:2]
+
+            # יצירת VideoWriter רק אם מחזירים וידאו
             if return_video and out is None:
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w,h))
 
@@ -442,6 +438,7 @@ def run_pullup_analysis(video_path,
             else:
                 if rt_fb_hold > 0: rt_fb_hold -= 1
 
+            # ציור/כתיבה — רק אם מחזירים וידאו
             if return_video and out is not None:
                 frame = draw_body_only(frame, lms)
                 frame = draw_overlay(frame, reps=rep_count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=height_live)
