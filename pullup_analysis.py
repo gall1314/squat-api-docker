@@ -14,79 +14,178 @@ import os, cv2, math, numpy as np, subprocess
 from PIL import ImageFont, ImageDraw, Image
 
 # ===================== STYLE / FONTS (like squat) =====================
+BAR_BG_ALPHA         = 0.55
+DONUT_RADIUS_SCALE   = 0.72
+DONUT_THICKNESS_FRAC = 0.28
+DEPTH_COLOR          = (40, 200, 80)   # BGR
+DEPTH_RING_BG        = (70, 70, 70)
+
+FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
+REPS_FONT_SIZE = 28
+FEEDBACK_FONT_SIZE = 22
+DEPTH_LABEL_FONT_SIZE = 14
+DEPTH_PCT_FONT_SIZE   = 18
+
+def _load_font(path, size):
+    try: return ImageFont.truetype(path, size)
+    except Exception: return ImageFont.load_default()
+
+REPS_FONT        = _load_font(FONT_PATH, REPS_FONT_SIZE)
+FEEDBACK_FONT    = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
+DEPTH_LABEL_FONT = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
+DEPTH_PCT_FONT   = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
+
+# ===================== MediaPipe =====================
 try:
     import mediapipe as mp
     mp_pose = mp.solutions.pose
 except Exception:
     mp_pose = None
 
-FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-FONT_SMALL_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+# ===================== BODY LINES (no face) =====================
+_FACE_LMS = set()
+_BODY_CONNECTIONS = tuple()
+_BODY_POINTS = tuple()
+if mp_pose:
+    _FACE_LMS = {
+        mp_pose.PoseLandmark.NOSE.value,
+        mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
+        mp_pose.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose.PoseLandmark.RIGHT_EYE.value, mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
+        mp_pose.PoseLandmark.LEFT_EAR.value, mp_pose.PoseLandmark.RIGHT_EAR.value,
+        mp_pose.PoseLandmark.MOUTH_LEFT.value, mp_pose.PoseLandmark.MOUTH_RIGHT.value,
+    }
+    _BODY_CONNECTIONS = tuple((a,b) for (a,b) in mp_pose.POSE_CONNECTIONS if a not in _FACE_LMS and b not in _FACE_LMS)
+    _BODY_POINTS = tuple(sorted({i for conn in _BODY_CONNECTIONS for i in conn}))
 
-TITLE_FONT_SIZE = 28
-LABEL_FONT_SIZE = 18
-DEPTH_FONT_SIZE = 18
-DEPTH_PCT_FONT_SIZE   = 18
+def _dyn_thickness(h):
+    line = max(2, int(round(h * 0.002)))
+    dot  = max(3, int(round(h * 0.004)))
+    return line, dot
 
-def _load_font(path, size, fallback=ImageFont.load_default):
-    try:
-        if path and os.path.exists(path):
-            return ImageFont.truetype(path, size=size)
-    except Exception:
-        pass
-    try:
-        return ImageFont.truetype("DejaVuSans.ttf", size=size)
-    except Exception:
-        pass
-    return fallback()
+def draw_body_only(frame, landmarks, color=(255,255,255)):
+    h, w = frame.shape[:2]
+    line_thick, dot_r = _dyn_thickness(h)
+    for a, b in _BODY_CONNECTIONS:
+        pa, pb = landmarks[a], landmarks[b]
+        ax, ay = int(pa.x*w), int(pa.y*h); bx, by = int(pb.x*w), int(pb.y*h)
+        cv2.line(frame, (ax, ay), (bx, by), color, line_thick, cv2.LINE_AA)
+    for i in _BODY_POINTS:
+        p = landmarks[i]; x, y = int(p.x*w), int(p.y*h)
+        cv2.circle(frame, (x, y), dot_r, color, -1, cv2.LINE_AA)
+    return frame
 
-TITLE_FONT = _load_font(FONT_PATH, TITLE_FONT_SIZE)
-LABEL_FONT = _load_font(FONT_SMALL_PATH, LABEL_FONT_SIZE)
-DEPTH_FONT = _load_font(FONT_SMALL_PATH, DEPTH_FONT_SIZE)
-DEPTH_PCT_FONT = _load_font(FONT_SMALL_PATH, DEPTH_PCT_FONT_SIZE)
+# ===================== Overlay (single PIL pass; NO solid rect behind "Reps") =====================
+def _wrap_two_lines(draw, text, font, max_width):
+    words=text.split()
+    if not words: return [""]
+    lines, cur = [], ""
+    for w in words:
+        trial=(cur+" "+w).strip()
+        if draw.textlength(trial, font=font) <= max_width: cur=trial
+        else:
+            if cur: lines.append(cur)
+            cur=w
+    if cur: lines.append(cur)
+    if len(lines)<=1: return lines
+    return [lines[0], " ".join(lines[1:])[:200]]
 
-def _draw_text_pil(img_bgr, text, org, font, color=(255,255,255), anchor=None):
-    # img_bgr: np.ndarray BGR
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(img_rgb)
-    draw = ImageDraw.Draw(pil_img)
-    try:
-        draw.text(org, text, font=font, fill=color, anchor=anchor)
-    except Exception:
-        draw.text(org, text, fill=color)
-    new_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    return new_bgr
+def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
+    h, w = frame.shape[:2]
+    # Make a single PIL image from BGR for crisp text
+    pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil)
 
-# ===================== GEOMETRY / UTILS (like squat) =====================
+    # Right donut (height)
+    cx = w - max(40, int(w*0.06))
+    cy = int(h*0.22)
+    radius = int(min(w,h) * DONUT_RADIUS_SCALE * 0.12)
+    thickness = max(6, int(radius * DONUT_THICKNESS_FRAC))
+    bbox = (cx-radius, cy-radius, cx+radius, cy+radius)
 
-def _ang(a, b, c):
+    # Base ring
+    draw.arc(bbox, 0, 360, fill=DEPTH_RING_BG, width=thickness)
+    # Progress
+    pct = max(0.0, min(1.0, float(height_pct)))
+    end_angle = int(360 * pct)
+    draw.arc(bbox, -90, -90 + end_angle, fill=DEPTH_COLOR, width=thickness)
+
+    # Soft top bar (for reps + title)
+    pad_y = max(6, int(h*0.02))
+    base = np.array(pil)
+    overlay = base.copy()
+    cv2.rectangle(overlay, (0,0), (w, pad_y + 42), (0,0,0), -1)
+    base = cv2.addWeighted(overlay, BAR_BG_ALPHA, base, 1 - BAR_BG_ALPHA, 0)
+    pil = Image.fromarray(base); draw = ImageDraw.Draw(pil)
+
+    # Left side text (title + reps)
+    title = "Pull-ups"
+    title_w = draw.textlength(title, font=REPS_FONT)
+    pad_x = max(12, int(w*0.02))
+    draw.text((pad_x, pad_y), title, font=REPS_FONT, fill=(255,255,255))
+    reps_text = f"Reps: {int(reps)}"
+    draw.text((pad_x, pad_y-1), reps_text, font=REPS_FONT, fill=(255,255,255))
+
+    # Donut labels
+    gap = max(2, int(radius*0.10))
+    base_y = cy - (DEPTH_LABEL_FONT.size + gap + DEPTH_PCT_FONT.size)//2
+    label_txt = "HEIGHT"; pct_txt = f"{int(pct*100)}%"
+    lw = draw.textlength(label_txt, font=DEPTH_LABEL_FONT); pw = draw.textlength(pct_txt, font=DEPTH_PCT_FONT)
+    draw.text((cx - int(lw//2), base_y), label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
+    draw.text((cx - int(pw//2), base_y + DEPTH_LABEL_FONT.size + gap), pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
+
+    # Feedback bottom
+    if feedback:
+        max_w = int(w - 2*12 - 20)
+        lines = _wrap_two_lines(draw, feedback, FEEDBACK_FONT, max_w)
+        line_h = FEEDBACK_FONT.size + 6
+        block_h = 2*8 + len(lines)*line_h + (len(lines)-1)*4
+        y0 = max(0, h - max(6, int(h*0.02)) - block_h); y1 = h - max(6, int(h*0.02))
+        base2 = np.array(pil); over2 = base2.copy()
+        cv2.rectangle(over2, (0,y0), (w,y1), (0,0,0), -1)
+        base2 = cv2.addWeighted(over2, BAR_BG_ALPHA, base2, 1 - BAR_BG_ALPHA, 0)
+        pil = Image.fromarray(base2); draw = ImageDraw.Draw(pil)
+        ty = y0 + 8
+        for ln in lines:
+            tw2 = draw.textlength(ln, font=FEEDBACK_FONT); tx = max(12, (w-int(tw2))//2)
+            draw.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255,255,255)); ty += line_h + 4
+
+    return np.array(pil)
+
+# ===================== Helpers =====================
+def _ang(a,b,c):
     ax, ay = a; bx, by = b; cx, cy = c
     v1x, v1y = ax-bx, ay-by
     v2x, v2y = cx-bx, cy-by
-    d1 = math.hypot(v1x, v1y)
-    d2 = math.hypot(v2x, v2y)
+    d1 = math.hypot(v1x, v1y); d2 = math.hypot(v2x, v2y)
     if d1<1e-6 or d2<1e-6: return 180.0
-    v1x /= d1; v1y /= d1
-    v2x /= d2; v2y /= d2
-    dot = v1x*v2x + v1y*v2y
-    dot = max(-1.0, min(1.0, dot))
+    v1x /= d1; v1y /= d1; v2x /= d2; v2y /= d2
+    dot = max(-1.0, min(1.0, v1x*v2x + v1y*v2y))
     return math.degrees(math.acos(dot))
 
 def _ema(prev, x, alpha):
     return x if prev is None else (alpha * x + (1.0 - alpha) * prev)
 
 def _half_floor(x):
-    # round down to nearest 0.5
     q = math.floor(float(x) * 2.0) / 2.0
     return max(0.0, min(10.0, q))
 
-# ===================== THRESHOLDS / PARAMS (as previously used) =====================
+def display_half_str(x):
+    q=round(float(x)*2)/2.0
+    return str(int(round(q))) if abs(q-round(q))<1e-9 else f"{q:.1f}"
 
+def score_label(s):
+    s = float(s)
+    if s>=9.0: return "Excellent"
+    if s>=7.0: return "Good"
+    if s>=5.5: return "Fair"
+    return "Needs work"
+
+# ===================== Thresholds / Params =====================
 VIS_THR_STRICT = 0.55
 HEAD_EMA_ALPHA = 0.35
 ELBOW_EMA_ALPHA = 0.35
 
-HEAD_MIN_ASCENT = 0.06       # normalized by image height
+HEAD_MIN_ASCENT = 0.06
 HEAD_VEL_UP_TINY = -0.0008
 
 ELBOW_TOP_ANGLE = 72.0
@@ -108,110 +207,12 @@ REFRACTORY_FRAMES = 8
 AUTO_STOP_AFTER_EXIT_SEC = 1.5
 TAIL_NOPOSE_STOP_SEC = 1.2
 
-# bottom-phase extension check
-BOTTOM_EXT_MIN_ANGLE = 168.0
-BOTTOM_HYST_DEG      = 2.0
-BOTTOM_FAIL_MIN_REPS = 2
-
-# ===================== FEEDBACK / SCORING =====================
-
-FB_CUE_HIGHER = "Try to pull a little higher"
-FB_CUE_BOTTOM = "Fully extend arms at the bottom"
-FB_CUE_SWING  = "Try to reduce momentum"
-
-FB_WEIGHTS = {
-    FB_CUE_HIGHER: 0.5,
-    FB_CUE_BOTTOM: 0.7,
-    FB_CUE_SWING:  0.7,
-}
-FB_DEFAULT_WEIGHT = 0.5
-PENALTY_MIN_IF_ANY = 0.5
-
-def score_label(s):
-    s = float(s)
-    if s>=9.0: return "Excellent"
-    if s>=7.0: return "Good"
-    if s>=5.5: return "Fair"
-    return "Needs work"
-
-def display_half_str(x):
-    q=round(float(x)*2)/2.0
-    return str(int(round(q))) if abs(q-round(q))<1e-9 else f"{q:.1f}"
-
-# ===================== BODY-ONLY skeleton (like squat) =====================
-_FACE_LMS = set()
-_BODY_CONNECTIONS = tuple()
-_BODY_POINTS = tuple()
-if mp_pose:
-    _FACE_LMS = {
-        mp_pose.PoseLandmark.NOSE.value,
-        mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
-        mp_pose.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose.PoseLandmark.RIGHT_EYE.value, mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
-        mp_pose.PoseLandmark.LEFT_EAR.value, mp_pose.PoseLandmark.RIGHT_EAR.value,
-        mp_pose.PoseLandmark.MOUTH_LEFT.value, mp_pose.PoseLandmark.MOUTH_RIGHT.value,
-    }
-    _BODY_CONNECTIONS = (
-        # arms
-        (mp_pose.PoseLandmark.LEFT_SHOULDER.value, mp_pose.PoseLandmark.LEFT_ELBOW.value),
-        (mp_pose.PoseLandmark.LEFT_ELBOW.value, mp_pose.PoseLandmark.LEFT_WRIST.value),
-        (mp_pose.PoseLandmark.RIGHT_SHOULDER.value, mp_pose.PoseLandmark.RIGHT_ELBOW.value),
-        (mp_pose.PoseLandmark.RIGHT_ELBOW.value, mp_pose.PoseLandmark.RIGHT_WRIST.value),
-        # shoulders
-        (mp_pose.PoseLandmark.LEFT_SHOULDER.value, mp_pose.PoseLandmark.RIGHT_SHOULDER.value),
-        # torso
-        (mp_pose.PoseLandmark.LEFT_SHOULDER.value, mp_pose.PoseLandmark.LEFT_HIP.value),
-        (mp_pose.PoseLandmark.RIGHT_SHOULDER.value, mp_pose.PoseLandmark.RIGHT_HIP.value),
-        (mp_pose.PoseLandmark.LEFT_HIP.value, mp_pose.PoseLandmark.RIGHT_HIP.value),
-    )
-    _BODY_POINTS = {
-        mp_pose.PoseLandmark.NOSE.value,
-        mp_pose.PoseLandmark.LEFT_SHOULDER.value, mp_pose.PoseLandmark.RIGHT_SHOULDER.value,
-        mp_pose.PoseLandmark.LEFT_ELBOW.value, mp_pose.PoseLandmark.RIGHT_ELBOW.value,
-        mp_pose.PoseLandmark.LEFT_WRIST.value, mp_pose.PoseLandmark.RIGHT_WRIST.value,
-        mp_pose.PoseLandmark.LEFT_HIP.value, mp_pose.PoseLandmark.RIGHT_HIP.value,
-    }
-
-def draw_body_only(img_bgr, lms):
-    h, w = img_bgr.shape[:2]
-    pts = []
-    for i, lm in enumerate(lms):
-        if i not in _BODY_POINTS: 
-            continue
-        if lm.visibility < 0.2: 
-            continue
-        x = int(lm.x * w); y = int(lm.y * h)
-        pts.append((i, x, y))
-    # lines
-    for a, b in _BODY_CONNECTIONS:
-        pa = next((p for p in pts if p[0]==a), None)
-        pb = next((p for p in pts if p[0]==b), None)
-        if pa and pb:
-            cv2.line(img_bgr, (pa[1], pa[2]), (pb[1], pb[2]), (255,255,255), 2)
-    # joints
-    for _, x, y in pts:
-        cv2.circle(img_bgr, (x,y), 3, (255,255,255), -1)
-    return img_bgr
-
-def draw_overlay(img_bgr, reps=0, feedback=None, height_pct=0.0):
-    h, w = img_bgr.shape[:2]
-    # Title
-    img_bgr = _draw_text_pil(img_bgr, f"Pull-ups", (16,16), TITLE_FONT, color=(255,255,255))
-    # Reps box
-    box_text = f"Reps: {reps}"
-    img_bgr = _draw_text_pil(img_bgr, box_text, (16, 56), LABEL_FONT, color=(220,220,220))
-    # Height bar (progress-like)
-    bar_w = 10
-    filled = int(max(0.0, min(1.0, height_pct)) * (h - 120))
-    y0 = 100
-    cv2.rectangle(img_bgr, (w-32, y0), (w-32+bar_w, y0 + h - 120), (255,255,255), 2)
-    cv2.rectangle(img_bgr, (w-32, y0 + (h-120 - filled)), (w-32+bar_w, y0 + h - 120), (255,255,255), -1)
-    # feedback bubble
-    if feedback:
-        img_bgr = _draw_text_pil(img_bgr, feedback, (16, h-40), LABEL_FONT, color=(255,255,255))
-    return img_bgr
+# Bottom extension check
+BOTTOM_EXT_MIN_ANGLE = 155.0   # כיפוף קטן מזה = לא פתיחה מלאה בתחתית
+BOTTOM_HYST_DEG      = 3.0     # היסטרזיס לספיגת דילוג פריימים/רעש
+BOTTOM_FAIL_MIN_REPS = 2       # נדרשות לפחות N חזרות לא טובות כדי להוסיף הערה סשן
 
 # ===================== MAIN =====================
-
 def run_pullup_analysis(video_path,
                         frame_skip=3,   # כמו סקווט
                         scale=0.4,      # כמו סקווט
@@ -242,11 +243,6 @@ def run_pullup_analysis(video_path,
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return _ret_err("Could not open video", feedback_path)
-
-    fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
-    # effective fps after frame skipping:
-    effective_fps = max(1.0, fps_in / max(1, frame_skip))
-    sec_to_frames = lambda s: max(1, int(s * effective_fps))
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
@@ -292,6 +288,9 @@ def run_pullup_analysis(video_path,
     bottom_phase_max_elbow = None
     bottom_fail_count = 0
 
+    fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
+    effective_fps = max(1.0, fps_in / max(1, frame_skip))
+    sec_to_frames = lambda s: max(1, int(s * effective_fps))
     OFFBAR_STOP_FRAMES = sec_to_frames(AUTO_STOP_AFTER_EXIT_SEC)
     NOPOSE_STOP_FRAMES = sec_to_frames(TAIL_NOPOSE_STOP_SEC)
     RT_FB_HOLD_FRAMES  = sec_to_frames(0.8)
@@ -301,10 +300,7 @@ def run_pullup_analysis(video_path,
             ret, frame = cap.read()
             if not ret: break
             frame_idx += 1
-
-            if frame_idx % frame_skip != 0:
-                continue
-
+            if frame_idx % frame_skip != 0: continue
             if scale != 1.0:
                 frame = cv2.resize(frame, (0,0), fx=scale, fy=scale)
             h, w = frame.shape[:2]
@@ -312,6 +308,7 @@ def run_pullup_analysis(video_path,
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w,h))
 
             res = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            height_live = 0.0
 
             if not res.pose_landmarks:
                 nopose_frames_since_any_rep = (nopose_frames_since_any_rep + 1) if rep_count>0 else 0
@@ -359,24 +356,24 @@ def run_pullup_analysis(video_path,
             else:
                 offbar_streak += 1; onbar_streak = 0
 
-            onbar_prev = onbar
             if not onbar and onbar_streak >= ONBAR_MIN_FRAMES:
                 onbar = True; asc_base_head = None; allow_new_peak = True
-                swing_streak = 0
+                swing_streak = 0  # reset
 
             if onbar and offbar_streak >= OFFBAR_MIN_FRAMES:
                 onbar = False; offbar_frames_since_any_rep = 0
 
-            if (not onbar) and rep_count>0:
+            if not onbar and rep_count>0:
                 offbar_frames_since_any_rep += 1
                 if offbar_frames_since_any_rep >= OFFBAR_STOP_FRAMES:
                     break
 
-            # Counting (ON-BAR)
+            # Counting (only ON-BAR)
             head_vel = 0.0 if head_prev is None else (head_y - head_prev)
             cur_rt = None
 
             if onbar and vis_strict_ok:
+                # Baseline per ascent
                 if asc_base_head is None:
                     if head_vel < -HEAD_VEL_UP_TINY:
                         asc_base_head = head_y
@@ -408,6 +405,7 @@ def run_pullup_analysis(video_path,
                 reset_by_desc = (asc_base_head is not None) and ((head_y - asc_base_head) >= RESET_DESCENT)
                 reset_by_elb  = (elbow_angle >= RESET_ELBOW)
                 if reset_by_desc or reset_by_elb:
+                    # Bottom extension check based on tracked maximum (raw)
                     if not bottom_already_reported:
                         effective_max = bottom_phase_max_elbow if bottom_phase_max_elbow is not None else max(raw_elbow_L, raw_elbow_R)
                         if effective_max < (BOTTOM_EXT_MIN_ANGLE - BOTTOM_HYST_DEG):
@@ -416,22 +414,28 @@ def run_pullup_analysis(video_path,
                                 session_feedback.add(FB_CUE_BOTTOM)
                                 cur_rt = cur_rt or FB_CUE_BOTTOM
                         else:
+                            # חזרה טובה מפחיתה את הספירה (עם רצפה 0) כדי לא "לנעול" הערה אם רוב החזרות טובות
                             bottom_fail_count = max(0, bottom_fail_count - 1)
                         bottom_already_reported = True
 
                     allow_new_peak = True
                     asc_base_head = head_y
-                    bottom_phase_max_elbow = None
+                    bottom_phase_max_elbow = None  # reset for next rep
 
+                # RT: need higher
                 if (cur_rt is None) and (asc_base_head is not None) and (ascent_amt < HEAD_MIN_ASCENT*0.7) and (head_vel < -HEAD_VEL_UP_TINY):
-                    session_feedback.add(FB_CUE_HIGHER); cur_rt = FB_CUE_HIGHER
+                    session_feedback.add(FB_CUE_HIGHER)
+                    cur_rt = FB_CUE_HIGHER
 
+                # RT: swing (kipping)
                 if torso_dx_norm > SWING_THR:
                     swing_streak += 1
                 else:
                     swing_streak = max(0, swing_streak-1)
                 if (cur_rt is None) and (swing_streak >= SWING_MIN_STREAK) and (not swing_already_reported):
-                    session_feedback.add(FB_CUE_SWING); cur_rt = FB_CUE_SWING; swing_already_reported = True
+                    session_feedback.add(FB_CUE_SWING)
+                    cur_rt = FB_CUE_SWING
+                    swing_already_reported = True
             else:
                 asc_base_head = None; allow_new_peak = True
                 swing_streak = 0
@@ -445,7 +449,7 @@ def run_pullup_analysis(video_path,
             else:
                 if rt_fb_hold > 0: rt_fb_hold -= 1
 
-            # draw/write only when returning video
+            # Draw skeleton + overlay — only if returning video
             if return_video and out is not None:
                 frame = draw_body_only(frame, lms)
                 frame = draw_overlay(frame, reps=rep_count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=height_live)
@@ -463,8 +467,8 @@ def run_pullup_analysis(video_path,
     else:
         penalty = 0.0
         if session_feedback:
-            penalty = sum(FB_WEIGHTS.get(msg, FB_DEFAULT_WEIGHT) for msg in session_feedback)
-            penalty = max(PENALTY_MIN_IF_ANY, penalty)
+            penalty = sum(0.5 if msg not in ("Try to pull a little higher","Fully extend arms at the bottom","Try to reduce momentum") else {"Try to pull a little higher":0.5,"Fully extend arms at the bottom":0.7,"Try to reduce momentum":0.7}[msg] for msg in session_feedback)
+            penalty = max(0.5, penalty)
         raw_score = max(0.0, 10.0 - penalty)
         technique_score = _half_floor(raw_score)
 
@@ -481,6 +485,7 @@ def run_pullup_analysis(video_path,
     except Exception:
         pass
 
+    # Return video only in full path; in fast path video_path will be ""
     final_path = ""
     if return_video:
         # ========== Encode faststart with chosen quality ==========
@@ -531,4 +536,5 @@ def _ret_err(msg, feedback_path):
 # תאימות
 def run_analysis(*args, **kwargs):
     return run_pullup_analysis(*args, **kwargs)
+
 
