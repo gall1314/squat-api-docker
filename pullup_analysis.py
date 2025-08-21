@@ -30,12 +30,10 @@ DEPTH_PCT_FONT   = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 try:
     import mediapipe as mp
     mp_pose = mp.solutions.pose
-    print(f"[mediapipe] loaded OK (mp={getattr(mp,'__version__','?')})")
-except Exception as e:
+except Exception:
     mp_pose = None
-    print("[mediapipe-import-error]", repr(e))
 
-# ===================== Helpers / Drawing =====================
+# ===================== Helpers (wrap) =====================
 def _wrap_two_lines(draw, text, font, max_width):
     words=text.split()
     if not words: return [""]
@@ -55,6 +53,7 @@ def _wrap_two_lines(draw, text, font, max_width):
         lines[-1] = last
     return lines
 
+# ===================== Body-only skeleton =====================
 _FACE_LMS = set()
 _BODY_CONNECTIONS = tuple()
 _BODY_POINTS = tuple()
@@ -86,11 +85,12 @@ def draw_body_only(frame, landmarks, color=(255,255,255)):
         cv2.circle(frame, (x, y), dot_r, color, -1, cv2.LINE_AA)
     return frame
 
+# ===================== Overlay (BGR↔RGB תקין) =====================
 def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
-    """טקסט/דונאט; PIL מקבל RGB ומחזירים BGR כדי למנוע טינט צבעים."""
+    """ציור דונאט + טקסט; PIL מקבל RGB ומחזירים BGR."""
     h, w, _ = frame.shape
 
-    # Donut (OpenCV על המסגרת המקורית - BGR)
+    # Donut (OpenCV) על ה־BGR המקורי
     ref_h = max(int(h*0.06), int(REPS_FONT_SIZE*1.6))
     radius = int(ref_h * DONUT_RADIUS_SCALE)
     thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
@@ -100,7 +100,7 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
     start_ang = -90; end_ang = start_ang + int(360 * pct)
     cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang, DEPTH_COLOR, thick, lineType=cv2.LINE_AA)
 
-    # טקסט ב-PIL (RGB)
+    # טקסטים ב־PIL (RGB)
     pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil)
 
@@ -137,10 +137,10 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
             tw2 = draw.textlength(ln, font=FEEDBACK_FONT); tx = max(12, (w-int(tw2))//2)
             draw.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255,255,255)); ty += line_h + 4
 
-    # חזרה ל-BGR
+    # חזרה ל־BGR
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
-# ===================== Math helpers =====================
+# ===================== Math helpers / scoring =====================
 def _ang(a,b,c):
     ba=np.array([a[0]-b[0], a[1]-b[1]]); bc=np.array([c[0]-b[0], c[1]-b[1]])
     den=(np.linalg.norm(ba)*np.linalg.norm(bc))+1e-9
@@ -165,46 +165,50 @@ def score_label(s):
     return "Needs work"
 
 # ===================== Thresholds / Params =====================
-# תנאי הטופ: מרוכך לגובה (chin over bar) בלבד
-ELBOW_TOP_ANGLE      = 100.0      # elbow ≤ 100°
-HEAD_MIN_ASCENT      = 0.0075     # בסיס: ~0.75% גובה פריים
-CHIN_RELAX           = float(os.getenv("CHIN_RELAX", "0.85"))  # מוריד 15% מהגובה הנדרש
+# “Chin over bar” רך יותר: מכפיל על הגובה הנדרש (ברירת מחדל: 0.85 => 15% ריכוך)
+CHIN_RELAX = float(os.getenv("CHIN_RELAX", "0.85"))
 
-RESET_DESCENT        = 0.0045
-RESET_ELBOW          = 135.0
-REFRACTORY_FRAMES    = 2
-HEAD_VEL_UP_TINY     = 0.0002
-ELBOW_EMA_ALPHA      = 0.35
-HEAD_EMA_ALPHA       = 0.30
+# ספים בסיסיים (כמו מקורי)
+VIS_THR_STRICT = 0.55
+HEAD_EMA_ALPHA = 0.35
+ELBOW_EMA_ALPHA = 0.35
 
-# On/Off-bar gating
-VIS_THR_STRICT       = 0.30
-WRIST_VIS_THR        = 0.20
-WRIST_ABOVE_HEAD_MARGIN = 0.02
-TORSO_X_THR          = 0.010
-ONBAR_MIN_FRAMES     = 2
-OFFBAR_MIN_FRAMES    = 6
-AUTO_STOP_AFTER_EXIT_SEC = 1.2
-TAIL_NOPOSE_STOP_SEC     = 1.0
+HEAD_MIN_ASCENT = 0.06          # יחסית לגובה הפריים
+HEAD_VEL_UP_TINY = -0.0008
 
-# Swing
-SWING_THR            = 0.012
-SWING_MIN_STREAK     = 3
+ELBOW_TOP_ANGLE = 72.0
+RESET_ELBOW = 158.0
+RESET_DESCENT = 0.04
+
+ONBAR_MIN_FRAMES = 2
+OFFBAR_MIN_FRAMES = 3
+
+WRIST_VIS_THR = 0.45
+WRIST_ABOVE_HEAD_MARGIN = 0.04
+
+TORSO_X_THR = 0.012
+SWING_THR = 0.012
+SWING_MIN_STREAK = 6
+
+REFRACTORY_FRAMES = 8
+
+AUTO_STOP_AFTER_EXIT_SEC = 1.5
+TAIL_NOPOSE_STOP_SEC = 1.2
 
 # Bottom extension
-BOTTOM_EXT_MIN_ANGLE = 155.0
-BOTTOM_HYST_DEG      = 3.0
+BOTTOM_EXT_MIN_ANGLE = 168.0
+BOTTOM_HYST_DEG      = 2.0
 BOTTOM_FAIL_MIN_REPS = 2
 
 # Feedback cues & weights
-FB_CUE_HIGHER   = "Go a bit higher (chin over bar)"
-FB_CUE_SWING    = "Reduce body swing (no kipping)"
-FB_CUE_BOTTOM   = "Fully extend arms at bottom"
+FB_CUE_HIGHER = "Try to pull a little higher"
+FB_CUE_BOTTOM = "Fully extend arms at the bottom"
+FB_CUE_SWING  = "Try to reduce momentum"
 
 FB_WEIGHTS = {
     FB_CUE_HIGHER: 0.5,
-    FB_CUE_SWING:  0.5,
-    FB_CUE_BOTTOM: 0.5,
+    FB_CUE_BOTTOM: 0.7,
+    FB_CUE_SWING:  0.7,
 }
 FB_DEFAULT_WEIGHT   = 0.5
 PENALTY_MIN_IF_ANY  = 0.5
@@ -220,7 +224,7 @@ def run_pullup_analysis(video_path,
                         return_video=True,
                         fast_mode=None):
     """
-    fast_mode=True  =>  מסלול מהיר מאוד (ללא וידאו): model_complexity=0, scale≈0.3, frame_skip≥4.
+    fast_mode=True  =>  מסלול מהיר (ללא וידאו): model_complexity=0, scale≈0.3, frame_skip≥4.
     preserve_quality=True => scale=1.0, frame_skip=1, CRF=18.
     """
     if mp_pose is None:
@@ -248,6 +252,16 @@ def run_pullup_analysis(video_path,
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
     sec_to_frames = lambda s: max(1, int(s * effective_fps))
+
+    # --- התאמות דינמיות למקרה של דילוג פריימים (כדי לא לאבד פסגות) ---
+    FS = max(1, int(frame_skip))
+    HEAD_MIN_ASCENT_EFF = HEAD_MIN_ASCENT * CHIN_RELAX
+    if FS >= 3:
+        HEAD_MIN_ASCENT_EFF *= 0.75   # ריכוך נוסף בדגימה דלילה
+    REFR_EFF = max(1, int(round(REFRACTORY_FRAMES / FS)))
+    if fast_mode:
+        REFR_EFF = 1
+    RESET_DESCENT_EFF = max(RESET_DESCENT * 0.35, RESET_DESCENT / max(1.0, FS*0.8))
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
@@ -284,7 +298,6 @@ def run_pullup_analysis(video_path,
     session_feedback=set()
     rt_fb_msg=None; rt_fb_hold=0
     rep_penalty_current = 0.0
-    rep_has_issue = False
 
     # Swing
     swing_streak=0
@@ -365,9 +378,7 @@ def run_pullup_analysis(video_path,
             if not onbar and onbar_streak >= ONBAR_MIN_FRAMES:
                 onbar = True; asc_base_head = None; allow_new_peak = True
                 swing_streak = 0
-                # התחל ספירת הערות לחזרה חדשה
                 rep_penalty_current = 0.0
-                rep_has_issue = False
 
             if onbar and offbar_streak >= OFFBAR_MIN_FRAMES:
                 onbar = False; offbar_frames_since_any_rep = 0
@@ -382,23 +393,21 @@ def run_pullup_analysis(video_path,
             cur_rt = None
 
             if onbar and vis_strict_ok:
-                # Baseline per ascent
                 if asc_base_head is None:
                     if head_vel < -HEAD_VEL_UP_TINY:
                         asc_base_head = head_y
                         rep_penalty_current = 0.0
-                        rep_has_issue = False
                 else:
-                    if (head_y - asc_base_head) > (RESET_DESCENT * 2):
+                    # ריסט רך יותר בדילוגים
+                    if (head_y - asc_base_head) > (RESET_DESCENT_EFF):
                         asc_base_head = head_y
                         rep_penalty_current = 0.0
-                        rep_has_issue = False
 
                 ascent_amt = 0.0 if asc_base_head is None else (asc_base_head - head_y)
 
-                # ===== TOP condition (relaxed height only) =====
-                at_top   = (elbow_angle <= ELBOW_TOP_ANGLE) and (ascent_amt >= HEAD_MIN_ASCENT * CHIN_RELAX)
-                can_cnt  = (frame_idx - last_peak_frame) >= REFRACTORY_FRAMES
+                # ===== TOP condition (relaxed height, מותאם לדילוגים) =====
+                at_top = (elbow_angle <= ELBOW_TOP_ANGLE) and (ascent_amt >= HEAD_MIN_ASCENT_EFF)
+                can_cnt = (frame_idx - last_peak_frame) >= REFR_EFF
 
                 if at_top and allow_new_peak and can_cnt:
                     rep_score = max(0.0, 10.0 - rep_penalty_current)
@@ -424,14 +433,13 @@ def run_pullup_analysis(video_path,
                     cand = max(raw_elbow_L, raw_elbow_R)
                     bottom_phase_max_elbow = cand if bottom_phase_max_elbow is None else max(bottom_phase_max_elbow, cand)
 
-                reset_by_desc = (asc_base_head is not None) and ((head_y - asc_base_head) >= RESET_DESCENT)
+                reset_by_desc = (asc_base_head is not None) and ((head_y - asc_base_head) >= RESET_DESCENT_EFF)
                 reset_by_elb  = (elbow_angle >= RESET_ELBOW)
                 if reset_by_desc or reset_by_elb:
                     if not bottom_already_reported:
                         effective_max = bottom_phase_max_elbow if bottom_phase_max_elbow is not None else max(raw_elbow_L, raw_elbow_R)
                         if effective_max < (BOTTOM_EXT_MIN_ANGLE - BOTTOM_HYST_DEG):
                             bottom_fail_count += 1
-                            rep_has_issue = True
                             rep_penalty_current += FB_WEIGHTS.get(FB_CUE_BOTTOM, FB_DEFAULT_WEIGHT)
                             if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS:
                                 session_feedback.add(FB_CUE_BOTTOM)
@@ -444,18 +452,18 @@ def run_pullup_analysis(video_path,
                     asc_base_head = head_y
                     bottom_phase_max_elbow = None
 
+                # RT: need higher (לא משפיע ספירה, כן משפיע ציון/טיפ)
                 if (cur_rt is None) and (asc_base_head is not None) and (ascent_amt < HEAD_MIN_ASCENT*0.7) and (head_vel < -HEAD_VEL_UP_TINY):
                     session_feedback.add(FB_CUE_HIGHER); cur_rt = FB_CUE_HIGHER
-                    rep_has_issue = True
                     rep_penalty_current += FB_WEIGHTS.get(FB_CUE_HIGHER, FB_DEFAULT_WEIGHT)
 
+                # RT: swing (kipping)
                 if torso_dx_norm > SWING_THR:
                     swing_streak += 1
                 else:
                     swing_streak = max(0, swing_streak-1)
                 if (cur_rt is None) and (swing_streak >= SWING_MIN_STREAK) and (not swing_already_reported):
                     session_feedback.add(FB_CUE_SWING); cur_rt = FB_CUE_SWING; swing_already_reported = True
-                    rep_has_issue = True
                     rep_penalty_current += FB_WEIGHTS.get(FB_CUE_SWING, FB_DEFAULT_WEIGHT)
             else:
                 asc_base_head = None; allow_new_peak = True
@@ -471,7 +479,7 @@ def run_pullup_analysis(video_path,
             else:
                 if rt_fb_hold > 0: rt_fb_hold -= 1
 
-            # Drawing only when returning video
+            # ציור/כתיבה — רק אם מחזירים וידאו
             if return_video and out is not None:
                 frame = draw_body_only(frame, lms)
                 frame = draw_overlay(frame, reps=rep_count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=height_live)
@@ -494,11 +502,12 @@ def run_pullup_analysis(video_path,
         raw_score = max(0.0, 10.0 - penalty)
         technique_score = _half_floor10(raw_score)
 
-    # form_tip: בחר את ההערה "הכבדה" ביותר אם קיימת; אחרת None
+    # form_tip: אם אין session feedback — נופל ל־RT tip האחרון (אם קיים)
+    form_tip = None
     if session_feedback:
         form_tip = max(session_feedback, key=lambda m: FB_WEIGHTS.get(m, FB_DEFAULT_WEIGHT))
-    else:
-        form_tip = None
+    elif 'rt_fb_msg' in locals() and rt_fb_msg:
+        form_tip = rt_fb_msg
 
     feedback_list = sorted(session_feedback) if session_feedback else ["Great form! Keep it up 💪"]
 
@@ -537,10 +546,10 @@ def run_pullup_analysis(video_path,
         "technique_score": float(technique_score),
         "technique_score_display": display_half_str(technique_score),
         "technique_label": score_label(technique_score),
-        "good_reps": int(good_reps),
+        "good_reps": int(good_reps),      # רק חזרות עם ציון 10
         "bad_reps": int(bad_reps),
         "feedback": feedback_list,
-        "form_tip": form_tip,                 # ← JSON path שה-UI שלך מחפש
+        "form_tip": form_tip,
         "tips": [],
         "reps": rep_reports,
         "video_path": final_path,
