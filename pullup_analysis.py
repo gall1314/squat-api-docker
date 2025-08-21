@@ -13,20 +13,6 @@
 import os, cv2, math, numpy as np, subprocess
 from PIL import ImageFont, ImageDraw, Image
 
-# ---- Feedback cues & scoring (restored) ----
-FB_CUE_HIGHER = "Try to pull a little higher"
-FB_CUE_BOTTOM = "Fully extend arms at the bottom"
-FB_CUE_SWING  = "Try to reduce momentum"
-
-FB_WEIGHTS = {
-    FB_CUE_HIGHER: 0.5,
-    FB_CUE_BOTTOM: 0.7,
-    FB_CUE_SWING:  0.7,
-}
-FB_DEFAULT_WEIGHT = 0.5         # אם תתווסף הערה שלא ברשימה
-PENALTY_MIN_IF_ANY = 0.5        # עונש מינימלי אם יש בכלל פידבק
-
-
 # ===================== STYLE / FONTS (like squat) =====================
 BAR_BG_ALPHA         = 0.55
 DONUT_RADIUS_SCALE   = 0.72
@@ -56,7 +42,30 @@ try:
 except Exception:
     mp_pose = None
 
-# ===================== BODY LINES (no face) =====================
+# ===================== Helpers (wrap text) =====================
+def _wrap_two_lines(draw, text, font, max_width):
+    words=text.split()
+    if not words: return [""]
+    lines, cur = [], ""
+    for w in words:
+        trial=(cur+" "+w).strip()
+        if draw.textlength(trial, font=font) <= max_width: cur=trial
+        else:
+            if cur: lines.append(cur)
+            cur=w
+    if cur: lines.append(cur)
+    if len(lines)<=1: return lines
+    # גזירה עד 2 שורות
+    last = " ".join(lines[1:])
+    if draw.textlength(last, font=font) > max_width:
+        # חתוך ועדכן "…"
+        while last and draw.textlength(last+"…", font=font) > max_width:
+            last = last[:-2]
+        last = last[:-2]+"…"
+    lines[-1] = last
+    return lines
+
+# ===================== BODY-ONLY skeleton (like squat) =====================
 _FACE_LMS = set()
 _BODY_CONNECTIONS = tuple()
 _BODY_POINTS = tuple()
@@ -88,55 +97,32 @@ def draw_body_only(frame, landmarks, color=(255,255,255)):
         cv2.circle(frame, (x, y), dot_r, color, -1, cv2.LINE_AA)
     return frame
 
-# ===================== Overlay (single PIL pass; NO solid rect behind "Reps") =====================
-def _wrap_two_lines(draw, text, font, max_width):
-    words=text.split()
-    if not words: return [""]
-    lines, cur = [], ""
-    for w in words:
-        trial=(cur+" "+w).strip()
-        if draw.textlength(trial, font=font) <= max_width: cur=trial
-        else:
-            if cur: lines.append(cur)
-            cur=w
-    if cur: lines.append(cur)
-    if len(lines)<=1: return lines
-    return [lines[0], " ".join(lines[1:])[:200]]
-
+# ===================== Overlay (PIL + OpenCV; בלי כותרת "Pull-ups") =====================
 def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
-    h, w = frame.shape[:2]
-    # Make a single PIL image from BGR for crisp text
-    pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    draw = ImageDraw.Draw(pil)
+    h, w, _ = frame.shape
 
-    # Right donut (height)
-    cx = w - max(40, int(w*0.06))
-    cy = int(h*0.22)
-    radius = int(min(w,h) * DONUT_RADIUS_SCALE * 0.12)
-    thickness = max(6, int(radius * DONUT_THICKNESS_FRAC))
-    bbox = (cx-radius, cy-radius, cx+radius, cy+radius)
+    # Donut (OpenCV)
+    ref_h = max(int(h*0.06), int(REPS_FONT_SIZE*1.6))
+    radius = int(ref_h * DONUT_RADIUS_SCALE)
+    thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
+    margin = 12; cx = w - margin - radius; cy = max(ref_h + radius//8, radius + thick//2 + 2)
+    pct = float(np.clip(height_pct,0,1))
+    cv2.circle(frame, (cx, cy), radius, DEPTH_RING_BG, thick, lineType=cv2.LINE_AA)
+    start_ang = -90; end_ang = start_ang + int(360 * pct)
+    cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang, DEPTH_COLOR, thick, lineType=cv2.LINE_AA)
 
-    # Base ring
-    draw.arc(bbox, 0, 360, fill=DEPTH_RING_BG, width=thickness)
-    # Progress
-    pct = max(0.0, min(1.0, float(height_pct)))
-    end_angle = int(360 * pct)
-    draw.arc(bbox, -90, -90 + end_angle, fill=DEPTH_COLOR, width=thickness)
+    # ONE PIL pass
+    pil = Image.fromarray(frame); draw = ImageDraw.Draw(pil)
 
-    # Soft top bar (for reps + title)
-    pad_y = max(6, int(h*0.02))
+    # Reps — רק פס שקוף + טקסט
+    reps_text = f"Reps: {reps}"
+    pad_x, pad_y = 10, 6
+    tw = draw.textlength(reps_text, font=REPS_FONT); th = REPS_FONT.size
     base = np.array(pil)
-    overlay = base.copy()
-    cv2.rectangle(overlay, (0,0), (w, pad_y + 42), (0,0,0), -1)
-    base = cv2.addWeighted(overlay, BAR_BG_ALPHA, base, 1 - BAR_BG_ALPHA, 0)
+    over = base.copy()
+    cv2.rectangle(over, (0,0), (int(tw + 2*pad_x), int(th + 2*pad_y)), (0,0,0), -1)
+    base = cv2.addWeighted(over, BAR_BG_ALPHA, base, 1 - BAR_BG_ALPHA, 0)
     pil = Image.fromarray(base); draw = ImageDraw.Draw(pil)
-
-    # Left side text (title + reps)
-    title = "Pull-ups"
-    title_w = draw.textlength(title, font=REPS_FONT)
-    pad_x = max(12, int(w*0.02))
-    draw.text((pad_x, pad_y), title, font=REPS_FONT, fill=(255,255,255))
-    reps_text = f"Reps: {int(reps)}"
     draw.text((pad_x, pad_y-1), reps_text, font=REPS_FONT, fill=(255,255,255))
 
     # Donut labels
@@ -163,7 +149,8 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
             tw2 = draw.textlength(ln, font=FEEDBACK_FONT); tx = max(12, (w-int(tw2))//2)
             draw.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255,255,255)); ty += line_h + 4
 
-    return np.array(pil)
+    # החזרה ב-BGR כדי למנוע הטיית צבע (תיקון הפילטר הכחול)
+    return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
 # ===================== Helpers =====================
 def _ang(a,b,c):
@@ -194,39 +181,39 @@ def score_label(s):
     if s>=5.5: return "Fair"
     return "Needs work"
 
-# ===================== Thresholds / Params =====================
-VIS_THR_STRICT = 0.55
-HEAD_EMA_ALPHA = 0.35
-ELBOW_EMA_ALPHA = 0.35
+# ===================== Logic params =====================
+ELBOW_TOP_ANGLE      = 100.0   # ≤100° = מספיק כפוף (שנה ל-90° אם תרצה קשיח)
+HEAD_MIN_ASCENT      = 0.0075  # ~0.75% מגובה הפריים
+RESET_DESCENT        = 0.0045
+RESET_ELBOW          = 135.0
+REFRACTORY_FRAMES    = 2
+HEAD_VEL_UP_TINY     = 0.0002
+ELBOW_EMA_ALPHA      = 0.35
+HEAD_EMA_ALPHA       = 0.30
 
-HEAD_MIN_ASCENT = 0.06
-HEAD_VEL_UP_TINY = -0.0008
+# On/Off-bar gating (כניסה/יציאה)
+VIS_THR_STRICT       = 0.30
+WRIST_VIS_THR        = 0.20
+WRIST_ABOVE_HEAD_MARGIN = 0.02
+TORSO_X_THR          = 0.010
+ONBAR_MIN_FRAMES     = 2
+OFFBAR_MIN_FRAMES    = 6
+AUTO_STOP_AFTER_EXIT_SEC = 1.2
+TAIL_NOPOSE_STOP_SEC     = 1.0
 
-ELBOW_TOP_ANGLE = 72.0
-RESET_ELBOW = 158.0
-RESET_DESCENT = 0.04
+# ======= Feedback cues & weights =======
+FB_CUE_HIGHER   = "Go a bit higher (chin over bar)"
+FB_CUE_SWING    = "Reduce body swing (no kipping)"
+FB_CUE_BOTTOM   = "Fully extend arms at bottom"
 
-ONBAR_MIN_FRAMES = 2
-OFFBAR_MIN_FRAMES = 3
+FB_WEIGHTS = {
+    FB_CUE_HIGHER: 0.5,
+    FB_CUE_SWING:  0.5,
+    FB_CUE_BOTTOM: 0.5,
+}
+FB_DEFAULT_WEIGHT = 0.5
+PENALTY_MIN_IF_ANY = 0.5
 
-WRIST_VIS_THR = 0.45
-WRIST_ABOVE_HEAD_MARGIN = 0.04
-
-TORSO_X_THR = 0.012
-SWING_THR = 0.012
-SWING_MIN_STREAK = 6
-
-REFRACTORY_FRAMES = 8
-
-AUTO_STOP_AFTER_EXIT_SEC = 1.5
-TAIL_NOPOSE_STOP_SEC = 1.2
-
-# Bottom extension check
-BOTTOM_EXT_MIN_ANGLE = 155.0   # כיפוף קטן מזה = לא פתיחה מלאה בתחתית
-BOTTOM_HYST_DEG      = 3.0     # היסטרזיס לספיגת דילוג פריימים/רעש
-BOTTOM_FAIL_MIN_REPS = 2       # נדרשות לפחות N חזרות לא טובות כדי להוסיף הערה סשן
-
-# ===================== MAIN =====================
 def run_pullup_analysis(video_path,
                         frame_skip=3,   # כמו סקווט
                         scale=0.4,      # כמו סקווט
@@ -289,7 +276,7 @@ def run_pullup_analysis(video_path,
     offbar_frames_since_any_rep = 0
     nopose_frames_since_any_rep = 0
 
-    # Feedback session collection
+    # Feedback session collection (מסך ← API/קובץ) וגם לציון
     session_feedback=set()
     rt_fb_msg=None; rt_fb_hold=0
 
@@ -298,7 +285,7 @@ def run_pullup_analysis(video_path,
     swing_already_reported=False
     bottom_already_reported=False
 
-    # bottom-phase elbow tracking (both arms)
+    # ---- track bottom-phase maximum elbow extension (raw, both arms) ----
     bottom_phase_max_elbow = None
     bottom_fail_count = 0
 
@@ -422,13 +409,12 @@ def run_pullup_analysis(video_path,
                     # Bottom extension check based on tracked maximum (raw)
                     if not bottom_already_reported:
                         effective_max = bottom_phase_max_elbow if bottom_phase_max_elbow is not None else max(raw_elbow_L, raw_elbow_R)
-                        if effective_max < (BOTTOM_EXT_MIN_ANGLE - BOTTOM_HYST_DEG):
+                        if effective_max < (RESET_ELBOW + 15):  # שמרני — כמקורי אצלך
                             bottom_fail_count += 1
-                            if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS:
+                            if bottom_fail_count >= 2:
                                 session_feedback.add(FB_CUE_BOTTOM)
                                 cur_rt = cur_rt or FB_CUE_BOTTOM
                         else:
-                            # חזרה טובה מפחיתה את הספירה (עם רצפה 0) כדי לא "לנעול" הערה אם רוב החזרות טובות
                             bottom_fail_count = max(0, bottom_fail_count - 1)
                         bottom_already_reported = True
 
@@ -453,8 +439,10 @@ def run_pullup_analysis(video_path,
             else:
                 asc_base_head = None; allow_new_peak = True
                 swing_streak = 0
+                # אם יצאנו מהבר – אפס את מעקב התחתית כדי לא לטנף לחזרה הבאה
                 bottom_phase_max_elbow = None
 
+            # Handle RT feedback hold
             if cur_rt:
                 if cur_rt != rt_fb_msg:
                     rt_fb_msg = cur_rt; rt_fb_hold = RT_FB_HOLD_FRAMES
@@ -463,7 +451,7 @@ def run_pullup_analysis(video_path,
             else:
                 if rt_fb_hold > 0: rt_fb_hold -= 1
 
-            # Draw skeleton + overlay — only if returning video
+            # Draw skeleton + overlay — רק במסלול שמחזיר וידאו
             if return_video and out is not None:
                 frame = draw_body_only(frame, lms)
                 frame = draw_overlay(frame, reps=rep_count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=height_live)
@@ -481,8 +469,8 @@ def run_pullup_analysis(video_path,
     else:
         penalty = 0.0
         if session_feedback:
-            penalty = sum(0.5 if msg not in ("Try to pull a little higher","Fully extend arms at the bottom","Try to reduce momentum") else {"Try to pull a little higher":0.5,"Fully extend arms at the bottom":0.7,"Try to reduce momentum":0.7}[msg] for msg in session_feedback)
-            penalty = max(0.5, penalty)
+            penalty = sum(FB_WEIGHTS.get(msg, FB_DEFAULT_WEIGHT) for msg in session_feedback)
+            penalty = max(PENALTY_MIN_IF_ANY, penalty)
         raw_score = max(0.0, 10.0 - penalty)
         technique_score = _half_floor(raw_score)
 
@@ -499,7 +487,7 @@ def run_pullup_analysis(video_path,
     except Exception:
         pass
 
-    # Return video only in full path; in fast path video_path will be ""
+    # Return video only when requested
     final_path = ""
     if return_video:
         # ========== Encode faststart with chosen quality ==========
@@ -550,5 +538,4 @@ def _ret_err(msg, feedback_path):
 # תאימות
 def run_analysis(*args, **kwargs):
     return run_pullup_analysis(*args, **kwargs)
-
 
