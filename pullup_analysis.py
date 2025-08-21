@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 # pullup_analysis.py
+# שמות ה-JSON נשמרים כמו במקורי (squat_count וכו').
 
 import os, cv2, math, numpy as np, subprocess
 from PIL import ImageFont, ImageDraw, Image
 
-# ===================== Fonts / Styles =====================
+# ===================== STYLE / FONTS =====================
 BAR_BG_ALPHA         = 0.55
 DONUT_RADIUS_SCALE   = 0.72
 DONUT_THICKNESS_FRAC = 0.28
@@ -33,7 +34,30 @@ try:
 except Exception:
     mp_pose = None
 
-# ===================== Helpers (wrap) =====================
+# ===================== Helpers =====================
+def _ang(a,b,c):
+    ba=np.array([a[0]-b[0], a[1]-b[1]]); bc=np.array([c[0]-b[0], c[1]-b[1]])
+    den=(np.linalg.norm(ba)*np.linalg.norm(bc))+1e-9
+    cos=float(np.clip(np.dot(ba,bc)/den, -1, 1))
+    return float(np.degrees(np.arccos(cos)))
+
+def _ema(prev,new,alpha):
+    return float(new) if prev is None else (alpha*float(new) + (1-alpha)*float(prev))
+
+def _half_floor10(x: float) -> float:
+    return max(0.0, min(10.0, math.floor(x * 2.0) / 2.0))
+
+def display_half_str(x):
+    q=round(float(x)*2)/2.0
+    return str(int(round(q))) if abs(q-round(q))<1e-9 else f"{q:.1f}"
+
+def score_label(s):
+    s=float(s)
+    if s>=9.0: return "Excellent"
+    if s>=7.0: return "Good"
+    if s>=5.5: return "Fair"
+    return "Needs work"
+
 def _wrap_two_lines(draw, text, font, max_width):
     words=text.split()
     if not words: return [""]
@@ -53,7 +77,7 @@ def _wrap_two_lines(draw, text, font, max_width):
         lines[-1] = last
     return lines
 
-# ===================== Body-only skeleton =====================
+# ===================== BODY-ONLY skeleton =====================
 _FACE_LMS = set()
 _BODY_CONNECTIONS = tuple()
 _BODY_POINTS = tuple()
@@ -87,23 +111,18 @@ def draw_body_only(frame, landmarks, color=(255,255,255)):
 
 # ===================== Overlay (BGR↔RGB תקין) =====================
 def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
-    """ציור דונאט + טקסט; PIL מקבל RGB ומחזירים BGR."""
     h, w, _ = frame.shape
-
-    # Donut (OpenCV) על ה־BGR המקורי
+    # Donut (OpenCV) ב-BGR
     ref_h = max(int(h*0.06), int(REPS_FONT_SIZE*1.6))
     radius = int(ref_h * DONUT_RADIUS_SCALE)
     thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
     margin = 12; cx = w - margin - radius; cy = max(ref_h + radius//8, radius + thick//2 + 2)
     pct = float(np.clip(height_pct,0,1))
     cv2.circle(frame, (cx, cy), radius, DEPTH_RING_BG, thick, lineType=cv2.LINE_AA)
-    start_ang = -90; end_ang = start_ang + int(360 * pct)
-    cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang, DEPTH_COLOR, thick, lineType=cv2.LINE_AA)
-
-    # טקסטים ב־PIL (RGB)
+    cv2.ellipse(frame, (cx, cy), (radius, radius), 0, -90, -90 + int(360*pct), DEPTH_COLOR, thick, lineType=cv2.LINE_AA)
+    # טקסטים ב-PIL (RGB)
     pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil)
-
     reps_text = f"Reps: {int(reps)}"
     pad_x, pad_y = 10, 6
     tw = draw.textlength(reps_text, font=REPS_FONT); th = REPS_FONT.size
@@ -112,16 +131,14 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
     base = cv2.addWeighted(over, BAR_BG_ALPHA, base, 1 - BAR_BG_ALPHA, 0)
     pil = Image.fromarray(base); draw = ImageDraw.Draw(pil)
     draw.text((pad_x, pad_y-1), reps_text, font=REPS_FONT, fill=(255,255,255))
-
-    # Donut labels
+    # תוויות דונאט
     gap = max(2, int(radius*0.10))
     base_y = cy - (DEPTH_LABEL_FONT.size + gap + DEPTH_PCT_FONT.size)//2
     label_txt = "HEIGHT"; pct_txt = f"{int(pct*100)}%"
     lw = draw.textlength(label_txt, font=DEPTH_LABEL_FONT); pw = draw.textlength(pct_txt, font=DEPTH_PCT_FONT)
     draw.text((cx - int(lw//2), base_y), label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
     draw.text((cx - int(pw//2), base_y + DEPTH_LABEL_FONT.size + gap), pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
-
-    # Feedback bar (תחתון)
+    # פידבק תחתון
     if feedback:
         max_w = int(w - 2*12 - 20)
         lines = _wrap_two_lines(draw, feedback, FEEDBACK_FONT, max_w)
@@ -136,40 +153,15 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
         for ln in lines:
             tw2 = draw.textlength(ln, font=FEEDBACK_FONT); tx = max(12, (w-int(tw2))//2)
             draw.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255,255,255)); ty += line_h + 4
-
-    # חזרה ל־BGR
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
-# ===================== Math helpers / scoring =====================
-def _ang(a,b,c):
-    ba=np.array([a[0]-b[0], a[1]-b[1]]); bc=np.array([c[0]-b[0], c[1]-b[1]])
-    den=(np.linalg.norm(ba)*np.linalg.norm(bc))+1e-9
-    cos=float(np.clip(np.dot(ba,bc)/den, -1, 1))
-    return float(np.degrees(np.arccos(cos)))
+# ===================== Params =====================
+# ריכוך “chin over bar”
+CHIN_RELAX = float(os.getenv("CHIN_RELAX", "0.85"))
 
-def _ema(prev,new,alpha):
-    return float(new) if prev is None else (alpha*float(new) + (1-alpha)*float(prev))
-
-def _half_floor10(x: float) -> float:
-    return max(0.0, min(10.0, math.floor(x * 2.0) / 2.0))
-
-def display_half_str(x):
-    q=round(float(x)*2)/2.0
-    return str(int(round(q))) if abs(q-round(q))<1e-9 else f"{q:.1f}"
-
-def score_label(s):
-    s=float(s)
-    if s>=9.0: return "Excellent"
-    if s>=7.0: return "Good"
-    if s>=5.5: return "Fair"
-    return "Needs work"
-
-# ===================== Thresholds / Params (base) =====================
-CHIN_RELAX = float(os.getenv("CHIN_RELAX", "0.85"))  # 15% ריכוך
-
-# ספים (מאוזנים)
-ELBOW_TOP_ANGLE = 100.0         # ≤100° = טופ
-HEAD_MIN_ASCENT = 0.06          # יחסית לגובה הפריים
+# ספים (מאוזנים ומוכחים)
+ELBOW_TOP_ANGLE = 100.0
+HEAD_MIN_ASCENT = 0.06
 HEAD_VEL_UP_TINY = -0.0008
 
 VIS_THR_STRICT = 0.55
@@ -204,15 +196,10 @@ FB_CUE_HIGHER = "Try to pull a little higher"
 FB_CUE_BOTTOM = "Fully extend arms at the bottom"
 FB_CUE_SWING  = "Try to reduce momentum"
 
-FB_WEIGHTS = {
-    FB_CUE_HIGHER: 0.5,
-    FB_CUE_BOTTOM: 0.7,
-    FB_CUE_SWING:  0.7,
-}
+FB_WEIGHTS = {FB_CUE_HIGHER:0.5, FB_CUE_BOTTOM:0.7, FB_CUE_SWING:0.7}
 FB_DEFAULT_WEIGHT   = 0.5
 PENALTY_MIN_IF_ANY  = 0.5
 
-# Debug (אופציונלי)
 DEBUG_ONBAR = bool(int(os.getenv("DEBUG_ONBAR", "0")))
 
 # ===================== MAIN =====================
@@ -225,10 +212,6 @@ def run_pullup_analysis(video_path,
                         encode_crf=None,
                         return_video=True,
                         fast_mode=None):
-    """
-    fast_mode=True  =>  מסלול מהיר (ללא וידאו): model_complexity=0, scale≈0.3, frame_skip≥4.
-    preserve_quality=True => scale=1.0, frame_skip=1, CRF=18.
-    """
     if mp_pose is None:
         return _ret_err("Mediapipe not available", feedback_path)
 
@@ -241,11 +224,10 @@ def run_pullup_analysis(video_path,
         frame_skip = max(frame_skip, 4)
 
     if preserve_quality:
-        scale = 1.0
-        frame_skip = 1
-        if encode_crf is None: encode_crf = 18
+        scale = 1.0; frame_skip = 1
+        encode_crf = 18 if encode_crf is None else encode_crf
     else:
-        if encode_crf is None: encode_crf = 23
+        encode_crf = 23 if encode_crf is None else encode_crf
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -255,14 +237,14 @@ def run_pullup_analysis(video_path,
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
     sec_to_frames = lambda s: max(1, int(s * effective_fps))
 
-    # --- התאמות לדילוג פריימים/fast ---
+    # התאמות לדילוגים / fast
     FS = max(1, int(frame_skip))
     HEAD_MIN_ASCENT_EFF = HEAD_MIN_ASCENT * CHIN_RELAX * (0.75 if FS >= 3 else 1.0)
     REFR_EFF = max(1, int(round(REFRACTORY_FRAMES / FS)))
     if fast_mode: REFR_EFF = 1
     RESET_DESCENT_EFF = max(RESET_DESCENT * 0.35, RESET_DESCENT / max(1.0, FS*0.8))
+    REARM_DESCENT_EFF = max(RESET_DESCENT_EFF * 0.50, 0.015)  # מאפשר ספירה בחזרה הבאה גם עם דיפ קצר
 
-    # on-bar רך יותר ב-fast
     if fast_mode:
         VIS_EFF   = min(VIS_THR_STRICT, 0.35)
         WRIST_VIS_EFF = 0.25
@@ -277,7 +259,7 @@ def run_pullup_analysis(video_path,
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
     frame_idx = 0
-    eff_idx = 0  # מס' הפריימים המעובדים אחרי הדילוג
+    eff_idx = 0
 
     # Counters
     rep_count=0; good_reps=0; bad_reps=0
@@ -297,10 +279,14 @@ def run_pullup_analysis(video_path,
 
     # State
     elbow_ema=None; head_ema=None; head_prev=None
-    asc_base_head=None; baseline_head_y_global=None
-    allow_new_peak=True; last_peak_frame=-99999
+    baseline_head_y_global=None
 
-    # ---- מחזור/חצי-מחזור לצורך פוסט־הוק ----
+    asc_base_head=None
+    allow_new_peak=True
+    last_peak_eff=-10**9
+    last_top_head=None
+
+    # מחזור לצורך Post-hoc
     cycle_peak_ascent = 0.0
     cycle_min_elbow   = 999.0
     counted_this_cycle = False
@@ -311,7 +297,7 @@ def run_pullup_analysis(video_path,
     offbar_frames_since_any_rep = 0
     nopose_frames_since_any_rep = 0
 
-    # Feedback (session + per-rep)
+    # Feedback
     session_feedback=set()
     rt_fb_msg=None; rt_fb_hold=0
     rep_penalty_current = 0.0
@@ -334,10 +320,8 @@ def run_pullup_analysis(video_path,
             grabbed = cap.grab()
             if not grabbed: break
             frame_idx += 1
-
             if frame_idx % FS != 0:
                 continue
-
             ret, frame = cap.retrieve()
             if not ret: break
             eff_idx += 1
@@ -354,8 +338,7 @@ def run_pullup_analysis(video_path,
 
             if not res.pose_landmarks:
                 nopose_frames_since_any_rep = (nopose_frames_since_any_rep + 1) if rep_count>0 else 0
-                if rep_count>0 and nopose_frames_since_any_rep >= NOPOSE_STOP_FRAMES:
-                    break
+                if rep_count>0 and nopose_frames_since_any_rep >= NOPOSE_STOP_FRAMES: break
                 if return_video and out is not None:
                     frame = draw_overlay(frame, reps=rep_count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=0.0)
                     out.write(frame)
@@ -366,15 +349,16 @@ def run_pullup_analysis(video_path,
             lms = res.pose_landmarks.landmark
             side, S,E,W = _pick_side_dyn(lms)
 
-            # strict visibility
+            # Visibility
             min_vis = min(lms[NOSE].visibility, lms[S].visibility, lms[E].visibility, lms[W].visibility)
             vis_strict_ok = (min_vis >= VIS_EFF)
 
-            # positions/angles
+            # Positions/angles
             head_raw = float(lms[NOSE].y)
             raw_elbow_L = _ang((lms[LSH].x, lms[LSH].y), (lms[LE].x, lms[LE].y), (lms[LW].x, lms[LW].y))
             raw_elbow_R = _ang((lms[RSH].x, lms[RSH].y), (lms[RE].x, lms[RE].y), (lms[RW].x, lms[RW].y))
             raw_elbow = raw_elbow_L if side == "LEFT" else raw_elbow_R
+            raw_elbow_min = min(raw_elbow_L, raw_elbow_R)
 
             elbow_ema = _ema(elbow_ema, raw_elbow, ELBOW_EMA_ALPHA)
             head_ema  = _ema(head_ema,  head_raw,  HEAD_EMA_ALPHA)
@@ -382,7 +366,7 @@ def run_pullup_analysis(video_path,
             if baseline_head_y_global is None: baseline_head_y_global = head_y
             height_live = float(np.clip((baseline_head_y_global - head_y)/max(0.12, HEAD_MIN_ASCENT_EFF*1.2), 0.0, 1.0))
 
-            # torso cx (to detect walking/swing)
+            # Torso drift
             torso_cx = np.mean([lms[LSH].x, lms[RSH].x, lms[LH].x, lms[RH].x]) * w
             torso_dx_norm = 0.0 if prev_torso_cx is None else abs(torso_cx - prev_torso_cx)/max(1.0, w)
             prev_torso_cx = torso_cx
@@ -399,8 +383,7 @@ def run_pullup_analysis(video_path,
                 offbar_streak += 1; onbar_streak = 0
 
             if DEBUG_ONBAR and eff_idx % 10 == 0:
-                print(f"[DBG] eff={eff_idx} onbar={onbar} visMin={min_vis:.2f} "
-                      f"lwAbove={lw_above} rwAbove={rw_above} torsoDx={torso_dx_norm:.4f}")
+                print(f"[DBG] eff={eff_idx} onbar={onbar} visMin={min_vis:.2f} lwAbove={lw_above} rwAbove={rw_above} torsoDx={torso_dx_norm:.4f}")
 
             # כניסה ל-onbar
             if (not onbar) and onbar_streak >= ONBAR_MIN_FRAMES:
@@ -409,47 +392,34 @@ def run_pullup_analysis(video_path,
                 allow_new_peak = True
                 swing_streak = 0
                 rep_penalty_current = 0.0
-                # איפוס מחזור
+                # reset cycle
                 cycle_peak_ascent = 0.0
                 cycle_min_elbow   = 999.0
                 counted_this_cycle = False
 
-            # יציאה מ-onbar → לפני שמאפסים, נספור פוסט־הוק אם צריך
+            # יציאה מ-onbar → Flush פוסט־הוק אם צריך
             if onbar and offbar_streak >= OFFBAR_MIN_FRAMES:
                 if (not counted_this_cycle) and (cycle_peak_ascent >= HEAD_MIN_ASCENT_EFF) and (cycle_min_elbow <= ELBOW_TOP_ANGLE):
-                    rep_score = max(0.0, 10.0 - rep_penalty_current)
-                    rep_is_good = (rep_score >= 10.0 - 1e-6)
+                    _count_rep(rep_reports, rep_count, rep_penalty_current, cycle_min_elbow,
+                               asc_base_head if asc_base_head is not None else head_y,
+                               baseline_head_y_global - cycle_peak_ascent if baseline_head_y_global is not None else head_y,
+                               all_scores)
                     rep_count += 1
-                    if rep_is_good: good_reps += 1
-                    else: bad_reps += 1
-                    all_scores.append(rep_score)
-                    rep_reports.append({
-                        "rep_index": rep_count,
-                        "score": float(rep_score),
-                        "good": bool(rep_is_good),
-                        "top_elbow": float(cycle_min_elbow),
-                        "ascent_from": float(asc_base_head if asc_base_head is not None else head_y),
-                        "peak_head_y": float(baseline_head_y_global - cycle_peak_ascent if baseline_head_y_global is not None else head_y)
-                    })
-                onbar = False
-                offbar_frames_since_any_rep = 0
-                # איפוס מחזור
+                    good_reps, bad_reps = _mark_good_bad(all_scores[-1], good_reps, bad_reps)
+                onbar = False; offbar_frames_since_any_rep = 0
                 asc_base_head = None
-                cycle_peak_ascent = 0.0
-                cycle_min_elbow   = 999.0
-                counted_this_cycle = False
+                cycle_peak_ascent = 0.0; cycle_min_elbow = 999.0; counted_this_cycle = False
 
             if (not onbar) and rep_count>0:
                 offbar_frames_since_any_rep += 1
-                if offbar_frames_since_any_rep >= OFFBAR_STOP_FRAMES:
-                    break
+                if offbar_frames_since_any_rep >= OFFBAR_STOP_FRAMES: break
 
-            # Counting (ON-BAR)
+            # ===== Counting (ON BAR) =====
             head_vel = 0.0 if head_prev is None else (head_y - head_prev)
             cur_rt = None
 
             if onbar and vis_strict_ok:
-                # התחלת מחזור עלייה
+                # התחלת עלייה
                 if asc_base_head is None:
                     if head_vel < -abs(HEAD_VEL_UP_TINY):
                         asc_base_head = head_y
@@ -458,103 +428,72 @@ def run_pullup_analysis(video_path,
                         cycle_min_elbow   = elbow_angle
                         counted_this_cycle = False
                 else:
-                    # עדכון מדדים למחזור
+                    # עדכון מחזור
                     cycle_peak_ascent = max(cycle_peak_ascent, (asc_base_head - head_y))
                     cycle_min_elbow   = min(cycle_min_elbow, elbow_angle)
 
-                    # ריסט רך יותר בדילוגים
-                    if (head_y - asc_base_head) > (RESET_DESCENT_EFF):
-                        # אם לא נספר אונליין — נספור פוסט־הוק כעת
+                    # ריסט (ירידה) — לפני איפוס, Flush פוסט־הוק אם צריך
+                    if (head_y - asc_base_head) > (RESET_DESCENT_EFF) or (elbow_angle >= RESET_ELBOW):
                         if (not counted_this_cycle) and (cycle_peak_ascent >= HEAD_MIN_ASCENT_EFF) and (cycle_min_elbow <= ELBOW_TOP_ANGLE):
-                            rep_score = max(0.0, 10.0 - rep_penalty_current)
-                            rep_is_good = (rep_score >= 10.0 - 1e-6)
+                            _count_rep(rep_reports, rep_count, rep_penalty_current, cycle_min_elbow,
+                                       asc_base_head, baseline_head_y_global - cycle_peak_ascent if baseline_head_y_global is not None else head_y,
+                                       all_scores)
                             rep_count += 1
-                            if rep_is_good: good_reps += 1
-                            else: bad_reps += 1
-                            all_scores.append(rep_score)
-                            rep_reports.append({
-                                "rep_index": rep_count,
-                                "score": float(rep_score),
-                                "good": bool(rep_is_good),
-                                "top_elbow": float(cycle_min_elbow),
-                                "ascent_from": float(asc_base_head),
-                                "peak_head_y": float(baseline_head_y_global - cycle_peak_ascent if baseline_head_y_global is not None else head_y)
-                            })
-                        # התחלה חדשה למחזור הבא
+                            good_reps, bad_reps = _mark_good_bad(all_scores[-1], good_reps, bad_reps)
                         asc_base_head = head_y
                         rep_penalty_current = 0.0
                         cycle_peak_ascent = 0.0
                         cycle_min_elbow   = elbow_angle
                         counted_this_cycle = False
+                        allow_new_peak = True
+                        bottom_phase_max_elbow = None
+                        bottom_already_reported = False
 
                 ascent_amt = 0.0 if asc_base_head is None else (asc_base_head - head_y)
 
-                # ===== TOP condition אונליין =====
+                # TOP אונליין (עם fallback raw ו-REARM)
                 at_top = (elbow_angle <= ELBOW_TOP_ANGLE) and (ascent_amt >= HEAD_MIN_ASCENT_EFF)
-                can_cnt = (frame_idx - last_peak_frame) >= REFR_EFF
+                raw_top = (raw_elbow_min <= (ELBOW_TOP_ANGLE + 4.0)) and (ascent_amt >= HEAD_MIN_ASCENT_EFF * 0.92)
+                at_top = at_top or raw_top
+                can_cnt = (eff_idx - last_peak_eff) >= REFR_EFF
 
-                if at_top and allow_new_peak and can_cnt:
-                    rep_score = max(0.0, 10.0 - rep_penalty_current)
-                    rep_is_good = (rep_score >= 10.0 - 1e-6)
+                if at_top and allow_new_peak and can_cnt and (not counted_this_cycle):
+                    _count_rep(rep_reports, rep_count, rep_penalty_current, elbow_angle,
+                               asc_base_head if asc_base_head is not None else head_y, head_y, all_scores)
                     rep_count += 1
-                    if rep_is_good: good_reps += 1
-                    else: bad_reps += 1
-                    all_scores.append(rep_score)
-                    rep_reports.append({
-                        "rep_index": rep_count,
-                        "score": float(rep_score),
-                        "good": bool(rep_is_good),
-                        "top_elbow": float(elbow_angle),
-                        "ascent_from": float(asc_base_head if asc_base_head is not None else head_y),
-                        "peak_head_y": float(head_y)
-                    })
-                    last_peak_frame = frame_idx
+                    good_reps, bad_reps = _mark_good_bad(all_scores[-1], good_reps, bad_reps)
+                    last_peak_eff = eff_idx
+                    last_top_head = head_y
                     allow_new_peak = False
                     counted_this_cycle = True
                     bottom_already_reported = False
                     bottom_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
 
-                if (allow_new_peak is False):
-                    cand = max(raw_elbow_L, raw_elbow_R)
-                    bottom_phase_max_elbow = cand if bottom_phase_max_elbow is None else max(bottom_phase_max_elbow, cand)
+                # Rearm על דיפ קטן מהטופ (לפתור חזרה #9)
+                if (allow_new_peak is False) and (last_top_head is not None):
+                    if (head_y - last_top_head) >= REARM_DESCENT_EFF:
+                        allow_new_peak = True
+                        bottom_already_reported = False
+                        bottom_phase_max_elbow = None
 
-                reset_by_desc = (asc_base_head is not None) and ((head_y - asc_base_head) >= RESET_DESCENT_EFF)
-                reset_by_elb  = (elbow_angle >= RESET_ELBOW)
-                if reset_by_desc or reset_by_elb:
-                    if not bottom_already_reported:
-                        effective_max = bottom_phase_max_elbow if bottom_phase_max_elbow is not None else max(raw_elbow_L, raw_elbow_R)
-                        if effective_max < (BOTTOM_EXT_MIN_ANGLE - BOTTOM_HYST_DEG):
-                            bottom_fail_count += 1
-                            rep_penalty_current += FB_WEIGHTS.get(FB_CUE_BOTTOM, FB_DEFAULT_WEIGHT)
-                            if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS:
-                                session_feedback.add(FB_CUE_BOTTOM); cur_rt = cur_rt or FB_CUE_BOTTOM
-                        else:
-                            bottom_fail_count = max(0, bottom_fail_count - 1)
-                        bottom_already_reported = True
-
-                    # (החלק של ריסט הבייסליין יקרה למעלה; כאן רק שחרור peak)
-                    allow_new_peak = True
-                    bottom_phase_max_elbow = None
-
-                # RT: need higher
+                # RT: higher
                 if (cur_rt is None) and (asc_base_head is not None) and (ascent_amt < HEAD_MIN_ASCENT*0.7) and (head_vel < -abs(HEAD_VEL_UP_TINY)):
                     session_feedback.add(FB_CUE_HIGHER); cur_rt = FB_CUE_HIGHER
                     rep_penalty_current += FB_WEIGHTS.get(FB_CUE_HIGHER, FB_DEFAULT_WEIGHT)
 
-                # RT: swing (kipping)
-                if torso_dx_norm > SWING_THR:
-                    swing_streak += 1
-                else:
-                    swing_streak = max(0, swing_streak-1)
+                # RT: swing
+                if torso_dx_norm > SWING_THR: swing_streak += 1
+                else: swing_streak = max(0, swing_streak-1)
                 if (cur_rt is None) and (swing_streak >= SWING_MIN_STREAK) and (not swing_already_reported):
                     session_feedback.add(FB_CUE_SWING); cur_rt = FB_CUE_SWING; swing_already_reported = True
                     rep_penalty_current += FB_WEIGHTS.get(FB_CUE_SWING, FB_DEFAULT_WEIGHT)
+
             else:
                 asc_base_head = None; allow_new_peak = True
                 swing_streak = 0
                 bottom_phase_max_elbow = None
 
-            # RT feedback hold
+            # RT hold
             if cur_rt:
                 if cur_rt != rt_fb_msg:
                     rt_fb_msg = cur_rt; rt_fb_hold = RT_FB_HOLD_FRAMES
@@ -563,7 +502,7 @@ def run_pullup_analysis(video_path,
             else:
                 if rt_fb_hold > 0: rt_fb_hold -= 1
 
-            # ציור/כתיבה — רק אם מחזירים וידאו
+            # ציור
             if return_video and out is not None:
                 frame = draw_body_only(frame, lms)
                 frame = draw_overlay(frame, reps=rep_count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=height_live)
@@ -571,11 +510,21 @@ def run_pullup_analysis(video_path,
 
             if head_y is not None: head_prev = head_y
 
+    # ===== EOF Flush =====
+    # אם יש מחזור פתוח שלא נספר, נספור אותו כעת.
+    if onbar and (not counted_this_cycle) and (cycle_peak_ascent >= HEAD_MIN_ASCENT_EFF) and (cycle_min_elbow <= ELBOW_TOP_ANGLE):
+        _count_rep(rep_reports, rep_count, rep_penalty_current, cycle_min_elbow,
+                   asc_base_head if asc_base_head is not None else (baseline_head_y_global or 0.0),
+                   (baseline_head_y_global - cycle_peak_ascent) if baseline_head_y_global is not None else (baseline_head_y_global or 0.0),
+                   all_scores)
+        rep_count += 1
+        good_reps, bad_reps = _mark_good_bad(all_scores[-1], good_reps, bad_reps)
+
     cap.release()
     if return_video and out: out.release()
     cv2.destroyAllWindows()
 
-    # ===== TECHNIQUE SCORE (סשן) =====
+    # ===== Technique score =====
     if rep_count == 0:
         technique_score = 0.0
     else:
@@ -586,27 +535,26 @@ def run_pullup_analysis(video_path,
         raw_score = max(0.0, 10.0 - penalty)
         technique_score = _half_floor10(raw_score)
 
-    # form_tip: אם אין session feedback — נופל ל־RT tip האחרון (אם קיים)
+    # form_tip (לא יחזור null)
     form_tip = None
     if session_feedback:
         form_tip = max(session_feedback, key=lambda m: FB_WEIGHTS.get(m, FB_DEFAULT_WEIGHT))
     elif 'rt_fb_msg' in locals() and rt_fb_msg:
         form_tip = rt_fb_msg
-
-    feedback_list = sorted(session_feedback) if session_feedback else ["Great form! Keep it up 💪"]
+    fb_list = sorted(session_feedback) if session_feedback else ["Great form! Keep it up 💪"]
 
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
             f.write(f"Total Reps: {int(rep_count)}\n")
             f.write(f"Technique Score: {display_half_str(technique_score)} / 10  ({score_label(technique_score)})\n")
-            if feedback_list:
+            if fb_list:
                 f.write("Feedback:\n")
-                for ln in feedback_list:
+                for ln in fb_list:
                     f.write(f"- {ln}\n")
     except Exception:
         pass
 
-    # ===== Video encode (רק אם מחזירים וידאו) =====
+    # ===== Encode video (אם צריך) =====
     final_path = ""
     if return_video:
         encoded_path = output_path.replace(".mp4", "_encoded.mp4")
@@ -632,13 +580,30 @@ def run_pullup_analysis(video_path,
         "technique_label": score_label(technique_score),
         "good_reps": int(good_reps),
         "bad_reps": int(bad_reps),
-        "feedback": feedback_list,
+        "feedback": fb_list,
         "form_tip": form_tip,
         "tips": [],
         "reps": rep_reports,
         "video_path": final_path,
         "feedback_path": feedback_path
     }
+
+# ---------- helpers ----------
+def _count_rep(rep_reports, rep_count, rep_penalty_current, top_elbow, ascent_from, peak_head_y, all_scores):
+    rep_score = max(0.0, 10.0 - rep_penalty_current)
+    all_scores.append(rep_score)
+    rep_reports.append({
+        "rep_index": int(rep_count + 1),
+        "score": float(rep_score),
+        "good": bool(rep_score >= 10.0 - 1e-6),
+        "top_elbow": float(top_elbow),
+        "ascent_from": float(ascent_from),
+        "peak_head_y": float(peak_head_y)
+    })
+
+def _mark_good_bad(score, good, bad):
+    if score >= 10.0 - 1e-6: return good+1, bad
+    return good, bad+1
 
 def _ret_err(msg, feedback_path):
     try:
@@ -657,3 +622,4 @@ def _ret_err(msg, feedback_path):
 # תאימות
 def run_analysis(*args, **kwargs):
     return run_pullup_analysis(*args, **kwargs)
+
