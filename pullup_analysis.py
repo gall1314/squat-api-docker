@@ -39,8 +39,8 @@ def _wrap_two_lines(draw, text, font, max_width):
     if not words: return [""]
     lines, cur = [], ""
     for w in words:
-        trial=(cur+" "+w).strip()
-        if draw.textlength(trial, font=font) <= max_width: cur=trial
+        t=(cur+" "+w).strip()
+        if draw.textlength(t, font=font) <= max_width: cur=t
         else:
             if cur: lines.append(cur)
             cur=w
@@ -164,11 +164,9 @@ def score_label(s):
     if s>=5.5: return "Fair"
     return "Needs work"
 
-# ===================== Thresholds / Params =====================
-# “Chin over bar” רך יותר: מכפיל על הגובה הנדרש (ברירת מחדל: 0.85 => 15% ריכוך)
-CHIN_RELAX = float(os.getenv("CHIN_RELAX", "0.85"))
+# ===================== Thresholds / Params (base) =====================
+CHIN_RELAX = float(os.getenv("CHIN_RELAX", "0.85"))  # 15% ריכוך
 
-# ספים בסיסיים (כמו מקורי)
 VIS_THR_STRICT = 0.55
 HEAD_EMA_ALPHA = 0.35
 ELBOW_EMA_ALPHA = 0.35
@@ -253,15 +251,28 @@ def run_pullup_analysis(video_path,
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
     sec_to_frames = lambda s: max(1, int(s * effective_fps))
 
-    # --- התאמות דינמיות למקרה של דילוג פריימים (כדי לא לאבד פסגות) ---
+    # --- התאמות אפקטיביות לדילוג פריימים/fast ---
     FS = max(1, int(frame_skip))
+
     HEAD_MIN_ASCENT_EFF = HEAD_MIN_ASCENT * CHIN_RELAX
     if FS >= 3:
-        HEAD_MIN_ASCENT_EFF *= 0.75   # ריכוך נוסף בדגימה דלילה
+        HEAD_MIN_ASCENT_EFF *= 0.75
+
     REFR_EFF = max(1, int(round(REFRACTORY_FRAMES / FS)))
     if fast_mode:
         REFR_EFF = 1
+
     RESET_DESCENT_EFF = max(RESET_DESCENT * 0.35, RESET_DESCENT / max(1.0, FS*0.8))
+
+    # שער on-bar “רך” יותר ב-fast כדי לא ליפול ל-0 חזרות
+    if fast_mode:
+        VIS_EFF = min(VIS_THR_STRICT, 0.40)
+        WRIST_MARGIN_EFF = WRIST_ABOVE_HEAD_MARGIN * 0.7
+        TORSO_X_EFF = TORSO_X_THR * 1.6
+    else:
+        VIS_EFF = VIS_THR_STRICT
+        WRIST_MARGIN_EFF = WRIST_ABOVE_HEAD_MARGIN
+        TORSO_X_EFF = TORSO_X_THR
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
@@ -343,9 +354,9 @@ def run_pullup_analysis(video_path,
             lms = res.pose_landmarks.landmark
             side, S,E,W = _pick_side_dyn(lms)
 
-            # strict visibility
+            # strict visibility (יעבור ל-VIS_EFF)
             min_vis = min(lms[NOSE].visibility, lms[S].visibility, lms[E].visibility, lms[W].visibility)
-            vis_strict_ok = (min_vis >= VIS_THR_STRICT)
+            vis_strict_ok = (min_vis >= VIS_EFF)
 
             # positions/angles
             head_raw = float(lms[NOSE].y)
@@ -357,20 +368,20 @@ def run_pullup_analysis(video_path,
             head_ema  = _ema(head_ema,  head_raw,  HEAD_EMA_ALPHA)
             head_y = head_ema; elbow_angle = elbow_ema
             if baseline_head_y_global is None: baseline_head_y_global = head_y
-            height_live = float(np.clip((baseline_head_y_global - head_y)/max(0.12, HEAD_MIN_ASCENT*1.2), 0.0, 1.0))
+            height_live = float(np.clip((baseline_head_y_global - head_y)/max(0.12, HEAD_MIN_ASCENT_EFF*1.2), 0.0, 1.0))
 
             # torso cx (to detect walking/swing)
             torso_cx = np.mean([lms[LSH].x, lms[RSH].x, lms[LH].x, lms[RH].x]) * w
             torso_dx_norm = 0.0 if prev_torso_cx is None else abs(torso_cx - prev_torso_cx)/max(1.0, w)
             prev_torso_cx = torso_cx
 
-            # On/Off-bar gating
+            # On/Off-bar gating (עם ריכוך ב-fast)
             lw_vis = lms[LW].visibility; rw_vis = lms[RW].visibility
-            lw_above = (lw_vis >= WRIST_VIS_THR) and (lms[LW].y < lms[NOSE].y - WRIST_ABOVE_HEAD_MARGIN)
-            rw_above = (rw_vis >= WRIST_VIS_THR) and (lms[RW].y < lms[NOSE].y - WRIST_ABOVE_HEAD_MARGIN)
+            lw_above = (lw_vis >= WRIST_VIS_THR) and (lms[LW].y < lms[NOSE].y - WRIST_MARGIN_EFF)
+            rw_above = (rw_vis >= WRIST_VIS_THR) and (lms[RW].y < lms[NOSE].y - WRIST_MARGIN_EFF)
             grip = (lw_above or rw_above)
 
-            if vis_strict_ok and grip and (torso_dx_norm <= TORSO_X_THR):
+            if vis_strict_ok and grip and (torso_dx_norm <= TORSO_X_EFF):
                 onbar_streak += 1; offbar_streak = 0
             else:
                 offbar_streak += 1; onbar_streak = 0
@@ -394,18 +405,17 @@ def run_pullup_analysis(video_path,
 
             if onbar and vis_strict_ok:
                 if asc_base_head is None:
-                    if head_vel < -HEAD_VEL_UP_TINY:
+                    if head_vel < -abs(HEAD_VEL_UP_TINY):   # עלייה (y יורד)
                         asc_base_head = head_y
                         rep_penalty_current = 0.0
                 else:
-                    # ריסט רך יותר בדילוגים
                     if (head_y - asc_base_head) > (RESET_DESCENT_EFF):
                         asc_base_head = head_y
                         rep_penalty_current = 0.0
 
                 ascent_amt = 0.0 if asc_base_head is None else (asc_base_head - head_y)
 
-                # ===== TOP condition (relaxed height, מותאם לדילוגים) =====
+                # ===== TOP condition (relaxed height, מותאם לדגימה) =====
                 at_top = (elbow_angle <= ELBOW_TOP_ANGLE) and (ascent_amt >= HEAD_MIN_ASCENT_EFF)
                 can_cnt = (frame_idx - last_peak_frame) >= REFR_EFF
 
@@ -442,8 +452,7 @@ def run_pullup_analysis(video_path,
                             bottom_fail_count += 1
                             rep_penalty_current += FB_WEIGHTS.get(FB_CUE_BOTTOM, FB_DEFAULT_WEIGHT)
                             if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS:
-                                session_feedback.add(FB_CUE_BOTTOM)
-                                cur_rt = cur_rt or FB_CUE_BOTTOM
+                                session_feedback.add(FB_CUE_BOTTOM); cur_rt = cur_rt or FB_CUE_BOTTOM
                         else:
                             bottom_fail_count = max(0, bottom_fail_count - 1)
                         bottom_already_reported = True
@@ -452,8 +461,8 @@ def run_pullup_analysis(video_path,
                     asc_base_head = head_y
                     bottom_phase_max_elbow = None
 
-                # RT: need higher (לא משפיע ספירה, כן משפיע ציון/טיפ)
-                if (cur_rt is None) and (asc_base_head is not None) and (ascent_amt < HEAD_MIN_ASCENT*0.7) and (head_vel < -HEAD_VEL_UP_TINY):
+                # RT: need higher
+                if (cur_rt is None) and (asc_base_head is not None) and (ascent_amt < HEAD_MIN_ASCENT*0.7) and (head_vel < -abs(HEAD_VEL_UP_TINY)):
                     session_feedback.add(FB_CUE_HIGHER); cur_rt = FB_CUE_HIGHER
                     rep_penalty_current += FB_WEIGHTS.get(FB_CUE_HIGHER, FB_DEFAULT_WEIGHT)
 
@@ -546,7 +555,7 @@ def run_pullup_analysis(video_path,
         "technique_score": float(technique_score),
         "technique_score_display": display_half_str(technique_score),
         "technique_label": score_label(technique_score),
-        "good_reps": int(good_reps),      # רק חזרות עם ציון 10
+        "good_reps": int(good_reps),
         "bad_reps": int(bad_reps),
         "feedback": feedback_list,
         "form_tip": form_tip,
