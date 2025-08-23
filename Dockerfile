@@ -1,45 +1,43 @@
-# CUDA 12.x + Ubuntu 22.04 (כולל דרייברים בתוך ה־runtime libs)
+# CUDA 12.x + Ubuntu 22.04 (כולל ספריות ריצה של NVIDIA)
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
-# ffmpeg וספריות X הדרושות ל־opencv, ועוד בסיס לפייתון
+# חשוב: לא צריך libnvidia-encode1 בתוך הקונטיינר (מגיע מה-host של Fly)
+# מתקינים ffmpeg וספריות X ל-OpenCV + פייתון
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     python3.10 python3.10-venv python3-pip \
     ffmpeg \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    libnvidia-encode1\
+    libglib2.0-0 libsm6 libxext6 libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
-# משתני סביבה מומלצים ל־NVIDIA בתוך קונטיינר
+# לאפשר לקונטיינר להשתמש ביכולות GPU כולל video (NVENC)
 ENV NVIDIA_VISIBLE_DEVICES=all \
-    NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# התקנת תלויות פייתון בסביבת venv כדי לשמור על אימג’ נקי
+# סביבת venv נקייה
 RUN python3.10 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# אופציונלי: נוודא pip עדכני
+# pip עדכני
 RUN python -m pip install --upgrade pip
 
-# אם אתה משתמש ב‑PyTorch עם CUDA, עדיף לקבע אינדקס גלגלים מתאים ל‑CUDA
-# ניתן לשלוט בגרסה דרך build arg (ברירת מחדל cu121 תואם CUDA 12.1/12.2/12.4 wheels)
+# אם תרצה להשתמש ב-PyTorch עם CUDA (לא חובה לפרויקט הנוכחי)
 ARG TORCH_CUDA=cu121
-# אפשר להשאיר את זה כאן כדי ש-requirements.txt יוכל לכלול "torch==<ver>+cu121"
 ENV PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/${TORCH_CUDA}"
 
-# העתקת דרישות והתקנה
+# דרישות פייתון
 COPY requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# העתקת הקוד
+# קוד האפליקציה
 COPY . .
 
-# אקספוז (התאם לפי האפליקציה שלך)
+# האפליקציה מאזינה על 8080 (ודא שבקוד אתה משתמש ב-PORT מהסביבה)
 EXPOSE 8080
 
 # הפעלה
 CMD ["python", "app.py"]
+
