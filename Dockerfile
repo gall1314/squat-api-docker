@@ -9,6 +9,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     libsm6 \
     libxext6 \
     libxrender1 \
+    libnvidia-encode1\
     && rm -rf /var/lib/apt/lists/*
 
 # משתני סביבה מומלצים ל־NVIDIA בתוך קונטיינר
