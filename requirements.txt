@@ -1,8 +1,9 @@
 Flask
 Flask-Cors
-opencv-python-headless
-mediapipe
+opencv-python-headless==4.9.0.80
+mediapipe==0.10.14
 numpy
 Pillow
 requests
-onnxruntime
+onnxruntime-gpu==1.18.1
+ffmpeg-python
