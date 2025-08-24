@@ -1,4 +1,3 @@
-# fly.toml — GPU Machines (minimal)
 app = "squat-api-docker"
 primary_region = "fra"
 
@@ -6,24 +5,18 @@ primary_region = "fra"
   internal_port = 8080
   force_https = true
   auto_start_machines = true
-  auto_stop_machines = "stop"   # מומלץ ב-GPU כדי לחסוך עלויות כשאין תנועה
+  auto_stop_machines = "stop"
   min_machines_running = 0
   processes = ["app"]
-  [http_service.concurrency]
-    type = "requests"
-    soft_limit = 20
-    hard_limit = 40
 
 [[vm]]
-  # שימי לב: אין כאן cpus/cpu_kind!
-  memory_mb = 2048
-  gpu_kind = "a10"   # אפשר גם "l40s" / "a100" לפי זמינות ב-region
-  gpus = 1
+  # בלי cpus/‏cpu_kind!
+  memory_mb = 16384        # ← זה המינימום ש-Fly מבקש כאן
+  gpu_kind  = "a10"        # או l40s / a100 אם תחליפי
+  gpus      = 1
 
 [env]
   PORT = "8080"
   NVIDIA_VISIBLE_DEVICES = "all"
   NVIDIA_DRIVER_CAPABILITIES = "compute,video,utility"
-  DEBUG = "1"                # לוגים בקוד
-  # FORCE_CPU_ENCODE = "1"   # אופציונלי: לעקוף NVENC לבדיקה
-  # MAX_WALL_SEC = "120"     # אופציונלי: watchdog עדין
+  DEBUG = "1"
