@@ -10,13 +10,10 @@ primary_region = "fra"
   processes = ["app"]
 
 [[vm]]
-  # בלי cpus/‏cpu_kind!
-  memory_mb = 16384        # ← זה המינימום ש-Fly מבקש כאן
-  gpu_kind  = "a10"        # או l40s / a100 אם תחליפי
-  gpus      = 1
+  cpu_kind = "shared"   # אפשר גם "performance" אם תרצה ביצועים חזקים יותר
+  cpus = 2              # 2 ליבות זה מספיק לרוב; אפשר לעלות ל-4 אם צריך
+  memory_mb = 1024      # זיכרון – תתחיל עם 1GB, תעלה אם רואה OOM
 
 [env]
   PORT = "8080"
-  NVIDIA_VISIBLE_DEVICES = "all"
-  NVIDIA_DRIVER_CAPABILITIES = "compute,video,utility"
   DEBUG = "1"
