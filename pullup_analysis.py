@@ -2,9 +2,18 @@
 # pullup_analysis_gpu.py — MediaPipe CPU + GPU NVENC encode (auto-fallback to CPU)
 # אם יש NVENC: קידוד על GPU (h264_nvenc). אם אין: נופל ל-libx264.
 
-import os, cv2, math, numpy as np, subprocess, shutil
+import os, cv2, math, numpy as np, subprocess, shutil, time, sys
 from collections import deque
 from PIL import ImageFont, ImageDraw, Image
+
+# ============ Runtime flags / logging ============
+DEBUG = bool(int(os.getenv("DEBUG", "1")))
+FORCE_CPU_ENCODE = bool(int(os.getenv("FORCE_CPU_ENCODE", "0")))
+MAX_WALL_SEC = float(os.getenv("MAX_WALL_SEC", "120"))
+
+def _log(*args):
+    if DEBUG:
+        print("[PULLUP]", *args, flush=True)
 
 # ============ Styles ============
 BAR_BG_ALPHA=0.55; DONUT_RADIUS_SCALE=0.72; DONUT_THICKNESS_FRAC=0.28
@@ -29,34 +38,42 @@ except Exception:
 
 # ============ NVENC helpers ============
 def _has_nvenc() -> bool:
-    """בודק אם ffmpeg כולל h264_nvenc/hevc_nvenc."""
+    """בודק אם ffmpeg כולל h264_nvenc/hevc_nvenc (ונכבד FORCE_CPU_ENCODE)."""
+    if FORCE_CPU_ENCODE:
+        _log("FORCE_CPU_ENCODE=1 → skip NVENC")
+        return False
     if shutil.which("ffmpeg") is None:
+        _log("ffmpeg not found in PATH")
         return False
     try:
         out = subprocess.check_output(
             ["ffmpeg","-hide_banner","-encoders"], stderr=subprocess.STDOUT
         ).decode("utf-8","ignore").lower()
-        return ("h264_nvenc" in out) or ("hevc_nvenc" in out)
-    except Exception:
+        has = ("h264_nvenc" in out) or ("hevc_nvenc" in out)
+        _log("NVENC available?", has)
+        return has
+    except Exception as e:
+        _log("ffmpeg encoders check failed:", e)
         return False
 
 def encode_with_nvenc(src, dst, preset="p5", bitrate="5M", maxrate="8M", bufsize="10M"):
     """
     קידוד מהיר על GPU (NVENC). אם יש אודיו—נעתיק אותו (copy).
+    שים לב: לא כופים NVDEC (-hwaccel cuda) כדי למנוע תקיעות ב-decode.
     """
     cmd = [
         "ffmpeg","-y",
-        "-hwaccel","cuda",  # פענוח מואץ כשאפשר
         "-i", src,
         "-c:v","h264_nvenc",
-        "-preset", preset,  # p6/p7 = מהיר יותר, קצת פחות איכות
+        "-preset", preset,
         "-b:v", bitrate, "-maxrate", maxrate, "-bufsize", bufsize,
         "-pix_fmt","yuv420p",
         "-movflags","+faststart",
         "-c:a","copy",
         dst
     ]
-    subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _log("Running NVENC:", " ".join(cmd))
+    subprocess.run(cmd, check=False)
 
 def encode_with_x264(src, dst, crf=23, preset="medium"):
     """Fallback ל-CPU."""
@@ -68,7 +85,8 @@ def encode_with_x264(src, dst, crf=23, preset="medium"):
         "-c:a","copy",
         dst
     ]
-    subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _log("Running x264:", " ".join(cmd))
+    subprocess.run(cmd, check=False)
 
 # ============ Helpers ============
 def _ang(a,b,c):
@@ -94,8 +112,7 @@ def _wrap_two_lines(draw, text, font, max_width):
         t=(cur+" "+w).strip()
         if draw.textlength(t, font=font)<=max_width: cur=t
         else:
-            if cur: lines.append(cur)
-            cur=w
+            if cur: lines.append(cur); cur=w
         if len(lines)==2: break
     if cur and len(lines)<2: lines.append(cur)
     if len(lines)>=2 and draw.textlength(lines[-1], font=font)>max_width:
@@ -174,7 +191,7 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
             draw.text((tx,ty),ln,font=FEEDBACK_FONT,fill=(255,255,255)); ty+=line_h+4
     return cv2.cvtColor(np.array(pil),cv2.COLOR_RGB2BGR)
 
-# ============ Params, feedback, וכו' (ללא שינוי מהותי) ============
+# ============ Params, feedback, וכו' ============
 ELBOW_TOP_ANGLE=100.0
 HEAD_MIN_ASCENT=0.0075
 RESET_DESCENT=0.0045
@@ -247,8 +264,10 @@ def run_pullup_analysis(video_path,
     else:
         encode_crf=23 if encode_crf is None else encode_crf
 
-    cap=cv2.VideoCapture(video_path)
-    if not cap.isOpened(): return _ret_err("Could not open video", feedback_path)
+    # שימוש ב-CAP_FFMPEG משפר תאימות בקונטיינרים
+    cap=cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        return _ret_err("Could not open video", feedback_path)
 
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps=max(1.0, fps_in/max(1,frame_skip))
@@ -311,6 +330,15 @@ def run_pullup_analysis(video_path,
     # Micro-burst counter
     burst_cntr=0
 
+    # Timers / status logs
+    start_ts = time.time()
+    last_log_ts = start_ts
+    processed_frames = 0
+
+    _log("Starting analyze:", dict(video_path=video_path, frame_skip=frame_skip, scale=scale,
+                                   preserve_quality=preserve_quality, fast_mode=bool(fast_mode),
+                                   return_video=return_video))
+
     with mp_pose.Pose(model_complexity=model_complexity, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while True:
             ret, frame = cap.read()
@@ -322,6 +350,17 @@ def run_pullup_analysis(video_path,
                 continue
             if burst_cntr > 0:
                 burst_cntr -= 1
+
+            processed_frames += 1
+            now = time.time()
+            if now - last_log_ts >= 2.0:  # סטטוס כל ~2ש׳
+                _log(f"frame_idx={frame_idx} processed={processed_frames} reps={rep_count}")
+                last_log_ts = now
+
+            # Watchdog עדין: אם אין התקדמות בכלל זמן רב (בעיקר הגנה על קבצים בעייתיים)
+            if (now - start_ts) > MAX_WALL_SEC and rep_count == 0 and processed_frames < 20:
+                _log("Watchdog: taking too long without progress; aborting early")
+                break
 
             if scale != 1.0:
                 frame=cv2.resize(frame,(0,0),fx=scale,fy=scale)
@@ -577,13 +616,12 @@ def run_pullup_analysis(video_path,
     # ===== Session Technique Score =====
     if rep_count==0: technique_score=0.0
     else:
-        # penalty לפי פידבקים שהצטברו (קיצור: אם לא אספנו—אין קנס)
-        # כאן השארנו לוגיקה פשוטה/אחידה
-        penalty = 0.0  # אפשר לשמר את המנגנון המלא אם צריך
+        # כאן אפשר להחזיר מנגנון ענישה מלא, כרגע ניטרלי
+        penalty = 0.0
         technique_score=_half_floor10(max(0.0,10.0-penalty))
 
-    # ===== Feedback list & form_tip (פשוט) =====
-    fb_list=[]; form_tip=None  # אפשר להחזיר לפי המנגנון המלא אם תרצה
+    # ===== Feedback list & form_tip =====
+    fb_list=[]; form_tip=None
 
     # ===== Encode (GPU NVENC אם זמין) =====
     final_path=""
@@ -591,8 +629,6 @@ def run_pullup_analysis(video_path,
         encoded_path=output_path.replace(".mp4","_encoded.mp4")
         try:
             if _has_nvenc():
-                # ניתן לשלוט בפרמטרים דרך ENV:
-                # NVENC_PRESET=p5/p6/p7, NVENC_BITRATE=5M, NVENC_MAXRATE=8M, NVENC_BUFSIZE=10M
                 nv_preset = os.getenv("NVENC_PRESET","p5")
                 nv_bitrate= os.getenv("NVENC_BITRATE","5M")
                 nv_maxrate= os.getenv("NVENC_MAXRATE","8M")
@@ -605,8 +641,11 @@ def run_pullup_analysis(video_path,
             if os.path.exists(output_path) and os.path.exists(encoded_path):
                 try: os.remove(output_path)
                 except: pass
-        except Exception:
+        except Exception as e:
+            _log("encode failed:", e)
             final_path=output_path if os.path.exists(output_path) else ""
+
+    _log("Finished analyze loop. reps=", rep_count, "final_video=", final_path or "(none)")
 
     result = {
         "squat_count": int(rep_count),
@@ -615,7 +654,7 @@ def run_pullup_analysis(video_path,
         "technique_label": score_label(technique_score),
         "good_reps": int(good_reps),
         "bad_reps": int(bad_reps),
-        "feedback": fb_list,            # אפשר להרחיב אם תרצה
+        "feedback": fb_list,
         "tips": [],
         "reps": rep_reports,
         "video_path": final_path if return_video else "",
