@@ -1,25 +1,29 @@
-app = "squat-api-docker-XXXX"
+# fly.toml — GPU Machines (minimal)
+app = "squat-api-docker"
 primary_region = "fra"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
   auto_start_machines = true
+  auto_stop_machines = "stop"   # מומלץ ב-GPU כדי לחסוך עלויות כשאין תנועה
   min_machines_running = 0
   processes = ["app"]
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 20
+    hard_limit = 40
 
 [[vm]]
-  cpu_kind = "shared"
-  cpus = 4
+  # שימי לב: אין כאן cpus/cpu_kind!
   memory_mb = 2048
-  gpu_kind = "a10"     # או l40s / a100 לפי הזמינות ב-region
+  gpu_kind = "a10"   # אפשר גם "l40s" / "a100" לפי זמינות ב-region
   gpus = 1
 
 [env]
+  PORT = "8080"
   NVIDIA_VISIBLE_DEVICES = "all"
   NVIDIA_DRIVER_CAPABILITIES = "compute,video,utility"
-  PORT = "8080"  # בקוד Flask/uvicorn קרא מזה
-  DEBUG = "1"    # להדליק לוגים בקוד הניתוח
-  # FORCE_CPU_ENCODE = "1"  # אם תרצה לעקוף NVENC בבדיקה
-  # MAX_WALL_SEC = "120"    # watchdog עדין, אופציונלי
+  DEBUG = "1"                # לוגים בקוד
+  # FORCE_CPU_ENCODE = "1"   # אופציונלי: לעקוף NVENC לבדיקה
+  # MAX_WALL_SEC = "120"     # אופציונלי: watchdog עדין
