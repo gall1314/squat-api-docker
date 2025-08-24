@@ -1,23 +1,25 @@
-app = "squat-api-docker"
-primary_region = "ord"
-
-[build]
+app = "squat-api-docker-XXXX"
+primary_region = "fra"
 
 [http_service]
   internal_port = 8080
   force_https = true
-  # אם תרצה שהמכונה תיעצר כשאין טראפיק (חיסכון בעלויות), שנה ל: 'stop'
-  auto_stop_machines = "off"
+  auto_stop_machines = "stop"
   auto_start_machines = true
-  # אם אתה משאיר auto_stop = "off", מומלץ לשמור לפחות מכונה אחת רצה:
-  min_machines_running = 1
+  min_machines_running = 0
   processes = ["app"]
 
 [[vm]]
-  # חייב performance כשיש GPU
-  cpu_kind = "performance"
-  cpus = 2
-  memory = "8gb"
+  cpu_kind = "shared"
+  cpus = 4
+  memory_mb = 2048
+  gpu_kind = "a10"     # או l40s / a100 לפי הזמינות ב-region
   gpus = 1
-  gpu_kind = "l40s"
-  processes = ["app"]
+
+[env]
+  NVIDIA_VISIBLE_DEVICES = "all"
+  NVIDIA_DRIVER_CAPABILITIES = "compute,video,utility"
+  PORT = "8080"  # בקוד Flask/uvicorn קרא מזה
+  DEBUG = "1"    # להדליק לוגים בקוד הניתוח
+  # FORCE_CPU_ENCODE = "1"  # אם תרצה לעקוף NVENC בבדיקה
+  # MAX_WALL_SEC = "120"    # watchdog עדין, אופציונלי
