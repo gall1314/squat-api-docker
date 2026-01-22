@@ -523,16 +523,18 @@ near_peak = (
     ascent_amt >= HEAD_MIN_ASCENT * 0.85
 )
 
-if near_peak and (head_vel < -abs(HEAD_VEL_UP_TINY)):
-    # allow NEAR to count as success
+if near_peak and (head_vel < -abs(HEAD_VEL_UP_TINY)) and allow_new_peak:
     face_failed = (not cycle_face_pass) and (not cycle_face_near)
 
     if face_failed:
-        # require persistence: more than 1 frame
         if not cycle_tip_higher:
             cycle_tip_higher = True
             session_feedback.add(FB_CUE_HIGHER)
             cur_rt = FB_CUE_HIGHER
+
+    # 🔒 חשוב: לנעול כדי לא להיתקע בלולאה
+    allow_new_peak = False
+
 
                 # Swing cue
                 if torso_dx_norm>SWING_THR: swing_streak+=1
