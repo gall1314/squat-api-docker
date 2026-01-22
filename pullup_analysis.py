@@ -517,14 +517,22 @@ def run_pullup_analysis(video_path,
                 face_near_q.append(near_by_chin or near_by_eyes)
                 if any(face_pass_q): cycle_face_pass=True
                 if any(face_near_q): cycle_face_near=True
+# softened "go higher" condition – only near peak + persistent miss
+near_peak = (
+    asc_base_head is not None and
+    ascent_amt >= HEAD_MIN_ASCENT * 0.85
+)
 
-                # show/add higher tip only if not passed and not near
-                if (asc_base_head is not None) and (ascent_amt >= HEAD_MIN_ASCENT*0.50) and (head_vel < -abs(HEAD_VEL_UP_TINY)):
-                    if (not cycle_face_pass) and (not cycle_face_near):
-                        if not cycle_tip_higher:
-                            session_feedback.add(FB_CUE_HIGHER)
-                            cycle_tip_higher=True
-                            cur_rt = FB_CUE_HIGHER
+if near_peak and (head_vel < -abs(HEAD_VEL_UP_TINY)):
+    # allow NEAR to count as success
+    face_failed = (not cycle_face_pass) and (not cycle_face_near)
+
+    if face_failed:
+        # require persistence: more than 1 frame
+        if not cycle_tip_higher:
+            cycle_tip_higher = True
+            session_feedback.add(FB_CUE_HIGHER)
+            cur_rt = FB_CUE_HIGHER
 
                 # Swing cue
                 if torso_dx_norm>SWING_THR: swing_streak+=1
