@@ -153,7 +153,7 @@ def run_squat_analysis(
 
     # גב
     TOP_THR_DEG = 145.0
-    BOTTOM_THR_DEG = 108.0
+    BOTTOM_THR_DEG    = 100.0
     TOP_BAD_MIN_SEC = 0.25
     BOTTOM_BAD_MIN_SEC = 0.35
 
