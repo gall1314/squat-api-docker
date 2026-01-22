@@ -518,22 +518,25 @@ def run_pullup_analysis(video_path,
                 if any(face_pass_q): cycle_face_pass=True
                 if any(face_near_q): cycle_face_near=True
 # softened "go higher" condition – only near peak + persistent miss
-near_peak = (
-    asc_base_head is not None and
-    ascent_amt >= HEAD_MIN_ASCENT * 0.85
-)
+                if any(face_near_q): cycle_face_near=True
 
-if near_peak and (head_vel < -abs(HEAD_VEL_UP_TINY)) and allow_new_peak:
-    face_failed = (not cycle_face_pass) and (not cycle_face_near)
+                # softened "go higher" condition – only near peak + persistent miss
+                near_peak = (
+                    asc_base_head is not None and
+                    ascent_amt >= HEAD_MIN_ASCENT * 0.85
+                )
 
-    if face_failed:
-        if not cycle_tip_higher:
-            cycle_tip_higher = True
-            session_feedback.add(FB_CUE_HIGHER)
-            cur_rt = FB_CUE_HIGHER
+                if near_peak and (head_vel < -abs(HEAD_VEL_UP_TINY)) and allow_new_peak:
+                    face_failed = (not cycle_face_pass) and (not cycle_face_near)
 
-    # 🔒 חשוב: לנעול כדי לא להיתקע בלולאה
-    allow_new_peak = False
+                    if face_failed and not cycle_tip_higher:
+                        cycle_tip_higher = True
+                        session_feedback.add(FB_CUE_HIGHER)
+                        cur_rt = FB_CUE_HIGHER
+
+                    # 🔒 למנוע טריגר חוזר
+                    allow_new_peak = False
+
 
 
                 # Swing cue
