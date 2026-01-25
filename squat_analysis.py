@@ -257,7 +257,7 @@ def run_squat_analysis(
                     rep_top_bad_frames >= TOP_BAD_MIN_FRAMES
                     or (
                         rep_bottom_bad_frames >= BOTTOM_BAD_MIN_FRAMES
-                        and depth_live < 0.85
+                        and rep_max_depth < 0.75
                     )
                 )
 
