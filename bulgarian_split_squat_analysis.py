@@ -511,9 +511,19 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
         depth_live = 0.0
 
         if not results.pose_landmarks:
-            # אין שלד — ריסט עומק, מפחית hold
-            if rt_fb_hold > 0: rt_fb_hold -= 1
-            stab_lms = lm_stab.stabilize(None)
+    if counter.count > 0:
+        nopose_frames_since_any_rep += 1
+    else:
+        nopose_frames_since_any_rep = 0
+
+    if counter.count > 0 and nopose_frames_since_any_rep >= NOPOSE_STOP_FRAMES:
+        break
+
+    if rt_fb_hold > 0:
+        rt_fb_hold -= 1
+
+    stab_lms = lm_stab.stabilize(None)
+
         else:
             lms = results.pose_landmarks.landmark
             if active_leg is None:
@@ -538,6 +548,14 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             movement_block = (hip_vel_ema > HIP_VEL_THRESH_PCT) or (ankle_vel_ema > ANKLE_VEL_THRESH_PCT)
             if movement_block: movement_free_streak = 0
             else:              movement_free_streak = min(MOVEMENT_CLEAR_FRAMES, movement_free_streak + 1)
+                if not movement_block:
+    no_movement_frames += 1
+else:
+    no_movement_frames = 0
+
+if counter.count > 0 and no_movement_frames >= NO_MOVEMENT_STOP_FRAMES:
+    break
+
 
             # === זוויות ===
             hip = lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_HIP").value, w, h)
