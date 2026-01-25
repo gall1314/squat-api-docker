@@ -292,6 +292,8 @@ def run_squat_analysis(
                     bad_reps += 1
 
                 stage = None
+                rep_max_depth = 0.0
+
 
             out.write(frame)
 
