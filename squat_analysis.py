@@ -229,6 +229,8 @@ def run_squat_analysis(
             if stage == "down":
                 rep_min_knee_angle = min(rep_min_knee_angle, knee_angle)
                 rep_min_torso_angle = min(rep_min_torso_angle, torso_angle)
+                rep_max_depth = max(rep_max_depth, depth_live)
+
 
                 if depth_live <= 0.2 and torso_angle < TOP_THR_DEG:
                     rep_top_bad_frames += 1
