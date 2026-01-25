@@ -146,6 +146,8 @@ def run_squat_analysis(
     rep_min_knee_angle = 180.0
     rep_min_torso_angle = 999.0
     rep_start_frame = None
+    rep_max_depth = 0.0
+
 
     stand_knee_ema = None
     STAND_KNEE_ALPHA = 0.30
