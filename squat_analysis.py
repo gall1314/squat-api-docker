@@ -1,22 +1,11 @@
 # -*- coding: utf-8 -*-
-# squat_analysis.py
-# FULL MERGED VERSION – stable counting, improved back logic, UI-safe output
+# squat_analysis.py — FULL MERGED VERSION
+# Stable counting + restored depth gate + improved back logic + UI-safe output
 
 import cv2
 import numpy as np
-from PIL import ImageFont
 import mediapipe as mp
-
-# ===================== STYLE / FONTS =====================
-FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
-
-def _load_font(path, size):
-    try:
-        return ImageFont.truetype(path, size)
-    except Exception:
-        return ImageFont.load_default()
-
-mp_pose = mp.solutions.pose
+from PIL import ImageFont
 
 # ===================== FEEDBACK =====================
 FB_SEVERITY = {
@@ -28,7 +17,7 @@ FB_SEVERITY = {
 }
 
 def pick_strongest_feedback(lst):
-    best, score = "", -1
+    best, score = None, -1
     for f in lst or []:
         s = FB_SEVERITY.get(f, 1)
         if s > score:
@@ -45,14 +34,10 @@ def merge_feedback(a, b):
 
 # ===================== SCORE DISPLAY =====================
 def score_label(score: float) -> str:
-    if score >= 9.5:
-        return "Excellent"
-    if score >= 8.5:
-        return "Very good"
-    if score >= 7.0:
-        return "Good"
-    if score >= 5.5:
-        return "Fair"
+    if score >= 9.5: return "Excellent"
+    if score >= 8.5: return "Very good"
+    if score >= 7.0: return "Good"
+    if score >= 5.5: return "Fair"
     return "Needs work"
 
 def display_half(score: float) -> str:
@@ -67,9 +52,21 @@ def calculate_angle(a, b, c):
     return 360 - ang if ang > 180 else ang
 
 # ===================== CORE PARAMS =====================
+mp_pose = mp.solutions.pose
+
 PERFECT_MIN_KNEE_SQ = 60.0
 STAND_KNEE_ANGLE = 160.0
 MIN_FRAMES_BETWEEN_REPS_SQ = 10
+
+# עומק – gates קשיחים (כמו בארוך)
+MIN_DEPTH_FOR_GOOD = 0.75     # פחות מזה → אין 10
+MIN_KNEE_ANGLE_GOOD = 90.0    # ברך לא מתכופפת מספיק → אין 10
+
+# גב
+TOP_THR_DEG = 145.0
+BOTTOM_THR_DEG = 100.0
+TOP_BAD_MIN_SEC = 0.25
+BOTTOM_BAD_MIN_SEC = 0.35
 
 # ===================== MAIN =====================
 def run_squat_analysis(
@@ -79,7 +76,6 @@ def run_squat_analysis(
     output_path="squat_analyzed.mp4",
     feedback_path="squat_feedback.txt"
 ):
-
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {
@@ -87,7 +83,7 @@ def run_squat_analysis(
             "technique_score": 0.0,
             "technique_score_display": "0",
             "technique_label": "Needs work",
-            "form_tip": "Could not open video",
+            "form_tip": None,
             "good_reps": 0,
             "bad_reps": 0,
             "feedback": ["Could not open video"],
@@ -105,7 +101,7 @@ def run_squat_analysis(
     stage = None
     frame_idx = 0
     last_rep_frame = -999
-    session_best_feedback = ""
+    session_best_feedback = None
 
     stand_knee_ema = None
     STAND_KNEE_ALPHA = 0.30
@@ -116,18 +112,12 @@ def run_squat_analysis(
     rep_max_depth = 0.0
     rep_start_frame = None
 
-    TOP_THR_DEG = 145.0
-    BOTTOM_THR_DEG = 100.0
-    TOP_BAD_MIN_SEC = 0.25
-    BOTTOM_BAD_MIN_SEC = 0.35
-
     rep_top_bad_frames = 0
     rep_bottom_bad_frames = 0
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 25
     eff_fps = max(1.0, fps / frame_skip)
     dt = 1.0 / eff_fps
-
     TOP_BAD_MIN_FRAMES = max(2, int(TOP_BAD_MIN_SEC / dt))
     BOTTOM_BAD_MIN_FRAMES = max(2, int(BOTTOM_BAD_MIN_SEC / dt))
 
@@ -174,9 +164,8 @@ def run_squat_analysis(
             torso_angle = calculate_angle(shoulder, hip, knee)
 
             if knee_angle > STAND_KNEE_ANGLE - 5:
-                stand_knee_ema = (
-                    knee_angle if stand_knee_ema is None
-                    else STAND_KNEE_ALPHA * knee_angle + (1 - STAND_KNEE_ALPHA) * stand_knee_ema
+                stand_knee_ema = knee_angle if stand_knee_ema is None else (
+                    STAND_KNEE_ALPHA * knee_angle + (1 - STAND_KNEE_ALPHA) * stand_knee_ema
                 )
 
             if stand_knee_ema:
@@ -208,14 +197,16 @@ def run_squat_analysis(
                 feedbacks = []
                 penalty = 0
 
-                hip_to_heel = abs(hip[1] - heel_y)
-                if hip_to_heel > 0.48:
-                    feedbacks.append("Try to squat deeper"); penalty += 3
-                elif hip_to_heel > 0.45:
-                    feedbacks.append("Almost there — go a bit lower"); penalty += 2
-                elif hip_to_heel > 0.43:
-                    feedbacks.append("Looking good — just a bit more depth"); penalty += 1
+                # ---- DEPTH GATE (RESTORED) ----
+                depth_gate_fail = (
+                    rep_max_depth < MIN_DEPTH_FOR_GOOD or
+                    rep_min_knee_angle > MIN_KNEE_ANGLE_GOOD
+                )
+                if depth_gate_fail:
+                    feedbacks.append("Try to squat deeper")
+                    penalty += 3
 
+                # ---- BACK LOGIC (IMPROVED) ----
                 back_flag = (
                     rep_top_bad_frames >= TOP_BAD_MIN_FRAMES or
                     (rep_bottom_bad_frames >= BOTTOM_BAD_MIN_FRAMES and rep_max_depth < 0.75)
@@ -233,10 +224,8 @@ def run_squat_analysis(
                     counter += 1
                     last_rep_frame = frame_idx
                     all_scores.append(score)
-                    if score >= 9.5:
-                        good_reps += 1
-                    else:
-                        bad_reps += 1
+                    if score >= 9.5: good_reps += 1
+                    else: bad_reps += 1
 
                 rep_reports.append({
                     "rep_index": counter,
@@ -258,8 +247,7 @@ def run_squat_analysis(
             out.write(frame)
 
     cap.release()
-    if out:
-        out.release()
+    if out: out.release()
 
     avg = np.mean(all_scores) if all_scores else 0.0
     technique_score = round(round(avg * 2) / 2, 2)
@@ -267,13 +255,8 @@ def run_squat_analysis(
     technique_label = score_label(technique_score)
     technique_score_display = display_half(technique_score)
 
-    form_tip = (
-        "Great form! Keep it up 💪"
-        if technique_score >= 8.5
-        else session_best_feedback
-        if session_best_feedback
-        else "Focus on control and depth"
-    )
+    # form_tip – רק אם יש באמת הערה
+    form_tip = session_best_feedback if session_best_feedback else None
 
     return {
         "squat_count": counter,
