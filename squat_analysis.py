@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
-# squat_analysis.py — FULL MERGED VERSION
-# Stable counting + restored depth gate + improved back logic + UI-safe output
+# squat_analysis.py
+# FULL RESTORED VERSION
+# Stable rep counting + TRUE depth gate (hip-ankle) + back curvature logic
+# Score 1–10 (0.5 steps) + UI-safe output
 
 import cv2
+import math
 import numpy as np
 import mediapipe as mp
-from PIL import ImageFont
 
 # ===================== FEEDBACK =====================
 FB_SEVERITY = {
@@ -30,7 +32,7 @@ def merge_feedback(a, b):
         return a
     if not a:
         return cand
-    return cand if FB_SEVERITY.get(cand,1) >= FB_SEVERITY.get(a,1) else a
+    return cand if FB_SEVERITY.get(cand, 1) >= FB_SEVERITY.get(a, 1) else a
 
 # ===================== SCORE DISPLAY =====================
 def score_label(score: float) -> str:
@@ -48,21 +50,21 @@ def display_half(score: float) -> str:
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
     rad = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
-    ang = np.abs(rad * 180.0 / np.pi)
+    ang = abs(rad * 180.0 / math.pi)
     return 360 - ang if ang > 180 else ang
 
 # ===================== CORE PARAMS =====================
 mp_pose = mp.solutions.pose
 
-PERFECT_MIN_KNEE_SQ = 60.0
 STAND_KNEE_ANGLE = 160.0
+PERFECT_MIN_KNEE_SQ = 60.0
 MIN_FRAMES_BETWEEN_REPS_SQ = 10
 
-# עומק – gates קשיחים (כמו בארוך)
-MIN_DEPTH_FOR_GOOD = 0.75     # פחות מזה → אין 10
-MIN_KNEE_ANGLE_GOOD = 90.0    # ברך לא מתכופפת מספיק → אין 10
+# ---- TRUE DEPTH GATES (FROM ORIGINAL LONG VERSION) ----
+MIN_DEPTH_HIP_ANKLE = 0.46        # hip must reach close to ankle
+MAX_KNEE_ANGLE_AT_BOTTOM = 95.0   # knee must flex enough
 
-# גב
+# ---- BACK CHECK ----
 TOP_THR_DEG = 145.0
 BOTTOM_THR_DEG = 100.0
 TOP_BAD_MIN_SEC = 0.25
@@ -78,19 +80,7 @@ def run_squat_analysis(
 ):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return {
-            "squat_count": 0,
-            "technique_score": 0.0,
-            "technique_score_display": "0",
-            "technique_label": "Needs work",
-            "form_tip": None,
-            "good_reps": 0,
-            "bad_reps": 0,
-            "feedback": ["Could not open video"],
-            "reps": [],
-            "video_path": "",
-            "feedback_path": feedback_path,
-        }
+        return _error_result("Could not open video", feedback_path)
 
     counter = 0
     good_reps = 0
@@ -103,13 +93,16 @@ def run_squat_analysis(
     last_rep_frame = -999
     session_best_feedback = None
 
+    # --- live depth (visual only) ---
     stand_knee_ema = None
     STAND_KNEE_ALPHA = 0.30
     depth_live = 0.0
 
+    # --- rep accumulators ---
     rep_min_knee_angle = 180.0
     rep_min_torso_angle = 999.0
     rep_max_depth = 0.0
+    rep_min_hip_to_ankle = 1.0
     rep_start_frame = None
 
     rep_top_bad_frames = 0
@@ -158,11 +151,15 @@ def run_squat_analysis(
             knee = [lm[R.RIGHT_KNEE.value].x, lm[R.RIGHT_KNEE.value].y]
             ankle = [lm[R.RIGHT_ANKLE.value].x, lm[R.RIGHT_ANKLE.value].y]
             shoulder = [lm[R.RIGHT_SHOULDER.value].x, lm[R.RIGHT_SHOULDER.value].y]
-            heel_y = lm[R.RIGHT_HEEL.value].y
+
+            hip_y = hip[1]
+            ankle_y = ankle[1]
+            hip_to_ankle = ankle_y - hip_y
 
             knee_angle = calculate_angle(hip, knee, ankle)
             torso_angle = calculate_angle(shoulder, hip, knee)
 
+            # ---- standing reference ----
             if knee_angle > STAND_KNEE_ANGLE - 5:
                 stand_knee_ema = knee_angle if stand_knee_ema is None else (
                     STAND_KNEE_ALPHA * knee_angle + (1 - STAND_KNEE_ALPHA) * stand_knee_ema
@@ -178,14 +175,17 @@ def run_squat_analysis(
                 rep_min_knee_angle = knee_angle
                 rep_min_torso_angle = torso_angle
                 rep_max_depth = depth_live
+                rep_min_hip_to_ankle = hip_to_ankle
                 rep_top_bad_frames = 0
                 rep_bottom_bad_frames = 0
                 rep_start_frame = frame_idx
 
+            # ===== DURING REP =====
             if stage == "down":
                 rep_min_knee_angle = min(rep_min_knee_angle, knee_angle)
                 rep_min_torso_angle = min(rep_min_torso_angle, torso_angle)
                 rep_max_depth = max(rep_max_depth, depth_live)
+                rep_min_hip_to_ankle = min(rep_min_hip_to_ankle, hip_to_ankle)
 
                 if depth_live <= 0.2 and torso_angle < TOP_THR_DEG:
                     rep_top_bad_frames += 1
@@ -197,21 +197,21 @@ def run_squat_analysis(
                 feedbacks = []
                 penalty = 0
 
-                # ---- DEPTH GATE (RESTORED) ----
-                depth_gate_fail = (
-                    rep_max_depth < MIN_DEPTH_FOR_GOOD or
-                    rep_min_knee_angle > MIN_KNEE_ANGLE_GOOD
+                # ---- TRUE DEPTH CHECK ----
+                depth_fail = (
+                    rep_min_hip_to_ankle > MIN_DEPTH_HIP_ANKLE or
+                    rep_min_knee_angle > MAX_KNEE_ANGLE_AT_BOTTOM
                 )
-                if depth_gate_fail:
+                if depth_fail:
                     feedbacks.append("Try to squat deeper")
                     penalty += 3
 
-                # ---- BACK LOGIC (IMPROVED) ----
-                back_flag = (
+                # ---- BACK CHECK ----
+                back_fail = (
                     rep_top_bad_frames >= TOP_BAD_MIN_FRAMES or
                     (rep_bottom_bad_frames >= BOTTOM_BAD_MIN_FRAMES and rep_max_depth < 0.75)
                 )
-                if back_flag:
+                if back_fail:
                     feedbacks.append("Try to keep your back a bit straighter")
                     penalty += 1
 
@@ -224,8 +224,10 @@ def run_squat_analysis(
                     counter += 1
                     last_rep_frame = frame_idx
                     all_scores.append(score)
-                    if score >= 9.5: good_reps += 1
-                    else: bad_reps += 1
+                    if score >= 9.5:
+                        good_reps += 1
+                    else:
+                        bad_reps += 1
 
                 rep_reports.append({
                     "rep_index": counter,
@@ -234,7 +236,9 @@ def run_squat_analysis(
                     "feedback": [pick_strongest_feedback(feedbacks)] if feedbacks else [],
                     "start_frame": rep_start_frame,
                     "end_frame": frame_idx,
-                    "depth_pct": rep_max_depth
+                    "depth_pct": rep_max_depth,
+                    "hip_to_ankle": rep_min_hip_to_ankle,
+                    "min_knee_angle": rep_min_knee_angle
                 })
 
                 session_best_feedback = merge_feedback(
@@ -247,23 +251,18 @@ def run_squat_analysis(
             out.write(frame)
 
     cap.release()
-    if out: out.release()
+    if out:
+        out.release()
 
     avg = np.mean(all_scores) if all_scores else 0.0
     technique_score = round(round(avg * 2) / 2, 2)
 
-    technique_label = score_label(technique_score)
-    technique_score_display = display_half(technique_score)
-
-    # form_tip – רק אם יש באמת הערה
-    form_tip = session_best_feedback if session_best_feedback else None
-
     return {
         "squat_count": counter,
         "technique_score": technique_score,
-        "technique_score_display": technique_score_display,
-        "technique_label": technique_label,
-        "form_tip": form_tip,
+        "technique_score_display": display_half(technique_score),
+        "technique_label": score_label(technique_score),
+        "form_tip": session_best_feedback,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
         "feedback": (
@@ -274,6 +273,21 @@ def run_squat_analysis(
         "reps": rep_reports,
         "video_path": output_path,
         "feedback_path": feedback_path
+    }
+
+def _error_result(msg, feedback_path):
+    return {
+        "squat_count": 0,
+        "technique_score": 0.0,
+        "technique_score_display": "0",
+        "technique_label": "Needs work",
+        "form_tip": None,
+        "good_reps": 0,
+        "bad_reps": 0,
+        "feedback": [msg],
+        "reps": [],
+        "video_path": "",
+        "feedback_path": feedback_path,
     }
 
 def run_analysis(*args, **kwargs):
