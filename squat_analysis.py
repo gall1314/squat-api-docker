@@ -1,37 +1,20 @@
 # -*- coding: utf-8 -*-
-# squat_analysis.py — FULL MERGED VERSION (stable counting + improved back logic)
+# squat_analysis.py
+# FULL MERGED VERSION – stable counting, improved back logic, UI-safe output
 
-import os
 import cv2
-import math
 import numpy as np
-import subprocess
-from PIL import ImageFont, ImageDraw, Image
+from PIL import ImageFont
 import mediapipe as mp
 
 # ===================== STYLE / FONTS =====================
-BAR_BG_ALPHA = 0.55
-DONUT_RADIUS_SCALE = 0.72
-DONUT_THICKNESS_FRAC = 0.28
-DEPTH_COLOR = (40, 200, 80)
-DEPTH_RING_BG = (70, 70, 70)
-
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
-REPS_FONT_SIZE = 28
-FEEDBACK_FONT_SIZE = 22
-DEPTH_LABEL_FONT_SIZE = 14
-DEPTH_PCT_FONT_SIZE = 18
 
 def _load_font(path, size):
     try:
         return ImageFont.truetype(path, size)
     except Exception:
         return ImageFont.load_default()
-
-REPS_FONT = _load_font(FONT_PATH, REPS_FONT_SIZE)
-FEEDBACK_FONT = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
-DEPTH_LABEL_FONT = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
-DEPTH_PCT_FONT = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 
 mp_pose = mp.solutions.pose
 
@@ -60,6 +43,22 @@ def merge_feedback(a, b):
         return cand
     return cand if FB_SEVERITY.get(cand,1) >= FB_SEVERITY.get(a,1) else a
 
+# ===================== SCORE DISPLAY =====================
+def score_label(score: float) -> str:
+    if score >= 9.5:
+        return "Excellent"
+    if score >= 8.5:
+        return "Very good"
+    if score >= 7.0:
+        return "Good"
+    if score >= 5.5:
+        return "Fair"
+    return "Needs work"
+
+def display_half(score: float) -> str:
+    q = round(score * 2) / 2
+    return str(int(q)) if q.is_integer() else f"{q:.1f}"
+
 # ===================== GEOMETRY =====================
 def calculate_angle(a, b, c):
     a, b, c = np.array(a), np.array(b), np.array(c)
@@ -73,16 +72,33 @@ STAND_KNEE_ANGLE = 160.0
 MIN_FRAMES_BETWEEN_REPS_SQ = 10
 
 # ===================== MAIN =====================
-def run_squat_analysis(video_path, frame_skip=3, scale=0.4,
-                       output_path="squat_analyzed.mp4",
-                       feedback_path="squat_feedback.txt"):
+def run_squat_analysis(
+    video_path,
+    frame_skip=3,
+    scale=0.4,
+    output_path="squat_analyzed.mp4",
+    feedback_path="squat_feedback.txt"
+):
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return {"squat_count": 0, "feedback": ["Could not open video"]}
+        return {
+            "squat_count": 0,
+            "technique_score": 0.0,
+            "technique_score_display": "0",
+            "technique_label": "Needs work",
+            "form_tip": "Could not open video",
+            "good_reps": 0,
+            "bad_reps": 0,
+            "feedback": ["Could not open video"],
+            "reps": [],
+            "video_path": "",
+            "feedback_path": feedback_path,
+        }
 
     counter = 0
-    good_reps = bad_reps = 0
+    good_reps = 0
+    bad_reps = 0
     rep_reports = []
     all_scores = []
 
@@ -118,9 +134,11 @@ def run_squat_analysis(video_path, frame_skip=3, scale=0.4,
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = None
 
-    with mp_pose.Pose(model_complexity=1,
-                      min_detection_confidence=0.5,
-                      min_tracking_confidence=0.5) as pose:
+    with mp_pose.Pose(
+        model_complexity=1,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5
+    ) as pose:
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -132,11 +150,11 @@ def run_squat_analysis(video_path, frame_skip=3, scale=0.4,
                 continue
 
             if scale != 1.0:
-                frame = cv2.resize(frame, (0,0), fx=scale, fy=scale)
+                frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
 
             if out is None:
                 h, w = frame.shape[:2]
-                out = cv2.VideoWriter(output_path, fourcc, eff_fps, (w,h))
+                out = cv2.VideoWriter(output_path, fourcc, eff_fps, (w, h))
 
             results = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             if not results.pose_landmarks:
@@ -156,8 +174,9 @@ def run_squat_analysis(video_path, frame_skip=3, scale=0.4,
             torso_angle = calculate_angle(shoulder, hip, knee)
 
             if knee_angle > STAND_KNEE_ANGLE - 5:
-                stand_knee_ema = knee_angle if stand_knee_ema is None else (
-                    STAND_KNEE_ALPHA*knee_angle + (1-STAND_KNEE_ALPHA)*stand_knee_ema
+                stand_knee_ema = (
+                    knee_angle if stand_knee_ema is None
+                    else STAND_KNEE_ALPHA * knee_angle + (1 - STAND_KNEE_ALPHA) * stand_knee_ema
                 )
 
             if stand_knee_ema:
@@ -184,7 +203,7 @@ def run_squat_analysis(video_path, frame_skip=3, scale=0.4,
                 elif depth_live >= 0.6 and torso_angle < BOTTOM_THR_DEG:
                     rep_bottom_bad_frames += 1
 
-            # ===== END REP (FIXED – like short version) =====
+            # ===== END REP =====
             if knee_angle > STAND_KNEE_ANGLE and stage == "down":
                 feedbacks = []
                 penalty = 0
@@ -205,18 +224,24 @@ def run_squat_analysis(video_path, frame_skip=3, scale=0.4,
                     feedbacks.append("Try to keep your back a bit straighter")
                     penalty += 1
 
-                score = 10.0 if not feedbacks else round(max(4, 10 - min(penalty,6)) * 2) / 2
+                score = (
+                    10.0 if not feedbacks
+                    else round(max(4, 10 - min(penalty, 6)) * 2) / 2
+                )
 
                 if frame_idx - last_rep_frame > MIN_FRAMES_BETWEEN_REPS_SQ:
                     counter += 1
                     last_rep_frame = frame_idx
                     all_scores.append(score)
-                    if score >= 9.5: good_reps += 1
-                    else: bad_reps += 1
+                    if score >= 9.5:
+                        good_reps += 1
+                    else:
+                        bad_reps += 1
 
                 rep_reports.append({
                     "rep_index": counter,
                     "score": score,
+                    "score_display": display_half(score),
                     "feedback": [pick_strongest_feedback(feedbacks)] if feedbacks else [],
                     "start_frame": rep_start_frame,
                     "end_frame": frame_idx,
@@ -228,22 +253,41 @@ def run_squat_analysis(video_path, frame_skip=3, scale=0.4,
                     [pick_strongest_feedback(feedbacks)] if feedbacks else []
                 )
 
-                stage = None  # === FIX === reset like short version
+                stage = None
 
             out.write(frame)
 
     cap.release()
-    if out: out.release()
+    if out:
+        out.release()
 
     avg = np.mean(all_scores) if all_scores else 0.0
-    technique_score = round(round(avg*2)/2, 2)
+    technique_score = round(round(avg * 2) / 2, 2)
+
+    technique_label = score_label(technique_score)
+    technique_score_display = display_half(technique_score)
+
+    form_tip = (
+        "Great form! Keep it up 💪"
+        if technique_score >= 8.5
+        else session_best_feedback
+        if session_best_feedback
+        else "Focus on control and depth"
+    )
 
     return {
         "squat_count": counter,
         "technique_score": technique_score,
+        "technique_score_display": technique_score_display,
+        "technique_label": technique_label,
+        "form_tip": form_tip,
         "good_reps": good_reps,
         "bad_reps": bad_reps,
-        "feedback": [session_best_feedback] if session_best_feedback else ["Great form! Keep it up 💪"],
+        "feedback": (
+            [session_best_feedback]
+            if session_best_feedback
+            else ["Great form! Keep it up 💪"]
+        ),
         "reps": rep_reports,
         "video_path": output_path,
         "feedback_path": feedback_path
