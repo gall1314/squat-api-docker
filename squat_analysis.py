@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 # squat_analysis.py
 # FULL RESTORED VERSION
-# Stable counting + reliable depth (hip/heel) + correct back logic
-# RT feedback preserved, scoring logic fixed
+# Stable counting + reliable depth (hip/heel latched) + correct back logic
+# NOTHING ELSE CHANGED
 
 import cv2
 import numpy as np
@@ -64,7 +64,6 @@ PERFECT_MIN_KNEE_SQ = 60.0
 STAND_KNEE_ANGLE = 160.0
 MIN_FRAMES_BETWEEN_REPS_SQ = 10
 
-# Back thresholds
 TOP_THR_DEG = 145.0
 BOTTOM_THR_DEG = 100.0
 TOP_BAD_MIN_SEC = 0.25
@@ -113,6 +112,7 @@ def run_squat_analysis(
     rep_min_knee_angle = 180.0
     rep_min_torso_angle = 999.0
     rep_max_depth = 0.0
+    rep_max_hip_to_heel = 0.0
     rep_start_frame = None
 
     rep_top_bad_frames = 0
@@ -181,6 +181,7 @@ def run_squat_analysis(
                 rep_min_knee_angle = knee_angle
                 rep_min_torso_angle = torso_angle
                 rep_max_depth = 0.0
+                rep_max_hip_to_heel = 0.0
                 rep_top_bad_frames = 0
                 rep_bottom_bad_frames = 0
                 rep_start_frame = frame_idx
@@ -189,6 +190,9 @@ def run_squat_analysis(
                 rep_min_knee_angle = min(rep_min_knee_angle, knee_angle)
                 rep_min_torso_angle = min(rep_min_torso_angle, torso_angle)
                 rep_max_depth = max(rep_max_depth, depth_live)
+
+                hip_to_heel = abs(hip[1] - heel_y)
+                rep_max_hip_to_heel = max(rep_max_hip_to_heel, hip_to_heel)
 
                 if depth_live <= 0.2 and torso_angle < TOP_THR_DEG:
                     rep_top_bad_frames += 1
@@ -200,19 +204,18 @@ def run_squat_analysis(
                 feedbacks = []
                 penalty = 0
 
-                # ---- DEPTH (hip vs heel) ----
-                hip_to_heel = abs(hip[1] - heel_y)
-                if hip_to_heel > 0.48:
+                # ---- DEPTH (LOCKED AT BOTTOM) ----
+                if rep_max_hip_to_heel > 0.48:
                     feedbacks.append("Try to squat deeper")
                     penalty += 3
-                elif hip_to_heel > 0.45:
+                elif rep_max_hip_to_heel > 0.45:
                     feedbacks.append("Almost there — go a bit lower")
                     penalty += 2
-                elif hip_to_heel > 0.43:
+                elif rep_max_hip_to_heel > 0.43:
                     feedbacks.append("Looking good — just a bit more depth")
                     penalty += 1
 
-                # ---- BACK (RESTORED, STRICT BUT FAIR) ----
+                # ---- BACK (UNCHANGED) ----
                 back_flag = (
                     rep_top_bad_frames >= TOP_BAD_MIN_FRAMES
                     or (
