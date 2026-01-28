@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# squat_analysis.py — תאיקון סופי: עומק לפי hip-below-knee, גב סלחני מאוד
+# squat_analysis.py — תיקון סופי: עומק לפי hip-below-knee, גב סלחני מאוד
 import os
 import cv2
 import math
@@ -487,95 +487,111 @@ def run_squat_analysis(video_path,
                             rt_fb_hold -= 1
 
                 # --- סיום חזרה ---
+                # תנאי נוסף: עומק מינימלי 25% כדי שהחזרה תיספר
+                # זה מונע ספירה של כיפוף קל (כמו החזרת מוט)
+                min_depth_for_count = 0.25
+                min_frames_in_down = 3  # לפחות 3 פריימים בשלב down
+                
+                frames_in_down = frame_idx - (rep_down_start_idx or frame_idx)
+                valid_rep = (rep_max_depth >= min_depth_for_count) and (frames_in_down >= min_frames_in_down)
+                
                 if (knee_angle > STAND_KNEE_ANGLE) and (stage == "down") and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
-                    feedbacks = []
-                    penalty = 0.0
-
-                    depth_pct = rep_max_depth
-                    
-                    # ===== ספי עומק מחמירים מאוד =====
-                    # 0.92+ = מעולה (no feedback)
-                    # 0.75-0.92 = קרוב ל-parallel = feedback קל
-                    # 0.55-0.75 = האגן מעל הברכיים = feedback בינוני
-                    # מתחת ל-0.55 = האגן הרבה מעל הברכיים = feedback חמור
-                    if   depth_pct < 0.55: feedbacks.append("Try to squat deeper");            penalty += 3
-                    elif depth_pct < 0.75: feedbacks.append("Almost there — go a bit lower");  penalty += 2
-                    elif depth_pct < 0.92: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
-
-                    # פידבק גב - אם היה פידבק בזמן אמת, לרשום אותו גם בסיכום
-                    # זה מבטיח שציון 10 לא יינתן אם הוצג פידבק גב
-                    if rep_had_back_feedback:
-                        feedbacks.append("Try to keep your back a bit straighter")
-                        penalty += 1.5
-
-                    # ציון
-                    if len(feedbacks) == 0:
-                        score = 10.0
+                    # אם לא עברנו את סף העומק המינימלי - לא לספור את החזרה
+                    if not valid_rep:
+                        # איפוס בלי לספור
+                        stage = "up"
+                        start_knee_angle = None
+                        rep_down_start_idx = None
                     else:
-                        score = max(4.0, 10.0 - penalty)
-                        score = round(score * 2) / 2
-                        score = min(score, 9.5)
+                        # חזרה תקינה - להמשיך עם הלוגיקה הרגילה
+                        feedbacks = []
+                        penalty = 0.0
 
-                    # דוח רפ
-                    rep_feedbacks, rep_feedback_by_cat = pick_strongest_per_category(feedbacks)
-                    
-                    # הגנות מפני ערכים לא תקינים
-                    safe_start_knee = float(start_knee_angle or knee_angle)
-                    if np.isnan(safe_start_knee) or np.isinf(safe_start_knee):
-                        safe_start_knee = 160.0
-                    
-                    safe_min_knee = float(rep_min_knee_angle)
-                    if np.isnan(safe_min_knee) or np.isinf(safe_min_knee):
-                        safe_min_knee = 160.0
+                        depth_pct = rep_max_depth
                         
-                    safe_max_knee = float(rep_max_knee_angle)
-                    if np.isnan(safe_max_knee) or np.isinf(safe_max_knee):
-                        safe_max_knee = 160.0
-                        
-                    safe_back_angle_top = float(rep_max_back_angle_top)
-                    if np.isnan(safe_back_angle_top) or np.isinf(safe_back_angle_top):
-                        safe_back_angle_top = 0.0
-                        
-                    safe_back_angle_bottom = float(rep_max_back_angle_bottom)
-                    if np.isnan(safe_back_angle_bottom) or np.isinf(safe_back_angle_bottom):
-                        safe_back_angle_bottom = 0.0
+                        # ===== ספי עומק מחמירים מאוד =====
+                        # 0.92+ = מעולה (no feedback)
+                        # 0.75-0.92 = קרוב ל-parallel = feedback קל
+                        # 0.55-0.75 = האגן מעל הברכיים = feedback בינוני
+                        # מתחת ל-0.55 = האגן הרבה מעל הברכיים = feedback חמור
+                        if   depth_pct < 0.55: feedbacks.append("Try to squat deeper");            penalty += 3
+                        elif depth_pct < 0.75: feedbacks.append("Almost there — go a bit lower");  penalty += 2
+                        elif depth_pct < 0.92: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
+
+                        # פידבק גב - אם היה פידבק בזמן אמת, לרשום אותו גם בסיכום
+                        # זה מבטיח שציון 10 לא יינתן אם הוצג פידבק גב
+                        if rep_had_back_feedback:
+                            feedbacks.append("Try to keep your back a bit straighter")
+                            penalty += 1.5
+
+                        # ציון
+                        if len(feedbacks) == 0:
+                            score = 10.0
+                        else:
+                            score = max(4.0, 10.0 - penalty)
+                            score = round(score * 2) / 2
+                            score = min(score, 9.5)
+
+                        # דוח רפ
+                        rep_feedbacks, rep_feedback_by_cat = pick_strongest_per_category(feedbacks)
                     
-                    rep_reports.append({
-                        "rep_index": counter + 1,
-                        "score": round(float(score), 1),
-                        "score_display": display_half_str(score),
-                        "feedback": rep_feedbacks,
-                        "tip": None,
-                        "start_frame": rep_start_frame or 0,
-                        "end_frame": frame_idx,
-                        "start_knee_angle": round(safe_start_knee, 2),
-                        "min_knee_angle": round(safe_min_knee, 2),
-                        "max_knee_angle": round(safe_max_knee, 2),
-                        "torso_angle_top": round(safe_back_angle_top, 2),
-                        "torso_angle_bottom": round(safe_back_angle_bottom, 2),
-                        "depth_pct": float(depth_pct),
-                        "top_bad_frames": int(rep_top_bad_frames),
-                        "bottom_bad_frames": int(rep_bottom_bad_frames)
-                    })
+                        # הגנות מפני ערכים לא תקינים
+                        safe_start_knee = float(start_knee_angle or knee_angle)
+                        if np.isnan(safe_start_knee) or np.isinf(safe_start_knee):
+                            safe_start_knee = 160.0
+                        
+                        safe_min_knee = float(rep_min_knee_angle)
+                        if np.isnan(safe_min_knee) or np.isinf(safe_min_knee):
+                            safe_min_knee = 160.0
+                            
+                        safe_max_knee = float(rep_max_knee_angle)
+                        if np.isnan(safe_max_knee) or np.isinf(safe_max_knee):
+                            safe_max_knee = 160.0
+                            
+                        safe_back_angle_top = float(rep_max_back_angle_top)
+                        if np.isnan(safe_back_angle_top) or np.isinf(safe_back_angle_top):
+                            safe_back_angle_top = 0.0
+                            
+                        safe_back_angle_bottom = float(rep_max_back_angle_bottom)
+                        if np.isnan(safe_back_angle_bottom) or np.isinf(safe_back_angle_bottom):
+                            safe_back_angle_bottom = 0.0
+                        
+                        rep_reports.append({
+                            "rep_index": counter + 1,
+                            "score": round(float(score), 1),
+                            "score_display": display_half_str(score),
+                            "feedback": rep_feedbacks,
+                            "tip": None,
+                            "start_frame": rep_start_frame or 0,
+                            "end_frame": frame_idx,
+                            "start_knee_angle": round(safe_start_knee, 2),
+                            "min_knee_angle": round(safe_min_knee, 2),
+                            "max_knee_angle": round(safe_max_knee, 2),
+                            "torso_angle_top": round(safe_back_angle_top, 2),
+                            "torso_angle_bottom": round(safe_back_angle_bottom, 2),
+                            "depth_pct": float(depth_pct),
+                            "top_bad_frames": int(rep_top_bad_frames),
+                            "bottom_bad_frames": int(rep_bottom_bad_frames)
+                        })
 
-                    # פידבק-סשן
-                    for cat, fb in rep_feedback_by_cat.items():
-                        best = session_feedback_by_cat.get(cat)
-                        if not best or FB_SEVERITY.get(fb, 1) > FB_SEVERITY.get(best, 1):
-                            session_feedback_by_cat[cat] = fb
-                    session_feedbacks = list(session_feedback_by_cat.values())
+                        # פידבק-סשן
+                        for cat, fb in rep_feedback_by_cat.items():
+                            best = session_feedback_by_cat.get(cat)
+                            if not best or FB_SEVERITY.get(fb, 1) > FB_SEVERITY.get(best, 1):
+                                session_feedback_by_cat[cat] = fb
+                        session_feedbacks = list(session_feedback_by_cat.values())
 
-                    start_knee_angle = None
-                    rep_down_start_idx = None
-                    stage = "up"
+                        start_knee_angle = None
+                        rep_down_start_idx = None
+                        stage = "up"
 
-                    # debounce
-                    if frame_idx - last_rep_frame > MIN_FRAMES_BETWEEN_REPS_SQ:
-                        counter += 1
-                        last_rep_frame = frame_idx
-                        if score >= 9.5: good_reps += 1
-                        else: bad_reps += 1
-                        all_scores.append(score)
+                        # debounce
+                        if frame_idx - last_rep_frame > MIN_FRAMES_BETWEEN_REPS_SQ:
+                            counter += 1
+                            last_rep_frame = frame_idx
+                            if score >= 9.5: good_reps += 1
+                            else: bad_reps += 1
+                            all_scores.append(score)
 
                 # --- ציור ---
                 frame = draw_body_only(frame, lm)
