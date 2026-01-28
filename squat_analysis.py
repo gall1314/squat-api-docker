@@ -69,7 +69,7 @@ def pick_strongest_per_category(feedback_list):
         best = best_by_cat.get(cat)
         if not best or FB_SEVERITY.get(f, 1) > FB_SEVERITY.get(best, 1):
             best_by_cat[cat] = f
-    return list(best_by_cat.values())
+    return list(best_by_cat.values()), best_by_cat
 
 def merge_feedback(global_best, new_list):
     cand = pick_strongest_feedback(new_list)
@@ -275,6 +275,7 @@ def run_squat_analysis(video_path,
     frame_idx = 0
     last_rep_frame = -999
     session_feedbacks = []
+    session_feedback_by_cat = {}
 
     # גלובל-מושן
     prev_hip = prev_la = prev_ra = None
@@ -423,9 +424,9 @@ def run_squat_analysis(video_path,
                     depth_ratio = 0.0
                     if knee_to_ankle > 1e-6:
                         depth_ratio = max(0.0, rep_max_hip_knee_delta) / knee_to_ankle
-                    if   depth_ratio < 0.10: feedbacks.append("Try to squat deeper");            penalty += 3
-                    elif depth_ratio < 0.16: feedbacks.append("Almost there — go a bit lower");  penalty += 2
-                    elif depth_ratio < 0.22: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
+                    if   depth_ratio < 0.08: feedbacks.append("Try to squat deeper");            penalty += 3
+                    elif depth_ratio < 0.14: feedbacks.append("Almost there — go a bit lower");  penalty += 2
+                    elif depth_ratio < 0.20: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
 
                     # גב — מתריעים רק אם נצברה חריגה למשך מינימום
                     back_flag = (rep_top_bad_frames >= TOP_BAD_MIN_FRAMES) or (rep_bottom_bad_frames >= BOTTOM_BAD_MIN_FRAMES)
@@ -440,7 +441,7 @@ def run_squat_analysis(video_path,
                     depth_pct = float(np.clip(depth_ratio, 0, 1))
 
                     # דוח רפ
-                    rep_feedbacks = pick_strongest_per_category(feedbacks)
+                    rep_feedbacks, rep_feedback_by_cat = pick_strongest_per_category(feedbacks)
                     rep_reports.append({
                         "rep_index": counter + 1,
                         "score": round(float(score), 1),
@@ -459,9 +460,11 @@ def run_squat_analysis(video_path,
                     })
 
                     # פידבק-סשן
-                    for fb in rep_feedbacks:
-                        if fb not in session_feedbacks:
-                            session_feedbacks.append(fb)
+                    for cat, fb in rep_feedback_by_cat.items():
+                        best = session_feedback_by_cat.get(cat)
+                        if not best or FB_SEVERITY.get(fb, 1) > FB_SEVERITY.get(best, 1):
+                            session_feedback_by_cat[cat] = fb
+                    session_feedbacks = list(session_feedback_by_cat.values())
 
                     start_knee_angle = None
                     rep_down_start_idx = None
