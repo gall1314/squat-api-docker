@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# squat_analysis.py — תיקון סופי: עומק לפי hip-below-knee, גב סלחני מאוד
+# squat_analysis.py — תאיקון סופי: עומק לפי hip-below-knee, גב סלחני מאוד
 import os
 import cv2
 import math
