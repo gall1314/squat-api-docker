@@ -308,7 +308,12 @@ def run_squat_analysis(video_path,
                        frame_skip=3,
                        scale=0.4,
                        output_path="squat_analyzed.mp4",
-                       feedback_path="squat_feedback.txt"):
+                       feedback_path="squat_feedback.txt",
+                       fast_mode=False):
+    """
+    fast_mode=True: רק ניתוח, בלי יצירת סרטון (מהיר יותר)
+    fast_mode=False: ניתוח + יצירת סרטון מנותח
+    """
     mp_pose_mod = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -318,6 +323,9 @@ def run_squat_analysis(video_path,
             "technique_score_display": display_half_str(0.0),
             "technique_label": score_label(0.0)
         }
+    
+    # אם fast_mode או אין output_path - לא ליצור סרטון
+    create_video = (not fast_mode) and (output_path is not None) and (output_path != "")
 
     counter = 0
     good_reps = 0
@@ -384,7 +392,7 @@ def run_squat_analysis(video_path,
             if scale != 1.0: frame = cv2.resize(frame, (0,0), fx=scale, fy=scale)
 
             h, w = frame.shape[:2]
-            if out is None:
+            if create_video and out is None:
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
 
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -392,8 +400,10 @@ def run_squat_analysis(video_path,
             if not results.pose_landmarks:
                 depth_live = 0.0
                 if rt_fb_hold > 0: rt_fb_hold -= 1
-                frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
-                out.write(frame); continue
+                if create_video:
+                    frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
+                    if out: out.write(frame)
+                continue
 
             try:
                 lm = results.pose_landmarks.landmark
@@ -594,15 +604,17 @@ def run_squat_analysis(video_path,
                             all_scores.append(score)
 
                 # --- ציור ---
-                frame = draw_body_only(frame, lm)
-                frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
-                out.write(frame)
+                if create_video:
+                    frame = draw_body_only(frame, lm)
+                    frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
+                    if out: out.write(frame)
 
             except Exception:
                 if rt_fb_hold > 0: rt_fb_hold -= 1
                 depth_live = 0.0
-                frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
-                if out is not None: out.write(frame)
+                if create_video and out is not None:
+                    frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
+                    out.write(frame)
                 continue
 
     cap.release()
@@ -632,20 +644,22 @@ def run_squat_analysis(video_path,
     except Exception as e:
         print(f"Warning: Could not write feedback file: {e}")
 
-    # faststart encode
-    encoded_path = output_path.replace(".mp4", "_encoded.mp4")
-    try:
-        subprocess.run([
-            "ffmpeg", "-y", "-i", output_path,
-            "-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart", "-pix_fmt", "yuv420p",
-            encoded_path
-        ], check=False, capture_output=True)
-        if os.path.exists(output_path) and os.path.exists(encoded_path):
-            os.remove(output_path)
-    except Exception as e:
-        print(f"Warning: FFmpeg encoding issue: {e}")
-    
-    final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
+    # faststart encode - רק אם יצרנו סרטון
+    final_video_path = ""
+    if create_video and output_path:
+        encoded_path = output_path.replace(".mp4", "_encoded.mp4")
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", output_path,
+                "-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart", "-pix_fmt", "yuv420p",
+                encoded_path
+            ], check=False, capture_output=True)
+            if os.path.exists(output_path) and os.path.exists(encoded_path):
+                os.remove(output_path)
+        except Exception as e:
+            print(f"Warning: FFmpeg encoding issue: {e}")
+        
+        final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
 
     result = {
         "squat_count": int(counter),
