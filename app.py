@@ -52,30 +52,37 @@ def _supports_arg(func, name: str) -> bool:
 def _run_with_tracks(func, src_path, out_video_path, fast: bool, *, frame_skip=3, scale=0.4, extra=None):
     """
     מריץ אנלייזר עם תמיכה בשני מסלולים:
-      fast=True  -> בלי וידאו (return_video=False / fast_mode=True / output_path=None אם נתמך)
-      fast=False -> עם וידאו (output_path=out_video_path או output_dir)
-    מעביר רק פרמטרים שהפונקציה תומכת בהם בפועל.
+      fast=True  -> בלי וידאו (fast_mode=True)
+      fast=False -> עם וידאו (output_path=out_video_path)
     """
     extra = extra or {}
     kwargs = {}
+    
+    # פרמטרים בסיסיים
     if _supports_arg(func, "frame_skip"): kwargs["frame_skip"] = frame_skip
     if _supports_arg(func, "scale"): kwargs["scale"] = scale
-    if _supports_arg(func, "return_video"): kwargs["return_video"] = (not fast)
-    if _supports_arg(func, "fast_mode"): kwargs["fast_mode"] = bool(fast)
+    
+    # מסלול מהיר vs רגיל
+    if _supports_arg(func, "fast_mode"): 
+        kwargs["fast_mode"] = bool(fast)
+    if _supports_arg(func, "return_video"): 
+        kwargs["return_video"] = (not fast)
 
-    if not fast:
-        if _supports_arg(func, "output_path") and out_video_path:
+    # תמיד לשלוח output_path אם הפונקציה תומכת
+    # (גם במסלול מהיר - הפונקציה תחליט אם להשתמש בו)
+    if _supports_arg(func, "output_path"):
+        if out_video_path:
             kwargs["output_path"] = out_video_path
-        elif _supports_arg(func, "output_dir"):
-            kwargs["output_dir"] = os.path.dirname(out_video_path) if out_video_path else MEDIA_DIR
-    else:
-        if _supports_arg(func, "output_path"):
-            kwargs["output_path"] = None  # מונע רינדור וידאו במסלול המהיר
+            print(f"[_run_with_tracks] Passing output_path={out_video_path}", file=sys.stderr, flush=True)
+    
+    if _supports_arg(func, "output_dir"):
+        kwargs["output_dir"] = os.path.dirname(out_video_path) if out_video_path else MEDIA_DIR
 
     for k, v in (extra.items()):
         if _supports_arg(func, k):
             kwargs[k] = v
 
+    print(f"[_run_with_tracks] Calling func with kwargs keys: {list(kwargs.keys())}", file=sys.stderr, flush=True)
     return func(src_path, **kwargs)
 
 def _missing_stub(mod_name, fn_names):
@@ -108,7 +115,7 @@ def load_func_soft(module_name, *func_names):
     return _missing_stub(module_name, func_names)
 
 # ---- Resolve analyzers (לא מפיל אם חסר משהו) ----
-run_squat       = load_func_soft('squat_analysis', 'run_analysis')
+run_squat       = load_func_soft('squat_analysis', 'run_analysis', 'run_squat_analysis')
 run_deadlift    = load_func_soft('deadlift_analysis', 'run_deadlift_analysis', 'run_analysis')
 run_bulgarian   = load_func_soft('bulgarian_split_squat_analysis', 'run_bulgarian_analysis', 'run_analysis')
 run_pullup      = load_func_soft('pullup_analysis', 'run_pullup_analysis', 'run_analysis')
@@ -128,6 +135,8 @@ def _save_raw_stream(raw_stream, dest_path, chunk_size=8*1024*1024):
 
 # -------- Core analyze logic (shared between multipart & raw) --------
 def _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_flag: bool):
+    print(f"[_do_analyze] type={resolved_type}, raw={raw_video_path}, analyzed={analyzed_path}, fast={fast_flag}", file=sys.stderr, flush=True)
+    
     if resolved_type == 'squat':
         return _run_with_tracks(run_squat, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
     elif resolved_type == 'deadlift':
@@ -181,6 +190,8 @@ def analyze():
 
             result = _standardize_video_path(result)
             output_path = result.get("video_path") or ""
+            print(f"[RAW] result video_path={output_path}", file=sys.stderr, flush=True)
+            
             full_url = request.host_url.rstrip('/') + '/media/' + os.path.basename(output_path) if output_path else None
 
             print(f"OK -> {full_url}", file=sys.stderr, flush=True)
@@ -215,6 +226,8 @@ def analyze():
         base_filename = f"{resolved_type}_{unique_id}"
         raw_video_path = os.path.join(MEDIA_DIR, base_filename + ".mp4")
         analyzed_path = os.path.join(MEDIA_DIR, base_filename + "_analyzed.mp4")
+        
+        print(f"[MP] raw_video_path={raw_video_path}, analyzed_path={analyzed_path}", file=sys.stderr, flush=True)
 
         t_save0 = time.time()
         _save_upload_streaming(video_file, raw_video_path, chunk_size=8*1024*1024)
@@ -226,6 +239,8 @@ def analyze():
 
         result = _standardize_video_path(result)
         output_path = result.get("video_path") or ""
+        print(f"[MP] result video_path={output_path}", file=sys.stderr, flush=True)
+        
         full_url = request.host_url.rstrip('/') + '/media/' + os.path.basename(output_path) if output_path else None
 
         print("OK ->", full_url, file=sys.stderr, flush=True)
