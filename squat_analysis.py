@@ -251,49 +251,48 @@ def _euclid(a, b):
 # ===================== זיהוי עומק מבוסס זווית ברך - עובד בכל זווית מצלמה =====================
 def calculate_depth_robust(mid_hip, mid_knee, mid_ankle, knee_angle, mid_shoulder):
     """
-    חישוב עומק מבוסס מרחק אוקלידי 2D (X+Y) במקום רק Y
-    זה הפתרון לבעיית הזוויות - מרחק 2D לא משתנה בזוויות שונות!
+    חישוב עומק משולב:
+    70% - מדד Y axis (hip-knee delta) - המדד המקורי שעבד
+    30% - זווית ברך - עוזר בזוויות שונות של מצלמה
     """
-    # 1. מרחק 2D בין אגן לברך (במקום רק Y!)
-    hip_knee_dist = np.sqrt((mid_hip[0] - mid_knee[0])**2 + (mid_hip[1] - mid_knee[1])**2)
+    # 1. המדד המקורי - Y axis (עבד טוב בזווית צד)
+    knee_to_ankle = max(1e-6, abs(mid_ankle[1] - mid_knee[1]))
+    hip_knee_delta = mid_hip[1] - mid_knee[1]
     
-    # 2. מרחק 2D בין ברך לקרסול (לנרמול)
-    knee_ankle_dist = np.sqrt((mid_knee[0] - mid_ankle[0])**2 + (mid_knee[1] - mid_ankle[1])**2)
-    knee_ankle_dist = max(1e-6, knee_ankle_dist)
+    # 2. נרמול לגובה אדם (עוזר בזוויות שונות)
+    person_height = max(1e-6, abs(mid_ankle[1] - mid_shoulder[1]))
     
-    # 3. מרחק 2D בין כתף לקרסול (גובה אדם)
-    person_height = np.sqrt((mid_shoulder[0] - mid_ankle[0])**2 + (mid_shoulder[1] - mid_ankle[1])**2)
-    person_height = max(1e-6, person_height)
+    # 3. חישוב מדד Y - ביחס לאורך השוק
+    y_depth_ratio = max(0.0, hip_knee_delta) / knee_to_ankle
     
-    # 4. חישוב עומק - כמה האגן קרוב לברך ביחס לאורך השוק
-    # כשיורדים לסקוואט, האגן מתקרב לברך
-    depth_ratio = hip_knee_dist / knee_ankle_dist
+    # 4. חישוב מדד Y - ביחס לגובה אדם
+    y_depth_normalized = max(0.0, hip_knee_delta) / person_height
     
-    # 5. נרמול לגובה אדם (עזרה נוספת)
-    normalized_depth = hip_knee_dist / person_height
+    # 5. שילוב שני מדדי Y
+    y_depth_combined = (y_depth_ratio * 0.7) + (y_depth_normalized * 30.0 * 0.3)
     
-    # 6. שילוב: 70% מדד יחס, 30% נרמול לגובה
-    combined = (depth_ratio * 0.7) + (normalized_depth * 15.0 * 0.3)
+    # נרמול: 0.35 = עומק מלא
+    y_depth_score = y_depth_combined / 0.35
     
-    # 7. נרמול סופי - ככל שהמספר קטן יותר = עומק גדול יותר
-    # מרחק קטן = אגן קרוב לברך = עומק טוב
-    # הופכים: 1 - (מרחק / סף)
-    # סף של 1.2 = ללא עומק, סף של 0.4 = עומק מלא
-    depth_normalized = 1.0 - max(0.0, min(1.0, (combined - 0.4) / 0.8))
+    # 6. מדד זווית ברך - לעזרה בזוויות שונות
+    # זווית קטנה = עומק טוב
+    if knee_angle <= 90:
+        angle_score = 1.0
+    elif knee_angle <= 105:
+        angle_score = 0.8 + (105 - knee_angle) / 15 * 0.2
+    elif knee_angle <= 120:
+        angle_score = 0.5 + (120 - knee_angle) / 15 * 0.3
+    elif knee_angle <= 135:
+        angle_score = 0.2 + (135 - knee_angle) / 15 * 0.3
+    else:
+        angle_score = max(0.0, (155 - knee_angle) / 20 * 0.2)
     
-    # 8. sanity check עם זווית ברך (משקל נמוך)
-    angle_check = 1.0
-    if knee_angle > 130:
-        # זווית גדולה מדי - ודאי לא ירד
-        angle_check = 0.5
-    elif knee_angle < 85:
-        # זווית קטנה - ודאי ירד טוב
-        angle_check = 1.1
-    
-    # 9. שילוב סופי
-    final_depth = depth_normalized * (0.85 + 0.15 * angle_check)
+    # 7. שילוב סופי: 70% Y axis, 30% זווית ברך
+    # Y axis הוא העיקרי, זווית ברך עוזרת בזוויות שונות
+    final_depth = (y_depth_score * 0.70) + (angle_score * 0.30)
     
     return float(np.clip(final_depth, 0, 1))
+
 
 
 
