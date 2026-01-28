@@ -248,37 +248,41 @@ MOVEMENT_CLEAR_FRAMES = 2
 def _euclid(a, b):
     return math.hypot(a[0]-b[0], a[1]-b[1])
 
-# ===================== שיפור זיהוי עומק - מדידה יותר חכמה =====================
+# ===================== זיהוי עומק משופר - משלב מדד אנכי וזווית ברך =====================
 def calculate_depth_robust(mid_hip, mid_knee, mid_ankle, knee_angle):
     """
-    חישוב עומק משופר שעובד טוב יותר בזוויות שונות של מצלמה
-    משלב כמה מדדים:
-    1. היחס בין ירך לברך (Y axis)
-    2. זווית הברך
-    3. מרחק אנכי נורמלי לגובה האדם
+    חישוב עומק שמשלב:
+    1. המדד האנכי המקורי (hip-knee vs knee-ankle)
+    2. זווית הברך כמדד משלים ומאמת
+    
+    זה עוזר לזהות עומק טוב גם בזוויות צילום שונות
     """
-    # מדד 1: היחס הבסיסי (כמו קודם)
+    # מדד אנכי בסיסי - המדד שעבד היטב במקור
     knee_to_ankle = max(1e-6, abs(mid_ankle[1] - mid_knee[1]))
     hip_knee_delta = mid_hip[1] - mid_knee[1]
-    basic_ratio = max(0.0, hip_knee_delta) / knee_to_ankle
+    vertical_ratio = max(0.0, hip_knee_delta) / knee_to_ankle
     
-    # מדד 2: זווית ברך (ככל שהזווית קטנה יותר, העומק גדול יותר)
-    # זווית של 90 מעלות = עומק טוב, מעל 120 = לא מספיק עומק
-    angle_factor = 1.0
-    if knee_angle > 100:
-        angle_factor = max(0.3, (170 - knee_angle) / 70.0)
+    # נרמול המדד האנכי לטווח 0-1
+    # סף של 0.35 = עומק מלא (100%)
+    vertical_depth = vertical_ratio / 0.35
     
-    # מדד 3: מרחק אופקי ברך-קרסול (סקוואט עמוק = הברך נוסעת יותר קדימה)
-    horizontal_knee_ankle = abs(mid_knee[0] - mid_ankle[0])
-    horizontal_factor = min(1.2, 0.7 + horizontal_knee_ankle * 2.0)
+    # מדד זווית ברך - לאימות ותיקון
+    # זווית 90° או פחות = עומק מלא
+    # זווית 130° ומעלה = אין כמעט עומק
+    angle_depth = 0.0
+    if knee_angle <= 90:
+        angle_depth = 1.0
+    elif knee_angle >= 130:
+        angle_depth = 0.0
+    else:
+        # ליניארי בין 90 ל-130
+        angle_depth = (130 - knee_angle) / 40.0
     
-    # שילוב המדדים עם משקלות
-    combined_depth = (basic_ratio * 0.5 + angle_factor * 0.3 + horizontal_factor * 0.2)
+    # משקלות: 75% מדד אנכי (המדד העיקרי), 25% זווית (מאמת)
+    # זה שומר על הדיוק של המדד המקורי אבל מוסיף תיקון לזוויות שונות
+    combined = (vertical_depth * 0.75) + (angle_depth * 0.25)
     
-    # נרמול לטווח 0-1, עם סף נמוך יותר לעומק טוב
-    normalized = combined_depth / 0.30  # הורדנו מ-0.35 ל-0.30 לרגישות גבוהה יותר
-    
-    return float(np.clip(normalized, 0, 1))
+    return float(np.clip(combined, 0, 1))
 
 # ===================== MAIN =====================
 def run_squat_analysis(video_path,
@@ -459,10 +463,11 @@ def run_squat_analysis(video_path,
                     # שימוש בעומק המקסימלי שהושג (לא העומק הנוכחי)
                     depth_pct = rep_max_depth
                     
-                    # ספים מעודכנים לעומק - יותר סלחניים
-                    if   depth_pct < 0.25: feedbacks.append("Try to squat deeper");            penalty += 3
-                    elif depth_pct < 0.45: feedbacks.append("Almost there — go a bit lower");  penalty += 2
-                    elif depth_pct < 0.60: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
+                    # ספי עומק מכוילים - מחמירים יותר מהגרסה הקודמת
+                    # depth_pct של 0.5 = ירידה סבירה, 0.7+ = עומק טוב, 0.85+ = מעולה
+                    if   depth_pct < 0.40: feedbacks.append("Try to squat deeper");            penalty += 3
+                    elif depth_pct < 0.60: feedbacks.append("Almost there — go a bit lower");  penalty += 2
+                    elif depth_pct < 0.75: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
 
                     # פידבק גב - רק אם באמת היה חמור
                     back_flag = (rep_top_bad_frames >= TOP_BAD_MIN_FRAMES) or (rep_bottom_bad_frames >= BOTTOM_BAD_MIN_FRAMES)
