@@ -437,16 +437,28 @@ def run_squat_analysis(video_path,
                 movement_block = (hip_vel_ema > HIP_VEL_THRESH_PCT) or (ankle_vel_ema > ANKLE_VEL_THRESH_PCT)
                 if movement_block: movement_free_streak = 0
                 else:              movement_free_streak = min(MOVEMENT_CLEAR_FRAMES, movement_free_streak + 1)
+                
+                # --- זיהוי הליכה/תנועה לא קשורה ---
+                # בהליכה: הקרסוליים זזים הרבה ביחס לירכיים
+                # בסקווט: הקרסוליים יציבים והירכיים זזות
+                ankle_to_hip_ratio = ankle_vel_ema / max(hip_vel_ema, 0.001)
+                is_walking = (ankle_vel_ema > ANKLE_VEL_THRESH_PCT * 0.8) and (ankle_to_hip_ratio > 1.5)
 
                 # --- זוויות ---
                 knee_angle   = calculate_angle(hip, knee, ankle)
                 back_angle   = angle_between_vectors(mid_shoulder - mid_hip, np.array([0.0, -1.0]))
 
                 # --- התחלת ירידה ---
+                # תנאים מחמירים יותר:
+                # 1. זווית ברך קטנה מ-120 (לא 130) - מספיק כפיפה אמיתית
+                # 2. אין תנועה גלובלית מהירה
+                # 3. לא בהליכה
+                # 4. הירכיים זזות יותר מהקרסוליים (תנועת סקווט אמיתית)
                 soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.1) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.1)
+                squat_motion = (hip_vel_ema > ankle_vel_ema * 0.3) or (hip_vel_ema < 0.005)  # ירכיים זזות או הכל יציב
                 knee_going_down = (stage != "down")
                 
-                if (knee_angle < 130) and knee_going_down and soft_start_ok:
+                if (knee_angle < 120) and knee_going_down and soft_start_ok and (not is_walking) and squat_motion:
                     start_knee_angle = float(knee_angle)
                     rep_min_knee_angle = 180.0
                     rep_max_knee_angle = -999.0
@@ -656,10 +668,10 @@ def run_squat_analysis(video_path,
             ], check=False, capture_output=True)
             if os.path.exists(output_path) and os.path.exists(encoded_path):
                 os.remove(output_path)
+            final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
         except Exception as e:
             print(f"Warning: FFmpeg encoding issue: {e}")
-        
-        final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
+            final_video_path = output_path if os.path.exists(output_path) else ""
 
     result = {
         "squat_count": int(counter),
