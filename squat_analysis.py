@@ -362,7 +362,6 @@ def run_squat_analysis(video_path,
                 
                 back_angle   = angle_between_vectors(mid_shoulder - mid_hip, np.array([0.0, -1.0]))
 
-                back_angle   = angle_between_vectors(shoulder - hip, np.array([0.0, -1.0]))
 
 
                 # --- התחלת ירידה (soft start) ---
@@ -380,11 +379,6 @@ def run_squat_analysis(video_path,
                     stage = "down"
 
                 # --- עומק "לייב" גם בירידה וגם בעלייה ---
-                knee_to_ankle = max(1e-6, abs(mid_ankle[1] - mid_knee[1]))
-                hip_knee_delta = mid_hip[1] - mid_knee[1]
-                depth_ratio = max(0.0, hip_knee_delta) / knee_to_ankle
-                depth_live = float(np.clip(depth_ratio / 0.35, 0, 1))
-
                 knee_to_ankle = max(1e-6, abs(ankle[1] - knee[1]))
                 hip_knee_delta = hip[1] - knee[1]
                 depth_live = float(np.clip(hip_knee_delta / knee_to_ankle, 0, 1))
@@ -398,22 +392,22 @@ def run_squat_analysis(video_path,
                     rep_max_hip_knee_delta = max(rep_max_hip_knee_delta, hip_knee_delta)
 
                     # Top: עומק קטן → דורש זקיפות יחסית; Bottom: עומק גדול → סלחני יותר
-                    if depth_live <= 0.30 and back_angle > TOP_BACK_MAX_DEG:
+                   if depth_live <= 0.25 and back_angle > TOP_BACK_MAX_DEG:
+    rep_top_bad_frames += 1
 
-                    if depth_live <= 0.20 and back_angle > TOP_BACK_MAX_DEG:
- 
-                        rep_top_bad_frames += 1
-                        # RT feedback עם hold
-                        if rt_fb_msg != "Try to keep your back a bit straighter":
-                            rt_fb_msg = "Try to keep your back a bit straighter"
-                            rt_fb_hold = RT_FB_HOLD_FRAMES
-                        else:
-                            rt_fb_hold = max(rt_fb_hold, RT_FB_HOLD_FRAMES)
-                    elif depth_live >= 0.70 and back_angle > BOTTOM_BACK_MAX_DEG:
+    if rt_fb_msg != "Try to keep your back a bit straighter":
+        rt_fb_msg = "Try to keep your back a bit straighter"
+        rt_fb_hold = RT_FB_HOLD_FRAMES
+    else:
+        rt_fb_hold = max(rt_fb_hold, RT_FB_HOLD_FRAMES)
 
-                    elif depth_live >= 0.60 and back_angle > BOTTOM_BACK_MAX_DEG:
+elif depth_live >= 0.65 and back_angle > BOTTOM_BACK_MAX_DEG:
+    rep_bottom_bad_frames += 1
 
-                        rep_bottom_bad_frames += 1
+else:
+    if rt_fb_hold > 0:
+        rt_fb_hold -= 1
+
                         # בזמן אמת לא נצעק בתחתית כדי לא להציק; נשמור לסוף רפ
                     else:
                         if rt_fb_hold > 0:
