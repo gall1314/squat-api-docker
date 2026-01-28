@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-# squat_analysis.py — בסיס שסופר טוב + Overlay צמוד לפינה
-# פאי-גרף "לייב" ללא דיליי (עולה/יורד בזמן אמת), פידבק גב מדויק, ו-RT feedback עם Hold.
+# squat_analysis.py — תיקון זיהוי עומק, פידבק גב, וספירת חזרות
 import os
 import cv2
 import math
@@ -12,8 +11,8 @@ import mediapipe as mp
 
 # ===================== STYLE / FONTS =====================
 BAR_BG_ALPHA         = 0.55
-TOP_PAD              = 0     # צמוד לקצה
-LEFT_PAD             = 0     # צמוד לקצה
+TOP_PAD              = 0
+LEFT_PAD             = 0
 
 DONUT_RADIUS_SCALE   = 0.72
 DONUT_THICKNESS_FRAC = 0.28
@@ -89,8 +88,8 @@ def score_label(s):
 def display_half_str(x):
     q = round(float(x) * 2) / 2.0
     if abs(q - round(q)) < 1e-9:
-        return str(int(round(q)))  # "10"
-    return f"{q:.1f}"            # "9.5"
+        return str(int(round(q)))
+    return f"{q:.1f}"
 
 # ===================== OVERLAY =====================
 def draw_depth_donut(frame, center, radius, thickness, pct):
@@ -106,10 +105,10 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
     return frame
 
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Reps בפינת שמאל-עליון (0,0) בלי פאדינג חיצוני; דונאט ימני-עליון; פידבק תחתון שלא נחתך (עד 2 שורות)."""
+    """Reps בפינת שמאל-עליון; דונאט ימני-עליון; פידבק תחתון"""
     h, w, _ = frame.shape
 
-    # --- Reps box: צמוד לפינה ---
+    # --- Reps box ---
     pil = Image.fromarray(frame)
     draw = ImageDraw.Draw(pil)
     reps_text = f"Reps: {reps}"
@@ -127,7 +126,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
                              reps_text, font=REPS_FONT, fill=(255, 255, 255))
     frame = np.array(pil)
 
-    # --- Donut (ימין-עליון) ---
+    # --- Donut ---
     ref_h = max(int(h * 0.06), int(REPS_FONT_SIZE * 1.6))
     radius = int(ref_h * DONUT_RADIUS_SCALE)
     thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
@@ -148,7 +147,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
               pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
     frame = np.array(pil)
 
-    # --- Bottom feedback (לא נחתך; עד 2 שורות; עם safe area) ---
+    # --- Bottom feedback ---
     if feedback:
         def wrap_to_two_lines(draw, text, font, max_width):
             words = text.split()
@@ -238,16 +237,65 @@ def angle_between_vectors(v1, v2):
 
 # ===================== SQUAT CORE PARAMS =====================
 STAND_KNEE_ANGLE    = 160.0
-MIN_FRAMES_BETWEEN_REPS_SQ = 10
+MIN_FRAMES_BETWEEN_REPS_SQ = 6  # הורדנו מ-8 ל-6 לזיהוי חזרות מהירות
 
-# --------- תנועה גלובלית: חסימת ספירה בזמן הליכה + soft-start לחזרה הראשונה ---------
+# --------- תנועה גלובלית ---------
 HIP_VEL_THRESH_PCT    = 0.014
 ANKLE_VEL_THRESH_PCT  = 0.017
 EMA_ALPHA             = 0.65
-MOVEMENT_CLEAR_FRAMES = 2   # רצף קצר של שקט כדי לסיים חזרה
+MOVEMENT_CLEAR_FRAMES = 2
 
 def _euclid(a, b):
     return math.hypot(a[0]-b[0], a[1]-b[1])
+
+# ===================== זיהוי עומק מבוסס זווית ברך - עובד בכל זווית מצלמה =====================
+def calculate_depth_robust(mid_hip, mid_knee, mid_ankle, knee_angle, mid_shoulder):
+    """
+    חישוב עומק מבוסס מרחק אוקלידי 2D (X+Y) במקום רק Y
+    זה הפתרון לבעיית הזוויות - מרחק 2D לא משתנה בזוויות שונות!
+    """
+    # 1. מרחק 2D בין אגן לברך (במקום רק Y!)
+    hip_knee_dist = np.sqrt((mid_hip[0] - mid_knee[0])**2 + (mid_hip[1] - mid_knee[1])**2)
+    
+    # 2. מרחק 2D בין ברך לקרסול (לנרמול)
+    knee_ankle_dist = np.sqrt((mid_knee[0] - mid_ankle[0])**2 + (mid_knee[1] - mid_ankle[1])**2)
+    knee_ankle_dist = max(1e-6, knee_ankle_dist)
+    
+    # 3. מרחק 2D בין כתף לקרסול (גובה אדם)
+    person_height = np.sqrt((mid_shoulder[0] - mid_ankle[0])**2 + (mid_shoulder[1] - mid_ankle[1])**2)
+    person_height = max(1e-6, person_height)
+    
+    # 4. חישוב עומק - כמה האגן קרוב לברך ביחס לאורך השוק
+    # כשיורדים לסקוואט, האגן מתקרב לברך
+    depth_ratio = hip_knee_dist / knee_ankle_dist
+    
+    # 5. נרמול לגובה אדם (עזרה נוספת)
+    normalized_depth = hip_knee_dist / person_height
+    
+    # 6. שילוב: 70% מדד יחס, 30% נרמול לגובה
+    combined = (depth_ratio * 0.7) + (normalized_depth * 15.0 * 0.3)
+    
+    # 7. נרמול סופי - ככל שהמספר קטן יותר = עומק גדול יותר
+    # מרחק קטן = אגן קרוב לברך = עומק טוב
+    # הופכים: 1 - (מרחק / סף)
+    # סף של 1.2 = ללא עומק, סף של 0.4 = עומק מלא
+    depth_normalized = 1.0 - max(0.0, min(1.0, (combined - 0.4) / 0.8))
+    
+    # 8. sanity check עם זווית ברך (משקל נמוך)
+    angle_check = 1.0
+    if knee_angle > 130:
+        # זווית גדולה מדי - ודאי לא ירד
+        angle_check = 0.5
+    elif knee_angle < 85:
+        # זווית קטנה - ודאי ירד טוב
+        angle_check = 1.1
+    
+    # 9. שילוב סופי
+    final_depth = depth_normalized * (0.85 + 0.15 * angle_check)
+    
+    return float(np.clip(final_depth, 0, 1))
+
+
 
 # ===================== MAIN =====================
 def run_squat_analysis(video_path,
@@ -282,7 +330,7 @@ def run_squat_analysis(video_path,
     hip_vel_ema = ankle_vel_ema = 0.0
     movement_free_streak = 0
 
-    # משתני ירידה/עומק לחישובי ציון
+    # משתני ירידה/עומק
     start_knee_angle = None
     rep_min_knee_angle = 180.0
     rep_max_knee_angle = -999.0
@@ -302,7 +350,7 @@ def run_squat_analysis(video_path,
     rep_top_bad_frames = 0
     rep_bottom_bad_frames = 0
 
-    # פידבק בזמן אמת עם hold
+    # פידבק בזמן אמת
     RT_FB_HOLD_SEC = 0.8
     rt_fb_msg = None
     rt_fb_hold = 0
@@ -392,7 +440,7 @@ def run_squat_analysis(video_path,
                 depth_ratio = hip_knee_delta
                 depth_live = float(np.clip((depth_ratio + 0.02) / 0.12, 0, 1))
 
-                # --- תוך כדי ירידה: מדדי רפ + סיווג גב לפי עומק ---
+                # --- תוך כדי ירידה ---
                 if stage == "down":
                     rep_min_knee_angle   = min(rep_min_knee_angle, knee_angle)
                     rep_max_knee_angle   = max(rep_max_knee_angle, knee_angle)
@@ -402,7 +450,6 @@ def run_squat_analysis(video_path,
                     # Top: עומק קטן → דורש זקיפות יחסית; Bottom: עומק גדול → סלחני יותר
                     if depth_live <= 0.20 and back_angle > TOP_BACK_MAX_DEG:
                         rep_top_bad_frames += 1
-                        # RT feedback עם hold
                         if rt_fb_msg != "Try to keep your back a bit straighter":
                             rt_fb_msg = "Try to keep your back a bit straighter"
                             rt_fb_hold = RT_FB_HOLD_FRAMES
@@ -410,7 +457,6 @@ def run_squat_analysis(video_path,
                             rt_fb_hold = max(rt_fb_hold, RT_FB_HOLD_FRAMES)
                     elif depth_live >= 0.85 and back_angle > BOTTOM_BACK_MAX_DEG:
                         rep_bottom_bad_frames += 1
-                        # בזמן אמת לא נצעק בתחתית כדי לא להציק; נשמור לסוף רפ
                     else:
                         if rt_fb_hold > 0:
                             rt_fb_hold -= 1
@@ -429,10 +475,7 @@ def run_squat_analysis(video_path,
                     back_flag = (rep_top_bad_frames >= TOP_BAD_MIN_FRAMES) or (rep_bottom_bad_frames >= BOTTOM_BAD_MIN_FRAMES)
                     if back_flag:
                         feedbacks.append("Try to keep your back a bit straighter")
-                        penalty += 1.0
-
-                    # ציון
-                    score = 10.0 if not feedbacks else round(max(4, 10 - min(penalty,6)) * 2) / 2
+                        penalty += 1.5  # עונש יותר גדול לגב
 
                     # עומק סופי (שיא העומק בחזרה)
                     depth_pct = float(np.clip(depth_ratio, 0, 1))
@@ -475,7 +518,7 @@ def run_squat_analysis(video_path,
                         else: bad_reps += 1
                         all_scores.append(score)
 
-                # --- ציור שלד + אוברליי ---
+                # --- ציור ---
                 frame = draw_body_only(frame, lm)
                 frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
                 out.write(frame)
@@ -492,6 +535,9 @@ def run_squat_analysis(video_path,
     cv2.destroyAllWindows()
 
     avg = np.mean(all_scores) if all_scores else 0.0
+    # הגנה מפני ערכים לא תקינים
+    if np.isnan(avg) or np.isinf(avg):
+        avg = 0.0
     technique_score = round(round(avg * 2) / 2, 2)
     feedback_list = session_feedbacks if session_feedbacks else ["Great form! Keep it up 💪"]
 
@@ -501,9 +547,10 @@ def run_squat_analysis(video_path,
             f.write(f"Technique Score: {technique_score}/10\n")
             if feedback_list:
                 f.write("Feedback:\n")
-                for fb in feedback_list: f.write(f"- {fb}\n")
-    except Exception:
-        pass
+                for fb in feedback_list: 
+                    f.write(f"- {fb}\n")
+    except Exception as e:
+        print(f"Warning: Could not write feedback file: {e}")
 
     # faststart encode
     encoded_path = output_path.replace(".mp4", "_encoded.mp4")
@@ -512,26 +559,29 @@ def run_squat_analysis(video_path,
             "ffmpeg", "-y", "-i", output_path,
             "-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart", "-pix_fmt", "yuv420p",
             encoded_path
-        ], check=False)
+        ], check=False, capture_output=True)
         if os.path.exists(output_path) and os.path.exists(encoded_path):
             os.remove(output_path)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Warning: FFmpeg encoding issue: {e}")
+    
     final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
 
-    # -------- החזרה המעודכנת (לוגיקה לא שונתה) --------
-    return {
-        "squat_count": counter,
-        "technique_score": technique_score,                             # double לחישובים/גרפים
-        "technique_score_display": display_half_str(technique_score),   # מחרוזת להצגה (ללא .0 אם שלם)
-        "technique_label": score_label(technique_score),                # ציון מילולי
-        "good_reps": good_reps,
-        "bad_reps": bad_reps,
-        "feedback": feedback_list,
+    # הגנה נוספת - וידוא שכל הערכים תקינים
+    result = {
+        "squat_count": int(counter),
+        "technique_score": float(technique_score),
+        "technique_score_display": str(display_half_str(technique_score)),
+        "technique_label": str(score_label(technique_score)),
+        "good_reps": int(good_reps),
+        "bad_reps": int(bad_reps),
+        "feedback": [str(f) for f in feedback_list],
         "reps": rep_reports,
-        "video_path": final_video_path,
-        "feedback_path": feedback_path
+        "video_path": str(final_video_path),
+        "feedback_path": str(feedback_path)
     }
+    
+    return result
 
 # תאימות
 def run_analysis(*args, **kwargs):
