@@ -268,38 +268,39 @@ def calculate_depth_robust(mid_hip, mid_knee, mid_ankle, knee_angle, mid_shoulde
     # חיובי = מתחת (טוב!), שלילי = מעל (צריך לרדת יותר)
     normalized_depth = hip_below_knee / thigh_length
     
-    # ===== חישוב ציון עומק =====
-    # normalized_depth >= 0.05 → האגן מתחת לברכיים = מושלם (100%)
-    # normalized_depth >= -0.1 → כמעט שם (parallel) = מצוין (85-100%)
-    # normalized_depth >= -0.3 → קרוב = טוב (60-85%)
-    # normalized_depth >= -0.5 → בינוני (35-60%)
-    # normalized_depth < -0.5 → האגן הרבה מעל הברכיים = גרוע (0-35%)
+    # ===== חישוב ציון עומק - ספים מחמירים יותר =====
+    # normalized_depth >= 0.0 → האגן בגובה הברכיים או מתחת = מושלם (100%)
+    # normalized_depth >= -0.15 → כמעט parallel = מצוין (85-100%)
+    # normalized_depth >= -0.35 → קרוב = טוב (60-85%)
+    # normalized_depth >= -0.55 → בינוני (35-60%)
+    # normalized_depth < -0.55 → האגן הרבה מעל הברכיים = גרוע (0-35%)
     
-    if normalized_depth >= 0.05:
-        # האגן מתחת לברכיים - מושלם!
+    if normalized_depth >= 0.0:
+        # האגן בגובה הברכיים או מתחת - מושלם!
         depth_score = 1.0
-    elif normalized_depth >= -0.1:
+    elif normalized_depth >= -0.15:
         # כמעט parallel - מצוין
-        # מיפוי: -0.1 → 0.85, 0.05 → 1.0
-        depth_score = 0.85 + ((normalized_depth + 0.1) / 0.15) * 0.15
-    elif normalized_depth >= -0.3:
+        depth_score = 0.85 + ((normalized_depth + 0.15) / 0.15) * 0.15
+    elif normalized_depth >= -0.35:
         # קרוב אבל לא שם - טוב
-        # מיפוי: -0.3 → 0.60, -0.1 → 0.85
-        depth_score = 0.60 + ((normalized_depth + 0.3) / 0.2) * 0.25
-    elif normalized_depth >= -0.5:
+        depth_score = 0.60 + ((normalized_depth + 0.35) / 0.20) * 0.25
+    elif normalized_depth >= -0.55:
         # בינוני - צריך לרדת יותר
-        # מיפוי: -0.5 → 0.35, -0.3 → 0.60
-        depth_score = 0.35 + ((normalized_depth + 0.5) / 0.2) * 0.25
+        depth_score = 0.35 + ((normalized_depth + 0.55) / 0.20) * 0.25
     else:
         # גרוע - האגן הרבה מעל הברכיים
-        # מיפוי: -0.8 → 0.0, -0.5 → 0.35
-        depth_score = max(0.0, 0.35 + ((normalized_depth + 0.5) / 0.3) * 0.35)
+        # מיפוי ליניארי: -0.55 → 0.35, -0.85 → 0.0
+        depth_score = max(0.0, 0.35 * (1.0 + (normalized_depth + 0.55) / 0.30))
     
-    # בונוס/עונש קל לפי זווית ברך (גיבוי למקרי קצה)
-    if knee_angle <= 85:
-        depth_score = min(1.0, depth_score + 0.05)  # בונוס קטן לזווית מאוד סגורה
-    elif knee_angle >= 145:
-        depth_score = max(0.0, depth_score - 0.05)  # עונש קטן לזווית מאוד פתוחה
+    # בונוס/עונש לפי זווית ברך (חיזוק הזיהוי)
+    if knee_angle <= 80:
+        depth_score = min(1.0, depth_score + 0.08)  # בונוס לזווית מאוד סגורה
+    elif knee_angle <= 95:
+        depth_score = min(1.0, depth_score + 0.04)  # בונוס קטן
+    elif knee_angle >= 130:
+        depth_score = max(0.0, depth_score - 0.10)  # עונש לזווית פתוחה מאוד
+    elif knee_angle >= 115:
+        depth_score = max(0.0, depth_score - 0.05)  # עונש קטן
     
     return float(np.clip(depth_score, 0, 1))
 
@@ -346,6 +347,7 @@ def run_squat_analysis(video_path,
     rep_start_frame = None
     rep_down_start_idx = None
     rep_max_depth = 0.0
+    rep_had_back_feedback = False  # האם היה פידבק גב בזמן אמת במהלך החזרה
 
     # עומק לייב
     depth_live = 0.0
@@ -445,6 +447,7 @@ def run_squat_analysis(video_path,
                     rep_max_depth = 0.0
                     rep_top_bad_frames = 0
                     rep_bottom_bad_frames = 0
+                    rep_had_back_feedback = False  # איפוס
                     rep_start_frame = frame_idx
                     rep_down_start_idx = frame_idx
                     stage = "down"
@@ -468,6 +471,7 @@ def run_squat_analysis(video_path,
                     if depth_live < 0.35 and back_angle > TOP_BACK_MAX_DEG:
                         rep_top_bad_frames += 1
                         if rep_top_bad_frames >= TOP_BAD_MIN_FRAMES:
+                            rep_had_back_feedback = True  # סימון שהיה פידבק גב
                             if rt_fb_msg != "Try to keep your back a bit straighter":
                                 rt_fb_msg = "Try to keep your back a bit straighter"
                                 rt_fb_hold = RT_FB_HOLD_FRAMES
@@ -476,6 +480,7 @@ def run_squat_analysis(video_path,
                     elif depth_live >= 0.70 and back_angle > BOTTOM_BACK_MAX_DEG:
                         rep_bottom_bad_frames += 1
                         if rep_bottom_bad_frames >= BOTTOM_BAD_MIN_FRAMES:
+                            rep_had_back_feedback = True  # סימון שהיה פידבק גב
                             if rt_fb_msg != "Try to keep your back a bit straighter":
                                 rt_fb_msg = "Try to keep your back a bit straighter"
                                 rt_fb_hold = RT_FB_HOLD_FRAMES
@@ -500,11 +505,9 @@ def run_squat_analysis(video_path,
                     elif depth_pct < 0.60: feedbacks.append("Almost there — go a bit lower");  penalty += 2
                     elif depth_pct < 0.85: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
 
-                    # פידבק גב - רק אם עבר את הסף הגבוה מאוד
-                    back_flag_top = (rep_top_bad_frames >= TOP_BAD_MIN_FRAMES)
-                    back_flag_bottom = (rep_bottom_bad_frames >= BOTTOM_BAD_MIN_FRAMES)
-                    
-                    if back_flag_top or back_flag_bottom:
+                    # פידבק גב - אם היה פידבק בזמן אמת, לרשום אותו גם בסיכום
+                    # זה מבטיח שציון 10 לא יינתן אם הוצג פידבק גב
+                    if rep_had_back_feedback:
                         feedbacks.append("Try to keep your back a bit straighter")
                         penalty += 1.5
 
