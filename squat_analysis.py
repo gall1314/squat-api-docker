@@ -359,6 +359,13 @@ def run_squat_analysis(video_path,
     rep_down_start_idx = None
     rep_max_depth = 0.0
     rep_had_back_feedback = False  # האם היה פידבק גב בזמן אמת במהלך החזרה
+    
+    # מעקב הליכה - תנועה אופקית של קרסוליים וירכיים
+    rep_ankle_x_start = None  # מיקום X התחלתי של קרסוליים
+    rep_hip_x_start = None    # מיקום X התחלתי של ירכיים
+    rep_max_ankle_x_drift = 0.0  # תזוזה אופקית מקסימלית של קרסוליים
+    rep_max_hip_x_drift = 0.0    # תזוזה אופקית מקסימלית של ירכיים
+    rep_horizontal_frames = 0    # מספר פריימים עם תנועה אופקית
 
     # עומק לייב
     depth_live = 0.0
@@ -445,25 +452,33 @@ def run_squat_analysis(video_path,
                 
                 # --- זיהוי הליכה/תנועה לא קשורה ---
                 # בהליכה: הקרסוליים זזים הרבה ביחס לירכיים
-                # בסקווט: הקרסוליים יציבים והירכיים זזות
+                # בסקווט: הקרסוליים יציבים והירכיים זזות אנכית
                 ankle_to_hip_ratio = ankle_vel_ema / max(hip_vel_ema, 0.001)
                 is_walking = (ankle_vel_ema > ANKLE_VEL_THRESH_PCT * 0.8) and (ankle_to_hip_ratio > 1.5)
+                
+                # מדד נוסף: תנועה אופקית של הירכיים
+                # בסקווט התנועה בעיקר אנכית, בהליכה יש תנועה אופקית משמעותית
+                hip_x_movement = abs(hip_px[0] - prev_hip[0]) / max(w, 1) if prev_hip else 0
+                hip_y_movement = abs(hip_px[1] - prev_hip[1]) / max(h, 1) if prev_hip else 0
+                is_horizontal_movement = (hip_x_movement > 0.01) and (hip_x_movement > hip_y_movement * 0.7)
 
                 # --- זוויות ---
                 knee_angle   = calculate_angle(hip, knee, ankle)
                 back_angle   = angle_between_vectors(mid_shoulder - mid_hip, np.array([0.0, -1.0]))
 
                 # --- התחלת ירידה ---
-                # תנאים מחמירים יותר:
-                # 1. זווית ברך קטנה מ-120 (לא 130) - מספיק כפיפה אמיתית
+                # תנאים מחמירים:
+                # 1. זווית ברך קטנה מ-115 - כפיפה אמיתית (לא רק הליכה)
                 # 2. אין תנועה גלובלית מהירה
                 # 3. לא בהליכה
-                # 4. הירכיים זזות יותר מהקרסוליים (תנועת סקווט אמיתית)
+                # 4. אין תנועה אופקית משמעותית
+                # 5. הירכיים זזות יותר מהקרסוליים (תנועת סקווט אמיתית)
                 soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.1) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.1)
-                squat_motion = (hip_vel_ema > ankle_vel_ema * 0.3) or (hip_vel_ema < 0.005)  # ירכיים זזות או הכל יציב
+                squat_motion = (hip_vel_ema > ankle_vel_ema * 0.3) or (hip_vel_ema < 0.005)
                 knee_going_down = (stage != "down")
+                not_walking = (not is_walking) and (not is_horizontal_movement)
                 
-                if (knee_angle < 120) and knee_going_down and soft_start_ok and (not is_walking) and squat_motion:
+                if (knee_angle < 115) and knee_going_down and soft_start_ok and not_walking and squat_motion:
                     start_knee_angle = float(knee_angle)
                     rep_min_knee_angle = 180.0
                     rep_max_knee_angle = -999.0
@@ -472,7 +487,12 @@ def run_squat_analysis(video_path,
                     rep_max_depth = 0.0
                     rep_top_bad_frames = 0
                     rep_bottom_bad_frames = 0
-                    rep_had_back_feedback = False  # איפוס
+                    rep_had_back_feedback = False
+                    rep_ankle_x_start = mid_ankle[0]
+                    rep_hip_x_start = mid_hip[0]  # חדש - מיקום X התחלתי של ירכיים
+                    rep_max_ankle_x_drift = 0.0
+                    rep_max_hip_x_drift = 0.0     # חדש
+                    rep_horizontal_frames = 0     # חדש - ספירת פריימים עם תנועה אופקית
                     rep_start_frame = frame_idx
                     rep_down_start_idx = frame_idx
                     stage = "down"
@@ -484,6 +504,18 @@ def run_squat_analysis(video_path,
                 if stage == "down":
                     rep_min_knee_angle   = min(rep_min_knee_angle, knee_angle)
                     rep_max_knee_angle   = max(rep_max_knee_angle, knee_angle)
+                    
+                    # מעקב תזוזה אופקית של קרסוליים וירכיים (זיהוי הליכה)
+                    if rep_ankle_x_start is not None:
+                        ankle_drift = abs(mid_ankle[0] - rep_ankle_x_start)
+                        rep_max_ankle_x_drift = max(rep_max_ankle_x_drift, ankle_drift)
+                    if rep_hip_x_start is not None:
+                        hip_drift = abs(mid_hip[0] - rep_hip_x_start)
+                        rep_max_hip_x_drift = max(rep_max_hip_x_drift, hip_drift)
+                    
+                    # ספירת פריימים עם תנועה אופקית (סימן להליכה)
+                    if is_horizontal_movement:
+                        rep_horizontal_frames += 1
                     rep_max_depth = max(rep_max_depth, depth_live)
                     
                     # עדכון זוויות גב לפי מיקום בתנועה
@@ -515,22 +547,40 @@ def run_squat_analysis(video_path,
 
                 # --- סיום חזרה ---
                 # תנאים לספירת חזרה תקינה:
-                # 1. עומק מינימלי 40% (לא רק כפיפה קלה)
-                # 2. לפחות 5 פריימים בשלב down
-                # 3. לא הייתה הליכה במהלך החזרה
-                min_depth_for_count = 0.40  # העלנו מ-0.25
-                min_frames_in_down = 5      # העלנו מ-3
+                # 1. עומק מינימלי 25%
+                # 2. לפחות 4 פריימים בשלב down
+                # 3. הקרסוליים לא זזו יותר מדי אופקית
+                # 4. הירכיים לא זזו יותר מדי אופקית
+                # 5. לא יותר מדי פריימים עם תנועה אופקית
+                min_depth_for_count = 0.25
+                min_frames_in_down = 4
+                max_ankle_drift = 0.06  # מקסימום 6% תזוזה אופקית של קרסוליים
+                max_hip_drift = 0.10    # מקסימום 10% תזוזה אופקית של ירכיים
+                max_horizontal_frames_ratio = 0.3  # מקסימום 30% מהפריימים עם תנועה אופקית
                 
                 frames_in_down = frame_idx - (rep_down_start_idx or frame_idx)
-                valid_rep = (rep_max_depth >= min_depth_for_count) and (frames_in_down >= min_frames_in_down) and (not is_walking)
+                horizontal_ratio = rep_horizontal_frames / max(frames_in_down, 1)
+                
+                ankles_stable = (rep_max_ankle_x_drift < max_ankle_drift)
+                hips_stable = (rep_max_hip_x_drift < max_hip_drift)
+                not_too_horizontal = (horizontal_ratio < max_horizontal_frames_ratio)
+                
+                valid_rep = (rep_max_depth >= min_depth_for_count) and \
+                           (frames_in_down >= min_frames_in_down) and \
+                           ankles_stable and hips_stable and not_too_horizontal
                 
                 if (knee_angle > STAND_KNEE_ANGLE) and (stage == "down") and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
-                    # אם לא עברנו את סף העומק המינימלי - לא לספור את החזרה
+                    # אם לא עברנו את התנאים - לא לספור את החזרה
                     if not valid_rep:
                         # איפוס בלי לספור
                         stage = "up"
                         start_knee_angle = None
                         rep_down_start_idx = None
+                        rep_ankle_x_start = None
+                        rep_hip_x_start = None
+                        rep_max_ankle_x_drift = 0.0
+                        rep_max_hip_x_drift = 0.0
+                        rep_horizontal_frames = 0
                     else:
                         # חזרה תקינה - להמשיך עם הלוגיקה הרגילה
                         feedbacks = []
@@ -612,6 +662,11 @@ def run_squat_analysis(video_path,
 
                         start_knee_angle = None
                         rep_down_start_idx = None
+                        rep_ankle_x_start = None
+                        rep_hip_x_start = None
+                        rep_max_ankle_x_drift = 0.0
+                        rep_max_hip_x_drift = 0.0
+                        rep_horizontal_frames = 0
                         stage = "up"
 
                         # debounce
@@ -703,6 +758,11 @@ def run_squat_analysis(video_path,
     
     return result
 
-# תאימות
-def run_analysis(*args, **kwargs):
-    return run_squat_analysis(*args, **kwargs)
+# תאימות - חתימה מפורשת כדי ש-inspect.signature יעבוד
+def run_analysis(video_path,
+                 frame_skip=3,
+                 scale=0.4,
+                 output_path="squat_analyzed.mp4",
+                 feedback_path="squat_feedback.txt",
+                 fast_mode=False):
+    return run_squat_analysis(video_path, frame_skip, scale, output_path, feedback_path, fast_mode)
