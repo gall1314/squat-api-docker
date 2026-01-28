@@ -47,6 +47,13 @@ FB_SEVERITY = {
     "Almost there — go a bit lower": 2,
     "Looking good — just a bit more depth": 1,
 }
+FEEDBACK_CATEGORY = {
+    "Try to squat deeper": "depth",
+    "Almost there — go a bit lower": "depth",
+    "Looking good — just a bit more depth": "depth",
+    "Try to keep your back a bit straighter": "back",
+    "Avoid knee collapse": "knees",
+}
 def pick_strongest_feedback(feedback_list):
     best, score = "", -1
     for f in feedback_list or []:
@@ -54,6 +61,15 @@ def pick_strongest_feedback(feedback_list):
         if s > score:
             best, score = f, s
     return best
+
+def pick_strongest_per_category(feedback_list):
+    best_by_cat = {}
+    for f in feedback_list or []:
+        cat = FEEDBACK_CATEGORY.get(f, "other")
+        best = best_by_cat.get(cat)
+        if not best or FB_SEVERITY.get(f, 1) > FB_SEVERITY.get(best, 1):
+            best_by_cat[cat] = f
+    return list(best_by_cat.values())
 
 def merge_feedback(global_best, new_list):
     cand = pick_strongest_feedback(new_list)
@@ -278,7 +294,7 @@ def run_squat_analysis(video_path,
     depth_live = 0.0
 
     # פידבק גב — סינון לפי משך ואזור
-    TOP_BACK_MAX_DEG    = 35.0   # Top: זווית נטייה מקסימלית מול אנכי
+    TOP_BACK_MAX_DEG    = 40.0   # Top: זווית נטייה מקסימלית מול אנכי
     BOTTOM_BACK_MAX_DEG = 65.0   # Bottom: מתריע רק אם ממש קיצוני
     TOP_BAD_MIN_SEC   = 0.25    # צריך לפחות משך זה ב-Top כדי להתריע
     BOTTOM_BAD_MIN_SEC= 0.35    # ובתחתית אפילו יותר
@@ -384,7 +400,7 @@ def run_squat_analysis(video_path,
                     rep_max_hip_knee_delta = max(rep_max_hip_knee_delta, hip_knee_delta)
 
                     # Top: עומק קטן → דורש זקיפות יחסית; Bottom: עומק גדול → סלחני יותר
-                    if depth_live <= 0.30 and back_angle > TOP_BACK_MAX_DEG:
+                    if depth_live <= 0.25 and back_angle > TOP_BACK_MAX_DEG:
                         rep_top_bad_frames += 1
                         # RT feedback עם hold
                         if rt_fb_msg != "Try to keep your back a bit straighter":
@@ -392,7 +408,7 @@ def run_squat_analysis(video_path,
                             rt_fb_hold = RT_FB_HOLD_FRAMES
                         else:
                             rt_fb_hold = max(rt_fb_hold, RT_FB_HOLD_FRAMES)
-                    elif depth_live >= 0.70 and back_angle > BOTTOM_BACK_MAX_DEG:
+                    elif depth_live >= 0.80 and back_angle > BOTTOM_BACK_MAX_DEG:
                         rep_bottom_bad_frames += 1
                         # בזמן אמת לא נצעק בתחתית כדי לא להציק; נשמור לסוף רפ
                     else:
@@ -424,11 +440,12 @@ def run_squat_analysis(video_path,
                     depth_pct = float(np.clip(depth_ratio, 0, 1))
 
                     # דוח רפ
+                    rep_feedbacks = pick_strongest_per_category(feedbacks)
                     rep_reports.append({
                         "rep_index": counter + 1,
                         "score": round(float(score), 1),
                         "score_display": display_half_str(score),  # <-- נוסף להצגה
-                        "feedback": feedbacks,
+                        "feedback": rep_feedbacks,
                         "tip": None,
                         "start_frame": rep_start_frame or 0,
                         "end_frame": frame_idx,
@@ -442,7 +459,7 @@ def run_squat_analysis(video_path,
                     })
 
                     # פידבק-סשן
-                    for fb in feedbacks:
+                    for fb in rep_feedbacks:
                         if fb not in session_feedbacks:
                             session_feedbacks.append(fb)
 
