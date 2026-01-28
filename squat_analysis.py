@@ -258,49 +258,47 @@ def calculate_depth_robust(mid_hip, mid_knee, mid_ankle, knee_angle, mid_shoulde
     אז hip.y > knee.y = האגן מתחת לברכיים = מושלם!
     """
     # המדד העיקרי: האם האגן מתחת לברכיים?
-    # חיובי = hip מתחת ל-knee (כי y גדול = למטה במסך)
     hip_below_knee = mid_hip[1] - mid_knee[1]
     
-    # נרמול לאורך הירך (מאפשר השוואה בין גבהים וזוויות מצלמה)
+    # נרמול לאורך הירך
     thigh_length = max(1e-6, _euclid(mid_hip, mid_knee))
-    
-    # יחס מנורמל: כמה האגן מתחת/מעל הברכיים ביחס לאורך הירך
-    # חיובי = מתחת (טוב!), שלילי = מעל (צריך לרדת יותר)
     normalized_depth = hip_below_knee / thigh_length
     
-    # ===== חישוב ציון עומק - ספים מחמירים יותר =====
+    # ===== חישוב ציון עומק - ספים מחמירים =====
     # normalized_depth >= 0.0 → האגן בגובה הברכיים או מתחת = מושלם (100%)
-    # normalized_depth >= -0.15 → כמעט parallel = מצוין (85-100%)
-    # normalized_depth >= -0.35 → קרוב = טוב (60-85%)
-    # normalized_depth >= -0.55 → בינוני (35-60%)
-    # normalized_depth < -0.55 → האגן הרבה מעל הברכיים = גרוע (0-35%)
+    # normalized_depth >= -0.20 → כמעט parallel = מצוין (80-100%)
+    # normalized_depth >= -0.40 → קרוב = טוב (55-80%)
+    # normalized_depth >= -0.60 → בינוני (30-55%)
+    # normalized_depth < -0.60 → גרוע (0-30%)
     
     if normalized_depth >= 0.0:
         # האגן בגובה הברכיים או מתחת - מושלם!
         depth_score = 1.0
-    elif normalized_depth >= -0.15:
+    elif normalized_depth >= -0.20:
         # כמעט parallel - מצוין
-        depth_score = 0.85 + ((normalized_depth + 0.15) / 0.15) * 0.15
-    elif normalized_depth >= -0.35:
-        # קרוב אבל לא שם - טוב
-        depth_score = 0.60 + ((normalized_depth + 0.35) / 0.20) * 0.25
-    elif normalized_depth >= -0.55:
+        depth_score = 0.80 + ((normalized_depth + 0.20) / 0.20) * 0.20
+    elif normalized_depth >= -0.40:
+        # קרוב אבל לא שם
+        depth_score = 0.55 + ((normalized_depth + 0.40) / 0.20) * 0.25
+    elif normalized_depth >= -0.60:
         # בינוני - צריך לרדת יותר
-        depth_score = 0.35 + ((normalized_depth + 0.55) / 0.20) * 0.25
+        depth_score = 0.30 + ((normalized_depth + 0.60) / 0.20) * 0.25
     else:
         # גרוע - האגן הרבה מעל הברכיים
-        # מיפוי ליניארי: -0.55 → 0.35, -0.85 → 0.0
-        depth_score = max(0.0, 0.35 * (1.0 + (normalized_depth + 0.55) / 0.30))
+        depth_score = max(0.0, 0.30 * (1.0 + (normalized_depth + 0.60) / 0.40))
     
-    # בונוס/עונש לפי זווית ברך (חיזוק הזיהוי)
-    if knee_angle <= 80:
-        depth_score = min(1.0, depth_score + 0.08)  # בונוס לזווית מאוד סגורה
-    elif knee_angle <= 95:
-        depth_score = min(1.0, depth_score + 0.04)  # בונוס קטן
-    elif knee_angle >= 130:
-        depth_score = max(0.0, depth_score - 0.10)  # עונש לזווית פתוחה מאוד
+    # עונשים/בונוסים משמעותיים לפי זווית ברך
+    # זווית גבוהה = הברך כמעט ישרה = לא יורדים מספיק
+    if knee_angle >= 125:
+        depth_score = max(0.0, depth_score - 0.25)  # עונש כבד!
     elif knee_angle >= 115:
-        depth_score = max(0.0, depth_score - 0.05)  # עונש קטן
+        depth_score = max(0.0, depth_score - 0.15)  # עונש בינוני
+    elif knee_angle >= 105:
+        depth_score = max(0.0, depth_score - 0.08)  # עונש קל
+    elif knee_angle <= 80:
+        depth_score = min(1.0, depth_score + 0.10)  # בונוס לזווית סגורה מאוד
+    elif knee_angle <= 90:
+        depth_score = min(1.0, depth_score + 0.05)  # בונוס קטן
     
     return float(np.clip(depth_score, 0, 1))
 
@@ -495,15 +493,14 @@ def run_squat_analysis(video_path,
 
                     depth_pct = rep_max_depth
                     
-                    # ===== ספי עומק מבוססי hip-below-knee =====
-                    # הציון מבוסס על האם האגן יורד מתחת לברכיים
-                    # 0.85+ = האגן בגובה הברכיים או מתחת = מעולה (no feedback)
-                    # 0.60-0.85 = קרוב ל-parallel = feedback קל
-                    # 0.35-0.60 = האגן מעל הברכיים = feedback בינוני
-                    # מתחת ל-0.35 = האגן הרבה מעל הברכיים = feedback חמור
-                    if   depth_pct < 0.35: feedbacks.append("Try to squat deeper");            penalty += 3
-                    elif depth_pct < 0.60: feedbacks.append("Almost there — go a bit lower");  penalty += 2
-                    elif depth_pct < 0.85: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
+                    # ===== ספי עומק מחמירים =====
+                    # 0.90+ = מעולה (no feedback)
+                    # 0.70-0.90 = קרוב ל-parallel = feedback קל
+                    # 0.45-0.70 = האגן מעל הברכיים = feedback בינוני
+                    # מתחת ל-0.45 = האגן הרבה מעל הברכיים = feedback חמור
+                    if   depth_pct < 0.45: feedbacks.append("Try to squat deeper");            penalty += 3
+                    elif depth_pct < 0.70: feedbacks.append("Almost there — go a bit lower");  penalty += 2
+                    elif depth_pct < 0.90: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
 
                     # פידבק גב - אם היה פידבק בזמן אמת, לרשום אותו גם בסיכום
                     # זה מבטיח שציון 10 לא יינתן אם הוצג פידבק גב
