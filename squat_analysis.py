@@ -237,7 +237,7 @@ def angle_between_vectors(v1, v2):
 
 # ===================== SQUAT CORE PARAMS =====================
 STAND_KNEE_ANGLE    = 160.0
-MIN_FRAMES_BETWEEN_REPS_SQ = 8  # הורדנו מ-10 ל-8 לזיהוי חזרות מהירות יותר
+MIN_FRAMES_BETWEEN_REPS_SQ = 6  # הורדנו מ-8 ל-6 לזיהוי חזרות מהירות
 
 # --------- תנועה גלובלית ---------
 HIP_VEL_THRESH_PCT    = 0.014
@@ -251,45 +251,50 @@ def _euclid(a, b):
 # ===================== זיהוי עומק מבוסס זווית ברך - עובד בכל זווית מצלמה =====================
 def calculate_depth_robust(mid_hip, mid_knee, mid_ankle, knee_angle, mid_shoulder):
     """
-    חישוב עומק מבוסס על המדד האנכי (hip-knee delta) 
-    עם נורמליזציה לגובה האדם כדי לעבוד טוב בזוויות שונות
-    
-    המדד האנכי הוא הנכון - אבל צריך לנרמל אותו לגובה האדם
+    חישוב עומק מבוסס מרחק אוקלידי 2D (X+Y) במקום רק Y
+    זה הפתרון לבעיית הזוויות - מרחק 2D לא משתנה בזוויות שונות!
     """
-    # 1. מדד אנכי בסיסי - כמה האגן ירד ביחס לברכיים
-    knee_to_ankle = max(1e-6, abs(mid_ankle[1] - mid_knee[1]))
-    hip_knee_delta = mid_hip[1] - mid_knee[1]
+    # 1. מרחק 2D בין אגן לברך (במקום רק Y!)
+    hip_knee_dist = np.sqrt((mid_hip[0] - mid_knee[0])**2 + (mid_hip[1] - mid_knee[1])**2)
     
-    # 2. נורמליזציה לגובה האדם (כתף-קרסול)
-    # זה עוזר בזוויות שונות של מצלמה
-    person_height = max(1e-6, abs(mid_ankle[1] - mid_shoulder[1]))
-    normalized_delta = hip_knee_delta / person_height
+    # 2. מרחק 2D בין ברך לקרסול (לנרמול)
+    knee_ankle_dist = np.sqrt((mid_knee[0] - mid_ankle[0])**2 + (mid_knee[1] - mid_ankle[1])**2)
+    knee_ankle_dist = max(1e-6, knee_ankle_dist)
     
-    # 3. המדד הבסיסי - ביחס לאורך השוק
-    basic_ratio = max(0.0, hip_knee_delta) / knee_to_ankle
+    # 3. מרחק 2D בין כתף לקרסול (גובה אדם)
+    person_height = np.sqrt((mid_shoulder[0] - mid_ankle[0])**2 + (mid_shoulder[1] - mid_ankle[1])**2)
+    person_height = max(1e-6, person_height)
     
-    # 4. שילוב שני המדדים האנכיים
-    # basic_ratio = מדויק בזווית צד
-    # normalized_delta = עובד טוב בזוויות שונות
-    vertical_depth = (basic_ratio * 0.6) + (normalized_delta * 40.0 * 0.4)
+    # 4. חישוב עומק - כמה האגן קרוב לברך ביחס לאורך השוק
+    # כשיורדים לסקוואט, האגן מתקרב לברך
+    depth_ratio = hip_knee_dist / knee_ankle_dist
     
-    # נרמול סופי: 0.35 = עומק מלא
-    vertical_depth = vertical_depth / 0.35
+    # 5. נרמול לגובה אדם (עזרה נוספת)
+    normalized_depth = hip_knee_dist / person_height
     
-    # 5. זווית ברך רק כ-sanity check (משקל נמוך)
-    # זה עוזר לזהות מצבים קיצוניים
-    angle_factor = 1.0
-    if knee_angle > 120:
-        # זווית גדולה מדי = בטח לא ירד מספיק
-        angle_factor = max(0.3, (150 - knee_angle) / 30.0)
-    elif knee_angle < 80:
-        # זווית קטנה מאוד = בטח ירד טוב
-        angle_factor = 1.0
+    # 6. שילוב: 70% מדד יחס, 30% נרמול לגובה
+    combined = (depth_ratio * 0.7) + (normalized_depth * 15.0 * 0.3)
     
-    # 6. שילוב סופי: 85% מדד אנכי, 15% זווית (רק לתיקונים)
-    combined = (vertical_depth * 0.85) + (vertical_depth * angle_factor * 0.15)
+    # 7. נרמול סופי - ככל שהמספר קטן יותר = עומק גדול יותר
+    # מרחק קטן = אגן קרוב לברך = עומק טוב
+    # הופכים: 1 - (מרחק / סף)
+    # סף של 1.2 = ללא עומק, סף של 0.4 = עומק מלא
+    depth_normalized = 1.0 - max(0.0, min(1.0, (combined - 0.4) / 0.8))
     
-    return float(np.clip(combined, 0, 1))
+    # 8. sanity check עם זווית ברך (משקל נמוך)
+    angle_check = 1.0
+    if knee_angle > 130:
+        # זווית גדולה מדי - ודאי לא ירד
+        angle_check = 0.5
+    elif knee_angle < 85:
+        # זווית קטנה - ודאי ירד טוב
+        angle_check = 1.1
+    
+    # 9. שילוב סופי
+    final_depth = depth_normalized * (0.85 + 0.15 * angle_check)
+    
+    return float(np.clip(final_depth, 0, 1))
+
 
 
 # ===================== MAIN =====================
@@ -338,14 +343,14 @@ def run_squat_analysis(video_path,
     # עומק לייב
     depth_live = 0.0
 
-    # ===== פידבק גב - סלחני מאוד, רק למקרים קיצוניים באמת =====
-    # הגדלנו את הסף למעלה ל-60 מעלות (נטייה מאוד חזקה)
-    # ובתחתית ל-80 מעלות (כמעט שוכב)
-    TOP_BACK_MAX_DEG    = 60.0   # סף גבוה מאוד - רק נטייה קיצונית
-    BOTTOM_BACK_MAX_DEG = 80.0   # סף גבוה מאוד - רק נטייה מסוכנת
-    # הגדלנו גם את משך הזמן הנדרש להתרעה
-    TOP_BAD_MIN_SEC   = 0.6      # צריך להיות ממושך
-    BOTTOM_BAD_MIN_SEC= 0.7      # צריך להיות ממושך מאוד
+    # ===== פידבק גב - כמעט לא להתריע - רק מקרים ממש קיצוניים =====
+    # הגדלנו לסף גבוה מאוד - 70 מעלות למעלה (כמעט אופקי!)
+    # ובתחתית 85 מעלות (ממש שוכב)
+    TOP_BACK_MAX_DEG    = 70.0   # סף מאוד גבוה - רק אם ממש אופקי
+    BOTTOM_BACK_MAX_DEG = 85.0   # סף מאוד גבוה - רק אם ממש שוכב
+    # הגדלנו את משך הזמן הנדרש להתרעה
+    TOP_BAD_MIN_SEC   = 0.8      # צריך להיות ממושך מאוד
+    BOTTOM_BAD_MIN_SEC= 1.0      # צריך להיות ממושך מאוד מאוד
     rep_top_bad_frames = 0
     rep_bottom_bad_frames = 0
 
@@ -420,11 +425,15 @@ def run_squat_analysis(video_path,
                 knee_angle   = calculate_angle(hip, knee, ankle)
                 back_angle   = angle_between_vectors(mid_shoulder - mid_hip, np.array([0.0, -1.0]))
 
-                # --- התחלת ירידה - סף נמוך לזיהוי גם חזרות קטנות ---
-                # הורדנו מ-110 ל-120 כדי לזהות גם חזרות קטנות מאוד
-                # אבל עם soft_start מוקפד יותר
-                soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.15) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.15)
-                if (knee_angle < 120) and (stage != "down") and soft_start_ok:
+                # --- התחלת ירידה - זיהוי רגיש גם לחזרות קטנות ---
+                # סף 125° - זה יזהה גם תנועות קטנות מאוד
+                # אבל עם soft_start חכם שמסנן הליכה
+                soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.1) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.1)
+                
+                # תנאי נוסף: הברך צריכה באמת לרדת (delta שלילי)
+                knee_going_down = (stage != "down")  # לא במהלך ירידה קיימת
+                
+                if (knee_angle < 125) and knee_going_down and soft_start_ok:
                     start_knee_angle = float(knee_angle)
                     rep_min_knee_angle = 180.0
                     rep_max_knee_angle = -999.0
@@ -473,8 +482,8 @@ def run_squat_analysis(video_path,
                     depth_pct = rep_max_depth
                     
                     # ספי עומק מחמירים - גם ביצוע גרוע יקבל התרעה:
-                    # 0.75+ = מעולה (parallel+)
-                    # 0.55-0.75 = טוב (כמעט parallel)
+                    # 0.70+ = מעולה (no feedback)
+                    # 0.55-0.70 = טוב (feedback קל)
                     # 0.35-0.55 = בינוני
                     # מתחת ל-0.35 = גרוע
                     if   depth_pct < 0.35: feedbacks.append("Try to squat deeper");            penalty += 3
@@ -485,10 +494,16 @@ def run_squat_analysis(video_path,
                     back_flag = (rep_top_bad_frames >= TOP_BAD_MIN_FRAMES) or (rep_bottom_bad_frames >= BOTTOM_BAD_MIN_FRAMES)
                     if back_flag:
                         feedbacks.append("Try to keep your back a bit straighter")
-                        penalty += 1.0
+                        penalty += 1.5  # עונש יותר גדול לגב
 
-                    # ציון
-                    score = 10.0 if not feedbacks else round(max(4, 10 - min(penalty,6)) * 2) / 2
+                    # ציון - חייב להיות מבוסס על הפידבקים
+                    if len(feedbacks) == 0:
+                        score = 10.0  # מושלם - אין שום פידבק
+                    else:
+                        # יש פידבק - הציון לא יכול להיות 10
+                        score = max(4.0, 10.0 - penalty)
+                        score = round(score * 2) / 2  # עיגול לחצי נקודה
+                        score = min(score, 9.5)  # מקסימום 9.5 אם יש פידבק
 
                     # דוח רפ
                     rep_feedbacks, rep_feedback_by_cat = pick_strongest_per_category(feedbacks)
@@ -614,4 +629,3 @@ def run_squat_analysis(video_path,
 # תאימות
 def run_analysis(*args, **kwargs):
     return run_squat_analysis(*args, **kwargs)
-
