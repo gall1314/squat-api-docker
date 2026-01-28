@@ -338,19 +338,15 @@ def run_squat_analysis(video_path,
     rep_start_frame = None
     rep_down_start_idx = None
     rep_max_hip_knee_delta = -999.0
-    rep_max_depth = 0.0  # נעקוב אחר העומק המקסימלי
 
-    # עומק לייב
+    # עומק "לייב" דו-כיווני (גם בירידה וגם בעלייה)
     depth_live = 0.0
 
-    # ===== פידבק גב - כמעט לא להתריע - רק מקרים ממש קיצוניים =====
-    # הגדלנו לסף גבוה מאוד - 70 מעלות למעלה (כמעט אופקי!)
-    # ובתחתית 85 מעלות (ממש שוכב)
-    TOP_BACK_MAX_DEG    = 70.0   # סף מאוד גבוה - רק אם ממש אופקי
-    BOTTOM_BACK_MAX_DEG = 85.0   # סף מאוד גבוה - רק אם ממש שוכב
-    # הגדלנו את משך הזמן הנדרש להתרעה
-    TOP_BAD_MIN_SEC   = 0.8      # צריך להיות ממושך מאוד
-    BOTTOM_BAD_MIN_SEC= 1.0      # צריך להיות ממושך מאוד מאוד
+    # פידבק גב — סינון לפי משך ואזור
+    TOP_BACK_MAX_DEG    = 40.0   # Top: זווית נטייה מקסימלית מול אנכי
+    BOTTOM_BACK_MAX_DEG = 65.0   # Bottom: מתריע רק אם ממש קיצוני
+    TOP_BAD_MIN_SEC   = 0.25    # צריך לפחות משך זה ב-Top כדי להתריע
+    BOTTOM_BAD_MIN_SEC= 0.35    # ובתחתית אפילו יותר
     rep_top_bad_frames = 0
     rep_bottom_bad_frames = 0
 
@@ -425,119 +421,80 @@ def run_squat_analysis(video_path,
                 knee_angle   = calculate_angle(hip, knee, ankle)
                 back_angle   = angle_between_vectors(mid_shoulder - mid_hip, np.array([0.0, -1.0]))
 
-                # --- התחלת ירידה - זיהוי רגיש גם לחזרות קטנות ---
-                # סף 125° - זה יזהה גם תנועות קטנות מאוד
-                # אבל עם soft_start חכם שמסנן הליכה
-                soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.1) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.1)
-                
-                # תנאי נוסף: הברך צריכה באמת לרדת (delta שלילי)
-                knee_going_down = (stage != "down")  # לא במהלך ירידה קיימת
-                
-                if (knee_angle < 125) and knee_going_down and soft_start_ok:
+                # --- התחלת ירידה (soft start) ---
+                soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.25) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.25)
+                if (knee_angle < 100) and (stage != "down") and soft_start_ok:
                     start_knee_angle = float(knee_angle)
                     rep_min_knee_angle = 180.0
                     rep_max_knee_angle = -999.0
                     rep_max_back_angle = -999.0
                     rep_max_hip_knee_delta = -999.0
-                    rep_max_depth = 0.0
                     rep_top_bad_frames = 0
                     rep_bottom_bad_frames = 0
                     rep_start_frame = frame_idx
                     rep_down_start_idx = frame_idx
                     stage = "down"
 
-                # --- חישוב עומק משופר ---
-                depth_live = calculate_depth_robust(mid_hip, mid_knee, mid_ankle, knee_angle, mid_shoulder)
+                # --- עומק "לייב" גם בירידה וגם בעלייה ---
+                hip_knee_delta = mid_hip[1] - mid_knee[1]
+                depth_ratio = hip_knee_delta
+                depth_live = float(np.clip((depth_ratio + 0.02) / 0.12, 0, 1))
 
                 # --- תוך כדי ירידה ---
                 if stage == "down":
                     rep_min_knee_angle   = min(rep_min_knee_angle, knee_angle)
                     rep_max_knee_angle   = max(rep_max_knee_angle, knee_angle)
                     rep_max_back_angle   = max(rep_max_back_angle, back_angle)
-                    knee_to_ankle = max(1e-6, abs(mid_ankle[1] - mid_knee[1]))
-                    hip_knee_delta = mid_hip[1] - mid_knee[1]
                     rep_max_hip_knee_delta = max(rep_max_hip_knee_delta, hip_knee_delta)
-                    rep_max_depth = max(rep_max_depth, depth_live)
 
-                    # פידבק גב עם הסף הסלחני יותר
-                    if depth_live <= 0.25 and back_angle > TOP_BACK_MAX_DEG:
+                    # Top: עומק קטן → דורש זקיפות יחסית; Bottom: עומק גדול → סלחני יותר
+                    if depth_live <= 0.20 and back_angle > TOP_BACK_MAX_DEG:
                         rep_top_bad_frames += 1
                         if rt_fb_msg != "Try to keep your back a bit straighter":
                             rt_fb_msg = "Try to keep your back a bit straighter"
                             rt_fb_hold = RT_FB_HOLD_FRAMES
                         else:
                             rt_fb_hold = max(rt_fb_hold, RT_FB_HOLD_FRAMES)
-                    elif depth_live >= 0.80 and back_angle > BOTTOM_BACK_MAX_DEG:
+                    elif depth_live >= 0.85 and back_angle > BOTTOM_BACK_MAX_DEG:
                         rep_bottom_bad_frames += 1
                     else:
                         if rt_fb_hold > 0:
                             rt_fb_hold -= 1
-
-                # --- סיום חזרה ---
+                # --- סיום חזרה (כמו שעבד) ---
                 if (knee_angle > STAND_KNEE_ANGLE) and (stage == "down") and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
                     feedbacks = []
                     penalty = 0.0
 
-                    # שימוש בעומק המקסימלי שהושג (לא העומק הנוכחי)
-                    depth_pct = rep_max_depth
-                    
-                    # ספי עומק מחמירים - גם ביצוע גרוע יקבל התרעה:
-                    # 0.70+ = מעולה (no feedback)
-                    # 0.55-0.70 = טוב (feedback קל)
-                    # 0.35-0.55 = בינוני
-                    # מתחת ל-0.35 = גרוע
-                    if   depth_pct < 0.35: feedbacks.append("Try to squat deeper");            penalty += 3
-                    elif depth_pct < 0.55: feedbacks.append("Almost there — go a bit lower");  penalty += 2
-                    elif depth_pct < 0.70: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
+                    # עומק
+                    depth_ratio = rep_max_hip_knee_delta
+                    if   depth_ratio < 0.00: feedbacks.append("Try to squat deeper");            penalty += 3
+                    elif depth_ratio < 0.03: feedbacks.append("Almost there — go a bit lower");  penalty += 2
+                    elif depth_ratio < 0.06: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
 
-                    # פידבק גב - רק אם באמת היה חמור
+                    # גב — מתריעים רק אם נצברה חריגה למשך מינימום
                     back_flag = (rep_top_bad_frames >= TOP_BAD_MIN_FRAMES) or (rep_bottom_bad_frames >= BOTTOM_BAD_MIN_FRAMES)
                     if back_flag:
                         feedbacks.append("Try to keep your back a bit straighter")
                         penalty += 1.5  # עונש יותר גדול לגב
 
-                    # ציון - חייב להיות מבוסס על הפידבקים
-                    if len(feedbacks) == 0:
-                        score = 10.0  # מושלם - אין שום פידבק
-                    else:
-                        # יש פידבק - הציון לא יכול להיות 10
-                        score = max(4.0, 10.0 - penalty)
-                        score = round(score * 2) / 2  # עיגול לחצי נקודה
-                        score = min(score, 9.5)  # מקסימום 9.5 אם יש פידבק
+                    # עומק סופי (שיא העומק בחזרה)
+                    depth_pct = float(np.clip(depth_ratio, 0, 1))
 
                     # דוח רפ
                     rep_feedbacks, rep_feedback_by_cat = pick_strongest_per_category(feedbacks)
-                    
-                    # הגנות מפני ערכים לא תקינים
-                    safe_start_knee = float(start_knee_angle or knee_angle)
-                    if np.isnan(safe_start_knee) or np.isinf(safe_start_knee):
-                        safe_start_knee = 160.0
-                    
-                    safe_min_knee = float(rep_min_knee_angle)
-                    if np.isnan(safe_min_knee) or np.isinf(safe_min_knee):
-                        safe_min_knee = 160.0
-                        
-                    safe_max_knee = float(rep_max_knee_angle)
-                    if np.isnan(safe_max_knee) or np.isinf(safe_max_knee):
-                        safe_max_knee = 160.0
-                        
-                    safe_back_angle = float(rep_max_back_angle)
-                    if np.isnan(safe_back_angle) or np.isinf(safe_back_angle):
-                        safe_back_angle = 0.0
-                    
                     rep_reports.append({
                         "rep_index": counter + 1,
                         "score": round(float(score), 1),
-                        "score_display": display_half_str(score),
+                        "score_display": display_half_str(score),  # <-- נוסף להצגה
                         "feedback": rep_feedbacks,
                         "tip": None,
                         "start_frame": rep_start_frame or 0,
                         "end_frame": frame_idx,
-                        "start_knee_angle": round(safe_start_knee, 2),
-                        "min_knee_angle": round(safe_min_knee, 2),
-                        "max_knee_angle": round(safe_max_knee, 2),
-                        "torso_min_angle": round(safe_back_angle, 2),
-                        "depth_pct": float(depth_pct),
+                        "start_knee_angle": round(float(start_knee_angle or knee_angle), 2),
+                        "min_knee_angle": round(float(rep_min_knee_angle), 2),
+                        "max_knee_angle": round(float(rep_max_knee_angle), 2),
+                        "torso_min_angle": round(float(rep_max_back_angle), 2),
+                        "depth_pct": depth_pct,
                         "top_bad_frames": int(rep_top_bad_frames),
                         "bottom_bad_frames": int(rep_bottom_bad_frames)
                     })
