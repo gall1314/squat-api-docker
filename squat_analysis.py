@@ -314,9 +314,13 @@ def run_squat_analysis(video_path,
     fast_mode=True: רק ניתוח, בלי יצירת סרטון (מהיר יותר)
     fast_mode=False: ניתוח + יצירת סרטון מנותח
     """
+    import sys
+    print(f"[SQUAT] Starting analysis: video={video_path}, output={output_path}, fast_mode={fast_mode}", file=sys.stderr, flush=True)
+    
     mp_pose_mod = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
+        print(f"[SQUAT] ERROR: Could not open video {video_path}", file=sys.stderr, flush=True)
         return {
             "squat_count": 0, "technique_score": 0.0, "good_reps": 0, "bad_reps": 0,
             "feedback": ["Could not open video"], "tips": [], "reps": [], "video_path": "", "feedback_path": feedback_path,
@@ -326,6 +330,7 @@ def run_squat_analysis(video_path,
     
     # אם fast_mode או אין output_path - לא ליצור סרטון
     create_video = (not fast_mode) and (output_path is not None) and (output_path != "")
+    print(f"[SQUAT] create_video={create_video}", file=sys.stderr, flush=True)
 
     counter = 0
     good_reps = 0
@@ -509,13 +514,15 @@ def run_squat_analysis(video_path,
                             rt_fb_hold -= 1
 
                 # --- סיום חזרה ---
-                # תנאי נוסף: עומק מינימלי 25% כדי שהחזרה תיספר
-                # זה מונע ספירה של כיפוף קל (כמו החזרת מוט)
-                min_depth_for_count = 0.25
-                min_frames_in_down = 3  # לפחות 3 פריימים בשלב down
+                # תנאים לספירת חזרה תקינה:
+                # 1. עומק מינימלי 40% (לא רק כפיפה קלה)
+                # 2. לפחות 5 פריימים בשלב down
+                # 3. לא הייתה הליכה במהלך החזרה
+                min_depth_for_count = 0.40  # העלנו מ-0.25
+                min_frames_in_down = 5      # העלנו מ-3
                 
                 frames_in_down = frame_idx - (rep_down_start_idx or frame_idx)
-                valid_rep = (rep_max_depth >= min_depth_for_count) and (frames_in_down >= min_frames_in_down)
+                valid_rep = (rep_max_depth >= min_depth_for_count) and (frames_in_down >= min_frames_in_down) and (not is_walking)
                 
                 if (knee_angle > STAND_KNEE_ANGLE) and (stage == "down") and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
                     # אם לא עברנו את סף העומק המינימלי - לא לספור את החזרה
@@ -658,19 +665,27 @@ def run_squat_analysis(video_path,
 
     # faststart encode - רק אם יצרנו סרטון
     final_video_path = ""
+    print(f"[SQUAT] Post-processing: create_video={create_video}, output_path={output_path}", file=sys.stderr, flush=True)
+    
     if create_video and output_path:
+        print(f"[SQUAT] Checking if output exists: {output_path} -> {os.path.exists(output_path)}", file=sys.stderr, flush=True)
         encoded_path = output_path.replace(".mp4", "_encoded.mp4")
         try:
-            subprocess.run([
+            result = subprocess.run([
                 "ffmpeg", "-y", "-i", output_path,
                 "-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart", "-pix_fmt", "yuv420p",
                 encoded_path
             ], check=False, capture_output=True)
+            print(f"[SQUAT] FFmpeg returncode={result.returncode}", file=sys.stderr, flush=True)
+            if result.returncode != 0:
+                print(f"[SQUAT] FFmpeg stderr: {result.stderr.decode()[:500]}", file=sys.stderr, flush=True)
+            
             if os.path.exists(output_path) and os.path.exists(encoded_path):
                 os.remove(output_path)
             final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
+            print(f"[SQUAT] final_video_path={final_video_path}", file=sys.stderr, flush=True)
         except Exception as e:
-            print(f"Warning: FFmpeg encoding issue: {e}")
+            print(f"[SQUAT] FFmpeg exception: {e}", file=sys.stderr, flush=True)
             final_video_path = output_path if os.path.exists(output_path) else ""
 
     result = {
