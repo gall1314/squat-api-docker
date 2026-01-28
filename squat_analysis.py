@@ -289,12 +289,12 @@ def calculate_depth_robust(mid_hip, mid_knee, mid_ankle, knee_angle, mid_shoulde
     
     # עונשים/בונוסים משמעותיים לפי זווית ברך
     # זווית גבוהה = הברך כמעט ישרה = לא יורדים מספיק
-    if knee_angle >= 125:
-        depth_score = max(0.0, depth_score - 0.25)  # עונש כבד!
-    elif knee_angle >= 115:
+    if knee_angle >= 120:
+        depth_score = max(0.0, depth_score - 0.35)  # עונש כבד מאוד!
+    elif knee_angle >= 110:
+        depth_score = max(0.0, depth_score - 0.25)  # עונש כבד
+    elif knee_angle >= 100:
         depth_score = max(0.0, depth_score - 0.15)  # עונש בינוני
-    elif knee_angle >= 105:
-        depth_score = max(0.0, depth_score - 0.08)  # עונש קל
     elif knee_angle <= 80:
         depth_score = min(1.0, depth_score + 0.10)  # בונוס לזווית סגורה מאוד
     elif knee_angle <= 90:
@@ -493,14 +493,14 @@ def run_squat_analysis(video_path,
 
                     depth_pct = rep_max_depth
                     
-                    # ===== ספי עומק מחמירים =====
-                    # 0.90+ = מעולה (no feedback)
-                    # 0.70-0.90 = קרוב ל-parallel = feedback קל
-                    # 0.45-0.70 = האגן מעל הברכיים = feedback בינוני
-                    # מתחת ל-0.45 = האגן הרבה מעל הברכיים = feedback חמור
-                    if   depth_pct < 0.45: feedbacks.append("Try to squat deeper");            penalty += 3
-                    elif depth_pct < 0.70: feedbacks.append("Almost there — go a bit lower");  penalty += 2
-                    elif depth_pct < 0.90: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
+                    # ===== ספי עומק מחמירים מאוד =====
+                    # 0.92+ = מעולה (no feedback)
+                    # 0.75-0.92 = קרוב ל-parallel = feedback קל
+                    # 0.55-0.75 = האגן מעל הברכיים = feedback בינוני
+                    # מתחת ל-0.55 = האגן הרבה מעל הברכיים = feedback חמור
+                    if   depth_pct < 0.55: feedbacks.append("Try to squat deeper");            penalty += 3
+                    elif depth_pct < 0.75: feedbacks.append("Almost there — go a bit lower");  penalty += 2
+                    elif depth_pct < 0.92: feedbacks.append("Looking good — just a bit more depth"); penalty += 1
 
                     # פידבק גב - אם היה פידבק בזמן אמת, לרשום אותו גם בסיכום
                     # זה מבטיח שציון 10 לא יינתן אם הוצג פידבק גב
@@ -597,6 +597,12 @@ def run_squat_analysis(video_path,
     if np.isnan(avg) or np.isinf(avg):
         avg = 0.0
     technique_score = round(round(avg * 2) / 2, 2)
+    
+    # אם יש פידבק כלשהו בסשן, הציון הסופי מקסימום 9.5
+    # זה מונע מצב של ציון 10 עם הערות
+    if session_feedbacks and len(session_feedbacks) > 0:
+        technique_score = min(technique_score, 9.5)
+    
     feedback_list = session_feedbacks if session_feedbacks else ["Great form! Keep it up 💪"]
 
     try:
