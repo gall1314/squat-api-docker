@@ -303,7 +303,7 @@ def run_squat_analysis(video_path,
     if not cap.isOpened():
         return {
             "squat_count": 0, "technique_score": 0.0, "good_reps": 0, "bad_reps": 0,
-            "feedback": ["Could not open video"], "tips": [], "reps": [], "video_path": "", "feedback_path": feedback_path,
+            "feedback": ["Could not open video"], "tip": None, "reps": [], "video_path": "", "feedback_path": feedback_path,
             "technique_score_display": display_half_str(0.0),
             "technique_label": score_label(0.0)
         }
@@ -421,12 +421,31 @@ def run_squat_analysis(video_path,
                 # --- זוויות ---
                 knee_angle   = calculate_angle(hip, knee, ankle)
                 back_angle   = angle_between_vectors(mid_shoulder - mid_hip, np.array([0.0, -1.0]))
+                
+                # --- בדיקת סימטריה - מזהה מצב "לקיחת מוט" ---
+                # זיהוי חכם: אם יש הפרש גדול בין הרגליים = כנראה לא סקוואט
+                left_knee_angle = calculate_angle(l_hip, l_knee, l_ankle)
+                right_knee_angle = knee_angle
+                knee_symmetry_diff = abs(left_knee_angle - right_knee_angle)
+                
+                # סימטריה: הפרש קטן = תנועה תקינה
+                # אם אחת הרגליים כפופה הרבה יותר = לקיחת מוט או מצב לא יציב
+                is_symmetric = knee_symmetry_diff < 30  # פחות מ-30° הפרש
+                
+                # בדיקת גובה ירכיים - האם באותו רמה
+                hip_level_diff = abs(l_hip[1] - hip[1])
+                hips_level = hip_level_diff < 0.06  # פחות מ-6% הפרש גובה
+                
+                # בדיקה נוספת: האם שתי הרגליים כפופות מספיק
+                # במצב לקיחת מוט, לרוב רק רגל אחת כפופה הרבה
+                both_knees_bent = (left_knee_angle < 135) and (right_knee_angle < 135)
 
-                # --- התחלת ירידה - פשוט ויעיל ---
+                # --- התחלת ירידה - עם בדיקות סימטריה ---
                 soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.2) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.2)
                 knee_going_down = (stage != "down")
                 
-                if (knee_angle < 125) and knee_going_down and soft_start_ok:
+                # תנאים: זווית + סימטריה + גובה + שתי הרגליים כפופות
+                if (knee_angle < 125) and knee_going_down and soft_start_ok and is_symmetric and hips_level and both_knees_bent:
                     start_knee_angle = float(knee_angle)
                     rep_min_knee_angle = 180.0
                     rep_max_knee_angle = -999.0
@@ -527,7 +546,7 @@ def run_squat_analysis(video_path,
                         "score": round(float(score), 1),
                         "score_display": display_half_str(score),
                         "feedback": rep_feedbacks,
-                        "tip": None,
+                        "tip": None,  # אין טיפ לרפ בודד - רק לסשן
                         "start_frame": rep_start_frame or 0,
                         "end_frame": frame_idx,
                         "start_knee_angle": round(safe_start_knee, 2),
@@ -587,6 +606,21 @@ def run_squat_analysis(video_path,
         technique_score = min(technique_score, 9.5)
     
     feedback_list = session_feedbacks if session_feedbacks else ["Great form! Keep it up 💪"]
+    
+    # ===== טיפ כללי אחד לסשן (לא משפיע על ציון) =====
+    session_tip = None
+    if session_feedback_by_cat:
+        # יש בעיה כלשהי - נתן טיפ לפי הבעיה הכי חמורה
+        if "depth" in session_feedback_by_cat:
+            # בעיית עומק היא הכי נפוצה
+            session_tip = "Focus on hip mobility and ankle flexibility to achieve better depth"
+        elif "back" in session_feedback_by_cat:
+            session_tip = "Work on core strength and practice maintaining a neutral spine"
+        elif "knees" in session_feedback_by_cat:
+            session_tip = "Practice the 'knees out' cue and consider strengthening your hip abductors"
+    else:
+        # ביצוע מושלם בכל החזרות
+        session_tip = "Outstanding consistency! Keep challenging yourself with progressive overload"
 
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
@@ -625,6 +659,7 @@ def run_squat_analysis(video_path,
         "good_reps": int(good_reps),
         "bad_reps": int(bad_reps),
         "feedback": [str(f) for f in feedback_list],
+        "tip": str(session_tip) if session_tip else None,  # טיפ כללי אחד לסשן
         "reps": rep_reports,
         "video_path": str(final_video_path),
         "feedback_path": str(feedback_path)
