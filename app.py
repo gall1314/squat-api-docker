@@ -24,7 +24,7 @@ EXERCISE_MAP = {
     "barbell bent over row": "bent_row", "bent over row": "bent_row",
     "barbell row": "bent_row", "row": "bent_row",
     "good morning": "good_morning", "good mornings": "good_morning", "good morningg": "good_morning",
-    "dips": "dips", "dip": "dips",
+    "dips": "dips", "dip": "dips", "bench dips": "dips", "bench dip": "dips",
 }
 
 # -------- Error handling & logging --------
