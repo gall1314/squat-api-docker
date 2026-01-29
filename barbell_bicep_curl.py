@@ -191,8 +191,16 @@ ELBOW_BOTTOM_EXT_REF = 170.0  # תחתית (יישור)
 ELBOW_TOP_FLEX_REF   = 60.0   # טופ (כיווץ יעד)
 ELBOW_EXT_END_THR    = 160.0  # סף סיום רפ (חזרה ליישור)
 MIN_BOTTOM_EXTENSION_ANGLE = 155.0
-MAX_TOP_FLEXION_ANGLE      = 60.0
+TOP_FLEXION_RATIO          = 0.60  # יעד טופ יחסי לטווח (מרכך את "curl higher")
+TOP_FLEXION_MIN_ANGLE      = 60.0  # רצפה כדי לא להיות קשוח מדי
+TOP_FLEXION_MAX_ANGLE      = 95.0  # תקרה כדי לא להיות רך מדי
+TOP_FLEXION_MARGIN_DEG     = 5.0   # מרווח נוסף לפני שמתריעים
 ECC_SLOW_MIN_SEC           = 0.25
+
+def _top_flexion_threshold(bottom_ref):
+    bottom_ref = float(bottom_ref)
+    target = bottom_ref - TOP_FLEXION_RATIO * (bottom_ref - ELBOW_TOP_FLEX_REF)
+    return float(np.clip(target, TOP_FLEXION_MIN_ANGLE, TOP_FLEXION_MAX_ANGLE))
 
 # ===================== תוויות וציון =====================
 def score_label(s):
@@ -339,6 +347,8 @@ def run_barbell_bicep_curl_analysis(video_path,
             # ===== דונאט הפוך: 100% בטופ =====
             # מיפוי כיווץ: 0 בתחתית (angle ~ 170), 1 בטופ (angle ~ 60)
             bottom_ref = ext_elbow_ema if ext_elbow_ema is not None else ELBOW_BOTTOM_EXT_REF
+            top_flex_thr = _top_flexion_threshold(bottom_ref)
+            top_flex_feedback_thr = top_flex_thr + TOP_FLEXION_MARGIN_DEG
             denom_live = max(10.0, (bottom_ref - ELBOW_TOP_FLEX_REF))  # ~110°
             depth_live = float(np.clip((bottom_ref - elbow_angle) / denom_live, 0.0, 1.0))
 
@@ -371,7 +381,7 @@ def run_barbell_bicep_curl_analysis(video_path,
 
                 # RT-feedback: לא מספיק גבוה למעלה
                 if stage == "up":
-                    if rep_min_elbow_angle > MAX_TOP_FLEXION_ANGLE:
+                    if rep_min_elbow_angle > top_flex_feedback_thr:
                         if rt_fb_msg != "Try to curl higher — aim to squeeze at the top":
                             rt_fb_msg = "Try to curl higher — aim to squeeze at the top"
                             rt_fb_hold = RT_FB_HOLD_FRAMES
@@ -394,7 +404,7 @@ def run_barbell_bicep_curl_analysis(video_path,
                         penalty += 3
 
                     # טופ מספיק גבוה
-                    if rep_min_elbow_angle > MAX_TOP_FLEXION_ANGLE:
+                    if rep_min_elbow_angle > top_flex_feedback_thr:
                         feedbacks.append("Try to curl higher — aim to squeeze at the top")
                         penalty += 2
 
@@ -508,4 +518,3 @@ def run_barbell_bicep_curl_analysis(video_path,
 # תאימות לשם אחיד
 def run_analysis(*args, **kwargs):
     return run_barbell_bicep_curl_analysis(*args, **kwargs)
-
