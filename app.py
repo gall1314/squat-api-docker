@@ -25,6 +25,9 @@ EXERCISE_MAP = {
     "barbell row": "bent_row", "row": "bent_row",
     "good morning": "good_morning", "good mornings": "good_morning", "good morningg": "good_morning",
     "dips": "dips", "dip": "dips", "bench dips": "dips", "bench dip": "dips",
+    "overhead press": "overhead_press", "barbell overhead press": "overhead_press",
+    "military press": "overhead_press", "standing press": "overhead_press",
+    "shoulder press": "overhead_press", "strict press": "overhead_press",
 }
 
 # -------- Error handling & logging --------
@@ -127,6 +130,7 @@ run_bicep_curl  = load_func_soft('barbell_bicep_curl', 'run_barbell_bicep_curl_a
 run_bent_row    = load_func_soft('bent_over_row_analysis', 'run_row_analysis', 'run_analysis')
 run_good_morning = load_func_soft('good_morning_analysis', 'run_good_morning_analysis', 'run_analysis')
 run_dips        = load_func_soft('dips_analysis', 'run_dips_analysis', 'run_analysis')
+run_overhead_press = load_func_soft('overhead_press_analysis', 'run_overhead_press_analysis', 'run_analysis')
 
 # -------- Streaming saves --------
 def _save_upload_streaming(file_storage, dest_path, chunk_size=8*1024*1024):
@@ -163,6 +167,8 @@ def _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_flag: bool):
         return _run_with_tracks(run_good_morning, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
     elif resolved_type == 'dips':
         return _run_with_tracks(run_dips, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
+    elif resolved_type == 'overhead_press':
+        return _run_with_tracks(run_overhead_press, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
     else:
         return {"error": f"Unhandled exercise type: {resolved_type}", "video_path": ""}
 
