@@ -79,15 +79,17 @@ def draw_body_only_from_dict(frame, pts_norm, color=(255,255,255)):
     return frame
 
 # ===================== BACK CURVATURE =====================
-def analyze_back_curvature(shoulder, hip, head_like, threshold=0.04):
-    line_vec = hip - shoulder
-    nrm = np.linalg.norm(line_vec) + 1e-9
-    u = line_vec / nrm
-    proj_len = np.dot(head_like - shoulder, u)
-    proj = shoulder + proj_len * u
-    off = head_like - proj
-    signed = float(np.sign(off[1]) * -1 * np.linalg.norm(off))  # inward negative
-    return signed, signed < -threshold
+def analyze_back_curvature(shoulder, hip, head_like, max_angle_deg=20.0, min_head_dist_ratio=0.35):
+    torso_vec = shoulder - hip  # hip -> shoulder
+    head_vec = head_like - shoulder
+    torso_nrm = np.linalg.norm(torso_vec) + 1e-9
+    head_nrm = np.linalg.norm(head_vec) + 1e-9
+    if head_nrm < (min_head_dist_ratio * torso_nrm):
+        return 0.0, False
+    cosang = float(np.dot(torso_vec, head_vec) / (torso_nrm * head_nrm))
+    cosang = float(np.clip(cosang, -1.0, 1.0))
+    angle_deg = math.degrees(math.acos(cosang))
+    return angle_deg, angle_deg > max_angle_deg
 
 # ===================== Deadlift thresholds =====================
 HINGE_START_THRESH    = 0.08
@@ -523,6 +525,8 @@ def run_deadlift_analysis(video_path,
                 if head is not None:
                     mid_spine = (shoulder + hip) * 0.5 * 0.4 + head * 0.6
                     _, rounded = analyze_back_curvature(shoulder, hip, mid_spine)
+                    if delta_x < (HINGE_START_THRESH * 1.05):
+                        rounded = False
                 else:
                     rounded = False
                 back_frames = back_frames + 1 if rounded else max(0, back_frames - 1)
@@ -657,6 +661,4 @@ def run_deadlift_analysis(video_path,
         "video_path": final_video_path,
         "feedback_path": feedback_path
     }
-
-
 
