@@ -337,6 +337,11 @@ def run_squat_analysis(video_path,
     rep_down_start_idx = None
     rep_max_depth = 0.0
     rep_had_back_feedback = False
+    
+    # משתני זיהוי הליכה
+    rep_start_hip_x = None
+    rep_start_ankle_x = None
+    rep_max_horizontal_movement = 0.0
 
     # עומק לייב
     depth_live = 0.0
@@ -421,35 +426,12 @@ def run_squat_analysis(video_path,
                 # --- זוויות ---
                 knee_angle   = calculate_angle(hip, knee, ankle)
                 back_angle   = angle_between_vectors(mid_shoulder - mid_hip, np.array([0.0, -1.0]))
-                
-                # --- בדיקת סימטריה - מזהה מצב "לקיחת מוט" ---
-                # זיהוי חכם: אם יש הפרש גדול בין הרגליים = כנראה לא סקוואט
-                left_knee_angle = calculate_angle(l_hip, l_knee, l_ankle)
-                right_knee_angle = knee_angle
-                knee_symmetry_diff = abs(left_knee_angle - right_knee_angle)
-                
-                # סימטריה מחמירה: הפרש קטן מאוד = תנועה תקינה
-                # אם אחת הרגליים כפופה הרבה יותר = לקיחת מוט או מצב לא יציב
-                is_symmetric = knee_symmetry_diff < 20  # פחות מ-20° הפרש (היה 30)
-                
-                # בדיקת גובה ירכיים - האם באותו רמה (יותר מחמיר)
-                hip_level_diff = abs(l_hip[1] - hip[1])
-                hips_level = hip_level_diff < 0.04  # פחות מ-4% הפרש גובה (היה 6)
-                
-                # בדיקה נוספת: האם שתי הרגליים כפופות מספיק (יותר מחמיר)
-                # במצב לקיחת מוט, לרוב רק רגל אחת כפופה הרבה
-                both_knees_bent = (left_knee_angle < 130) and (right_knee_angle < 130)
-                
-                # בדיקה חדשה: האם שתי הקרסוליים באותו גובה
-                ankle_level_diff = abs(l_ankle[1] - ankle[1])
-                ankles_level = ankle_level_diff < 0.05  # פחות מ-5% הפרש
 
-                # --- התחלת ירידה - עם בדיקות סימטריה מחמירות ---
+                # --- התחלת ירידה - פשוט + זיהוי הליכה ---
                 soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.2) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.2)
                 knee_going_down = (stage != "down")
                 
-                # תנאים מחמירים: זווית + סימטריה + גובה ירכיים + שתי רגליים כפופות + גובה קרסוליים
-                if (knee_angle < 125) and knee_going_down and soft_start_ok and is_symmetric and hips_level and both_knees_bent and ankles_level:
+                if (knee_angle < 125) and knee_going_down and soft_start_ok:
                     start_knee_angle = float(knee_angle)
                     rep_min_knee_angle = 180.0
                     rep_max_knee_angle = -999.0
@@ -461,6 +443,12 @@ def run_squat_analysis(video_path,
                     rep_had_back_feedback = False
                     rep_start_frame = frame_idx
                     rep_down_start_idx = frame_idx
+                    
+                    # === זיהוי הליכה - מיקום X התחלתי ===
+                    rep_start_hip_x = mid_hip[0]
+                    rep_start_ankle_x = mid_ankle[0]
+                    rep_max_horizontal_movement = 0.0
+                    
                     stage = "down"
 
                 # --- חישוב עומק ---
@@ -471,6 +459,14 @@ def run_squat_analysis(video_path,
                     rep_min_knee_angle   = min(rep_min_knee_angle, knee_angle)
                     rep_max_knee_angle   = max(rep_max_knee_angle, knee_angle)
                     rep_max_depth = max(rep_max_depth, depth_live)
+                    
+                    # === מעקב אחר תנועה אופקית (זיהוי הליכה) ===
+                    # כמה זזנו אופקית מתחילת החזרה
+                    horizontal_movement = max(
+                        abs(mid_hip[0] - rep_start_hip_x),
+                        abs(mid_ankle[0] - rep_start_ankle_x)
+                    )
+                    rep_max_horizontal_movement = max(rep_max_horizontal_movement, horizontal_movement)
                     
                     # עדכון זוויות גב
                     if depth_live < 0.35:
@@ -496,20 +492,17 @@ def run_squat_analysis(video_path,
                         if rt_fb_hold > 0:
                             rt_fb_hold -= 1
 
-                # --- סיום חזרה - עם בדיקות תקינות ---
-                # בדיקה חשובה: כמה זמן היינו בשלב "down"
-                frames_in_down = frame_idx - (rep_down_start_idx or frame_idx)
-                min_frames_for_valid_rep = 8  # לפחות 8 פריימים = ~0.3 שניות
+                # --- סיום חזרה - בדיקת תנועה אופקית ---
+                # סף תנועה אופקית: אם זזנו יותר מ-8% מרוחב המסך = הליכה, לא סקוואט
+                max_horizontal_allowed = 0.08  # 8% מרוחב המסך
                 
                 # בדיקת עומק מינימלי
                 min_depth_for_rep = 0.20  # לפחות 20% עומק
                 
                 # התנאים לחזרה תקינה:
-                # 1. זווית ברך חזרה לעמידה
-                # 2. תנועה נעצרה (movement_free_streak)
-                # 3. היינו מספיק זמן בירידה (לא תנועה מהירה של לקיחת מוט)
-                # 4. הגענו לעומק מינימלי
-                is_valid_rep = (frames_in_down >= min_frames_for_valid_rep) and (rep_max_depth >= min_depth_for_rep)
+                # 1. לא זזנו יותר מדי אופקית (הליכה)
+                # 2. הגענו לעומק מינימלי
+                is_valid_rep = (rep_max_horizontal_movement < max_horizontal_allowed) and (rep_max_depth >= min_depth_for_rep)
                 
                 if (knee_angle > STAND_KNEE_ANGLE) and (stage == "down") and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
                     # אם לא עברנו את התנאים - איפוס בלי ספירה
