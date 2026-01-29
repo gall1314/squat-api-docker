@@ -338,10 +338,11 @@ def run_squat_analysis(video_path,
     rep_max_depth = 0.0
     rep_had_back_feedback = False
     
-    # משתני זיהוי הליכה
+    # משתני זיהוי הליכה וסימטריה
     rep_start_hip_x = None
     rep_start_ankle_x = None
     rep_max_horizontal_movement = 0.0
+    rep_max_asymmetry = 0.0
 
     # עומק לייב
     depth_live = 0.0
@@ -427,7 +428,7 @@ def run_squat_analysis(video_path,
                 knee_angle   = calculate_angle(hip, knee, ankle)
                 back_angle   = angle_between_vectors(mid_shoulder - mid_hip, np.array([0.0, -1.0]))
 
-                # --- התחלת ירידה - פשוט + זיהוי הליכה ---
+                # --- התחלת ירידה - פשוט ---
                 soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.2) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.2)
                 knee_going_down = (stage != "down")
                 
@@ -449,6 +450,11 @@ def run_squat_analysis(video_path,
                     rep_start_ankle_x = mid_ankle[0]
                     rep_max_horizontal_movement = 0.0
                     
+                    # === זיהוי סימטריה - זוויות התחלתיות ===
+                    rep_start_left_knee = calculate_angle(l_hip, l_knee, l_ankle)
+                    rep_start_right_knee = knee_angle
+                    rep_max_asymmetry = 0.0
+                    
                     stage = "down"
 
                 # --- חישוב עומק ---
@@ -461,13 +467,18 @@ def run_squat_analysis(video_path,
                     rep_max_depth = max(rep_max_depth, depth_live)
                     
                     # === מעקב אחר תנועה אופקית (זיהוי הליכה) ===
-                    # כמה זזנו אופקית מתחילת החזרה
                     if rep_start_hip_x is not None and rep_start_ankle_x is not None:
                         horizontal_movement = max(
                             abs(mid_hip[0] - rep_start_hip_x),
                             abs(mid_ankle[0] - rep_start_ankle_x)
                         )
                         rep_max_horizontal_movement = max(rep_max_horizontal_movement, horizontal_movement)
+                    
+                    # === מעקב אחר אי-סימטריה (זיהוי מצב לקיחת מוט) ===
+                    left_knee_angle = calculate_angle(l_hip, l_knee, l_ankle)
+                    right_knee_angle = knee_angle
+                    current_asymmetry = abs(left_knee_angle - right_knee_angle)
+                    rep_max_asymmetry = max(rep_max_asymmetry, current_asymmetry)
                     
                     # עדכון זוויות גב
                     if depth_live < 0.35:
@@ -493,18 +504,29 @@ def run_squat_analysis(video_path,
                         if rt_fb_hold > 0:
                             rt_fb_hold -= 1
 
-                # --- סיום חזרה - בדיקת תנועה אופקית ---
-                # סף תנועה אופקית: אם זזנו יותר מ-20% = הליכה ארוכה למוט
-                # בסקוואט רגיל יכולה להיות תנועה של 10-15% קדימה/אחורה
-                max_horizontal_allowed = 0.20  # 20% מרוחב המסך
+                # --- סיום חזרה - בדיקה משולבת חכמה ---
+                # הרעיון: לקיחת מוט = תנועה אופקית גדולה + אי-סימטריה גדולה **ביחד**
+                # סקוואט רגיל אפילו עם תנועה או אי-סימטריה קלה = עדיין תקין
                 
-                # בדיקת עומק מינימלי - מאוד סלחני כדי לא לפספס חזרות
-                min_depth_for_rep = 0.12  # לפחות 12% עומק (גם חזרות רדודות יספרו)
+                # סף 1: תנועה אופקית
+                max_horizontal_allowed = 0.25  # 25% - סלחני מאוד
+                has_excessive_horizontal = rep_max_horizontal_movement > max_horizontal_allowed
                 
-                # התנאים לחזרה תקינה:
-                # 1. לא זזנו יותר מדי אופקית (הליכה ארוכה)
-                # 2. הגענו לעומק מינימלי (גם אם רדוד)
-                is_valid_rep = (rep_max_horizontal_movement < max_horizontal_allowed) and (rep_max_depth >= min_depth_for_rep)
+                # סף 2: אי-סימטריה
+                max_asymmetry_allowed = 35  # 35 מעלות הפרש - סלחני מאוד
+                has_excessive_asymmetry = rep_max_asymmetry > max_asymmetry_allowed
+                
+                # סף 3: עומק מינימלי (נשאר כמו קודם)
+                min_depth_for_rep = 0.12
+                has_minimal_depth = rep_max_depth >= min_depth_for_rep
+                
+                # === החלטה חכמה ===
+                # חוסמים רק אם יש **גם** תנועה אופקית גדולה **וגם** אי-סימטריה גדולה
+                # זה מזהה בדיוק את מצב לקיחת המוט!
+                is_pickup_motion = has_excessive_horizontal and has_excessive_asymmetry
+                
+                # חזרה תקינה = לא תנועת לקיחה + יש עומק מינימלי
+                is_valid_rep = (not is_pickup_motion) and has_minimal_depth
                 
                 if (knee_angle > STAND_KNEE_ANGLE) and (stage == "down") and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
                     # אם לא עברנו את התנאים - איפוס בלי ספירה
@@ -515,6 +537,7 @@ def run_squat_analysis(video_path,
                         rep_start_hip_x = None
                         rep_start_ankle_x = None
                         rep_max_horizontal_movement = 0.0
+                        rep_max_asymmetry = 0.0
                         continue  # לא נספור, רק נאפס
                     
                     # חזרה תקינה - ממשיכים עם הלוגיקה הרגילה
@@ -595,6 +618,7 @@ def run_squat_analysis(video_path,
                     rep_start_hip_x = None
                     rep_start_ankle_x = None
                     rep_max_horizontal_movement = 0.0
+                    rep_max_asymmetry = 0.0
                     stage = "up"
 
                     # debounce
