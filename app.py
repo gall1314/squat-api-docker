@@ -16,6 +16,7 @@ os.makedirs(MEDIA_DIR, exist_ok=True)
 EXERCISE_MAP = {
     "barbell squat": "squat", "barbell back squat": "squat", "squat": "squat",
     "deadlift": "deadlift",
+    "romanian deadlift": "romanian_deadlift", "rdl": "romanian_deadlift",
     "bulgarian split squat": "bulgarian", "split squat": "bulgarian",
     "pull-up": "pullup", "pull up": "pullup", "pullups": "pullup",
     "barbell bicep curl": "bicep_curl", "bicep curl": "bicep_curl",
@@ -117,6 +118,7 @@ def load_func_soft(module_name, *func_names):
 # ---- Resolve analyzers (לא מפיל אם חסר משהו) ----
 run_squat       = load_func_soft('squat_analysis', 'run_analysis', 'run_squat_analysis')
 run_deadlift    = load_func_soft('deadlift_analysis', 'run_deadlift_analysis', 'run_analysis')
+run_rdl         = load_func_soft('romanian_deadlift_analysis', 'run_romanian_deadlift_analysis', 'run_analysis')
 run_bulgarian   = load_func_soft('bulgarian_split_squat_analysis', 'run_bulgarian_analysis', 'run_analysis')
 run_pullup      = load_func_soft('pullup_analysis', 'run_pullup_analysis', 'run_analysis')
 run_bicep_curl  = load_func_soft('barbell_bicep_curl', 'run_barbell_bicep_curl_analysis', 'run_analysis')
@@ -141,6 +143,8 @@ def _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_flag: bool):
         return _run_with_tracks(run_squat, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
     elif resolved_type == 'deadlift':
         return _run_with_tracks(run_deadlift, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
+    elif resolved_type == 'romanian_deadlift':
+        return _run_with_tracks(run_rdl, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
     elif resolved_type == 'bulgarian':
         return _run_with_tracks(run_bulgarian, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
     elif resolved_type == 'pullup':
@@ -263,5 +267,4 @@ def healthz():
 if __name__ == "__main__":
     # Fly.io expects 0.0.0.0:8080
     app.run(host="0.0.0.0", port=8080)
-
 
