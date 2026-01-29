@@ -79,15 +79,17 @@ def draw_body_only_from_dict(frame, pts_norm, color=(255,255,255)):
     return frame
 
 # ===================== BACK CURVATURE =====================
-def analyze_back_curvature(shoulder, hip, head_like, threshold=0.04):
-    line_vec = hip - shoulder
-    nrm = np.linalg.norm(line_vec) + 1e-9
-    u = line_vec / nrm
-    proj_len = np.dot(head_like - shoulder, u)
-    proj = shoulder + proj_len * u
-    off = head_like - proj
-    signed = float(np.sign(off[1]) * -1 * np.linalg.norm(off))  # inward negative
-    return signed, signed < -threshold
+def analyze_back_curvature(shoulder, hip, head_like, max_angle_deg=20.0, min_head_dist_ratio=0.35):
+    torso_vec = shoulder - hip  # hip -> shoulder
+    head_vec = head_like - shoulder
+    torso_nrm = np.linalg.norm(torso_vec) + 1e-9
+    head_nrm = np.linalg.norm(head_vec) + 1e-9
+    if head_nrm < (min_head_dist_ratio * torso_nrm):
+        return 0.0, False
+    cosang = float(np.dot(torso_vec, head_vec) / (torso_nrm * head_nrm))
+    cosang = float(np.clip(cosang, -1.0, 1.0))
+    angle_deg = math.degrees(math.acos(cosang))
+    return angle_deg, angle_deg > max_angle_deg
 
 # ===================== Deadlift thresholds =====================
 HINGE_START_THRESH    = 0.08
@@ -95,6 +97,9 @@ STAND_DELTA_TARGET   = 0.025
 END_THRESH           = 0.035
 MIN_FRAMES_BETWEEN_REPS = 10
 PROG_ALPHA           = 0.35  # smoothing for donut only
+LEG_BACK_MISMATCH_MIN_FRAMES = 4
+LEG_BACK_ANGLE_FAST_DEG = 0.8
+LEG_BACK_ANGLE_SLOW_DEG = 0.3
 
 # Tips (non-scoring) thresholds (no bottom-pause tip)
 TIP_MIN_ECC_S     = 0.35
@@ -110,6 +115,14 @@ def choose_deadlift_tip(down_s, top_s, rom):
     if rom is not None and TIP_SMALL_ROM_LO <= rom <= TIP_SMALL_ROM_HI:
         return "Hinge a bit deeper within comfort"
     return "Keep the bar close and move smoothly"
+
+def angle_deg(a, b, c):
+    ba = a - b
+    bc = c - b
+    nrm = (np.linalg.norm(ba) * np.linalg.norm(bc)) + 1e-9
+    cosang = float(np.dot(ba, bc) / nrm)
+    cosang = float(np.clip(cosang, -1.0, 1.0))
+    return float(math.degrees(math.acos(cosang)))
 
 # ===================== Kalman Leg Tracker (robust to occlusion) =====================
 LEG_VIS_THR    = 0.55
@@ -456,10 +469,14 @@ def run_deadlift_analysis(video_path,
     # back curvature frames accumulation
     BACK_MIN_FRAMES = max(2, int(0.25 / dt))
     back_frames = 0
+    leg_back_leg_fast = 0
+    leg_back_back_fast = 0
 
     # tempo counters per rep
     down_frames = up_frames = top_hold_frames = 0
     prev_progress = None
+    prev_knee_angle = None
+    prev_torso_angle = None
 
     # trackers
     right_leg = KalmanLegTracker("right")
@@ -523,6 +540,8 @@ def run_deadlift_analysis(video_path,
                 if head is not None:
                     mid_spine = (shoulder + hip) * 0.5 * 0.4 + head * 0.6
                     _, rounded = analyze_back_curvature(shoulder, hip, mid_spine)
+                    if delta_x < (HINGE_START_THRESH * 1.05):
+                        rounded = False
                 else:
                     rounded = False
                 back_frames = back_frames + 1 if rounded else max(0, back_frames - 1)
@@ -532,8 +551,12 @@ def run_deadlift_analysis(video_path,
                     rep = True
                     bottom_est = delta_x
                     back_frames = 0
+                    leg_back_leg_fast = 0
+                    leg_back_back_fast = 0
                     down_frames = up_frames = top_hold_frames = 0
                     prev_progress = prog
+                    prev_knee_angle = None
+                    prev_torso_angle = None
 
                 # progress (bi-directional proximity to upright)
                 if rep:
@@ -550,6 +573,24 @@ def run_deadlift_analysis(video_path,
 
                     if prog >= 0.90: top_hold_frames += 1
                     if rounded: rt_fb = "Try to keep your back a bit straighter"
+
+                    if (lm[PL.RIGHT_KNEE.value].visibility > 0.5 and
+                        lm[PL.RIGHT_ANKLE.value].visibility > 0.5 and
+                        lm[PL.RIGHT_HIP.value].visibility > 0.5 and
+                        lm[PL.RIGHT_SHOULDER.value].visibility > 0.5):
+                        knee = np.array([lm[PL.RIGHT_KNEE.value].x, lm[PL.RIGHT_KNEE.value].y], dtype=float)
+                        ankle = np.array([lm[PL.RIGHT_ANKLE.value].x, lm[PL.RIGHT_ANKLE.value].y], dtype=float)
+                        knee_angle = angle_deg(hip, knee, ankle)
+                        torso_angle = angle_deg(shoulder, hip, hip + np.array([0.0, -1.0]))
+                        if prev_knee_angle is not None and prev_torso_angle is not None and prog > 0.1:
+                            dk = knee_angle - prev_knee_angle
+                            dt = prev_torso_angle - torso_angle
+                            if dk > LEG_BACK_ANGLE_FAST_DEG and dt < LEG_BACK_ANGLE_SLOW_DEG:
+                                leg_back_leg_fast += 1
+                            elif dt > LEG_BACK_ANGLE_FAST_DEG and dk < LEG_BACK_ANGLE_SLOW_DEG:
+                                leg_back_back_fast += 1
+                        prev_knee_angle = knee_angle
+                        prev_torso_angle = torso_angle
                 else:
                     prog = PROG_ALPHA*1.0 + (1-PROG_ALPHA)*prog
 
@@ -562,6 +603,10 @@ def run_deadlift_analysis(video_path,
                             fb.append("Try to finish more upright"); penalty += 1.0
                         if back_frames >= BACK_MIN_FRAMES:
                             fb.append("Try to keep your back a bit straighter"); penalty += 1.5
+                        if leg_back_leg_fast >= LEG_BACK_MISMATCH_MIN_FRAMES:
+                            fb.append("Drive the back up with the legs (avoid legs shooting up first)"); penalty += 1.0
+                        if leg_back_back_fast >= LEG_BACK_MISMATCH_MIN_FRAMES:
+                            fb.append("Let the legs push more (avoid back rising faster than the legs)"); penalty += 1.0
 
                         score = round(max(4, 10 - penalty) * 2) / 2
                         moved_enough = (bottom_est - delta_x) > 0.05
@@ -589,8 +634,12 @@ def run_deadlift_analysis(video_path,
                     rep = False
                     bottom_est = None
                     back_frames = 0
+                    leg_back_leg_fast = 0
+                    leg_back_back_fast = 0
                     prev_progress = None
                     down_frames = up_frames = top_hold_frames = 0
+                    prev_knee_angle = None
+                    prev_torso_angle = None
 
                 # ציור רק אם return_video=True
                 if return_video:
@@ -628,6 +677,8 @@ def run_deadlift_analysis(video_path,
         for msg in (r.get("feedback") or []):
             if msg and msg not in seen:
                 seen.add(msg); feedback_list.append(msg)
+    if not feedback_list:
+        feedback_list = ["Great form! Keep it up 💪"]
 
     final_video_path = ""
     if return_video:
@@ -652,11 +703,8 @@ def run_deadlift_analysis(video_path,
         "technique_label": score_label(technique_score),
         "good_reps": good_reps,
         "bad_reps": bad_reps,
-        "feedback": feedback_list,   # רק בעיות; אם מושלם – []
+        "feedback": feedback_list,   # בעיות אם קיימות; אחרת Great form
         "reps": reps_report,
         "video_path": final_video_path,
         "feedback_path": feedback_path
     }
-
-
-
