@@ -191,9 +191,9 @@ ELBOW_BOTTOM_EXT_REF = 170.0  # תחתית (יישור)
 ELBOW_TOP_FLEX_REF   = 60.0   # טופ (כיווץ יעד)
 ELBOW_EXT_END_THR    = 160.0  # סף סיום רפ (חזרה ליישור)
 MIN_BOTTOM_EXTENSION_ANGLE = 155.0
-TOP_FLEXION_RATIO          = 0.75  # יעד טופ יחסי לטווח (מרכך את "curl higher")
+TOP_FLEXION_RATIO          = 0.70  # יעד טופ יחסי לטווח (מרכך את "curl higher")
 TOP_FLEXION_MIN_ANGLE      = 55.0  # רצפה כדי לא להיות קשוח מדי
-TOP_FLEXION_MAX_ANGLE      = 75.0  # תקרה כדי לא להיות רך מדי
+TOP_FLEXION_MAX_ANGLE      = 85.0  # תקרה כדי לא להיות רך מדי
 ECC_SLOW_MIN_SEC           = 0.25
 
 def _top_flexion_threshold(bottom_ref):
