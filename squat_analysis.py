@@ -494,16 +494,16 @@ def run_squat_analysis(video_path,
                             rt_fb_hold -= 1
 
                 # --- סיום חזרה - בדיקת תנועה אופקית ---
-                # סף תנועה אופקית: אם זזנו יותר מ-15% מרוחב המסך = הליכה
-                # בסקוואט רגיל יש תנועה קלה קדימה/אחורה, זה נורמלי
-                max_horizontal_allowed = 0.15  # 15% מרוחב המסך
+                # סף תנועה אופקית: אם זזנו יותר מ-20% = הליכה ארוכה למוט
+                # בסקוואט רגיל יכולה להיות תנועה של 10-15% קדימה/אחורה
+                max_horizontal_allowed = 0.20  # 20% מרוחב המסך
                 
-                # בדיקת עומק מינימלי
-                min_depth_for_rep = 0.15  # לפחות 15% עומק (היה 20%)
+                # בדיקת עומק מינימלי - מאוד סלחני כדי לא לפספס חזרות
+                min_depth_for_rep = 0.12  # לפחות 12% עומק (גם חזרות רדודות יספרו)
                 
                 # התנאים לחזרה תקינה:
                 # 1. לא זזנו יותר מדי אופקית (הליכה ארוכה)
-                # 2. הגענו לעומק מינימלי
+                # 2. הגענו לעומק מינימלי (גם אם רדוד)
                 is_valid_rep = (rep_max_horizontal_movement < max_horizontal_allowed) and (rep_max_depth >= min_depth_for_rep)
                 
                 if (knee_angle > STAND_KNEE_ANGLE) and (stage == "down") and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
