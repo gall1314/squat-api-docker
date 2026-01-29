@@ -23,6 +23,7 @@ EXERCISE_MAP = {
     "bent-over row": "bent_row", "barbell bent-over row": "bent_row",
     "barbell bent over row": "bent_row", "bent over row": "bent_row",
     "barbell row": "bent_row", "row": "bent_row",
+    "good morning": "good_morning", "good mornings": "good_morning", "good morningg": "good_morning",
 }
 
 # -------- Error handling & logging --------
@@ -123,6 +124,7 @@ run_bulgarian   = load_func_soft('bulgarian_split_squat_analysis', 'run_bulgaria
 run_pullup      = load_func_soft('pullup_analysis', 'run_pullup_analysis', 'run_analysis')
 run_bicep_curl  = load_func_soft('barbell_bicep_curl', 'run_barbell_bicep_curl_analysis', 'run_analysis')
 run_bent_row    = load_func_soft('bent_over_row_analysis', 'run_row_analysis', 'run_analysis')
+run_good_morning = load_func_soft('good_morning_analysis', 'run_good_morning_analysis', 'run_analysis')
 
 # -------- Streaming saves --------
 def _save_upload_streaming(file_storage, dest_path, chunk_size=8*1024*1024):
@@ -155,6 +157,8 @@ def _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_flag: bool):
         result = _run_with_tracks(run_bent_row, raw_video_path, analyzed_path, fast_flag,
                                   frame_skip=3, scale=0.4, extra={"output_dir": MEDIA_DIR})
         return _standardize_video_path(result)
+    elif resolved_type == 'good_morning':
+        return _run_with_tracks(run_good_morning, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
     else:
         return {"error": f"Unhandled exercise type: {resolved_type}", "video_path": ""}
 
@@ -267,4 +271,3 @@ def healthz():
 if __name__ == "__main__":
     # Fly.io expects 0.0.0.0:8080
     app.run(host="0.0.0.0", port=8080)
-
