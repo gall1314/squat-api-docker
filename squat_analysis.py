@@ -462,11 +462,12 @@ def run_squat_analysis(video_path,
                     
                     # === מעקב אחר תנועה אופקית (זיהוי הליכה) ===
                     # כמה זזנו אופקית מתחילת החזרה
-                    horizontal_movement = max(
-                        abs(mid_hip[0] - rep_start_hip_x),
-                        abs(mid_ankle[0] - rep_start_ankle_x)
-                    )
-                    rep_max_horizontal_movement = max(rep_max_horizontal_movement, horizontal_movement)
+                    if rep_start_hip_x is not None and rep_start_ankle_x is not None:
+                        horizontal_movement = max(
+                            abs(mid_hip[0] - rep_start_hip_x),
+                            abs(mid_ankle[0] - rep_start_ankle_x)
+                        )
+                        rep_max_horizontal_movement = max(rep_max_horizontal_movement, horizontal_movement)
                     
                     # עדכון זוויות גב
                     if depth_live < 0.35:
@@ -493,14 +494,15 @@ def run_squat_analysis(video_path,
                             rt_fb_hold -= 1
 
                 # --- סיום חזרה - בדיקת תנועה אופקית ---
-                # סף תנועה אופקית: אם זזנו יותר מ-8% מרוחב המסך = הליכה, לא סקוואט
-                max_horizontal_allowed = 0.08  # 8% מרוחב המסך
+                # סף תנועה אופקית: אם זזנו יותר מ-15% מרוחב המסך = הליכה
+                # בסקוואט רגיל יש תנועה קלה קדימה/אחורה, זה נורמלי
+                max_horizontal_allowed = 0.15  # 15% מרוחב המסך
                 
                 # בדיקת עומק מינימלי
-                min_depth_for_rep = 0.20  # לפחות 20% עומק
+                min_depth_for_rep = 0.15  # לפחות 15% עומק (היה 20%)
                 
                 # התנאים לחזרה תקינה:
-                # 1. לא זזנו יותר מדי אופקית (הליכה)
+                # 1. לא זזנו יותר מדי אופקית (הליכה ארוכה)
                 # 2. הגענו לעומק מינימלי
                 is_valid_rep = (rep_max_horizontal_movement < max_horizontal_allowed) and (rep_max_depth >= min_depth_for_rep)
                 
@@ -510,6 +512,9 @@ def run_squat_analysis(video_path,
                         stage = "up"
                         start_knee_angle = None
                         rep_down_start_idx = None
+                        rep_start_hip_x = None
+                        rep_start_ankle_x = None
+                        rep_max_horizontal_movement = 0.0
                         continue  # לא נספור, רק נאפס
                     
                     # חזרה תקינה - ממשיכים עם הלוגיקה הרגילה
@@ -587,6 +592,9 @@ def run_squat_analysis(video_path,
 
                     start_knee_angle = None
                     rep_down_start_idx = None
+                    rep_start_hip_x = None
+                    rep_start_ankle_x = None
+                    rep_max_horizontal_movement = 0.0
                     stage = "up"
 
                     # debounce
