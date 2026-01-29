@@ -428,24 +428,28 @@ def run_squat_analysis(video_path,
                 right_knee_angle = knee_angle
                 knee_symmetry_diff = abs(left_knee_angle - right_knee_angle)
                 
-                # סימטריה: הפרש קטן = תנועה תקינה
+                # סימטריה מחמירה: הפרש קטן מאוד = תנועה תקינה
                 # אם אחת הרגליים כפופה הרבה יותר = לקיחת מוט או מצב לא יציב
-                is_symmetric = knee_symmetry_diff < 30  # פחות מ-30° הפרש
+                is_symmetric = knee_symmetry_diff < 20  # פחות מ-20° הפרש (היה 30)
                 
-                # בדיקת גובה ירכיים - האם באותו רמה
+                # בדיקת גובה ירכיים - האם באותו רמה (יותר מחמיר)
                 hip_level_diff = abs(l_hip[1] - hip[1])
-                hips_level = hip_level_diff < 0.06  # פחות מ-6% הפרש גובה
+                hips_level = hip_level_diff < 0.04  # פחות מ-4% הפרש גובה (היה 6)
                 
-                # בדיקה נוספת: האם שתי הרגליים כפופות מספיק
+                # בדיקה נוספת: האם שתי הרגליים כפופות מספיק (יותר מחמיר)
                 # במצב לקיחת מוט, לרוב רק רגל אחת כפופה הרבה
-                both_knees_bent = (left_knee_angle < 135) and (right_knee_angle < 135)
+                both_knees_bent = (left_knee_angle < 130) and (right_knee_angle < 130)
+                
+                # בדיקה חדשה: האם שתי הקרסוליים באותו גובה
+                ankle_level_diff = abs(l_ankle[1] - ankle[1])
+                ankles_level = ankle_level_diff < 0.05  # פחות מ-5% הפרש
 
-                # --- התחלת ירידה - עם בדיקות סימטריה ---
+                # --- התחלת ירידה - עם בדיקות סימטריה מחמירות ---
                 soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.2) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.2)
                 knee_going_down = (stage != "down")
                 
-                # תנאים: זווית + סימטריה + גובה + שתי הרגליים כפופות
-                if (knee_angle < 125) and knee_going_down and soft_start_ok and is_symmetric and hips_level and both_knees_bent:
+                # תנאים מחמירים: זווית + סימטריה + גובה ירכיים + שתי רגליים כפופות + גובה קרסוליים
+                if (knee_angle < 125) and knee_going_down and soft_start_ok and is_symmetric and hips_level and both_knees_bent and ankles_level:
                     start_knee_angle = float(knee_angle)
                     rep_min_knee_angle = 180.0
                     rep_max_knee_angle = -999.0
@@ -492,8 +496,30 @@ def run_squat_analysis(video_path,
                         if rt_fb_hold > 0:
                             rt_fb_hold -= 1
 
-                # --- סיום חזרה - פשוט ---
+                # --- סיום חזרה - עם בדיקות תקינות ---
+                # בדיקה חשובה: כמה זמן היינו בשלב "down"
+                frames_in_down = frame_idx - (rep_down_start_idx or frame_idx)
+                min_frames_for_valid_rep = 8  # לפחות 8 פריימים = ~0.3 שניות
+                
+                # בדיקת עומק מינימלי
+                min_depth_for_rep = 0.20  # לפחות 20% עומק
+                
+                # התנאים לחזרה תקינה:
+                # 1. זווית ברך חזרה לעמידה
+                # 2. תנועה נעצרה (movement_free_streak)
+                # 3. היינו מספיק זמן בירידה (לא תנועה מהירה של לקיחת מוט)
+                # 4. הגענו לעומק מינימלי
+                is_valid_rep = (frames_in_down >= min_frames_for_valid_rep) and (rep_max_depth >= min_depth_for_rep)
+                
                 if (knee_angle > STAND_KNEE_ANGLE) and (stage == "down") and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
+                    # אם לא עברנו את התנאים - איפוס בלי ספירה
+                    if not is_valid_rep:
+                        stage = "up"
+                        start_knee_angle = None
+                        rep_down_start_idx = None
+                        continue  # לא נספור, רק נאפס
+                    
+                    # חזרה תקינה - ממשיכים עם הלוגיקה הרגילה
                     feedbacks = []
                     penalty = 0.0
 
