@@ -475,16 +475,16 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
-dt = 1.0 / float(effective_fps)
+    dt = 1.0 / float(effective_fps)
 
-# === EXIT CONDITIONS (כמו בפול-אפ) ===
-NOPOSE_STOP_SEC = 1.2
-NOPOSE_STOP_FRAMES = int(NOPOSE_STOP_SEC * effective_fps)
-nopose_frames_since_any_rep = 0
+    # === EXIT CONDITIONS (כמו בפול-אפ) ===
+    NOPOSE_STOP_SEC = 1.2
+    NOPOSE_STOP_FRAMES = int(NOPOSE_STOP_SEC * effective_fps)
+    nopose_frames_since_any_rep = 0
 
-NO_MOVEMENT_STOP_SEC = 1.3
-NO_MOVEMENT_STOP_FRAMES = int(NO_MOVEMENT_STOP_SEC * effective_fps)
-no_movement_frames = 0
+    NO_MOVEMENT_STOP_SEC = 1.3
+    NO_MOVEMENT_STOP_FRAMES = int(NO_MOVEMENT_STOP_SEC * effective_fps)
+    no_movement_frames = 0
 
 
     # עומק "לייב" דו-כיווני (גם בירידה וגם בעלייה)
@@ -521,21 +521,22 @@ no_movement_frames = 0
         depth_live = 0.0
 
         if not results.pose_landmarks:
-    if counter.count > 0:
-        nopose_frames_since_any_rep += 1
-    else:
-        nopose_frames_since_any_rep = 0
+            if counter.count > 0:
+                nopose_frames_since_any_rep += 1
+            else:
+                nopose_frames_since_any_rep = 0
 
-    if counter.count > 0 and nopose_frames_since_any_rep >= NOPOSE_STOP_FRAMES:
-        break
+            if counter.count > 0 and nopose_frames_since_any_rep >= NOPOSE_STOP_FRAMES:
+                break
 
-    if rt_fb_hold > 0:
-        rt_fb_hold -= 1
+            if rt_fb_hold > 0:
+                rt_fb_hold -= 1
+            no_movement_frames = 0
 
-    stab_lms = lm_stab.stabilize(None)
-else:
-    nopose_frames_since_any_rep = 0
-    lms = results.pose_landmarks.landmark
+            stab_lms = lm_stab.stabilize(None)
+        else:
+            nopose_frames_since_any_rep = 0
+            lms = results.pose_landmarks.landmark
             if active_leg is None:
                 active_leg = detect_active_leg(lms)
             side = "RIGHT" if active_leg == "right" else "LEFT"
@@ -556,17 +557,15 @@ else:
             ankle_vel_ema = MOTION_EMA_ALPHA*an_vel  + (1-MOTION_EMA_ALPHA)*ankle_vel_ema
             prev_hip, prev_la, prev_ra = hip_px, l_ankle_px, r_ankle_px
             movement_block = (hip_vel_ema > HIP_VEL_THRESH_PCT) or (ankle_vel_ema > ANKLE_VEL_THRESH_PCT)
-            if movement_block: movement_free_streak = 0
-            else:              movement_free_streak = min(MOVEMENT_CLEAR_FRAMES, movement_free_streak + 1)
-                ifif movement_block:
-    movement_free_streak = 0
-    no_movement_frames = 0
-else:
-    movement_free_streak = min(MOVEMENT_CLEAR_FRAMES, movement_free_streak + 1)
-    no_movement_frames += 1
+            if movement_block:
+                movement_free_streak = 0
+                no_movement_frames = 0
+            else:
+                movement_free_streak = min(MOVEMENT_CLEAR_FRAMES, movement_free_streak + 1)
+                no_movement_frames += 1
 
-if counter.count > 0 and no_movement_frames >= NO_MOVEMENT_STOP_FRAMES:
-    break
+            if counter.count > 0 and no_movement_frames >= NO_MOVEMENT_STOP_FRAMES:
+                break
 
 
 
