@@ -79,15 +79,16 @@ def draw_body_only_from_dict(frame, pts_norm, color=(255,255,255)):
     return frame
 
 # ===================== BACK CURVATURE =====================
-def analyze_back_curvature(shoulder, hip, head_like, threshold=0.04):
+def analyze_back_curvature(shoulder, hip, head_like, threshold_ratio=0.10):
     line_vec = hip - shoulder
     nrm = np.linalg.norm(line_vec) + 1e-9
     u = line_vec / nrm
     proj_len = np.dot(head_like - shoulder, u)
     proj = shoulder + proj_len * u
     off = head_like - proj
-    signed = float(np.sign(off[1]) * -1 * np.linalg.norm(off))  # inward negative
-    return signed, signed < -threshold
+    off_dist = np.linalg.norm(off)
+    signed = float(np.sign(off[1]) * -1 * (off_dist / nrm))  # inward negative, normalized
+    return signed, signed < -threshold_ratio
 
 # ===================== Deadlift thresholds =====================
 HINGE_START_THRESH    = 0.08
@@ -523,6 +524,8 @@ def run_deadlift_analysis(video_path,
                 if head is not None:
                     mid_spine = (shoulder + hip) * 0.5 * 0.4 + head * 0.6
                     _, rounded = analyze_back_curvature(shoulder, hip, mid_spine)
+                    if delta_x < (HINGE_START_THRESH * 1.05):
+                        rounded = False
                 else:
                     rounded = False
                 back_frames = back_frames + 1 if rounded else max(0, back_frames - 1)
@@ -657,6 +660,5 @@ def run_deadlift_analysis(video_path,
         "video_path": final_video_path,
         "feedback_path": feedback_path
     }
-
 
 
