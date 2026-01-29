@@ -515,10 +515,12 @@ def run_pullup_analysis(video_path,
 
                 face_pass_q.append(passed_by_chin or passed_by_eyes)
                 face_near_q.append(near_by_chin or near_by_eyes)
-                if any(face_pass_q): cycle_face_pass=True
-                if any(face_near_q): cycle_face_near=True
-# softened "go higher" condition – only near peak + persistent miss
-                if any(face_near_q): cycle_face_near=True
+                pass_hits = sum(face_pass_q)
+                near_hits = sum(face_near_q)
+                if pass_hits >= FACE_PASS_WIN:
+                    cycle_face_pass = True
+                if near_hits >= FACE_NEAR_WIN:
+                    cycle_face_near = True
 
                 # softened "go higher" condition – only near peak + persistent miss
                 near_peak = (
@@ -527,7 +529,11 @@ def run_pullup_analysis(video_path,
                 )
 
                 if near_peak and (head_vel < -abs(HEAD_VEL_UP_TINY)) and allow_new_peak:
-                    face_failed = (not cycle_face_pass) and (not cycle_face_near)
+                    face_failed = (
+                        len(face_near_q) >= FACE_NEAR_WIN
+                        and (not cycle_face_pass)
+                        and (not cycle_face_near)
+                    )
 
                     if face_failed and not cycle_tip_higher:
                         cycle_tip_higher = True
