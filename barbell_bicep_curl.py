@@ -191,10 +191,11 @@ ELBOW_BOTTOM_EXT_REF = 170.0  # תחתית (יישור)
 ELBOW_TOP_FLEX_REF   = 60.0   # טופ (כיווץ יעד)
 ELBOW_EXT_END_THR    = 160.0  # סף סיום רפ (חזרה ליישור)
 MIN_BOTTOM_EXTENSION_ANGLE = 155.0
-TOP_FLEXION_RATIO          = 0.60  # יעד טופ יחסי לטווח (מרכך את "curl higher")
+TOP_FLEXION_RATIO          = 0.50  # יעד טופ יחסי לטווח (מרכך את "curl higher")
 TOP_FLEXION_MIN_ANGLE      = 60.0  # רצפה כדי לא להיות קשוח מדי
-TOP_FLEXION_MAX_ANGLE      = 95.0  # תקרה כדי לא להיות רך מדי
-TOP_FLEXION_MARGIN_DEG     = 5.0   # מרווח נוסף לפני שמתריעים
+TOP_FLEXION_MAX_ANGLE      = 130.0 # תקרה כדי לא להיות רך מדי
+TOP_FLEXION_MARGIN_DEG     = 12.0  # מרווח נוסף לפני שמתריעים
+TOP_FLEXION_TRIGGER_FRAMES = 6     # כמה פריימים רצופים לפני RT alert
 ECC_SLOW_MIN_SEC           = 0.25
 
 def _top_flexion_threshold(bottom_ref):
@@ -268,6 +269,7 @@ def run_barbell_bicep_curl_analysis(video_path,
     rep_max_elbow_angle = -999.0
     top_index = None
     last_angle = None
+    top_flex_bad_frames = 0
 
     # RT feedback
     rt_fb_msg = None
@@ -367,6 +369,7 @@ def run_barbell_bicep_curl_analysis(video_path,
                 rep_min_elbow_angle = 999.0
                 rep_max_elbow_angle = -999.0
                 top_index = None
+                top_flex_bad_frames = 0
                 rt_fb_msg = None
                 rt_fb_hold = 0
 
@@ -382,6 +385,10 @@ def run_barbell_bicep_curl_analysis(video_path,
                 # RT-feedback: לא מספיק גבוה למעלה
                 if stage == "up":
                     if rep_min_elbow_angle > top_flex_feedback_thr:
+                        top_flex_bad_frames += 1
+                    else:
+                        top_flex_bad_frames = 0
+                    if top_flex_bad_frames >= TOP_FLEXION_TRIGGER_FRAMES:
                         if rt_fb_msg != "Try to curl higher — aim to squeeze at the top":
                             rt_fb_msg = "Try to curl higher — aim to squeeze at the top"
                             rt_fb_hold = RT_FB_HOLD_FRAMES
@@ -460,6 +467,7 @@ def run_barbell_bicep_curl_analysis(video_path,
                     rep_min_elbow_angle = 999.0
                     rep_max_elbow_angle = -999.0
                     top_index = None
+                    top_flex_bad_frames = 0
                     rt_fb_msg = None
                     rt_fb_hold = 0
 
