@@ -619,6 +619,8 @@ def run_pullup_analysis(video_path,
     all_fb = set(session_feedback) if session_feedback else set()
     FEEDBACK_ORDER = FORM_TIP_PRIORITY
     fb_list = [cue for cue in FEEDBACK_ORDER if cue in all_fb]  # ordered, unique
+    if not fb_list and rep_count > 0 and bad_reps == 0:
+        fb_list = ["Great form! Keep it up 💪"]
 
     form_tip = None
     if all_fb:
@@ -626,7 +628,7 @@ def run_pullup_analysis(video_path,
                                                   -FEEDBACK_ORDER.index(m) if m in FEEDBACK_ORDER else -999))
         form_tip = FORM_TIP_MESSAGES.get(form_tip_key, "Focus on smooth, controlled reps")
 
-    # Write file (no "Great form")
+    # Write file
     try:
         with open(feedback_path,"w",encoding="utf-8") as f:
             f.write(f"Total Reps: {int(rep_count)}\n")
