@@ -163,7 +163,7 @@ def _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_flag: bool):
     elif resolved_type == 'bulgarian':
         return _run_with_tracks(run_bulgarian, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
     elif resolved_type == 'pullup':
-        return _run_with_tracks(run_pullup, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
+        return _run_with_tracks(run_pullup, raw_video_path, analyzed_path, False, frame_skip=3, scale=0.4)
     elif resolved_type == 'bicep_curl':
         return _run_with_tracks(run_bicep_curl, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
     elif resolved_type == 'bent_row':

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 # pullup_analysis.py — original rep counting kept (27/27) + burst & robust feedback
-# feedback = all cues; form_tip = single prioritized cue (omitted if none)
+# feedback = all cues; form_tip = separate short guidance message (omitted if none)
 
 import os, cv2, math, numpy as np, subprocess
 from collections import deque
@@ -165,6 +165,11 @@ PENALTY_MIN_IF_ANY=0.5
 
 # סדר עדיפויות ל-form_tip
 FORM_TIP_PRIORITY = [FB_CUE_HIGHER, FB_CUE_BOTTOM, FB_CUE_SWING]
+FORM_TIP_MESSAGES = {
+    FB_CUE_HIGHER: "Aim to clear the bar with your chin every rep",
+    FB_CUE_BOTTOM: "Reset to a full hang before pulling again",
+    FB_CUE_SWING: "Keep a steady body line throughout the pull",
+}
 
 # ============ Swing / Bottom heuristics ============
 SWING_THR=0.012; SWING_MIN_STREAK=3
@@ -206,10 +211,8 @@ def run_pullup_analysis(video_path,
     if mp_pose is None:
         return _ret_err("Mediapipe not available", feedback_path)
 
-    model_complexity = 0 if fast_mode else 1
-    if fast_mode:
-        return_video = False
-        scale = min(scale, 0.35)
+    model_complexity = 1
+    return_video = True
 
     if preserve_quality:
         scale=1.0; frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
@@ -600,7 +603,10 @@ def run_pullup_analysis(video_path,
     cv2.destroyAllWindows()
 
     # ===== Session Technique Score =====
-    if rep_count==0: technique_score=0.0
+    if rep_count==0:
+        technique_score=0.0
+    elif all_scores:
+        technique_score=_half_floor10(np.mean(all_scores))
     else:
         if session_feedback:
             penalty = sum(FB_WEIGHTS.get(m,FB_DEFAULT_WEIGHT) for m in set(session_feedback))
@@ -616,8 +622,9 @@ def run_pullup_analysis(video_path,
 
     form_tip = None
     if all_fb:
-        form_tip = max(all_fb, key=lambda m: (FB_WEIGHTS.get(m, FB_DEFAULT_WEIGHT),
-                                              -FEEDBACK_ORDER.index(m) if m in FEEDBACK_ORDER else -999))
+        form_tip_key = max(all_fb, key=lambda m: (FB_WEIGHTS.get(m, FB_DEFAULT_WEIGHT),
+                                                  -FEEDBACK_ORDER.index(m) if m in FEEDBACK_ORDER else -999))
+        form_tip = FORM_TIP_MESSAGES.get(form_tip_key, "Focus on smooth, controlled reps")
 
     # Write file (no "Great form")
     try:
