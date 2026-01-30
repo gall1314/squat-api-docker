@@ -557,6 +557,8 @@ def run_dips_analysis(video_path,
     # Build feedback
     all_fb = set(session_feedback) if session_feedback else set()
     fb_list = [cue for cue in FORM_TIP_PRIORITY if cue in all_fb]
+    if not fb_list and technique_score >= 10.0 - 1e-6:
+        fb_list = ["Great form! Keep it up 💪"]
 
     form_tip = None
     if all_fb:
