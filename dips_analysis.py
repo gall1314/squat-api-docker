@@ -148,7 +148,7 @@ WRIST_BELOW_SHOULDER_MARGIN = 0.02  # שורשי ידיים צריכים להי�
 TORSO_STABILITY_THR = 0.012         # תנועת טורסו מקסימלית
 ONDIPS_MIN_FRAMES = 3
 OFFDIPS_MIN_FRAMES = 6
-AUTO_STOP_AFTER_EXIT_SEC = 1.5
+AUTO_STOP_AFTER_EXIT_SEC = 1.2
 TAIL_NOPOSE_STOP_SEC = 1.0
 
 # ============ Feedback Cues & Weights ============
@@ -197,7 +197,7 @@ FLARE_FAIL_MIN_REPS = 2
 
 # ============ Micro-burst ============
 BURST_FRAMES = int(os.getenv("BURST_FRAMES", "2"))
-INFLECT_VEL_THR = float(os.getenv("INFLECT_VEL_THR", "0.0008"))
+INFLECT_VEL_THR = float(os.getenv("INFLECT_VEL_THR", "0.0006"))
 
 DEBUG_ONDIPS = bool(int(os.getenv("DEBUG_ONDIPS", "0")))
 
@@ -276,7 +276,7 @@ def run_dips_analysis(video_path,
     NOPOSE_STOP_FRAMES=sec_to_frames(TAIL_NOPOSE_STOP_SEC)
     RT_FB_HOLD_FRAMES=sec_to_frames(0.8)
 
-    REARM_ASCENT_EFF=max(RESET_ASCENT*0.60, 0.015)
+    REARM_ASCENT_EFF=max(RESET_ASCENT*0.60, 0.012)
 
     # Micro-burst
     burst_cntr=0
@@ -494,7 +494,7 @@ def run_dips_analysis(video_path,
                         if ((desc_base_shoulder + cycle_max_descent) - shoulder_y) >= REARM_ASCENT_EFF:
                             allow_new_bottom=True
 
-                # Real-time feedback
+                # Real-time feedback at bottom
                 if at_bottom and not cycle_tip_deeper:
                     if bottom_phase_min_elbow and bottom_phase_min_elbow > DEPTH_MIN_ANGLE:
                         cycle_tip_deeper = True
