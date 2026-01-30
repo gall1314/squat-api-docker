@@ -600,7 +600,10 @@ def run_pullup_analysis(video_path,
     cv2.destroyAllWindows()
 
     # ===== Session Technique Score =====
-    if rep_count==0: technique_score=0.0
+    if rep_count==0:
+        technique_score=0.0
+    elif all_scores:
+        technique_score=_half_floor10(np.mean(all_scores))
     else:
         if session_feedback:
             penalty = sum(FB_WEIGHTS.get(m,FB_DEFAULT_WEIGHT) for m in set(session_feedback))
