@@ -155,7 +155,7 @@ def _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_flag: bool):
     print(f"[_do_analyze] type={resolved_type}, raw={raw_video_path}, analyzed={analyzed_path}, fast={fast_flag}", file=sys.stderr, flush=True)
     
     if resolved_type == 'squat':
-        return _run_with_tracks(run_squat, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
+        return _run_with_tracks(run_squat, raw_video_path, analyzed_path, False, frame_skip=3, scale=0.4)
     elif resolved_type == 'deadlift':
         return _run_with_tracks(run_deadlift, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
     elif resolved_type == 'romanian_deadlift':
@@ -163,7 +163,7 @@ def _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_flag: bool):
     elif resolved_type == 'bulgarian':
         return _run_with_tracks(run_bulgarian, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
     elif resolved_type == 'pullup':
-        return _run_with_tracks(run_pullup, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
+        return _run_with_tracks(run_pullup, raw_video_path, analyzed_path, False, frame_skip=3, scale=0.4)
     elif resolved_type == 'bicep_curl':
         return _run_with_tracks(run_bicep_curl, raw_video_path, analyzed_path, fast_flag, frame_skip=3, scale=0.4)
     elif resolved_type == 'bent_row':

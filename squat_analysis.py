@@ -294,10 +294,6 @@ def run_squat_analysis(video_path,
                        output_path="squat_analyzed.mp4",
                        feedback_path="squat_feedback.txt",
                        fast_mode=False):
-    """
-    fast_mode=True: רק ניתוח, בלי יצירת סרטון
-    fast_mode=False: ניתוח + יצירת סרטון
-    """
     mp_pose_mod = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -308,7 +304,7 @@ def run_squat_analysis(video_path,
             "technique_label": score_label(0.0)
         }
     
-    create_video = (not fast_mode) and (output_path is not None) and (output_path != "")
+    create_video = (output_path is not None) and (output_path != "")
 
     counter = 0
     good_reps = 0
