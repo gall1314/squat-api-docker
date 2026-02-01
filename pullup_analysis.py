@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# pullup_analysis.py — OPTIMIZED VERSION
-# Fixes: burst loop, face detection throttling, simplified exit logic
+# pullup_analysis.py — SMART FORM_TIP edition
+# form_tip = optimization advice (doesn't affect score, only helps improve)
 
 import os, cv2, math, numpy as np, subprocess
 from collections import deque
@@ -145,7 +145,7 @@ WRIST_ABOVE_HEAD_MARGIN=0.02; TORSO_X_THR=0.010
 ONBAR_MIN_FRAMES=2; OFFBAR_MIN_FRAMES=6
 AUTO_STOP_AFTER_EXIT_SEC=1.2; TAIL_NOPOSE_STOP_SEC=1.0
 
-# Feedback weights
+# ============ FEEDBACK (issues that affect score) ============
 FB_CUE_HIGHER = "Go a bit higher (chin over bar)"
 FB_CUE_SWING  = "Reduce body swing (no kipping)"
 FB_CUE_BOTTOM = "Fully extend arms at bottom"
@@ -162,21 +162,37 @@ FB_WEIGHTS = {
 FB_DEFAULT_WEIGHT=0.5
 PENALTY_MIN_IF_ANY=0.5
 
-FORM_TIP_PRIORITY = [FB_CUE_HIGHER, FB_CUE_BOTTOM, FB_CUE_SWING]
+FEEDBACK_ORDER = [FB_CUE_HIGHER, FB_CUE_BOTTOM, FB_CUE_SWING]
+
+# ============ FORM_TIP (optimization advice - doesn't affect score!) ============
+# These are performance optimization tips based on measurable patterns
+
+FORM_TIP_SLOW_ECCENTRIC = "slow_eccentric"
+FORM_TIP_EXPLOSIVE_PULL = "explosive_pull" 
+FORM_TIP_TOP_PAUSE = "top_pause"
+FORM_TIP_TEMPO_CONSISTENCY = "tempo_consistency"
+
 FORM_TIP_MESSAGES = {
-    FB_CUE_HIGHER: "Aim to clear the bar with your chin every rep",
-    FB_CUE_BOTTOM: "Reset to a full hang before pulling again",
-    FB_CUE_SWING: "Keep a steady body line throughout the pull",
+    FORM_TIP_SLOW_ECCENTRIC: "Try lowering slower (3-4 sec) for better muscle growth",
+    FORM_TIP_EXPLOSIVE_PULL: "Pull up faster to build explosive strength",
+    FORM_TIP_TOP_PAUSE: "Hold at the top for 1-2 seconds to maximize strength",
+    FORM_TIP_TEMPO_CONSISTENCY: "Keep a steady rhythm between reps for endurance",
 }
+
+# Thresholds for form tips (all ENV-configurable)
+ECCENTRIC_FAST_THR = float(os.getenv("ECCENTRIC_FAST_THR", "0.8"))  # seconds
+CONCENTRIC_SLOW_THR = float(os.getenv("CONCENTRIC_SLOW_THR", "2.0"))  # seconds
+TOP_HOLD_SHORT_THR = float(os.getenv("TOP_HOLD_SHORT_THR", "0.3"))  # seconds
+TEMPO_VARIANCE_THR = float(os.getenv("TEMPO_VARIANCE_THR", "0.35"))  # 35% coefficient of variation
 
 # Swing / Bottom
 SWING_THR=0.012; SWING_MIN_STREAK=3
-BOTTOM_EXT_MIN_ANGLE=155.0; BOTTOM_HYST_DEG=3.0
+BOTTOM_EXT_MIN_ANGLE=155.0; BOTTOM_NEAR_DEG=6.0
 BOTTOM_FAIL_MIN_REPS=2
 DEBUG_ONBAR=bool(int(os.getenv("DEBUG_ONBAR","0")))
 
-# 🔧 FIX 1: Face detection throttling (check every N frames instead of every frame)
-FACE_CHECK_INTERVAL = int(os.getenv("FACE_CHECK_INTERVAL", "3"))  # Check every 3 frames
+# Face detection throttling
+FACE_CHECK_INTERVAL = int(os.getenv("FACE_CHECK_INTERVAL", "3"))
 
 # Face vs Bar params
 CHIN_BAR_MARGIN   = float(os.getenv("CHIN_BAR_MARGIN", "0.006"))
@@ -190,13 +206,12 @@ EYE_VIS_THR       = float(os.getenv("EYE_VIS_THR",     "0.40"))
 FACE_PASS_WIN     = int(os.getenv("FACE_PASS_WIN",     "3"))
 FACE_NEAR_WIN     = int(os.getenv("FACE_NEAR_WIN",     "5"))
 
-# 🔧 FIX 2: Disable micro-burst by default (can re-enable via env var)
-BURST_ENABLED     = bool(int(os.getenv("BURST_ENABLED", "0")))  # OFF by default
+# Micro-burst disabled by default
+BURST_ENABLED     = bool(int(os.getenv("BURST_ENABLED", "0")))
 BURST_FRAMES      = int(os.getenv("BURST_FRAMES",    "2"))
 INFLECT_VEL_THR   = float(os.getenv("INFLECT_VEL_THR","0.0006"))
 
 # Bottom lockout
-BOTTOM_NEAR_DEG     = float(os.getenv("BOTTOM_NEAR_DEG", "6.0"))
 LOCKOUT_DIST_MIN    = float(os.getenv("LOCKOUT_DIST_MIN","0.36"))
 LOCKOUT_NEAR_RELAX  = float(os.getenv("LOCKOUT_NEAR_RELAX","0.02"))
 
@@ -226,6 +241,7 @@ def run_pullup_analysis(video_path,
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps=max(1.0, fps_in/max(1,frame_skip))
     sec_to_frames=lambda s: max(1,int(s*effective_fps))
+    frames_to_sec=lambda f: float(f)/effective_fps
 
     fourcc=cv2.VideoWriter_fourcc(*'mp4v')
     out=None; frame_idx=0
@@ -259,14 +275,20 @@ def run_pullup_analysis(video_path,
     # Feedback state
     session_feedback=set()
     rt_fb_msg=None; rt_fb_hold=0
-    swing_streak=0; swing_already_reported=False
-    bottom_already_reported=False
+    swing_streak=0
     bottom_phase_max_elbow=None
     bottom_fail_count=0
     bottom_lockout_max=None
+    bottom_already_reported=False
 
     # Per-cycle tips
     cycle_tip_higher=False; cycle_tip_swing=False; cycle_tip_bottom=False
+
+    # 🆕 TEMPO TRACKING for form_tip
+    rep_phase_timings = []  # List of {concentric_sec, top_hold_sec, eccentric_sec}
+    phase_start_frame = None
+    phase_type = None  # "concentric", "top", "eccentric"
+    last_phase_transition_frame = None
 
     OFFBAR_STOP_FRAMES=sec_to_frames(AUTO_STOP_AFTER_EXIT_SEC)
     NOPOSE_STOP_FRAMES=sec_to_frames(TAIL_NOPOSE_STOP_SEC)
@@ -280,11 +302,10 @@ def run_pullup_analysis(video_path,
     cycle_face_near=False
     face_pass_q = deque(maxlen=FACE_PASS_WIN)
     face_near_q = deque(maxlen=FACE_NEAR_WIN)
-    face_check_counter = 0  # 🔧 FIX: throttle face checks
+    face_check_counter = 0
 
-    # 🔧 FIX: Micro-burst counter (disabled by default)
     burst_cntr=0
-    processed_frame_count = 0  # Count actual processed frames
+    processed_frame_count = 0
 
     with mp_pose.Pose(model_complexity=model_complexity, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while True:
@@ -292,7 +313,6 @@ def run_pullup_analysis(video_path,
             if not ret: break
             frame_idx += 1
 
-            # 🔧 FIX: Simplified frame processing logic
             process_now = (burst_cntr > 0) or (frame_idx % max(1, frame_skip) == 0)
             if not process_now:
                 continue
@@ -363,10 +383,11 @@ def run_pullup_analysis(video_path,
                 face_pass_q.clear(); face_near_q.clear()
                 bottom_phase_max_elbow=None
                 bottom_lockout_max=None
+                phase_start_frame=None
+                phase_type=None
 
-            # 🔧 FIX: Simplified exit logic (removed duplicate bottom check)
+            # Exit onbar
             if onbar and offbar_streak>=OFFBAR_MIN_FRAMES:
-                # Single bottom extension check
                 if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
                     cycle_tip_bottom = True
                     bottom_fail_count += 1
@@ -391,6 +412,8 @@ def run_pullup_analysis(video_path,
                 face_pass_q.clear(); face_near_q.clear()
                 bottom_phase_max_elbow=None
                 bottom_lockout_max=None
+                phase_start_frame=None
+                phase_type=None
 
             if (not onbar) and rep_count>0:
                 offbar_frames_since_any_rep+=1
@@ -399,12 +422,11 @@ def run_pullup_analysis(video_path,
             head_vel=0.0 if head_prev is None else (head_y-head_prev)
             cur_rt=None
 
-            # 🔧 FIX: Micro-burst only if enabled
+            # Micro-burst
             if BURST_ENABLED and onbar and (asc_base_head is not None):
                 near_inflect = (abs(head_vel) <= INFLECT_VEL_THR)
                 sign_flip = (head_vel_prev is not None) and ((head_vel_prev > 0 and head_vel <= 0) or (head_vel_prev < 0 and head_vel >= 0))
                 if near_inflect or sign_flip:
-                    # Only set burst if not already in burst mode
                     if burst_cntr == 0:
                         burst_cntr = BURST_FRAMES
             head_vel_prev = head_vel
@@ -417,6 +439,9 @@ def run_pullup_analysis(video_path,
                         cycle_peak_ascent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
                         bottom_phase_max_elbow=None
                         bottom_lockout_max=None
+                        # 🆕 Start concentric phase
+                        phase_start_frame=processed_frame_count
+                        phase_type="concentric"
                 else:
                     cycle_peak_ascent=max(cycle_peak_ascent,(asc_base_head-head_y))
                     cycle_min_elbow=min(cycle_min_elbow,elbow_angle)
@@ -438,8 +463,15 @@ def run_pullup_analysis(video_path,
 
                     reset_by_desc=(asc_base_head is not None) and ((head_y-asc_base_head)>=RESET_DESCENT)
                     reset_by_elb =(elbow_angle>=RESET_ELBOW)
+                    
                     if reset_by_desc or reset_by_elb:
-                        # Check bottom extension
+                        # 🆕 Eccentric phase ended → record timing
+                        if phase_type == "eccentric" and phase_start_frame is not None:
+                            eccentric_frames = processed_frame_count - phase_start_frame
+                            eccentric_sec = frames_to_sec(eccentric_frames)
+                            if len(rep_phase_timings) > 0:
+                                rep_phase_timings[-1]["eccentric_sec"] = eccentric_sec
+                        
                         if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
                             cycle_tip_bottom = True
                             bottom_fail_count += 1
@@ -465,6 +497,9 @@ def run_pullup_analysis(video_path,
                         cycle_tip_higher=False; cycle_tip_swing=False; cycle_tip_bottom=False
                         cycle_face_pass=False; cycle_face_near=False
                         face_pass_q.clear(); face_near_q.clear()
+                        # 🆕 Start new concentric
+                        phase_start_frame=processed_frame_count
+                        phase_type="concentric"
 
                 ascent_amt=0.0 if asc_base_head is None else (asc_base_head-head_y)
 
@@ -474,6 +509,19 @@ def run_pullup_analysis(video_path,
                 can_cnt=(frame_idx - last_peak_frame) >= REFRACTORY_FRAMES
 
                 if at_top and allow_new_peak and can_cnt and (not counted_this_cycle):
+                    # 🆕 Concentric ended → record timing
+                    if phase_type == "concentric" and phase_start_frame is not None:
+                        concentric_frames = processed_frame_count - phase_start_frame
+                        concentric_sec = frames_to_sec(concentric_frames)
+                        rep_phase_timings.append({
+                            "concentric_sec": concentric_sec,
+                            "top_hold_sec": 0.0,
+                            "eccentric_sec": 0.0
+                        })
+                        # Start top hold phase
+                        phase_start_frame = processed_frame_count
+                        phase_type = "top"
+                    
                     rep_has_tip = cycle_tip_higher or cycle_tip_swing or cycle_tip_bottom
                     _count_rep(rep_reports,rep_count,0.0,elbow_angle,
                                asc_base_head if asc_base_head is not None else head_y, head_y,
@@ -487,14 +535,23 @@ def run_pullup_analysis(video_path,
                 if (allow_new_peak is False) and (last_peak_frame>0):
                     if head_prev is not None and (head_y - head_prev) > 0 and (asc_base_head is not None):
                         if (head_y - (asc_base_head - cycle_peak_ascent)) >= REARM_DESCENT_EFF:
+                            # 🆕 Top hold ended → record timing
+                            if phase_type == "top" and phase_start_frame is not None:
+                                top_hold_frames = processed_frame_count - phase_start_frame
+                                top_hold_sec = frames_to_sec(top_hold_frames)
+                                if len(rep_phase_timings) > 0:
+                                    rep_phase_timings[-1]["top_hold_sec"] = top_hold_sec
+                                # Start eccentric phase
+                                phase_start_frame = processed_frame_count
+                                phase_type = "eccentric"
+                            
                             allow_new_peak=True
 
-                # 🔧 FIX: Throttled face detection (check every N frames)
+                # Face detection (throttled)
                 face_check_counter += 1
                 if face_check_counter >= FACE_CHECK_INTERVAL:
                     face_check_counter = 0
                     
-                    # Bar position
                     cur_bar_y = min(lms[LW].y, lms[RW].y)
                     bar_y_ema = cur_bar_y if bar_y_ema is None else (BAR_EMA_ALPHA*cur_bar_y + (1 - BAR_EMA_ALPHA)*bar_y_ema)
                     bar_y_eff = bar_y_ema if bar_y_ema is not None else cur_bar_y
@@ -519,7 +576,6 @@ def run_pullup_analysis(video_path,
                     if near_hits >= FACE_NEAR_WIN:
                         cycle_face_near = True
 
-                    # Height cue
                     near_peak = (
                         asc_base_head is not None and
                         ascent_amt >= HEAD_MIN_ASCENT * 0.85
@@ -585,7 +641,7 @@ def run_pullup_analysis(video_path,
     if return_video and out: out.release()
     cv2.destroyAllWindows()
 
-    # Session score
+    # ============ SESSION SCORE (feedback-based) ============
     if rep_count==0:
         technique_score=0.0
     elif all_scores:
@@ -598,18 +654,57 @@ def run_pullup_analysis(video_path,
             penalty = 0.0
         technique_score=_half_floor10(max(0.0,10.0-penalty))
 
-    # Build feedback
+    # ============ FORM_TIP LOGIC (optimization, not score-based) ============
+    form_tip = None
+    
+    if rep_count >= 2 and len(rep_phase_timings) >= 2:
+        # Analyze tempo patterns
+        concentric_times = [t["concentric_sec"] for t in rep_phase_timings if t["concentric_sec"] > 0]
+        top_hold_times = [t["top_hold_sec"] for t in rep_phase_timings if t["top_hold_sec"] > 0]
+        eccentric_times = [t["eccentric_sec"] for t in rep_phase_timings if t["eccentric_sec"] > 0]
+        
+        tip_scores = {}  # {tip_key: priority_score}
+        
+        # 1. Fast eccentric → suggest slow eccentric (HIGHEST PRIORITY for hypertrophy)
+        if len(eccentric_times) >= 2:
+            avg_eccentric = np.mean(eccentric_times)
+            if avg_eccentric < ECCENTRIC_FAST_THR:
+                tip_scores[FORM_TIP_SLOW_ECCENTRIC] = 100  # highest priority
+        
+        # 2. Short top hold → suggest pausing at top (STRENGTH)
+        if len(top_hold_times) >= 2:
+            avg_top_hold = np.mean(top_hold_times)
+            if avg_top_hold < TOP_HOLD_SHORT_THR:
+                tip_scores[FORM_TIP_TOP_PAUSE] = 80
+        
+        # 3. Slow concentric → suggest explosive pull (POWER)
+        if len(concentric_times) >= 2:
+            avg_concentric = np.mean(concentric_times)
+            if avg_concentric > CONCENTRIC_SLOW_THR:
+                tip_scores[FORM_TIP_EXPLOSIVE_PULL] = 70
+        
+        # 4. Inconsistent tempo → suggest consistency (ENDURANCE)
+        if len(concentric_times) >= 3:
+            total_times = [c + t + e for c, t, e in zip(
+                concentric_times[:min(len(concentric_times), len(top_hold_times), len(eccentric_times))],
+                top_hold_times[:min(len(concentric_times), len(top_hold_times), len(eccentric_times))],
+                eccentric_times[:min(len(concentric_times), len(top_hold_times), len(eccentric_times))]
+            )]
+            if len(total_times) >= 3:
+                cv = np.std(total_times) / (np.mean(total_times) + 1e-9)  # coefficient of variation
+                if cv > TEMPO_VARIANCE_THR:
+                    tip_scores[FORM_TIP_TEMPO_CONSISTENCY] = 60
+        
+        # Select highest priority tip
+        if tip_scores:
+            best_tip = max(tip_scores, key=tip_scores.get)
+            form_tip = FORM_TIP_MESSAGES.get(best_tip)
+
+    # Build feedback list
     all_fb = set(session_feedback) if session_feedback else set()
-    FEEDBACK_ORDER = FORM_TIP_PRIORITY
     fb_list = [cue for cue in FEEDBACK_ORDER if cue in all_fb]
     if not fb_list and rep_count > 0 and bad_reps == 0:
         fb_list = ["Great form! Keep it up 💪"]
-
-    form_tip = None
-    if all_fb:
-        form_tip_key = max(all_fb, key=lambda m: (FB_WEIGHTS.get(m, FB_DEFAULT_WEIGHT),
-                                                  -FEEDBACK_ORDER.index(m) if m in FEEDBACK_ORDER else -999))
-        form_tip = FORM_TIP_MESSAGES.get(form_tip_key, "Focus on smooth, controlled reps")
 
     # Write file
     try:
@@ -619,6 +714,8 @@ def run_pullup_analysis(video_path,
             if fb_list:
                 f.write("Feedback:\n")
                 for ln in fb_list: f.write(f"- {ln}\n")
+            if form_tip:
+                f.write(f"\nForm Tip: {form_tip}\n")
     except Exception:
         pass
 
