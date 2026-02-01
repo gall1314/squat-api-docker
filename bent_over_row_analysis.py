@@ -6,6 +6,8 @@ Bent-Over Barbell Row — analysis pipeline matching the Squat standard:
 - Rep counting with frame skipping + soft-start gating
 - Live donut progress, single feedback line, body-only skeleton
 - Faststart-encoded analyzed video output
+- FIXED: proper_reps now returns actual count instead of null
+- FIXED: form_tip now returns best tip instead of null
 """
 import os
 import cv2
@@ -203,22 +205,26 @@ def row_depth_from_elbow(elbow_angle, ext_ref, top_ref):
     return clamp(pct, DONUT_FLOOR, DONUT_CEIL)
 
 def analyze_rep(rep_metrics):
-    """Return penalties, feedbacks for a single rep based on collected metrics."""
+    """Return penalties, feedbacks, and is_proper for a single rep based on collected metrics."""
     feedback = []
     penalty = 0.0
+    is_proper = True  # Start assuming proper, mark False if severe issues
 
     # ROM check
     if rep_metrics["min_elbow_angle"] is None or rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX + 5:
         penalty += ROM_PENALTY_STRONG
         feedback.append(("severe", "Pull higher — reach your torso"))
+        is_proper = False
     elif rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX:
         penalty += ROM_PENALTY_LIGHT
         feedback.append(("medium", "Stronger elbow flexion at the top"))
+        is_proper = False
 
     # Momentum / torso drift
     if rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > TORSO_DRIFT_MAX:
         penalty += MOMENTUM_PENALTY
         feedback.append(("severe", "Avoid using momentum — keep your torso still"))
+        is_proper = False
     elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > 0.5*TORSO_DRIFT_MAX:
         penalty += TORSO_PENALTY
         feedback.append(("medium", "Keep your torso angle consistent"))
@@ -251,7 +257,7 @@ def analyze_rep(rep_metrics):
                 session_msgs.append(msg)
     tips = [msg for (s,msg) in feedback if s == "tip"]
 
-    return penalty, overlay_msg, session_msgs, tips
+    return penalty, overlay_msg, session_msgs, tips, is_proper
 
 def faststart_remux(in_path):
     """Remux MP4 with moov at start (faststart). Returns output path."""
@@ -273,8 +279,8 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     """
     Main entry. Mirrors squat pipeline and return schema (incl. 'squat_count').
     Returns a dict with keys:
-      - success, squat_count, technique_score, technique_score_display, technique_label
-      - feedback (unique, severe-first), tips
+      - success, squat_count, proper_reps, technique_score, technique_score_display, technique_label
+      - feedback (unique, severe-first), tips, form_tip (best single tip)
       - rep_details (per rep metrics)
       - analyzed_video_path
       - fps, duration_s
@@ -308,6 +314,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
 
     # State
     reps = 0
+    proper_reps = 0  # NEW: Track proper reps
     last_rep_frame = -9999
     frame_idx = -1
 
@@ -436,7 +443,12 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                         "torso_mean": torso_mean,
                         "depth_pct": row_depth_from_elbow(elbow_min, ext_ref, top_ref)
                     }
-                    pen, ov_msg, sess_msgs, tips = analyze_rep(rep_m)
+                    pen, ov_msg, sess_msgs, tips, is_proper = analyze_rep(rep_m)
+                    
+                    # Count proper reps
+                    if is_proper:
+                        proper_reps += 1
+                    
                     # Keep one overlay message at a time
                     overlay_msg = ov_msg or overlay_msg
 
@@ -475,13 +487,28 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     # Scoring
     score = MAX_SCORE
     for rep_m in rep_details:
-        pen, _, _, _ = analyze_rep(rep_m)
+        pen, _, _, _, _ = analyze_rep(rep_m)
         score -= (pen / max(1, len(rep_details)))  # average penalty
     score = clamp(score, MIN_SCORE, MAX_SCORE)
     score = round_to_half(score)
 
     # Technique label
     label = technique_label(score)
+
+    # Select best form tip (prioritize by severity)
+    form_tip = None
+    if session_feedback:
+        form_tip = session_feedback[0]  # Most severe feedback
+    elif session_tips:
+        form_tip = session_tips[0]  # Or first tip if no severe issues
+    else:
+        # Default encouraging message if everything is good
+        if proper_reps == reps and reps > 0:
+            form_tip = "Great form! Keep it up"
+        elif reps > 0:
+            form_tip = "Focus on consistent form across all reps"
+        else:
+            form_tip = "Complete a full rep to get feedback"
 
     # Faststart remux
     out_fast = faststart_remux(out_path)
@@ -492,11 +519,13 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
         "success": True,
         "squat_count": reps,                # keep same key name for UI compatibility
         "row_count": reps,
+        "proper_reps": proper_reps,         # FIXED: Now returns actual count
         "technique_score": float(score),
         "technique_score_display": f"{score:.1f}",
         "technique_label": label,
         "feedback": session_feedback,       # unique, severe-first
         "tips": session_tips,               # do not reduce score
+        "form_tip": form_tip,               # FIXED: Now returns best single tip
         "rep_details": rep_details,         # per-rep metrics
         "analyzed_video_path": out_fast,    # file path; caller can build URL
         "fps": src_fps/max(1,FRAME_SKIP),
