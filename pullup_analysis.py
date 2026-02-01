@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# pullup_analysis.py — original rep counting kept (27/27) + burst & robust feedback
-# feedback = all cues; form_tip = separate short guidance message (omitted if none)
+# pullup_analysis.py — OPTIMIZED VERSION
+# Fixes: burst loop, face detection throttling, simplified exit logic
 
 import os, cv2, math, numpy as np, subprocess
 from collections import deque
@@ -68,7 +68,7 @@ def _dyn_thickness(h):
 def _dist_xy(a, b):
     return math.hypot(a[0]-b[0], a[1]-b[1])
 
-# ============ Body-only skeleton (לא מציירים פנים) ============
+# ============ Body-only skeleton ============
 _FACE_LMS=set(); _BODY_CONNECTIONS=tuple(); _BODY_POINTS=tuple()
 if mp_pose:
     _FACE_LMS={
@@ -131,7 +131,7 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
             draw.text((tx,ty),ln,font=FEEDBACK_FONT,fill=(255,255,255)); ty+=line_h+4
     return cv2.cvtColor(np.array(pil),cv2.COLOR_RGB2BGR)
 
-# ============ Params (rep counting – original) ============
+# ============ Params ============
 ELBOW_TOP_ANGLE=100.0
 HEAD_MIN_ASCENT=0.0075
 RESET_DESCENT=0.0045
@@ -145,12 +145,11 @@ WRIST_ABOVE_HEAD_MARGIN=0.02; TORSO_X_THR=0.010
 ONBAR_MIN_FRAMES=2; OFFBAR_MIN_FRAMES=6
 AUTO_STOP_AFTER_EXIT_SEC=1.2; TAIL_NOPOSE_STOP_SEC=1.0
 
-# ============ Feedback cues & weights ============
+# Feedback weights
 FB_CUE_HIGHER = "Go a bit higher (chin over bar)"
 FB_CUE_SWING  = "Reduce body swing (no kipping)"
 FB_CUE_BOTTOM = "Fully extend arms at bottom"
 
-# weights for session score (ENV-overridable)
 FB_W_HIGHER = float(os.getenv("FB_W_HIGHER", "1.0"))
 FB_W_SWING  = float(os.getenv("FB_W_SWING",  "0.5"))
 FB_W_BOTTOM = float(os.getenv("FB_W_BOTTOM", "1.0"))
@@ -163,7 +162,6 @@ FB_WEIGHTS = {
 FB_DEFAULT_WEIGHT=0.5
 PENALTY_MIN_IF_ANY=0.5
 
-# סדר עדיפויות ל-form_tip
 FORM_TIP_PRIORITY = [FB_CUE_HIGHER, FB_CUE_BOTTOM, FB_CUE_SWING]
 FORM_TIP_MESSAGES = {
     FB_CUE_HIGHER: "Aim to clear the bar with your chin every rep",
@@ -171,14 +169,16 @@ FORM_TIP_MESSAGES = {
     FB_CUE_SWING: "Keep a steady body line throughout the pull",
 }
 
-# ============ Swing / Bottom heuristics ============
+# Swing / Bottom
 SWING_THR=0.012; SWING_MIN_STREAK=3
 BOTTOM_EXT_MIN_ANGLE=155.0; BOTTOM_HYST_DEG=3.0
-BOTTOM_FAIL_MIN_REPS=2  # כמה פעמים "לא ננעל" למטה עד שנציג טיפ סשן
-
+BOTTOM_FAIL_MIN_REPS=2
 DEBUG_ONBAR=bool(int(os.getenv("DEBUG_ONBAR","0")))
 
-# ============ Face vs Bar (feedback only; לא משפיע על הספירה) ============
+# 🔧 FIX 1: Face detection throttling (check every N frames instead of every frame)
+FACE_CHECK_INTERVAL = int(os.getenv("FACE_CHECK_INTERVAL", "3"))  # Check every 3 frames
+
+# Face vs Bar params
 CHIN_BAR_MARGIN   = float(os.getenv("CHIN_BAR_MARGIN", "0.006"))
 EYE_BAR_MARGIN    = float(os.getenv("EYE_BAR_MARGIN",  "0.012"))
 CHIN_NEAR_EXTRA   = float(os.getenv("CHIN_NEAR_EXTRA","0.008"))
@@ -190,11 +190,12 @@ EYE_VIS_THR       = float(os.getenv("EYE_VIS_THR",     "0.40"))
 FACE_PASS_WIN     = int(os.getenv("FACE_PASS_WIN",     "3"))
 FACE_NEAR_WIN     = int(os.getenv("FACE_NEAR_WIN",     "5"))
 
-# ============ Micro-burst סביב נקודת מפנה ============
-BURST_FRAMES    = int(os.getenv("BURST_FRAMES",    "2"))
-INFLECT_VEL_THR = float(os.getenv("INFLECT_VEL_THR","0.0006"))
+# 🔧 FIX 2: Disable micro-burst by default (can re-enable via env var)
+BURST_ENABLED     = bool(int(os.getenv("BURST_ENABLED", "0")))  # OFF by default
+BURST_FRAMES      = int(os.getenv("BURST_FRAMES",    "2"))
+INFLECT_VEL_THR   = float(os.getenv("INFLECT_VEL_THR","0.0006"))
 
-# ============ Bottom lockout (מרחק כתף↔שורש יד / טורסו) ============
+# Bottom lockout
 BOTTOM_NEAR_DEG     = float(os.getenv("BOTTOM_NEAR_DEG", "6.0"))
 LOCKOUT_DIST_MIN    = float(os.getenv("LOCKOUT_DIST_MIN","0.36"))
 LOCKOUT_NEAR_RELAX  = float(os.getenv("LOCKOUT_NEAR_RELAX","0.02"))
@@ -255,14 +256,14 @@ def run_pullup_analysis(video_path,
     onbar=False; onbar_streak=0; offbar_streak=0; prev_torso_cx=None
     offbar_frames_since_any_rep=0; nopose_frames_since_any_rep=0
 
-    # Feedback/session state
+    # Feedback state
     session_feedback=set()
     rt_fb_msg=None; rt_fb_hold=0
     swing_streak=0; swing_already_reported=False
     bottom_already_reported=False
     bottom_phase_max_elbow=None
     bottom_fail_count=0
-    bottom_lockout_max=None  # max normalized (shoulder↔wrist)/torso per cycle
+    bottom_lockout_max=None
 
     # Per-cycle tips
     cycle_tip_higher=False; cycle_tip_swing=False; cycle_tip_bottom=False
@@ -273,15 +274,17 @@ def run_pullup_analysis(video_path,
 
     REARM_DESCENT_EFF=max(RESET_DESCENT*0.60, 0.012)
 
-    # Face-vs-bar (feedback only)
+    # Face-vs-bar
     bar_y_ema=None
     cycle_face_pass=False
     cycle_face_near=False
     face_pass_q = deque(maxlen=FACE_PASS_WIN)
     face_near_q = deque(maxlen=FACE_NEAR_WIN)
+    face_check_counter = 0  # 🔧 FIX: throttle face checks
 
-    # Micro-burst counter
+    # 🔧 FIX: Micro-burst counter (disabled by default)
     burst_cntr=0
+    processed_frame_count = 0  # Count actual processed frames
 
     with mp_pose.Pose(model_complexity=model_complexity, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while True:
@@ -289,12 +292,15 @@ def run_pullup_analysis(video_path,
             if not ret: break
             frame_idx += 1
 
-            # process frame now? (burst or stride)
+            # 🔧 FIX: Simplified frame processing logic
             process_now = (burst_cntr > 0) or (frame_idx % max(1, frame_skip) == 0)
             if not process_now:
                 continue
+            
             if burst_cntr > 0:
                 burst_cntr -= 1
+            
+            processed_frame_count += 1
 
             if scale != 1.0:
                 frame=cv2.resize(frame,(0,0),fx=scale,fy=scale)
@@ -347,14 +353,10 @@ def run_pullup_analysis(video_path,
             else:
                 offbar_streak+=1; onbar_streak=0
 
-            if DEBUG_ONBAR and frame_idx % 10 == 0:
-                print(f"[DBG] f={frame_idx} onbar={onbar} vis={min_vis:.2f} lwAbove={lw_above} rwAbove={rw_above} torsoDx={torso_dx_norm:.4f}")
-
-            # ---- Enter onbar
+            # Enter onbar
             if (not onbar) and onbar_streak>=ONBAR_MIN_FRAMES:
                 onbar=True
                 asc_base_head=None; allow_new_peak=True; swing_streak=0
-                # reset cycle
                 cycle_peak_ascent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
                 cycle_tip_higher=False; cycle_tip_swing=False; cycle_tip_bottom=False
                 cycle_face_pass=False; cycle_face_near=False
@@ -362,16 +364,10 @@ def run_pullup_analysis(video_path,
                 bottom_phase_max_elbow=None
                 bottom_lockout_max=None
 
-            # ---- Exit onbar → post-hoc
+            # 🔧 FIX: Simplified exit logic (removed duplicate bottom check)
             if onbar and offbar_streak>=OFFBAR_MIN_FRAMES:
-                # evaluate bottom extension with dual signal
-                elbow_ok   = (bottom_phase_max_elbow is not None) and (bottom_phase_max_elbow >= BOTTOM_EXT_MIN_ANGLE)
-                elbow_near = (bottom_phase_max_elbow is not None) and (bottom_phase_max_elbow >= (BOTTOM_EXT_MIN_ANGLE - BOTTOM_NEAR_DEG))
-                lock_ok    = (bottom_lockout_max is not None) and (bottom_lockout_max >= LOCKOUT_DIST_MIN)
-                lock_near  = (bottom_lockout_max is not None) and (bottom_lockout_max >= (LOCKOUT_DIST_MIN - LOCKOUT_NEAR_RELAX))
-                extended   = elbow_ok or lock_ok
-                near_enough= elbow_near or lock_near
-                if not extended and not near_enough:
+                # Single bottom extension check
+                if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
                     cycle_tip_bottom = True
                     bottom_fail_count += 1
                     if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS and not bottom_already_reported:
@@ -403,16 +399,18 @@ def run_pullup_analysis(video_path,
             head_vel=0.0 if head_prev is None else (head_y-head_prev)
             cur_rt=None
 
-            # Micro-burst trigger near inflection (bottom/top)
-            if onbar and (asc_base_head is not None):
+            # 🔧 FIX: Micro-burst only if enabled
+            if BURST_ENABLED and onbar and (asc_base_head is not None):
                 near_inflect = (abs(head_vel) <= INFLECT_VEL_THR)
                 sign_flip = (head_vel_prev is not None) and ((head_vel_prev > 0 and head_vel <= 0) or (head_vel_prev < 0 and head_vel >= 0))
                 if near_inflect or sign_flip:
-                    burst_cntr = max(burst_cntr, BURST_FRAMES)
+                    # Only set burst if not already in burst mode
+                    if burst_cntr == 0:
+                        burst_cntr = BURST_FRAMES
             head_vel_prev = head_vel
 
             if onbar and vis_strict_ok:
-                # ---- REP COUNTING (original logic) ----
+                # REP COUNTING
                 if asc_base_head is None:
                     if head_vel<-abs(HEAD_VEL_UP_TINY):
                         asc_base_head=head_y
@@ -423,12 +421,12 @@ def run_pullup_analysis(video_path,
                     cycle_peak_ascent=max(cycle_peak_ascent,(asc_base_head-head_y))
                     cycle_min_elbow=min(cycle_min_elbow,elbow_angle)
 
-                    # track bottom phase metrics
+                    # Track bottom metrics
                     max_elb_now = max(raw_elbow_L, raw_elbow_R)
                     if bottom_phase_max_elbow is None: bottom_phase_max_elbow = max_elb_now
                     else: bottom_phase_max_elbow = max(bottom_phase_max_elbow, max_elb_now)
 
-                    # normalized shoulder↔wrist (lockout)
+                    # Lockout distance
                     mid_sh = ((lms[LSH].x + lms[RSH].x)/2.0, (lms[LSH].y + lms[RSH].y)/2.0)
                     mid_hp = ((lms[LH].x + lms[RH].x)/2.0, (lms[LH].y + lms[RH].y)/2.0)
                     torso_len = _dist_xy(mid_sh, mid_hp) + 1e-6
@@ -441,14 +439,8 @@ def run_pullup_analysis(video_path,
                     reset_by_desc=(asc_base_head is not None) and ((head_y-asc_base_head)>=RESET_DESCENT)
                     reset_by_elb =(elbow_angle>=RESET_ELBOW)
                     if reset_by_desc or reset_by_elb:
-                        # evaluate bottom at cycle end (dual signal)
-                        elbow_ok   = (bottom_phase_max_elbow is not None) and (bottom_phase_max_elbow >= BOTTOM_EXT_MIN_ANGLE)
-                        elbow_near = (bottom_phase_max_elbow is not None) and (bottom_phase_max_elbow >= (BOTTOM_EXT_MIN_ANGLE - BOTTOM_NEAR_DEG))
-                        lock_ok    = (bottom_lockout_max is not None) and (bottom_lockout_max >= LOCKOUT_DIST_MIN)
-                        lock_near  = (bottom_lockout_max is not None) and (bottom_lockout_max >= (LOCKOUT_DIST_MIN - LOCKOUT_NEAR_RELAX))
-                        extended   = elbow_ok or lock_ok
-                        near_enough= elbow_near or lock_near
-                        if not extended and not near_enough:
+                        # Check bottom extension
+                        if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
                             cycle_tip_bottom = True
                             bottom_fail_count += 1
                             if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS and not bottom_already_reported:
@@ -465,7 +457,6 @@ def run_pullup_analysis(video_path,
                             if rep_has_tip: bad_reps+=1
                             else: good_reps+=1
 
-                        # reset for next cycle
                         asc_base_head=head_y
                         cycle_peak_ascent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
                         allow_new_peak=True
@@ -491,62 +482,61 @@ def run_pullup_analysis(video_path,
                     if rep_has_tip: bad_reps+=1
                     else: good_reps+=1
                     last_peak_frame=frame_idx; allow_new_peak=False; counted_this_cycle=True
-                    # start measuring bottom phase after top
                     bottom_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
-                    # lockout continues to update via per-frame logic
 
                 if (allow_new_peak is False) and (last_peak_frame>0):
                     if head_prev is not None and (head_y - head_prev) > 0 and (asc_base_head is not None):
                         if (head_y - (asc_base_head - cycle_peak_ascent)) >= REARM_DESCENT_EFF:
                             allow_new_peak=True
 
-                # ---- FEEDBACK ONLY: face vs bar (softened) ----
-                cur_bar_y = min(lms[LW].y, lms[RW].y)
-                bar_y_ema = cur_bar_y if bar_y_ema is None else (BAR_EMA_ALPHA*cur_bar_y + (1 - BAR_EMA_ALPHA)*bar_y_ema)
-                bar_y_eff = bar_y_ema if bar_y_ema is not None else cur_bar_y
+                # 🔧 FIX: Throttled face detection (check every N frames)
+                face_check_counter += 1
+                if face_check_counter >= FACE_CHECK_INTERVAL:
+                    face_check_counter = 0
+                    
+                    # Bar position
+                    cur_bar_y = min(lms[LW].y, lms[RW].y)
+                    bar_y_ema = cur_bar_y if bar_y_ema is None else (BAR_EMA_ALPHA*cur_bar_y + (1 - BAR_EMA_ALPHA)*bar_y_ema)
+                    bar_y_eff = bar_y_ema if bar_y_ema is not None else cur_bar_y
 
-                mouth_ok = (lms[MOUTH_L].visibility>=MOUTH_VIS_THR and lms[MOUTH_R].visibility>=MOUTH_VIS_THR)
-                eyes_ok  = (lms[LEFT_EYE].visibility>=EYE_VIS_THR and lms[RIGHT_EYE].visibility>=EYE_VIS_THR)
-                mouth_y = (lms[MOUTH_L].y + lms[MOUTH_R].y)*0.5 if mouth_ok else None
-                eye_min_y = min(lms[LEFT_EYE].y, lms[RIGHT_EYE].y) if eyes_ok else None
+                    mouth_ok = (lms[MOUTH_L].visibility>=MOUTH_VIS_THR and lms[MOUTH_R].visibility>=MOUTH_VIS_THR)
+                    eyes_ok  = (lms[LEFT_EYE].visibility>=EYE_VIS_THR and lms[RIGHT_EYE].visibility>=EYE_VIS_THR)
+                    mouth_y = (lms[MOUTH_L].y + lms[MOUTH_R].y)*0.5 if mouth_ok else None
+                    eye_min_y = min(lms[LEFT_EYE].y, lms[RIGHT_EYE].y) if eyes_ok else None
 
-                eye_margin = max(EYE_BAR_MARGIN, CHIN_BAR_MARGIN + 0.002)
-                passed_by_chin = (mouth_y is not None) and (mouth_y <= bar_y_eff + CHIN_BAR_MARGIN)
-                passed_by_eyes = (mouth_y is None) and (eye_min_y is not None) and (eye_min_y <= bar_y_eff - eye_margin)
-                near_by_chin  = (mouth_y is not None) and (mouth_y <= bar_y_eff + (CHIN_BAR_MARGIN + CHIN_NEAR_EXTRA))
-                near_by_eyes  = (mouth_y is None) and (eye_min_y is not None) and (eye_min_y <= bar_y_eff - max(0.001, eye_margin - EYE_NEAR_RELAX))
+                    eye_margin = max(EYE_BAR_MARGIN, CHIN_BAR_MARGIN + 0.002)
+                    passed_by_chin = (mouth_y is not None) and (mouth_y <= bar_y_eff + CHIN_BAR_MARGIN)
+                    passed_by_eyes = (mouth_y is None) and (eye_min_y is not None) and (eye_min_y <= bar_y_eff - eye_margin)
+                    near_by_chin  = (mouth_y is not None) and (mouth_y <= bar_y_eff + (CHIN_BAR_MARGIN + CHIN_NEAR_EXTRA))
+                    near_by_eyes  = (mouth_y is None) and (eye_min_y is not None) and (eye_min_y <= bar_y_eff - max(0.001, eye_margin - EYE_NEAR_RELAX))
 
-                face_pass_q.append(passed_by_chin or passed_by_eyes)
-                face_near_q.append(near_by_chin or near_by_eyes)
-                pass_hits = sum(face_pass_q)
-                near_hits = sum(face_near_q)
-                if pass_hits >= FACE_PASS_WIN:
-                    cycle_face_pass = True
-                if near_hits >= FACE_NEAR_WIN:
-                    cycle_face_near = True
+                    face_pass_q.append(passed_by_chin or passed_by_eyes)
+                    face_near_q.append(near_by_chin or near_by_eyes)
+                    pass_hits = sum(face_pass_q)
+                    near_hits = sum(face_near_q)
+                    if pass_hits >= FACE_PASS_WIN:
+                        cycle_face_pass = True
+                    if near_hits >= FACE_NEAR_WIN:
+                        cycle_face_near = True
 
-                # softened "go higher" condition – only near peak + persistent miss
-                near_peak = (
-                    asc_base_head is not None and
-                    ascent_amt >= HEAD_MIN_ASCENT * 0.85
-                )
-
-                if near_peak and (head_vel < -abs(HEAD_VEL_UP_TINY)) and allow_new_peak:
-                    face_failed = (
-                        len(face_near_q) >= FACE_NEAR_WIN
-                        and (not cycle_face_pass)
-                        and (not cycle_face_near)
+                    # Height cue
+                    near_peak = (
+                        asc_base_head is not None and
+                        ascent_amt >= HEAD_MIN_ASCENT * 0.85
                     )
 
-                    if face_failed and not cycle_tip_higher:
-                        cycle_tip_higher = True
-                        session_feedback.add(FB_CUE_HIGHER)
-                        cur_rt = FB_CUE_HIGHER
+                    if near_peak and (head_vel < -abs(HEAD_VEL_UP_TINY)) and allow_new_peak:
+                        face_failed = (
+                            len(face_near_q) >= FACE_NEAR_WIN
+                            and (not cycle_face_pass)
+                            and (not cycle_face_near)
+                        )
 
-                    # 🔒 למנוע טריגר חוזר
-                    allow_new_peak = False
-
-
+                        if face_failed and not cycle_tip_higher:
+                            cycle_tip_higher = True
+                            session_feedback.add(FB_CUE_HIGHER)
+                            cur_rt = FB_CUE_HIGHER
+                            allow_new_peak = False
 
                 # Swing cue
                 if torso_dx_norm>SWING_THR: swing_streak+=1
@@ -558,7 +548,7 @@ def run_pullup_analysis(video_path,
                 asc_base_head=None; allow_new_peak=True
                 swing_streak=0
 
-            # RT hold for overlay
+            # RT feedback hold
             if cur_rt:
                 if cur_rt!=rt_fb_msg: rt_fb_msg=cur_rt; rt_fb_hold=RT_FB_HOLD_FRAMES
                 else: rt_fb_hold=max(rt_fb_hold,RT_FB_HOLD_FRAMES)
@@ -573,16 +563,9 @@ def run_pullup_analysis(video_path,
 
             if head_y is not None: head_prev=head_y
 
-    # ===== EOF post-hoc (original) =====
+    # EOF post-hoc
     if onbar and (not counted_this_cycle) and (cycle_peak_ascent>=HEAD_MIN_ASCENT) and (cycle_min_elbow<=ELBOW_TOP_ANGLE):
-        # bottom tip at end (dual signal)
-        elbow_ok   = (bottom_phase_max_elbow is not None) and (bottom_phase_max_elbow >= BOTTOM_EXT_MIN_ANGLE)
-        elbow_near = (bottom_phase_max_elbow is not None) and (bottom_phase_max_elbow >= (BOTTOM_EXT_MIN_ANGLE - BOTTOM_NEAR_DEG))
-        lock_ok    = (bottom_lockout_max is not None) and (bottom_lockout_max >= LOCKOUT_DIST_MIN)
-        lock_near  = (bottom_lockout_max is not None) and (bottom_lockout_max >= (LOCKOUT_DIST_MIN - LOCKOUT_NEAR_RELAX))
-        extended   = elbow_ok or lock_ok
-        near_enough= elbow_near or lock_near
-        if not extended and not near_enough:
+        if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
             cycle_tip_bottom = True
             bottom_fail_count += 1
             if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS and not bottom_already_reported:
@@ -602,7 +585,7 @@ def run_pullup_analysis(video_path,
     if return_video and out: out.release()
     cv2.destroyAllWindows()
 
-    # ===== Session Technique Score =====
+    # Session score
     if rep_count==0:
         technique_score=0.0
     elif all_scores:
@@ -615,10 +598,10 @@ def run_pullup_analysis(video_path,
             penalty = 0.0
         technique_score=_half_floor10(max(0.0,10.0-penalty))
 
-    # ===== Build feedback list (all cues) & form_tip (single) =====
+    # Build feedback
     all_fb = set(session_feedback) if session_feedback else set()
     FEEDBACK_ORDER = FORM_TIP_PRIORITY
-    fb_list = [cue for cue in FEEDBACK_ORDER if cue in all_fb]  # ordered, unique
+    fb_list = [cue for cue in FEEDBACK_ORDER if cue in all_fb]
     if not fb_list and rep_count > 0 and bad_reps == 0:
         fb_list = ["Great form! Keep it up 💪"]
 
@@ -639,7 +622,7 @@ def run_pullup_analysis(video_path,
     except Exception:
         pass
 
-    # Encode (if needed)
+    # Encode
     final_path=""
     if return_video and os.path.exists(output_path):
         encoded_path=output_path.replace(".mp4","_encoded.mp4")
@@ -661,7 +644,7 @@ def run_pullup_analysis(video_path,
         "technique_label": score_label(technique_score),
         "good_reps": int(good_reps),
         "bad_reps": int(bad_reps),
-        "feedback": fb_list,            # ALL cues that occurred (might be empty)
+        "feedback": fb_list,
         "tips": [],
         "reps": rep_reports,
         "video_path": final_path if return_video else "",
@@ -672,9 +655,18 @@ def run_pullup_analysis(video_path,
 
     return result
 
-# ---------- helpers ----------
+# Helper for bottom extension check
+def _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
+    """Returns True if bottom extension FAILED (needs tip)"""
+    elbow_ok   = (bottom_phase_max_elbow is not None) and (bottom_phase_max_elbow >= BOTTOM_EXT_MIN_ANGLE)
+    elbow_near = (bottom_phase_max_elbow is not None) and (bottom_phase_max_elbow >= (BOTTOM_EXT_MIN_ANGLE - BOTTOM_NEAR_DEG))
+    lock_ok    = (bottom_lockout_max is not None) and (bottom_lockout_max >= LOCKOUT_DIST_MIN)
+    lock_near  = (bottom_lockout_max is not None) and (bottom_lockout_max >= (LOCKOUT_DIST_MIN - LOCKOUT_NEAR_RELAX))
+    extended   = elbow_ok or lock_ok
+    near_enough= elbow_near or lock_near
+    return not (extended or near_enough)
+
 def _count_rep(rep_reports, rep_count, _rep_penalty_unused, top_elbow, ascent_from, peak_head_y, all_scores, rep_has_tip):
-    # Per-rep score: 10.0 if no tip in that cycle; otherwise 9.5
     rep_score = 10.0 if not rep_has_tip else 9.5
     all_scores.append(rep_score)
     rep_reports.append({
