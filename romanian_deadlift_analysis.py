@@ -81,6 +81,16 @@ def merge_feedback(global_best, new_list):
         return cand
     return cand if FB_SEVERITY.get(cand,1) >= FB_SEVERITY.get(global_best,1) else global_best
 
+def dedupe_feedback(feedback_list):
+    seen = set()
+    unique = []
+    for fb in feedback_list or []:
+        if fb in seen:
+            continue
+        seen.add(fb)
+        unique.append(fb)
+    return unique
+
 # ===================== SCORE DISPLAY =====================
 def score_label(s):
     s = float(s)
@@ -419,7 +429,7 @@ def run_romanian_deadlift_analysis(video_path,
     if session_feedbacks and len(session_feedbacks) > 0:
         technique_score = min(technique_score, 9.5)
 
-    feedback_list = session_feedbacks if session_feedbacks else ["Great form! Keep it up 💪"]
+    feedback_list = dedupe_feedback(session_feedbacks) if session_feedbacks else ["Great form! Keep it up 💪"]
 
     session_tip = None
     if session_feedback_by_cat:
