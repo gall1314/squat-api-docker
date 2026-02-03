@@ -18,18 +18,18 @@ WORKDIR /app
 # רצוי לשדרג pip וכלי build
 RUN python -m pip install --upgrade pip setuptools wheel
 
+# הגדרות להתמודדות עם בעיות רשת PyPI
+ENV PIP_DEFAULT_TIMEOUT=100
+ENV PIP_RETRIES=10
+
 # התקנת דרישות
 COPY requirements.txt requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --timeout 100 --retries 10 -r requirements.txt
 
 # קוד האפליקציה
 COPY . .
 
-# אם אתה משתמש בפונט מקומי בקוד – ודא שקובץ ה‑TTF נמצא ברפו. (או התקן חבילת פונטים מערכתית)
-
-# ה־API מאזין על 8080 (ודא שב-app.py אתה קורא PORT מהסביבה או ברירת מחדל 8080)
+# ה-API מאזין על 8080
 EXPOSE 8080
 
 CMD ["python", "app.py"]
-
-
