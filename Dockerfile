@@ -26,8 +26,8 @@ ENV PIP_RETRIES=5
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 ENV PIP_PROGRESS_BAR=off
 ENV PIP_INDEX_URL=https://pypi.org/simple
-ENV PIP_EXTRA_INDEX_URL=https://pypi.python.org/simple
-ENV PIP_TRUSTED_HOST="pypi.org files.pythonhosted.org"
+ENV PIP_EXTRA_INDEX_URL="https://pypi.python.org/simple https://pypi.tuna.tsinghua.edu.cn/simple"
+ENV PIP_TRUSTED_HOST="pypi.org files.pythonhosted.org pypi.tuna.tsinghua.edu.cn"
 
 # התקנת דרישות
 COPY requirements.txt requirements.txt
@@ -35,8 +35,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir --timeout 30 --retries 5 --prefer-binary \
     --index-url https://pypi.org/simple \
     --extra-index-url https://pypi.python.org/simple \
+    --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
     --trusted-host pypi.org \
     --trusted-host files.pythonhosted.org \
+    --trusted-host pypi.tuna.tsinghua.edu.cn \
     -r requirements.txt
 
 # קוד האפליקציה
