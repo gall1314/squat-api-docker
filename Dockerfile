@@ -22,7 +22,7 @@ RUN python -m pip install --upgrade pip setuptools wheel
 ENV PIP_DEFAULT_TIMEOUT=100
 ENV PIP_RETRIES=20
 ENV PIP_INDEX_URL=https://pypi.org/simple
-ENV PIP_TRUSTED_HOST=pypi.org files.pythonhosted.org
+ENV PIP_TRUSTED_HOST="pypi.org files.pythonhosted.org"
 
 # התקנת דרישות
 COPY requirements.txt requirements.txt
