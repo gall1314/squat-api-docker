@@ -2,7 +2,7 @@ app = "squat-api-docker"
 primary_region = "fra"
 
 [build]
-  builder = "paketobuildpacks/builder:base"
+  dockerfile = "Dockerfile"
 
 [http_service]
   internal_port = 8080
