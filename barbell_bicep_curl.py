@@ -223,7 +223,11 @@ def run_barbell_bicep_curl_analysis(video_path,
                                     frame_skip=3,     # זהה לסקוואט
                                     scale=0.4,        # זהה לסקוואט
                                     output_path="barbell_curl_analyzed.mp4",
-                                    feedback_path="barbell_curl_feedback.txt"):
+                                    feedback_path="barbell_curl_feedback.txt",
+                                    return_video=True,
+                                    fast_mode=None):
+    if fast_mode is True:
+        return_video = False
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {
@@ -284,7 +288,7 @@ def run_barbell_bicep_curl_analysis(video_path,
             if scale != 1.0: frame = cv2.resize(frame, (0,0), fx=scale, fy=scale)
 
             h, w = frame.shape[:2]
-            if out is None:
+            if return_video and out is None:
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
 
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -294,8 +298,10 @@ def run_barbell_bicep_curl_analysis(video_path,
             if not results.pose_landmarks:
                 depth_live = 0.0
                 if rt_fb_hold > 0: rt_fb_hold -= 1
-                frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
-                out.write(frame); continue
+                if return_video and out is not None:
+                    frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
+                    out.write(frame)
+                continue
 
             lm = results.pose_landmarks.landmark
             R = mp_pose.PoseLandmark
@@ -338,8 +344,10 @@ def run_barbell_bicep_curl_analysis(video_path,
             if not angles:
                 if rt_fb_hold > 0: rt_fb_hold -= 1
                 depth_live = 0.0
-                frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
-                out.write(frame); continue
+                if return_video and out is not None:
+                    frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
+                    out.write(frame)
+                continue
             elbow_angle = float(np.mean(angles))
 
             # EMA ליישור תחתית (כמו סקוואט — מתעדכן רק כשהיד כמעט ישרה ושקט תנועתי)
@@ -472,12 +480,13 @@ def run_barbell_bicep_curl_analysis(video_path,
                     rt_fb_hold = 0
 
             # ציור שלד גוף בלבד + Overlay זהה
-            frame = draw_body_only(frame, lm)
-            frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
-            out.write(frame)
+            if return_video and out is not None:
+                frame = draw_body_only(frame, lm)
+                frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
+                out.write(frame)
 
     cap.release()
-    if out: out.release()
+    if return_video and out: out.release()
     cv2.destroyAllWindows()
 
     # ציון סופי והחזרה
@@ -497,18 +506,20 @@ def run_barbell_bicep_curl_analysis(video_path,
         pass
 
     # קידוד faststart (כמו בסקוואט)
-    encoded_path = output_path.replace(".mp4", "_encoded.mp4")
-    try:
-        subprocess.run([
-            "ffmpeg", "-y", "-i", output_path,
-            "-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart", "-pix_fmt", "yuv420p",
-            encoded_path
-        ], check=False)
-        if os.path.exists(output_path) and os.path.exists(encoded_path):
-            os.remove(output_path)
-    except Exception:
-        pass
-    final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
+    final_video_path = ""
+    if return_video and output_path:
+        encoded_path = output_path.replace(".mp4", "_encoded.mp4")
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", output_path,
+                "-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart", "-pix_fmt", "yuv420p",
+                encoded_path
+            ], check=False)
+            if os.path.exists(output_path) and os.path.exists(encoded_path):
+                os.remove(output_path)
+        except Exception:
+            pass
+        final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
 
     return {
         "squat_count": counter,  # נשמר לשמירה על תאימות UI קיימת
