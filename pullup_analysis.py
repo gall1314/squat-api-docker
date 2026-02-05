@@ -24,14 +24,16 @@ except Exception:
     mp_pose=None
 
 # Reused fast-mode Pose (avoids per-request graph/delegate creation)
-_FAST_POSE = None
+# Initialized once at module load so fast requests don't pay graph init/download cost.
+if mp_pose is not None:
+    try:
+        _FAST_POSE = mp_pose.Pose(model_complexity=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    except Exception:
+        _FAST_POSE = None
+else:
+    _FAST_POSE = None
 
 def _get_fast_pose():
-    global _FAST_POSE
-    if mp_pose is None:
-        return None
-    if _FAST_POSE is None:
-        _FAST_POSE = mp_pose.Pose(model_complexity=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
     return _FAST_POSE
 
 # ============ Helpers ============
