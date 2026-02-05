@@ -230,13 +230,21 @@ def run_pullup_analysis(video_path,
     
     if fast_path:
         return_video = False  # Never produce video in fast path
-    
-    # Model complexity
-    model_complexity = 1
+
+    # Speed profile: fast path behaves like squat fast mode (fewer frames + lighter model)
+    if fast_path:
+        effective_frame_skip = max(1, frame_skip * 2)
+        effective_scale = scale * 0.85
+        model_complexity = 0
+        print(f"[FAST MODE][pullup] frame_skip={effective_frame_skip} (2x), scale={effective_scale:.2f}, model=lite", flush=True)
+    else:
+        effective_frame_skip = frame_skip
+        effective_scale = scale
+        model_complexity = 1
 
     # Encoding params (only relevant for slow path)
     if preserve_quality:
-        scale=1.0; frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
+        effective_scale=1.0; effective_frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
     else:
         encode_crf=23 if encode_crf is None else encode_crf
 
@@ -244,7 +252,7 @@ def run_pullup_analysis(video_path,
     if not cap.isOpened(): return _ret_err("Could not open video", feedback_path)
 
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
-    effective_fps=max(1.0, fps_in/max(1,frame_skip))
+    effective_fps=max(1.0, fps_in/max(1,effective_frame_skip))
     sec_to_frames=lambda s: max(1,int(s*effective_fps))
     frames_to_sec=lambda f: float(f)/effective_fps
 
@@ -323,7 +331,7 @@ def run_pullup_analysis(video_path,
             if not ret: break
             frame_idx += 1
 
-            process_now = (burst_cntr > 0) or (frame_idx % max(1, frame_skip) == 0)
+            process_now = (burst_cntr > 0) or (frame_idx % max(1, effective_frame_skip) == 0)
             if not process_now:
                 continue
             
@@ -333,8 +341,8 @@ def run_pullup_analysis(video_path,
             processed_frame_count += 1
 
             # Resize frame (for both paths, affects pose detection)
-            if scale != 1.0:
-                frame=cv2.resize(frame,(0,0),fx=scale,fy=scale)
+            if effective_scale != 1.0:
+                frame=cv2.resize(frame,(0,0),fx=effective_scale,fy=effective_scale)
             h,w=frame.shape[:2]
 
             # Initialize video writer (SLOW PATH ONLY)

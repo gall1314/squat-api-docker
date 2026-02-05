@@ -3,7 +3,7 @@
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-import os, uuid, shutil, inspect, importlib, sys, traceback, time
+import os, uuid, shutil, inspect, importlib, importlib.util, sys, traceback, time
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import BadRequest, ClientDisconnected
 
@@ -118,6 +118,11 @@ def load_func_soft(module_name, *func_names):
     Import module and return the first existing attribute from func_names.
     If module/function missing — returns a stub that yields a clear JSON error instead of crashing.
     """
+    # Avoid noisy import traceback for analyzers that are not shipped in this build.
+    if importlib.util.find_spec(module_name) is None:
+        print(f"[loader] SKIP missing optional module {module_name}", file=sys.stderr, flush=True)
+        return _missing_stub(module_name, func_names)
+
     try:
         mod = importlib.import_module(module_name)
     except Exception as e:
@@ -288,10 +293,14 @@ def analyze():
             form = request.form
             files = request.files
         except (ClientDisconnected, BadRequest) as e:
+            content_length = request.content_length
             print(f"[MP] request parsing failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            print(f"[MP] client likely disconnected while upload was in-flight (content_length={content_length})",
+                  file=sys.stderr, flush=True)
             return jsonify({
                 "error": "client_disconnected",
-                "detail": "Upload interrupted before the multipart payload was fully received"
+                "detail": "Upload interrupted before the multipart payload was fully received",
+                "content_length": content_length
             }), 400
 
         video_file = files.get('video')
