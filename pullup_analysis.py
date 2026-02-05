@@ -23,6 +23,17 @@ try:
 except Exception:
     mp_pose=None
 
+# Reused fast-mode Pose (avoids per-request graph/delegate creation)
+_FAST_POSE = None
+
+def _get_fast_pose():
+    global _FAST_POSE
+    if mp_pose is None:
+        return None
+    if _FAST_POSE is None:
+        _FAST_POSE = mp_pose.Pose(model_complexity=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+    return _FAST_POSE
+
 # ============ Helpers ============
 def _ang(a,b,c):
     ba=np.array([a[0]-b[0],a[1]-b[1]]); bc=np.array([c[0]-b[0],c[1]-b[1]])
@@ -321,7 +332,15 @@ def run_pullup_analysis(video_path,
     burst_cntr=0
     processed_frame_count = 0
 
-    with mp_pose.Pose(model_complexity=model_complexity, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    pose = _get_fast_pose() if fast_path else mp_pose.Pose(
+        model_complexity=model_complexity,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    if pose is None:
+        return _ret_err("Mediapipe not available", feedback_path)
+
+    try:
         while True:
             ret, frame = cap.read()
             if not ret: break
@@ -633,24 +652,29 @@ def run_pullup_analysis(video_path,
                 out.write(frame)
 
             if head_y is not None: head_prev=head_y
-
-    # EOF post-hoc
-    if onbar and (not counted_this_cycle) and (cycle_peak_ascent>=HEAD_MIN_ASCENT) and (cycle_min_elbow<=ELBOW_TOP_ANGLE):
-        if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
-            cycle_tip_bottom = True
-            bottom_fail_count += 1
-            if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS and not bottom_already_reported:
-                session_feedback.add(FB_CUE_BOTTOM)
-                bottom_already_reported = True
-
-        rep_has_tip = cycle_tip_higher or cycle_tip_swing or cycle_tip_bottom
-        _count_rep(rep_reports,rep_count,0.0,cycle_min_elbow,
-                   asc_base_head if asc_base_head is not None else (baseline_head_y_global or 0.0),
-                   (baseline_head_y_global - cycle_peak_ascent) if baseline_head_y_global is not None else (baseline_head_y_global or 0.0),
-                   all_scores, rep_has_tip)
-        rep_count+=1
-        if rep_has_tip: bad_reps+=1
-        else: good_reps+=1
+    
+        # EOF post-hoc
+        if onbar and (not counted_this_cycle) and (cycle_peak_ascent>=HEAD_MIN_ASCENT) and (cycle_min_elbow<=ELBOW_TOP_ANGLE):
+            if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
+                cycle_tip_bottom = True
+                bottom_fail_count += 1
+                if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS and not bottom_already_reported:
+                    session_feedback.add(FB_CUE_BOTTOM)
+                    bottom_already_reported = True
+    
+            rep_has_tip = cycle_tip_higher or cycle_tip_swing or cycle_tip_bottom
+            _count_rep(rep_reports,rep_count,0.0,cycle_min_elbow,
+                       asc_base_head if asc_base_head is not None else (baseline_head_y_global or 0.0),
+                       (baseline_head_y_global - cycle_peak_ascent) if baseline_head_y_global is not None else (baseline_head_y_global or 0.0),
+                       all_scores, rep_has_tip)
+            rep_count+=1
+            if rep_has_tip: bad_reps+=1
+            else: good_reps+=1
+    
+    finally:
+        # Fast mode keeps a shared Pose instance alive for reuse.
+        if not fast_path:
+            pose.close()
 
     cap.release()
     if slow_path and out: 
