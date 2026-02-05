@@ -5,6 +5,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import os, uuid, shutil, inspect, importlib, sys, traceback, time
 from werkzeug.utils import secure_filename
+from werkzeug.exceptions import BadRequest, ClientDisconnected
 
 app = Flask(__name__)
 CORS(app)
@@ -229,15 +230,25 @@ def analyze():
         if "multipart/form-data" not in ctype:
             return jsonify({"error": "Bad request", "detail": "Send video as multipart/form-data (field 'video') or raw video/mp4 with query params"}), 400
 
-        video_file = request.files.get('video')
+        try:
+            form = request.form
+            files = request.files
+        except (ClientDisconnected, BadRequest) as e:
+            print(f"[MP] request parsing failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            return jsonify({
+                "error": "client_disconnected",
+                "detail": "Upload interrupted before the multipart payload was fully received"
+            }), 400
+
+        video_file = files.get('video')
         if not video_file:
             print("NO 'video' FILE FIELD", file=sys.stderr, flush=True)
             return jsonify({"error": "No video uploaded", "detail": "form-data field name must be 'video'"}), 400
 
-        print("FORM KEYS:", list(request.form.keys()), file=sys.stderr, flush=True)
-        print("FILES KEYS:", list(request.files.keys()), file=sys.stderr, flush=True)
+        print("FORM KEYS:", list(form.keys()), file=sys.stderr, flush=True)
+        print("FILES KEYS:", list(files.keys()), file=sys.stderr, flush=True)
 
-        exercise_type = request.form.get('exercise_type')
+        exercise_type = form.get('exercise_type')
         if not exercise_type:
             return jsonify({"error": "Missing exercise_type"}), 400
 
@@ -246,7 +257,7 @@ def analyze():
         if not resolved_type:
             return jsonify({"error": f"Unsupported exercise type: {exercise_type}"}), 400
 
-        fast_flag = request.form.get('fast', 'false').lower() == 'true'
+        fast_flag = form.get('fast', 'false').lower() == 'true'
         print(f"[MP] Resolved: {resolved_type} | fast={fast_flag}", file=sys.stderr, flush=True)
 
         unique_id = str(uuid.uuid4())[:8]
