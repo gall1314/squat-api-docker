@@ -27,7 +27,7 @@ except Exception:
 # Initialized once at module load so fast requests don't pay graph init/download cost.
 if mp_pose is not None:
     try:
-        _FAST_POSE = mp_pose.Pose(model_complexity=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        _FAST_POSE = mp_pose.Pose(model_complexity=0, min_detection_confidence=0.5, min_tracking_confidence=0.5)
         # Warm up once so first fast request won't pay delegate/model lazy init cost.
         _FAST_POSE.process(np.zeros((64, 64, 3), dtype=np.uint8))
     except Exception:
@@ -249,9 +249,9 @@ def run_pullup_analysis(video_path,
     # Keep pull-up counting stable in fast mode: disable video only, keep cadence/model identical.
     effective_frame_skip = frame_skip
     effective_scale = scale
-    model_complexity = 1
+    model_complexity = 0 if fast_path else 1
     if fast_path:
-        print(f"[FAST MODE][pullup] stable-count profile: frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=full", flush=True)
+        print(f"[FAST MODE][pullup] stable-count profile: frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=lite", flush=True)
 
     # Encoding params (only relevant for slow path)
     if preserve_quality:
