@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# app.py — unified API (multipart + raw), optimized for performance
+# app.py — Fast/Slow dual-mode API
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -62,10 +62,13 @@ def _supports_arg(func, name: str) -> bool:
     except Exception:
         return False
 
-def _run_analyzer(func, src_path, out_video_path, *, frame_skip=3, scale=0.4, extra=None):
+def _run_analyzer(func, src_path, out_video_path, fast_mode: bool, *, frame_skip=3, scale=0.4, extra=None):
     """
-    מריץ אנלייזר עם פרמטרים אופטימליים
-    תמיד מייצר וידאו מלא (אין פיצול)
+    מריץ אנלייזר עם תמיכה בשני מסלולים:
+      fast_mode=True  → רק JSON, ללא וידאו (10-15 שניות)
+      fast_mode=False → JSON + וידאו מנותח (60 שניות)
+    
+    ** חשוב: התוצאות (reps, scores, feedback) זהות בשני המצבים! **
     """
     extra = extra or {}
     kwargs = {}
@@ -76,12 +79,17 @@ def _run_analyzer(func, src_path, out_video_path, *, frame_skip=3, scale=0.4, ex
     if _supports_arg(func, "scale"): 
         kwargs["scale"] = scale
     
-    # תמיד לייצר וידאו מלא
-    if _supports_arg(func, "return_video"): 
-        kwargs["return_video"] = True
+    # מסלול מהיר vs איטי
+    if _supports_arg(func, "fast_mode"):
+        kwargs["fast_mode"] = fast_mode
+        print(f"[_run_analyzer] fast_mode={fast_mode}", file=sys.stderr, flush=True)
     
-    # output_path לשמירת הוידאו המנותח
-    if _supports_arg(func, "output_path") and out_video_path:
+    if _supports_arg(func, "return_video"):
+        kwargs["return_video"] = (not fast_mode)
+        print(f"[_run_analyzer] return_video={not fast_mode}", file=sys.stderr, flush=True)
+    
+    # output_path - רק במצב איטי (עם וידאו)
+    if not fast_mode and _supports_arg(func, "output_path") and out_video_path:
         kwargs["output_path"] = out_video_path
         print(f"[_run_analyzer] output_path={out_video_path}", file=sys.stderr, flush=True)
     
@@ -125,7 +133,7 @@ def load_func_soft(module_name, *func_names):
     print(f"[loader] {module_name}: none of {func_names} found", file=sys.stderr, flush=True)
     return _missing_stub(module_name, func_names)
 
-# ---- Resolve analyzers (לא מפיל אם חסר משהו) ----
+# ---- Resolve analyzers ----
 run_squat       = load_func_soft('squat_analysis', 'run_analysis', 'run_squat_analysis')
 run_deadlift    = load_func_soft('deadlift_analysis', 'run_deadlift_analysis', 'run_analysis')
 run_rdl         = load_func_soft('romanian_deadlift_analysis', 'run_romanian_deadlift_analysis', 'run_analysis')
@@ -140,62 +148,66 @@ run_pushup      = load_func_soft('pushup_analysis', 'run_pushup_analysis', 'run_
 
 # -------- Streaming saves --------
 def _save_upload_streaming(file_storage, dest_path, chunk_size=16*1024*1024):
-    """שמירה ישירה עם chunks גדולים יותר למהירות"""
+    """שמירה ישירה עם chunks גדולים"""
     with open(dest_path, "wb") as f:
         shutil.copyfileobj(file_storage.stream, f, length=chunk_size)
 
 def _save_raw_stream(raw_stream, dest_path, chunk_size=16*1024*1024):
-    """שמירה ישירה עם chunks גדולים יותר למהירות"""
+    """שמירה ישירה עם chunks גדולים"""
     with open(dest_path, "wb") as f:
         shutil.copyfileobj(raw_stream, f, length=chunk_size)
 
 # -------- Core analyze logic --------
-def _do_analyze(resolved_type, raw_video_path, analyzed_path):
+def _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_mode: bool):
     """
     מריץ ניתוח על הוידאו
-    תמיד מייצר וידאו מלא - אין פיצול!
+    
+    fast_mode=True:  רק JSON (10-15 שניות)
+    fast_mode=False: JSON + וידאו (60 שניות)
+    
+    ** התוצאות זהות בשני המצבים! **
     """
-    print(f"[_do_analyze] type={resolved_type}, raw={raw_video_path}, analyzed={analyzed_path}", 
+    print(f"[_do_analyze] type={resolved_type}, raw={raw_video_path}, analyzed={analyzed_path}, fast_mode={fast_mode}", 
           file=sys.stderr, flush=True)
     
-    # פרמטרים אופטימליים לביצועים
+    # פרמטרים אופטימליים
     frame_skip = 3
     scale = 0.4
     
     if resolved_type == 'squat':
-        return _run_analyzer(run_squat, raw_video_path, analyzed_path, 
+        return _run_analyzer(run_squat, raw_video_path, analyzed_path, fast_mode,
                            frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'deadlift':
-        return _run_analyzer(run_deadlift, raw_video_path, analyzed_path, 
+        return _run_analyzer(run_deadlift, raw_video_path, analyzed_path, fast_mode,
                            frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'romanian_deadlift':
-        return _run_analyzer(run_rdl, raw_video_path, analyzed_path, 
+        return _run_analyzer(run_rdl, raw_video_path, analyzed_path, fast_mode,
                            frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'bulgarian':
-        return _run_analyzer(run_bulgarian, raw_video_path, analyzed_path, 
+        return _run_analyzer(run_bulgarian, raw_video_path, analyzed_path, fast_mode,
                            frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'pullup':
-        return _run_analyzer(run_pullup, raw_video_path, analyzed_path, 
+        return _run_analyzer(run_pullup, raw_video_path, analyzed_path, fast_mode,
                            frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'bicep_curl':
-        return _run_analyzer(run_bicep_curl, raw_video_path, analyzed_path, 
+        return _run_analyzer(run_bicep_curl, raw_video_path, analyzed_path, fast_mode,
                            frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'bent_row':
-        result = _run_analyzer(run_bent_row, raw_video_path, analyzed_path, 
+        result = _run_analyzer(run_bent_row, raw_video_path, analyzed_path, fast_mode,
                              frame_skip=frame_skip, scale=scale, 
                              extra={"output_dir": MEDIA_DIR})
         return _standardize_video_path(result)
     elif resolved_type == 'good_morning':
-        return _run_analyzer(run_good_morning, raw_video_path, analyzed_path, 
+        return _run_analyzer(run_good_morning, raw_video_path, analyzed_path, fast_mode,
                            frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'dips':
-        return _run_analyzer(run_dips, raw_video_path, analyzed_path, 
+        return _run_analyzer(run_dips, raw_video_path, analyzed_path, fast_mode,
                            frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'overhead_press':
-        return _run_analyzer(run_overhead_press, raw_video_path, analyzed_path, 
+        return _run_analyzer(run_overhead_press, raw_video_path, analyzed_path, fast_mode,
                            frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'pushup':
-        return _run_analyzer(run_pushup, raw_video_path, analyzed_path, 
+        return _run_analyzer(run_pushup, raw_video_path, analyzed_path, fast_mode,
                            frame_skip=frame_skip, scale=scale)
     else:
         return {"error": f"Unhandled exercise type: {resolved_type}", "video_path": ""}
@@ -203,6 +215,19 @@ def _do_analyze(resolved_type, raw_video_path, analyzed_path):
 # -------- API --------
 @app.route('/analyze', methods=['POST'])
 def analyze():
+    """
+    POST /analyze
+    
+    Parameters:
+    - exercise_type: string (required) - סוג התרגיל
+    - fast: boolean (optional, default=true) - מצב מהיר או מלא
+      * fast=true:  רק JSON, ללא וידאו (10-15 שניות)
+      * fast=false: JSON + וידאו מנותח (60 שניות)
+    
+    Returns:
+    - result: object - תוצאות הניתוח (reps, scores, feedback)
+    - video_url: string|null - URL לוידאו מנותח (רק אם fast=false)
+    """
     t0 = time.time()
     try:
         print("==== POST RECEIVED ====", file=sys.stderr, flush=True)
@@ -219,7 +244,10 @@ def analyze():
             if not resolved_type:
                 return jsonify({"error": f"Unsupported exercise type: {exercise_type}"}), 400
 
-            print(f"[RAW] Resolved: {resolved_type}", file=sys.stderr, flush=True)
+            # fast mode - default true
+            fast_str = request.args.get('fast', 'true').lower()
+            fast_mode = (fast_str == 'true')
+            print(f"[RAW] Resolved: {resolved_type} | fast_mode={fast_mode}", file=sys.stderr, flush=True)
 
             unique_id = str(uuid.uuid4())[:8]
             base_filename = f"{resolved_type}_{unique_id}"
@@ -231,7 +259,7 @@ def analyze():
             t_save1 = time.time()
             print(f"[RAW] Saved in {(t_save1 - t_save0):.3f}s", file=sys.stderr, flush=True)
 
-            result = _do_analyze(resolved_type, raw_video_path, analyzed_path)
+            result = _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_mode)
             if not isinstance(result, dict):
                 result = {"error": "invalid_result", 
                          "detail": "Analyzer did not return a dict", 
@@ -242,7 +270,7 @@ def analyze():
             print(f"[RAW] result video_path={output_path}", file=sys.stderr, flush=True)
             
             full_url = None
-            if output_path:
+            if output_path and os.path.exists(output_path):
                 full_url = request.host_url.rstrip('/') + '/media/' + os.path.basename(output_path)
 
             print(f"[RAW] OK -> {full_url}", file=sys.stderr, flush=True)
@@ -286,7 +314,10 @@ def analyze():
         if not resolved_type:
             return jsonify({"error": f"Unsupported exercise type: {exercise_type}"}), 400
 
-        print(f"[MP] Resolved: {resolved_type}", file=sys.stderr, flush=True)
+        # fast mode - default true
+        fast_str = form.get('fast', 'true').lower()
+        fast_mode = (fast_str == 'true')
+        print(f"[MP] Resolved: {resolved_type} | fast_mode={fast_mode}", file=sys.stderr, flush=True)
 
         unique_id = str(uuid.uuid4())[:8]
         base_filename = f"{resolved_type}_{unique_id}"
@@ -301,7 +332,7 @@ def analyze():
         t_save1 = time.time()
         print(f"[MP] Saved in {(t_save1 - t_save0):.3f}s", file=sys.stderr, flush=True)
 
-        result = _do_analyze(resolved_type, raw_video_path, analyzed_path)
+        result = _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_mode)
         if not isinstance(result, dict):
             result = {"error": "invalid_result", 
                      "detail": "Analyzer did not return a dict", 
@@ -312,7 +343,7 @@ def analyze():
         print(f"[MP] result video_path={output_path}", file=sys.stderr, flush=True)
         
         full_url = None
-        if output_path:
+        if output_path and os.path.exists(output_path):
             full_url = request.host_url.rstrip('/') + '/media/' + os.path.basename(output_path)
 
         print(f"[MP] OK -> {full_url}", file=sys.stderr, flush=True)
