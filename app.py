@@ -239,8 +239,8 @@ def analyze():
         ctype = (request.content_type or "").lower()
         print(f"Content-Type: {ctype}", file=sys.stderr, flush=True)
 
-        # ---------- RAW upload path (video/mp4 in body) ----------
-        if ctype.startswith("video/"):
+        # ---------- RAW upload path (video/* or application/octet-stream in body) ----------
+        if ctype.startswith("video/") or ctype == "application/octet-stream":
             exercise_type = (request.args.get('exercise_type') or "").strip().lower()
             if not exercise_type:
                 return jsonify({"error": "Missing exercise_type (use query param)"}), 400
@@ -286,7 +286,7 @@ def analyze():
         if "multipart/form-data" not in ctype:
             return jsonify({
                 "error": "Bad request", 
-                "detail": "Send video as multipart/form-data (field 'video') or raw video/mp4 with query params"
+                "detail": "Send video as multipart/form-data (field 'video') or raw video body (Content-Type: video/* or application/octet-stream) with query params"
             }), 400
 
         try:
@@ -294,13 +294,16 @@ def analyze():
             files = request.files
         except (ClientDisconnected, BadRequest) as e:
             content_length = request.content_length
+            size_mb = round((content_length or 0) / (1024 * 1024), 2)
             print(f"[MP] request parsing failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
             print(f"[MP] client likely disconnected while upload was in-flight (content_length={content_length})",
                   file=sys.stderr, flush=True)
             return jsonify({
                 "error": "client_disconnected",
                 "detail": "Upload interrupted before the multipart payload was fully received",
-                "content_length": content_length
+                "content_length": content_length,
+                "size_mb": size_mb,
+                "hint": "Client/proxy timed out during upload. Retry on better network, send smaller/compressed video, or use raw video upload (Content-Type: video/mp4 with ?exercise_type=...&fast=true)."
             }), 400
 
         video_file = files.get('video')
