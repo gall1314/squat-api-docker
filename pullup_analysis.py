@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# pullup_analysis.py — SMART FORM_TIP edition
+# pullup_analysis.py — SMART FORM_TIP edition with fast/slow modes
 # form_tip = optimization advice (doesn't affect score, only helps improve)
 
 import os, cv2, math, numpy as np, subprocess
@@ -165,8 +165,6 @@ PENALTY_MIN_IF_ANY=0.5
 FEEDBACK_ORDER = [FB_CUE_HIGHER, FB_CUE_BOTTOM, FB_CUE_SWING]
 
 # ============ FORM_TIP (optimization advice - doesn't affect score!) ============
-# These are performance optimization tips based on measurable patterns
-
 FORM_TIP_SLOW_ECCENTRIC = "slow_eccentric"
 FORM_TIP_EXPLOSIVE_PULL = "explosive_pull" 
 FORM_TIP_TOP_PAUSE = "top_pause"
@@ -179,22 +177,18 @@ FORM_TIP_MESSAGES = {
     FORM_TIP_TEMPO_CONSISTENCY: "Keep a steady rhythm between reps for endurance",
 }
 
-# Thresholds for form tips (all ENV-configurable)
-ECCENTRIC_FAST_THR = float(os.getenv("ECCENTRIC_FAST_THR", "0.8"))  # seconds
-CONCENTRIC_SLOW_THR = float(os.getenv("CONCENTRIC_SLOW_THR", "2.0"))  # seconds
-TOP_HOLD_SHORT_THR = float(os.getenv("TOP_HOLD_SHORT_THR", "0.3"))  # seconds
-TEMPO_VARIANCE_THR = float(os.getenv("TEMPO_VARIANCE_THR", "0.35"))  # 35% coefficient of variation
+ECCENTRIC_FAST_THR = float(os.getenv("ECCENTRIC_FAST_THR", "0.8"))
+CONCENTRIC_SLOW_THR = float(os.getenv("CONCENTRIC_SLOW_THR", "2.0"))
+TOP_HOLD_SHORT_THR = float(os.getenv("TOP_HOLD_SHORT_THR", "0.3"))
+TEMPO_VARIANCE_THR = float(os.getenv("TEMPO_VARIANCE_THR", "0.35"))
 
-# Swing / Bottom
 SWING_THR=0.012; SWING_MIN_STREAK=3
 BOTTOM_EXT_MIN_ANGLE=155.0; BOTTOM_NEAR_DEG=6.0
 BOTTOM_FAIL_MIN_REPS=2
 DEBUG_ONBAR=bool(int(os.getenv("DEBUG_ONBAR","0")))
 
-# Face detection throttling
 FACE_CHECK_INTERVAL = int(os.getenv("FACE_CHECK_INTERVAL", "3"))
 
-# Face vs Bar params
 CHIN_BAR_MARGIN   = float(os.getenv("CHIN_BAR_MARGIN", "0.006"))
 EYE_BAR_MARGIN    = float(os.getenv("EYE_BAR_MARGIN",  "0.012"))
 CHIN_NEAR_EXTRA   = float(os.getenv("CHIN_NEAR_EXTRA","0.008"))
@@ -206,12 +200,10 @@ EYE_VIS_THR       = float(os.getenv("EYE_VIS_THR",     "0.40"))
 FACE_PASS_WIN     = int(os.getenv("FACE_PASS_WIN",     "3"))
 FACE_NEAR_WIN     = int(os.getenv("FACE_NEAR_WIN",     "5"))
 
-# Micro-burst disabled by default
 BURST_ENABLED     = bool(int(os.getenv("BURST_ENABLED", "0")))
 BURST_FRAMES      = int(os.getenv("BURST_FRAMES",    "2"))
 INFLECT_VEL_THR   = float(os.getenv("INFLECT_VEL_THR","0.0006"))
 
-# Bottom lockout
 LOCKOUT_DIST_MIN    = float(os.getenv("LOCKOUT_DIST_MIN","0.36"))
 LOCKOUT_NEAR_RELAX  = float(os.getenv("LOCKOUT_NEAR_RELAX","0.02"))
 
@@ -224,16 +216,35 @@ def run_pullup_analysis(video_path,
                         encode_crf=None,
                         return_video=True,
                         fast_mode=None):
+    """
+    Pull-up analysis with fast/slow modes
+    
+    fast_mode=True:  רק ניתוח JSON, ללא וידאו (מהיר)
+    fast_mode=False: ניתוח JSON + וידאו מנותח (איטי)
+    
+    ** הלוגיקה של ספירת חזרות וציונים זהה לחלוטין! **
+    """
     if mp_pose is None:
         return _ret_err("Mediapipe not available", feedback_path)
 
-    model_complexity = 1
+    # === הפרדה בין מסלולים ===
     if fast_mode is True:
         return_video = False
+    create_video = bool(return_video) and (output_path is not None) and (output_path != "")
 
+    # במצב מהיר: פי 2 פחות פריימים, model lite
+    if fast_mode:
+        effective_frame_skip = frame_skip * 2
+        effective_scale = scale * 0.85
+        model_complexity = 0
+        print(f"[FAST MODE] frame_skip={effective_frame_skip} (2x), scale={effective_scale:.2f}, model=lite", flush=True)
+    else:
+        effective_frame_skip = frame_skip
+        effective_scale = scale
+        model_complexity = 1
 
     if preserve_quality:
-        scale=1.0; frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
+        effective_scale=1.0; effective_frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
     else:
         encode_crf=23 if encode_crf is None else encode_crf
 
@@ -241,17 +252,15 @@ def run_pullup_analysis(video_path,
     if not cap.isOpened(): return _ret_err("Could not open video", feedback_path)
 
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
-    effective_fps=max(1.0, fps_in/max(1,frame_skip))
+    effective_fps=max(1.0, fps_in/max(1,effective_frame_skip))
     sec_to_frames=lambda s: max(1,int(s*effective_fps))
     frames_to_sec=lambda f: float(f)/effective_fps
 
     fourcc=cv2.VideoWriter_fourcc(*'mp4v')
     out=None; frame_idx=0
 
-    # Counters
     rep_count=0; good_reps=0; bad_reps=0; rep_reports=[]; all_scores=[]
 
-    # Landmarks
     LSH=mp_pose.PoseLandmark.LEFT_SHOULDER.value;  RSH=mp_pose.PoseLandmark.RIGHT_SHOULDER.value
     LE =mp_pose.PoseLandmark.LEFT_ELBOW.value;     RE =mp_pose.PoseLandmark.RIGHT_ELBOW.value
     LW =mp_pose.PoseLandmark.LEFT_WRIST.value;     RW =mp_pose.PoseLandmark.RIGHT_WRIST.value
@@ -265,7 +274,6 @@ def run_pullup_analysis(video_path,
         vR=lms[RSH].visibility+lms[RE].visibility+lms[RW].visibility
         return ("LEFT",LSH,LE,LW) if vL>=vR else ("RIGHT",RSH,RE,RW)
 
-    # State
     elbow_ema=None; head_ema=None; head_prev=None; head_vel_prev=None
     baseline_head_y_global=None
     asc_base_head=None; allow_new_peak=True; last_peak_frame=-10**9
@@ -274,7 +282,6 @@ def run_pullup_analysis(video_path,
     onbar=False; onbar_streak=0; offbar_streak=0; prev_torso_cx=None
     offbar_frames_since_any_rep=0; nopose_frames_since_any_rep=0
 
-    # Feedback state
     session_feedback=set()
     rt_fb_msg=None; rt_fb_hold=0
     swing_streak=0
@@ -283,13 +290,11 @@ def run_pullup_analysis(video_path,
     bottom_lockout_max=None
     bottom_already_reported=False
 
-    # Per-cycle tips
     cycle_tip_higher=False; cycle_tip_swing=False; cycle_tip_bottom=False
 
-    # 🆕 TEMPO TRACKING for form_tip
-    rep_phase_timings = []  # List of {concentric_sec, top_hold_sec, eccentric_sec}
+    rep_phase_timings = []
     phase_start_frame = None
-    phase_type = None  # "concentric", "top", "eccentric"
+    phase_type = None
     last_phase_transition_frame = None
 
     OFFBAR_STOP_FRAMES=sec_to_frames(AUTO_STOP_AFTER_EXIT_SEC)
@@ -298,7 +303,6 @@ def run_pullup_analysis(video_path,
 
     REARM_DESCENT_EFF=max(RESET_DESCENT*0.60, 0.012)
 
-    # Face-vs-bar
     bar_y_ema=None
     cycle_face_pass=False
     cycle_face_near=False
@@ -315,7 +319,7 @@ def run_pullup_analysis(video_path,
             if not ret: break
             frame_idx += 1
 
-            process_now = (burst_cntr > 0) or (frame_idx % max(1, frame_skip) == 0)
+            process_now = (burst_cntr > 0) or (frame_idx % max(1, effective_frame_skip) == 0)
             if not process_now:
                 continue
             
@@ -324,11 +328,11 @@ def run_pullup_analysis(video_path,
             
             processed_frame_count += 1
 
-            if scale != 1.0:
-                frame=cv2.resize(frame,(0,0),fx=scale,fy=scale)
+            if effective_scale != 1.0:
+                frame=cv2.resize(frame,(0,0),fx=effective_scale,fy=effective_scale)
             h,w=frame.shape[:2]
 
-            if return_video and out is None:
+            if create_video and out is None:
                 out=cv2.VideoWriter(output_path,fourcc,effective_fps,(w,h))
 
             res=pose.process(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
@@ -337,7 +341,7 @@ def run_pullup_analysis(video_path,
             if not res.pose_landmarks:
                 nopose_frames_since_any_rep = (nopose_frames_since_any_rep+1) if rep_count>0 else 0
                 if rep_count>0 and nopose_frames_since_any_rep>=NOPOSE_STOP_FRAMES: break
-                if return_video and out is not None:
+                if create_video and out is not None:
                     out.write(draw_overlay(frame,reps=rep_count,feedback=(rt_fb_msg if rt_fb_hold>0 else None),height_pct=0.0))
                 if rt_fb_hold>0: rt_fb_hold-=1
                 continue
@@ -359,7 +363,12 @@ def run_pullup_analysis(video_path,
             head_ema=_ema(head_ema,head_raw,HEAD_EMA_ALPHA)
             head_y=head_ema; elbow_angle=elbow_ema
             if baseline_head_y_global is None: baseline_head_y_global=head_y
-            height_live=float(np.clip((baseline_head_y_global-head_y)/max(0.12,HEAD_MIN_ASCENT*1.2),0.0,1.0))
+            
+            current_height=float(np.clip((baseline_head_y_global-head_y)/max(0.12,HEAD_MIN_ASCENT*1.2),0.0,1.0))
+            
+            # height_live רק למצב וידאו
+            if create_video:
+                height_live = current_height
 
             torso_cx=np.mean([lms[LSH].x,lms[RSH].x,lms[LH].x,lms[RH].x])*w
             torso_dx_norm=0.0 if prev_torso_cx is None else abs(torso_cx-prev_torso_cx)/max(1.0,w)
@@ -375,7 +384,6 @@ def run_pullup_analysis(video_path,
             else:
                 offbar_streak+=1; onbar_streak=0
 
-            # Enter onbar
             if (not onbar) and onbar_streak>=ONBAR_MIN_FRAMES:
                 onbar=True
                 asc_base_head=None; allow_new_peak=True; swing_streak=0
@@ -388,7 +396,6 @@ def run_pullup_analysis(video_path,
                 phase_start_frame=None
                 phase_type=None
 
-            # Exit onbar
             if onbar and offbar_streak>=OFFBAR_MIN_FRAMES:
                 if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
                     cycle_tip_bottom = True
@@ -424,7 +431,6 @@ def run_pullup_analysis(video_path,
             head_vel=0.0 if head_prev is None else (head_y-head_prev)
             cur_rt=None
 
-            # Micro-burst
             if BURST_ENABLED and onbar and (asc_base_head is not None):
                 near_inflect = (abs(head_vel) <= INFLECT_VEL_THR)
                 sign_flip = (head_vel_prev is not None) and ((head_vel_prev > 0 and head_vel <= 0) or (head_vel_prev < 0 and head_vel >= 0))
@@ -434,26 +440,22 @@ def run_pullup_analysis(video_path,
             head_vel_prev = head_vel
 
             if onbar and vis_strict_ok:
-                # REP COUNTING
                 if asc_base_head is None:
                     if head_vel<-abs(HEAD_VEL_UP_TINY):
                         asc_base_head=head_y
                         cycle_peak_ascent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
                         bottom_phase_max_elbow=None
                         bottom_lockout_max=None
-                        # 🆕 Start concentric phase
                         phase_start_frame=processed_frame_count
                         phase_type="concentric"
                 else:
                     cycle_peak_ascent=max(cycle_peak_ascent,(asc_base_head-head_y))
                     cycle_min_elbow=min(cycle_min_elbow,elbow_angle)
 
-                    # Track bottom metrics
                     max_elb_now = max(raw_elbow_L, raw_elbow_R)
                     if bottom_phase_max_elbow is None: bottom_phase_max_elbow = max_elb_now
                     else: bottom_phase_max_elbow = max(bottom_phase_max_elbow, max_elb_now)
 
-                    # Lockout distance
                     mid_sh = ((lms[LSH].x + lms[RSH].x)/2.0, (lms[LSH].y + lms[RSH].y)/2.0)
                     mid_hp = ((lms[LH].x + lms[RH].x)/2.0, (lms[LH].y + lms[RH].y)/2.0)
                     torso_len = _dist_xy(mid_sh, mid_hp) + 1e-6
@@ -467,7 +469,6 @@ def run_pullup_analysis(video_path,
                     reset_by_elb =(elbow_angle>=RESET_ELBOW)
                     
                     if reset_by_desc or reset_by_elb:
-                        # 🆕 Eccentric phase ended → record timing
                         if phase_type == "eccentric" and phase_start_frame is not None:
                             eccentric_frames = processed_frame_count - phase_start_frame
                             eccentric_sec = frames_to_sec(eccentric_frames)
@@ -499,7 +500,6 @@ def run_pullup_analysis(video_path,
                         cycle_tip_higher=False; cycle_tip_swing=False; cycle_tip_bottom=False
                         cycle_face_pass=False; cycle_face_near=False
                         face_pass_q.clear(); face_near_q.clear()
-                        # 🆕 Start new concentric
                         phase_start_frame=processed_frame_count
                         phase_type="concentric"
 
@@ -511,7 +511,6 @@ def run_pullup_analysis(video_path,
                 can_cnt=(frame_idx - last_peak_frame) >= REFRACTORY_FRAMES
 
                 if at_top and allow_new_peak and can_cnt and (not counted_this_cycle):
-                    # 🆕 Concentric ended → record timing
                     if phase_type == "concentric" and phase_start_frame is not None:
                         concentric_frames = processed_frame_count - phase_start_frame
                         concentric_sec = frames_to_sec(concentric_frames)
@@ -520,7 +519,6 @@ def run_pullup_analysis(video_path,
                             "top_hold_sec": 0.0,
                             "eccentric_sec": 0.0
                         })
-                        # Start top hold phase
                         phase_start_frame = processed_frame_count
                         phase_type = "top"
                     
@@ -537,19 +535,16 @@ def run_pullup_analysis(video_path,
                 if (allow_new_peak is False) and (last_peak_frame>0):
                     if head_prev is not None and (head_y - head_prev) > 0 and (asc_base_head is not None):
                         if (head_y - (asc_base_head - cycle_peak_ascent)) >= REARM_DESCENT_EFF:
-                            # 🆕 Top hold ended → record timing
                             if phase_type == "top" and phase_start_frame is not None:
                                 top_hold_frames = processed_frame_count - phase_start_frame
                                 top_hold_sec = frames_to_sec(top_hold_frames)
                                 if len(rep_phase_timings) > 0:
                                     rep_phase_timings[-1]["top_hold_sec"] = top_hold_sec
-                                # Start eccentric phase
                                 phase_start_frame = processed_frame_count
                                 phase_type = "eccentric"
                             
                             allow_new_peak=True
 
-                # Face detection (throttled)
                 face_check_counter += 1
                 if face_check_counter >= FACE_CHECK_INTERVAL:
                     face_check_counter = 0
@@ -596,7 +591,6 @@ def run_pullup_analysis(video_path,
                             cur_rt = FB_CUE_HIGHER
                             allow_new_peak = False
 
-                # Swing cue
                 if torso_dx_norm>SWING_THR: swing_streak+=1
                 else: swing_streak=max(0,swing_streak-1)
                 if (cur_rt is None) and (swing_streak>=SWING_MIN_STREAK) and (not cycle_tip_swing):
@@ -606,22 +600,22 @@ def run_pullup_analysis(video_path,
                 asc_base_head=None; allow_new_peak=True
                 swing_streak=0
 
-            # RT feedback hold
-            if cur_rt:
-                if cur_rt!=rt_fb_msg: rt_fb_msg=cur_rt; rt_fb_hold=RT_FB_HOLD_FRAMES
-                else: rt_fb_hold=max(rt_fb_hold,RT_FB_HOLD_FRAMES)
-            else:
-                if rt_fb_hold>0: rt_fb_hold-=1
+            # RT feedback רק במצב וידאו
+            if create_video:
+                if cur_rt:
+                    if cur_rt!=rt_fb_msg: rt_fb_msg=cur_rt; rt_fb_hold=RT_FB_HOLD_FRAMES
+                    else: rt_fb_hold=max(rt_fb_hold,RT_FB_HOLD_FRAMES)
+                else:
+                    if rt_fb_hold>0: rt_fb_hold-=1
 
-            # Draw
-            if return_video and out is not None:
+            # ציור רק במצב וידאו
+            if create_video and out is not None:
                 frame=draw_body_only(frame,lms)
                 frame=draw_overlay(frame,reps=rep_count,feedback=(rt_fb_msg if rt_fb_hold>0 else None),height_pct=height_live)
                 out.write(frame)
 
             if head_y is not None: head_prev=head_y
 
-    # EOF post-hoc
     if onbar and (not counted_this_cycle) and (cycle_peak_ascent>=HEAD_MIN_ASCENT) and (cycle_min_elbow<=ELBOW_TOP_ANGLE):
         if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
             cycle_tip_bottom = True
@@ -640,10 +634,9 @@ def run_pullup_analysis(video_path,
         else: good_reps+=1
 
     cap.release()
-    if return_video and out: out.release()
+    if create_video and out: out.release()
     cv2.destroyAllWindows()
 
-    # ============ SESSION SCORE (feedback-based) ============
     if rep_count==0:
         technique_score=0.0
     elif all_scores:
@@ -656,36 +649,30 @@ def run_pullup_analysis(video_path,
             penalty = 0.0
         technique_score=_half_floor10(max(0.0,10.0-penalty))
 
-    # ============ FORM_TIP LOGIC (optimization, not score-based) ============
     form_tip = None
     
     if rep_count >= 2 and len(rep_phase_timings) >= 2:
-        # Analyze tempo patterns
         concentric_times = [t["concentric_sec"] for t in rep_phase_timings if t["concentric_sec"] > 0]
         top_hold_times = [t["top_hold_sec"] for t in rep_phase_timings if t["top_hold_sec"] > 0]
         eccentric_times = [t["eccentric_sec"] for t in rep_phase_timings if t["eccentric_sec"] > 0]
         
-        tip_scores = {}  # {tip_key: priority_score}
+        tip_scores = {}
         
-        # 1. Fast eccentric → suggest slow eccentric (HIGHEST PRIORITY for hypertrophy)
         if len(eccentric_times) >= 2:
             avg_eccentric = np.mean(eccentric_times)
             if avg_eccentric < ECCENTRIC_FAST_THR:
-                tip_scores[FORM_TIP_SLOW_ECCENTRIC] = 100  # highest priority
+                tip_scores[FORM_TIP_SLOW_ECCENTRIC] = 100
         
-        # 2. Short top hold → suggest pausing at top (STRENGTH)
         if len(top_hold_times) >= 2:
             avg_top_hold = np.mean(top_hold_times)
             if avg_top_hold < TOP_HOLD_SHORT_THR:
                 tip_scores[FORM_TIP_TOP_PAUSE] = 80
         
-        # 3. Slow concentric → suggest explosive pull (POWER)
         if len(concentric_times) >= 2:
             avg_concentric = np.mean(concentric_times)
             if avg_concentric > CONCENTRIC_SLOW_THR:
                 tip_scores[FORM_TIP_EXPLOSIVE_PULL] = 70
         
-        # 4. Inconsistent tempo → suggest consistency (ENDURANCE)
         if len(concentric_times) >= 3:
             total_times = [c + t + e for c, t, e in zip(
                 concentric_times[:min(len(concentric_times), len(top_hold_times), len(eccentric_times))],
@@ -693,22 +680,19 @@ def run_pullup_analysis(video_path,
                 eccentric_times[:min(len(concentric_times), len(top_hold_times), len(eccentric_times))]
             )]
             if len(total_times) >= 3:
-                cv = np.std(total_times) / (np.mean(total_times) + 1e-9)  # coefficient of variation
+                cv = np.std(total_times) / (np.mean(total_times) + 1e-9)
                 if cv > TEMPO_VARIANCE_THR:
                     tip_scores[FORM_TIP_TEMPO_CONSISTENCY] = 60
         
-        # Select highest priority tip
         if tip_scores:
             best_tip = max(tip_scores, key=tip_scores.get)
             form_tip = FORM_TIP_MESSAGES.get(best_tip)
 
-    # Build feedback list
     all_fb = set(session_feedback) if session_feedback else set()
     fb_list = [cue for cue in FEEDBACK_ORDER if cue in all_fb]
     if not fb_list and rep_count > 0 and bad_reps == 0:
         fb_list = ["Great form! Keep it up 💪"]
 
-    # Write file
     try:
         with open(feedback_path,"w",encoding="utf-8") as f:
             f.write(f"Total Reps: {int(rep_count)}\n")
@@ -721,9 +705,8 @@ def run_pullup_analysis(video_path,
     except Exception:
         pass
 
-    # Encode
     final_path=""
-    if return_video and os.path.exists(output_path):
+    if create_video and os.path.exists(output_path):
         encoded_path=output_path.replace(".mp4","_encoded.mp4")
         try:
             subprocess.run(["ffmpeg","-y","-i",output_path,"-c:v","libx264","-preset","medium",
@@ -746,7 +729,7 @@ def run_pullup_analysis(video_path,
         "feedback": fb_list,
         "tips": [],
         "reps": rep_reports,
-        "video_path": final_path if return_video else "",
+        "video_path": final_path if create_video else "",
         "feedback_path": feedback_path
     }
     if form_tip is not None:
@@ -754,9 +737,7 @@ def run_pullup_analysis(video_path,
 
     return result
 
-# Helper for bottom extension check
 def _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
-    """Returns True if bottom extension FAILED (needs tip)"""
     elbow_ok   = (bottom_phase_max_elbow is not None) and (bottom_phase_max_elbow >= BOTTOM_EXT_MIN_ANGLE)
     elbow_near = (bottom_phase_max_elbow is not None) and (bottom_phase_max_elbow >= (BOTTOM_EXT_MIN_ANGLE - BOTTOM_NEAR_DEG))
     lock_ok    = (bottom_lockout_max is not None) and (bottom_lockout_max >= LOCKOUT_DIST_MIN)
