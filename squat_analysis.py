@@ -293,7 +293,8 @@ def run_squat_analysis(video_path,
                        scale=0.4,
                        output_path="squat_analyzed.mp4",
                        feedback_path="squat_feedback.txt",
-                       fast_mode=False):
+                       fast_mode=False,
+                       return_video=True):
     mp_pose_mod = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -304,7 +305,9 @@ def run_squat_analysis(video_path,
             "technique_label": score_label(0.0)
         }
     
-    create_video = (output_path is not None) and (output_path != "")
+    if fast_mode is True:
+        return_video = False
+    create_video = bool(return_video) and (output_path is not None) and (output_path != "")
 
     counter = 0
     good_reps = 0
@@ -720,5 +723,6 @@ def run_analysis(video_path,
                  scale=0.4,
                  output_path="squat_analyzed.mp4",
                  feedback_path="squat_feedback.txt",
-                 fast_mode=False):
-    return run_squat_analysis(video_path, frame_skip, scale, output_path, feedback_path, fast_mode)
+                 fast_mode=False,
+                 return_video=True):
+    return run_squat_analysis(video_path, frame_skip, scale, output_path, feedback_path, fast_mode, return_video)

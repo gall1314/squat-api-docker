@@ -275,7 +275,7 @@ def faststart_remux(in_path):
     except Exception:
         return in_path  # fallback
 
-def run_row_analysis(input_video_path, output_dir="./media", user_session_id=None):
+def run_row_analysis(input_video_path, output_dir="./media", user_session_id=None, return_video=True, fast_mode=None):
     """
     Main entry. Mirrors squat pipeline and return schema (incl. 'squat_count').
     Returns a dict with keys:
@@ -287,6 +287,9 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     """
     if mp is None:
         return {"success": False, "error": "mediapipe not installed"}
+
+    if fast_mode is True:
+        return_video = False
 
     os.makedirs(output_dir, exist_ok=True)
     cap = cv2.VideoCapture(input_video_path)
@@ -304,7 +307,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     out_basename = f"barbell_row_{uid}_analyzed.mp4"
     out_path = os.path.join(output_dir, out_basename)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, src_fps/max(1,FRAME_SKIP), (out_w, out_h))
+    writer = cv2.VideoWriter(out_path, fourcc, src_fps/max(1,FRAME_SKIP), (out_w, out_h)) if return_video else None
 
     # Pose estimator
     mp_pose = mp.solutions.pose
@@ -470,10 +473,11 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                     knee_vals  = []
 
             # Draw overlay (with current skeleton) before writing
-            if lm:
-                draw_skeleton(frame, lm)
-            frame = render_overlay(frame, reps, live_depth_pct, overlay_msg)
-            writer.write(frame)
+            if return_video and writer is not None:
+                if lm:
+                    draw_skeleton(frame, lm)
+                frame = render_overlay(frame, reps, live_depth_pct, overlay_msg)
+                writer.write(frame)
 
         # Finalize
     finally:
@@ -482,7 +486,8 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
         except Exception:
             pass
         cap.release()
-        writer.release()
+        if writer is not None:
+            writer.release()
 
     # Scoring
     score = MAX_SCORE
@@ -511,7 +516,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
             form_tip = "Complete a full rep to get feedback"
 
     # Faststart remux
-    out_fast = faststart_remux(out_path)
+    out_fast = faststart_remux(out_path) if return_video else ""
 
     # Return schema (matching squat keys; include squat_count)
     duration_s = (time.time() - start_time)
@@ -527,7 +532,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
         "tips": session_tips,               # do not reduce score
         "form_tip": form_tip,               # FIXED: Now returns best single tip
         "rep_details": rep_details,         # per-rep metrics
-        "analyzed_video_path": out_fast,    # file path; caller can build URL
+        "analyzed_video_path": out_fast if return_video else "",    # file path; caller can build URL
         "fps": src_fps/max(1,FRAME_SKIP),
         "duration_s": duration_s,
     }

@@ -460,7 +460,11 @@ def choose_session_tip(counter: BulgarianRepCounter):
 # ===================== ריצה =====================
 def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
                            output_path="analyzed_output.mp4",
-                           feedback_path="feedback_summary.txt"):
+                           feedback_path="feedback_summary.txt",
+                           return_video=True,
+                           fast_mode=None):
+    if fast_mode is True:
+        return_video = False
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     cap = cv2.VideoCapture(video_path)
     counter = BulgarianRepCounter()
@@ -512,7 +516,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
         if scale != 1.0: frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
 
         h, w = frame.shape[:2]
-        if out is None:
+        if return_video and out is None:
             out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
 
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -620,10 +624,12 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             stab_lms = lm_stab.stabilize(lms)
 
         # === ציור ===
-        if 'stab_lms' in locals() and stab_lms:
-            frame = draw_body_only(frame, stab_lms)
-        frame = draw_overlay(frame, reps=counter.count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
-        out.write(frame)
+        if return_video:
+            if 'stab_lms' in locals() and stab_lms:
+                frame = draw_body_only(frame, stab_lms)
+            frame = draw_overlay(frame, reps=counter.count, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
+            if out is not None:
+                out.write(frame)
 
     pose.close(); cap.release();
     if out: out.release()
@@ -650,21 +656,23 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
         pass
 
     # קידוד faststart אמין + fallback
-    encoded_path = output_path.replace('.mp4', '_encoded.mp4')
-    try:
-        subprocess.run([
-            'ffmpeg','-y','-i', output_path,
-            '-c:v','libx264','-preset','fast','-movflags','+faststart','-pix_fmt','yuv420p',
-            encoded_path
-        ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        final_path = encoded_path if os.path.isfile(encoded_path) else output_path
-    except Exception:
-        final_path = output_path
+    final_path = ""
+    if return_video and output_path:
+        encoded_path = output_path.replace('.mp4', '_encoded.mp4')
+        try:
+            subprocess.run([
+                'ffmpeg','-y','-i', output_path,
+                '-c:v','libx264','-preset','fast','-movflags','+faststart','-pix_fmt','yuv420p',
+                encoded_path
+            ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            final_path = encoded_path if os.path.isfile(encoded_path) else output_path
+        except Exception:
+            final_path = output_path if os.path.isfile(output_path) else ""
 
-    if not os.path.isfile(final_path) and os.path.isfile(output_path):
-        final_path = output_path
+        if not os.path.isfile(final_path) and os.path.isfile(output_path):
+            final_path = output_path
 
-    result["video_path"] = final_path
+    result["video_path"] = final_path if return_video else ""
     result["feedback_path"] = feedback_path
     return result
 
