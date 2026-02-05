@@ -23,6 +23,21 @@ try:
 except Exception:
     mp_pose=None
 
+# Reused fast-mode Pose (avoids per-request graph/delegate creation)
+# Initialized once at module load so fast requests don't pay graph init/download cost.
+if mp_pose is not None:
+    try:
+        _FAST_POSE = mp_pose.Pose(model_complexity=0, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        # Warm up once so first fast request won't pay delegate/model lazy init cost.
+        _FAST_POSE.process(np.zeros((64, 64, 3), dtype=np.uint8))
+    except Exception:
+        _FAST_POSE = None
+else:
+    _FAST_POSE = None
+
+def _get_fast_pose():
+    return _FAST_POSE
+
 # ============ Helpers ============
 def _ang(a,b,c):
     ba=np.array([a[0]-b[0],a[1]-b[1]]); bc=np.array([c[0]-b[0],c[1]-b[1]])
@@ -230,13 +245,17 @@ def run_pullup_analysis(video_path,
     
     if fast_path:
         return_video = False  # Never produce video in fast path
-    
-    # Model complexity
-    model_complexity = 1
+
+    # Keep pull-up counting stable in fast mode: disable video only, keep cadence/model identical.
+    effective_frame_skip = frame_skip
+    effective_scale = scale
+    model_complexity = 0 if fast_path else 1
+    if fast_path:
+        print(f"[FAST MODE][pullup] stable-count profile: frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=lite", flush=True)
 
     # Encoding params (only relevant for slow path)
     if preserve_quality:
-        scale=1.0; frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
+        effective_scale=1.0; effective_frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
     else:
         encode_crf=23 if encode_crf is None else encode_crf
 
@@ -244,7 +263,7 @@ def run_pullup_analysis(video_path,
     if not cap.isOpened(): return _ret_err("Could not open video", feedback_path)
 
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
-    effective_fps=max(1.0, fps_in/max(1,frame_skip))
+    effective_fps=max(1.0, fps_in/max(1,effective_frame_skip))
     sec_to_frames=lambda s: max(1,int(s*effective_fps))
     frames_to_sec=lambda f: float(f)/effective_fps
 
@@ -317,13 +336,21 @@ def run_pullup_analysis(video_path,
     burst_cntr=0
     processed_frame_count = 0
 
-    with mp_pose.Pose(model_complexity=model_complexity, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    pose = _get_fast_pose() if fast_path else mp_pose.Pose(
+        model_complexity=model_complexity,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    if pose is None:
+        return _ret_err("Mediapipe not available", feedback_path)
+
+    try:
         while True:
             ret, frame = cap.read()
             if not ret: break
             frame_idx += 1
 
-            process_now = (burst_cntr > 0) or (frame_idx % max(1, frame_skip) == 0)
+            process_now = (burst_cntr > 0) or (frame_idx % max(1, effective_frame_skip) == 0)
             if not process_now:
                 continue
             
@@ -333,8 +360,8 @@ def run_pullup_analysis(video_path,
             processed_frame_count += 1
 
             # Resize frame (for both paths, affects pose detection)
-            if scale != 1.0:
-                frame=cv2.resize(frame,(0,0),fx=scale,fy=scale)
+            if effective_scale != 1.0:
+                frame=cv2.resize(frame,(0,0),fx=effective_scale,fy=effective_scale)
             h,w=frame.shape[:2]
 
             # Initialize video writer (SLOW PATH ONLY)
@@ -629,24 +656,29 @@ def run_pullup_analysis(video_path,
                 out.write(frame)
 
             if head_y is not None: head_prev=head_y
-
-    # EOF post-hoc
-    if onbar and (not counted_this_cycle) and (cycle_peak_ascent>=HEAD_MIN_ASCENT) and (cycle_min_elbow<=ELBOW_TOP_ANGLE):
-        if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
-            cycle_tip_bottom = True
-            bottom_fail_count += 1
-            if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS and not bottom_already_reported:
-                session_feedback.add(FB_CUE_BOTTOM)
-                bottom_already_reported = True
-
-        rep_has_tip = cycle_tip_higher or cycle_tip_swing or cycle_tip_bottom
-        _count_rep(rep_reports,rep_count,0.0,cycle_min_elbow,
-                   asc_base_head if asc_base_head is not None else (baseline_head_y_global or 0.0),
-                   (baseline_head_y_global - cycle_peak_ascent) if baseline_head_y_global is not None else (baseline_head_y_global or 0.0),
-                   all_scores, rep_has_tip)
-        rep_count+=1
-        if rep_has_tip: bad_reps+=1
-        else: good_reps+=1
+    
+        # EOF post-hoc
+        if onbar and (not counted_this_cycle) and (cycle_peak_ascent>=HEAD_MIN_ASCENT) and (cycle_min_elbow<=ELBOW_TOP_ANGLE):
+            if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
+                cycle_tip_bottom = True
+                bottom_fail_count += 1
+                if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS and not bottom_already_reported:
+                    session_feedback.add(FB_CUE_BOTTOM)
+                    bottom_already_reported = True
+    
+            rep_has_tip = cycle_tip_higher or cycle_tip_swing or cycle_tip_bottom
+            _count_rep(rep_reports,rep_count,0.0,cycle_min_elbow,
+                       asc_base_head if asc_base_head is not None else (baseline_head_y_global or 0.0),
+                       (baseline_head_y_global - cycle_peak_ascent) if baseline_head_y_global is not None else (baseline_head_y_global or 0.0),
+                       all_scores, rep_has_tip)
+            rep_count+=1
+            if rep_has_tip: bad_reps+=1
+            else: good_reps+=1
+    
+    finally:
+        # Fast mode keeps a shared Pose instance alive for reuse.
+        if not fast_path:
+            pose.close()
 
     cap.release()
     if slow_path and out: 
