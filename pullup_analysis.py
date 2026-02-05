@@ -231,16 +231,12 @@ def run_pullup_analysis(video_path,
     if fast_path:
         return_video = False  # Never produce video in fast path
 
-    # Speed profile: fast path behaves like squat fast mode (fewer frames + lighter model)
+    # Keep pull-up counting stable in fast mode: disable video only, keep cadence/model identical.
+    effective_frame_skip = frame_skip
+    effective_scale = scale
+    model_complexity = 1
     if fast_path:
-        effective_frame_skip = max(1, frame_skip * 2)
-        effective_scale = scale * 0.85
-        model_complexity = 0
-        print(f"[FAST MODE][pullup] frame_skip={effective_frame_skip} (2x), scale={effective_scale:.2f}, model=lite", flush=True)
-    else:
-        effective_frame_skip = frame_skip
-        effective_scale = scale
-        model_complexity = 1
+        print(f"[FAST MODE][pullup] stable-count profile: frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=full", flush=True)
 
     # Encoding params (only relevant for slow path)
     if preserve_quality:
