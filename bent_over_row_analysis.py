@@ -275,7 +275,10 @@ def faststart_remux(in_path):
     except Exception:
         return in_path  # fallback
 
-def run_row_analysis(input_video_path, output_dir="./media", user_session_id=None):
+def run_row_analysis(input_video_path, output_dir="./media", user_session_id=None,
+                    frame_skip=FRAME_SKIP, scale=SCALE, output_path=None, return_video=True, fast_mode=None):
+    if fast_mode is True:
+        return_video = False
     """
     Main entry. Mirrors squat pipeline and return schema (incl. 'squat_count').
     Returns a dict with keys:
@@ -296,15 +299,15 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out_w  = int(width * SCALE)
-    out_h  = int(height * SCALE)
+    out_w  = int(width * scale)
+    out_h  = int(height * scale)
 
     # Output temp path
     uid = uuid.uuid4().hex[:8]
-    out_basename = f"barbell_row_{uid}_analyzed.mp4"
-    out_path = os.path.join(output_dir, out_basename)
+    out_basename = output_path if output_path else f"barbell_row_{uid}_analyzed.mp4"
+    out_path = out_basename if os.path.isabs(out_basename) else os.path.join(output_dir, out_basename)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, src_fps/max(1,FRAME_SKIP), (out_w, out_h))
+    writer = cv2.VideoWriter(out_path, fourcc, src_fps/max(1,frame_skip), (out_w, out_h)) if return_video else None
 
     # Pose estimator
     mp_pose = mp.solutions.pose
@@ -351,7 +354,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
             if not ok:
                 break
             frame_idx += 1
-            if FRAME_SKIP > 1 and (frame_idx % FRAME_SKIP != 0):
+            if frame_skip > 1 and (frame_idx % frame_skip != 0):
                 continue
 
             # Resize
@@ -473,7 +476,8 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
             if lm:
                 draw_skeleton(frame, lm)
             frame = render_overlay(frame, reps, live_depth_pct, overlay_msg)
-            writer.write(frame)
+            if return_video and writer is not None:
+                writer.write(frame)
 
         # Finalize
     finally:
@@ -482,7 +486,8 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
         except Exception:
             pass
         cap.release()
-        writer.release()
+        if return_video and writer is not None:
+            writer.release()
 
     # Scoring
     score = MAX_SCORE
@@ -511,7 +516,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
             form_tip = "Complete a full rep to get feedback"
 
     # Faststart remux
-    out_fast = faststart_remux(out_path)
+    out_fast = faststart_remux(out_path) if return_video else ""
 
     # Return schema (matching squat keys; include squat_count)
     duration_s = (time.time() - start_time)
@@ -528,7 +533,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
         "form_tip": form_tip,               # FIXED: Now returns best single tip
         "rep_details": rep_details,         # per-rep metrics
         "analyzed_video_path": out_fast,    # file path; caller can build URL
-        "fps": src_fps/max(1,FRAME_SKIP),
+        "fps": src_fps/max(1,frame_skip),
         "duration_s": duration_s,
     }
     return result

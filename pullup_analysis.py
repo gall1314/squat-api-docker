@@ -227,8 +227,9 @@ def run_pullup_analysis(video_path,
     if mp_pose is None:
         return _ret_err("Mediapipe not available", feedback_path)
 
-    model_complexity = 1
-    return_video = True
+    model_complexity = 0 if fast_mode else 1
+    if fast_mode:
+        return_video = False
 
     if preserve_quality:
         scale=1.0; frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
