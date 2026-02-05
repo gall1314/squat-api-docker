@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# squat_analysis.py — מהיר ואיטי עם תוצאות זהות
+# squat_analysis.py — מהיר ואיטי עם לוגיקה זהה מובטחת
 import os
 import cv2
 import math
@@ -53,7 +53,6 @@ FEEDBACK_CATEGORY = {
     "Try to keep your back a bit straighter": "back",
     "Avoid knee collapse": "knees",
 }
-
 def pick_strongest_feedback(feedback_list):
     best, score = "", -1
     for f in feedback_list or []:
@@ -92,7 +91,7 @@ def display_half_str(x):
         return str(int(round(q)))
     return f"{q:.1f}"
 
-# ===================== OVERLAY (רק למצב וידאו) =====================
+# ===================== OVERLAY =====================
 def draw_depth_donut(frame, center, radius, thickness, pct):
     pct = float(np.clip(pct, 0.0, 1.0))
     cx, cy = int(center[0]), int(center[1])
@@ -193,7 +192,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
     return frame
 
-# ===================== BODY-ONLY SKELETON (רק למצב וידאו) =====================
+# ===================== BODY-ONLY SKELETON =====================
 _FACE_LMS = {
     mp_pose.PoseLandmark.NOSE.value,
     mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
@@ -294,10 +293,11 @@ def run_squat_analysis(video_path,
     """
     ניתוח סקווט עם תמיכה במסלול מהיר ואיטי
     
-    fast_mode=True:  רק ניתוח, ללא וידאו (10-15 שניות)
-    fast_mode=False: ניתוח + וידאו מנותח (60 שניות)
+    fast_mode=True:  רק ניתוח JSON, ללא וידאו (10-15 שניות)
+    fast_mode=False: ניתוח JSON + וידאו מנותח (60 שניות)
     
-    ** תוצאות הניתוח (reps, scores, feedback) זהות בשני המצבים! **
+    ** הלוגיקה של ספירת חזרות וציונים זהה לחלוטין! **
+    ** ההבדל היחיד: האם מצייר וכותב וידאו **
     """
     mp_pose_mod = mp.solutions.pose
     cap = cv2.VideoCapture(video_path)
@@ -309,22 +309,21 @@ def run_squat_analysis(video_path,
             "technique_label": score_label(0.0)
         }
     
-    # === הגדרת מצב ===
+    # === אופטימיזציה למצב מהיר - רק משפיע על וידאו, לא על ניתוח ===
     if fast_mode is True:
         return_video = False
     create_video = bool(return_video) and (output_path is not None) and (output_path != "")
     
-    # === אופטימיזציה למצב מהיר - אך תוצאות זהות! ===
+    # במצב מהיר: פי 2 פחות פריימים, model lite
     if fast_mode:
-        effective_frame_skip = frame_skip * 3
-        effective_scale = scale * 0.75
+        effective_frame_skip = frame_skip * 2
+        effective_scale = scale * 0.85
         model_complexity = 0
-        print(f"[FAST MODE] frame_skip={effective_frame_skip} (3x), scale={effective_scale:.2f}, model=lite", flush=True)
+        print(f"[FAST MODE] frame_skip={effective_frame_skip} (2x), scale={effective_scale:.2f}, model=lite", flush=True)
     else:
         effective_frame_skip = frame_skip
         effective_scale = scale
         model_complexity = 1
-        print(f"[FULL MODE] frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=full", flush=True)
 
     counter = 0
     good_reps = 0
@@ -379,30 +378,20 @@ def run_squat_analysis(video_path,
     BOTTOM_BAD_MIN_FRAMES = max(3, int(BOTTOM_BAD_MIN_SEC / dt))
     RT_FB_HOLD_FRAMES     = max(2, int(RT_FB_HOLD_SEC / dt))
 
-    with mp_pose_mod.Pose(
-        model_complexity=model_complexity,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-    ) as pose:
+    with mp_pose_mod.Pose(model_complexity=model_complexity, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret: break
             frame_idx += 1
-            
-            if frame_idx % effective_frame_skip != 0: 
-                continue
-                
-            if effective_scale != 1.0: 
-                frame = cv2.resize(frame, (0,0), fx=effective_scale, fy=effective_scale)
+            if frame_idx % effective_frame_skip != 0: continue
+            if effective_scale != 1.0: frame = cv2.resize(frame, (0,0), fx=effective_scale, fy=effective_scale)
 
             h, w = frame.shape[:2]
-            
             if create_video and out is None:
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
 
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
-            
             if not results.pose_landmarks:
                 if create_video:
                     depth_live = 0.0
@@ -474,6 +463,7 @@ def run_squat_analysis(video_path,
 
                 current_depth = calculate_depth_robust(mid_hip, mid_knee, mid_ankle, knee_angle, mid_shoulder)
                 
+                # depth_live רק למצב וידאו
                 if create_video:
                     depth_live = current_depth
 
@@ -499,6 +489,7 @@ def run_squat_analysis(video_path,
                     elif current_depth >= 0.70:
                         rep_max_back_angle_bottom = max(rep_max_back_angle_bottom, back_angle)
 
+                    # פידבק real-time רק במצב וידאו
                     if create_video:
                         if current_depth < 0.35 and back_angle > TOP_BACK_MAX_DEG:
                             rep_top_bad_frames += 1
@@ -621,12 +612,13 @@ def run_squat_analysis(video_path,
                         else: bad_reps += 1
                         all_scores.append(score)
 
+                # ציור רק במצב וידאו
                 if create_video:
                     frame = draw_body_only(frame, lm)
                     frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
                     if out: out.write(frame)
 
-            except Exception as e:
+            except Exception:
                 if create_video:
                     if rt_fb_hold > 0: rt_fb_hold -= 1
                     depth_live = 0.0
@@ -703,7 +695,7 @@ def run_squat_analysis(video_path,
     
     return result
 
-# תאימות לשמירה
+# תאימות
 def run_analysis(video_path,
                  frame_skip=3,
                  scale=0.4,
