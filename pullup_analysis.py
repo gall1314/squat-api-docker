@@ -28,6 +28,8 @@ except Exception:
 if mp_pose is not None:
     try:
         _FAST_POSE = mp_pose.Pose(model_complexity=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        # Warm up once so first fast request won't pay delegate/model lazy init cost.
+        _FAST_POSE.process(np.zeros((64, 64, 3), dtype=np.uint8))
     except Exception:
         _FAST_POSE = None
 else:
