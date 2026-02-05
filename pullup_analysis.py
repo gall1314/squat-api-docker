@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# pullup_analysis.py — SMART FORM_TIP edition with fast/slow modes
+# pullup_analysis.py — SMART FORM_TIP edition with FAST/SLOW path optimization
 # form_tip = optimization advice (doesn't affect score, only helps improve)
 
 import os, cv2, math, numpy as np, subprocess
@@ -15,10 +15,6 @@ REPS_FONT_SIZE=28; FEEDBACK_FONT_SIZE=22; DEPTH_LABEL_FONT_SIZE=14; DEPTH_PCT_FO
 def _load_font(p,s):
     try: return ImageFont.truetype(p,s)
     except: return ImageFont.load_default()
-REPS_FONT=_load_font(FONT_PATH,REPS_FONT_SIZE)
-FEEDBACK_FONT=_load_font(FONT_PATH,FEEDBACK_FONT_SIZE)
-DEPTH_LABEL_FONT=_load_font(FONT_PATH,DEPTH_LABEL_FONT_SIZE)
-DEPTH_PCT_FONT=_load_font(FONT_PATH,DEPTH_PCT_FONT_SIZE)
 
 # ============ MediaPipe ============
 try:
@@ -68,18 +64,21 @@ def _dyn_thickness(h):
 def _dist_xy(a, b):
     return math.hypot(a[0]-b[0], a[1]-b[1])
 
-# ============ Body-only skeleton ============
+# ============ Body-only skeleton (SLOW PATH ONLY) ============
 _FACE_LMS=set(); _BODY_CONNECTIONS=tuple(); _BODY_POINTS=tuple()
-if mp_pose:
-    _FACE_LMS={
-        mp_pose.PoseLandmark.NOSE.value,
-        mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
-        mp_pose.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose.PoseLandmark.RIGHT_EYE.value, mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
-        mp_pose.PoseLandmark.LEFT_EAR.value, mp_pose.PoseLandmark.RIGHT_EAR.value,
-        mp_pose.PoseLandmark.MOUTH_LEFT.value, mp_pose.PoseLandmark.MOUTH_RIGHT.value,
-    }
-    _BODY_CONNECTIONS=tuple((a,b) for (a,b) in mp_pose.POSE_CONNECTIONS if a not in _FACE_LMS and b not in _FACE_LMS)
-    _BODY_POINTS=tuple(sorted({i for conn in _BODY_CONNECTIONS for i in conn}))
+
+def _init_skeleton_data():
+    global _FACE_LMS, _BODY_CONNECTIONS, _BODY_POINTS
+    if mp_pose and not _BODY_CONNECTIONS:
+        _FACE_LMS={
+            mp_pose.PoseLandmark.NOSE.value,
+            mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
+            mp_pose.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose.PoseLandmark.RIGHT_EYE.value, mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
+            mp_pose.PoseLandmark.LEFT_EAR.value, mp_pose.PoseLandmark.RIGHT_EAR.value,
+            mp_pose.PoseLandmark.MOUTH_LEFT.value, mp_pose.PoseLandmark.MOUTH_RIGHT.value,
+        }
+        _BODY_CONNECTIONS=tuple((a,b) for (a,b) in mp_pose.POSE_CONNECTIONS if a not in _FACE_LMS and b not in _FACE_LMS)
+        _BODY_POINTS=tuple(sorted({i for conn in _BODY_CONNECTIONS for i in conn}))
 
 def draw_body_only(frame, lms, color=(255,255,255)):
     h,w=frame.shape[:2]; line, dot=_dyn_thickness(h)
@@ -100,6 +99,12 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
     pct=float(np.clip(height_pct,0,1))
     cv2.circle(frame,(cx,cy),r,DEPTH_RING_BG,th,cv2.LINE_AA)
     cv2.ellipse(frame,(cx,cy),(r,r),0,-90,-90+int(360*pct),DEPTH_COLOR,th,cv2.LINE_AA)
+    
+    REPS_FONT=_load_font(FONT_PATH,REPS_FONT_SIZE)
+    FEEDBACK_FONT=_load_font(FONT_PATH,FEEDBACK_FONT_SIZE)
+    DEPTH_LABEL_FONT=_load_font(FONT_PATH,DEPTH_LABEL_FONT_SIZE)
+    DEPTH_PCT_FONT=_load_font(FONT_PATH,DEPTH_PCT_FONT_SIZE)
+    
     pil=Image.fromarray(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)); draw=ImageDraw.Draw(pil)
 
     txt=f"Reps: {int(reps)}"; pad_x,pad_y=10,6
@@ -216,35 +221,22 @@ def run_pullup_analysis(video_path,
                         encode_crf=None,
                         return_video=True,
                         fast_mode=None):
-    """
-    Pull-up analysis with fast/slow modes
-    
-    fast_mode=True:  רק ניתוח JSON, ללא וידאו (מהיר)
-    fast_mode=False: ניתוח JSON + וידאו מנותח (איטי)
-    
-    ** הלוגיקה של ספירת חזרות וציונים זהה לחלוטין! **
-    """
     if mp_pose is None:
         return _ret_err("Mediapipe not available", feedback_path)
 
-    # === הפרדה בין מסלולים ===
-    if fast_mode is True:
-        return_video = False
-    create_video = bool(return_video) and (output_path is not None) and (output_path != "")
+    # ============ PATH DECISION ============
+    fast_path = (fast_mode is True)
+    slow_path = not fast_path
+    
+    if fast_path:
+        return_video = False  # Never produce video in fast path
+    
+    # Model complexity
+    model_complexity = 1
 
-    # במצב מהיר: פי 2 פחות פריימים, model lite
-    if fast_mode:
-        effective_frame_skip = frame_skip * 2
-        effective_scale = scale * 0.85
-        model_complexity = 0
-        print(f"[FAST MODE] frame_skip={effective_frame_skip} (2x), scale={effective_scale:.2f}, model=lite", flush=True)
-    else:
-        effective_frame_skip = frame_skip
-        effective_scale = scale
-        model_complexity = 1
-
+    # Encoding params (only relevant for slow path)
     if preserve_quality:
-        effective_scale=1.0; effective_frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
+        scale=1.0; frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
     else:
         encode_crf=23 if encode_crf is None else encode_crf
 
@@ -252,15 +244,22 @@ def run_pullup_analysis(video_path,
     if not cap.isOpened(): return _ret_err("Could not open video", feedback_path)
 
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
-    effective_fps=max(1.0, fps_in/max(1,effective_frame_skip))
+    effective_fps=max(1.0, fps_in/max(1,frame_skip))
     sec_to_frames=lambda s: max(1,int(s*effective_fps))
     frames_to_sec=lambda f: float(f)/effective_fps
 
-    fourcc=cv2.VideoWriter_fourcc(*'mp4v')
-    out=None; frame_idx=0
+    # Video writer (SLOW PATH ONLY)
+    out=None
+    if slow_path:
+        fourcc=cv2.VideoWriter_fourcc(*'mp4v')
+        _init_skeleton_data()  # Initialize skeleton drawing data
+    
+    frame_idx=0
 
+    # Counters
     rep_count=0; good_reps=0; bad_reps=0; rep_reports=[]; all_scores=[]
 
+    # Landmarks
     LSH=mp_pose.PoseLandmark.LEFT_SHOULDER.value;  RSH=mp_pose.PoseLandmark.RIGHT_SHOULDER.value
     LE =mp_pose.PoseLandmark.LEFT_ELBOW.value;     RE =mp_pose.PoseLandmark.RIGHT_ELBOW.value
     LW =mp_pose.PoseLandmark.LEFT_WRIST.value;     RW =mp_pose.PoseLandmark.RIGHT_WRIST.value
@@ -274,6 +273,7 @@ def run_pullup_analysis(video_path,
         vR=lms[RSH].visibility+lms[RE].visibility+lms[RW].visibility
         return ("LEFT",LSH,LE,LW) if vL>=vR else ("RIGHT",RSH,RE,RW)
 
+    # State
     elbow_ema=None; head_ema=None; head_prev=None; head_vel_prev=None
     baseline_head_y_global=None
     asc_base_head=None; allow_new_peak=True; last_peak_frame=-10**9
@@ -282,6 +282,7 @@ def run_pullup_analysis(video_path,
     onbar=False; onbar_streak=0; offbar_streak=0; prev_torso_cx=None
     offbar_frames_since_any_rep=0; nopose_frames_since_any_rep=0
 
+    # Feedback state
     session_feedback=set()
     rt_fb_msg=None; rt_fb_hold=0
     swing_streak=0
@@ -290,8 +291,10 @@ def run_pullup_analysis(video_path,
     bottom_lockout_max=None
     bottom_already_reported=False
 
+    # Per-cycle tips
     cycle_tip_higher=False; cycle_tip_swing=False; cycle_tip_bottom=False
 
+    # Tempo tracking for form_tip
     rep_phase_timings = []
     phase_start_frame = None
     phase_type = None
@@ -303,6 +306,7 @@ def run_pullup_analysis(video_path,
 
     REARM_DESCENT_EFF=max(RESET_DESCENT*0.60, 0.012)
 
+    # Face-vs-bar
     bar_y_ema=None
     cycle_face_pass=False
     cycle_face_near=False
@@ -319,7 +323,7 @@ def run_pullup_analysis(video_path,
             if not ret: break
             frame_idx += 1
 
-            process_now = (burst_cntr > 0) or (frame_idx % max(1, effective_frame_skip) == 0)
+            process_now = (burst_cntr > 0) or (frame_idx % max(1, frame_skip) == 0)
             if not process_now:
                 continue
             
@@ -328,11 +332,13 @@ def run_pullup_analysis(video_path,
             
             processed_frame_count += 1
 
-            if effective_scale != 1.0:
-                frame=cv2.resize(frame,(0,0),fx=effective_scale,fy=effective_scale)
+            # Resize frame (for both paths, affects pose detection)
+            if scale != 1.0:
+                frame=cv2.resize(frame,(0,0),fx=scale,fy=scale)
             h,w=frame.shape[:2]
 
-            if create_video and out is None:
+            # Initialize video writer (SLOW PATH ONLY)
+            if slow_path and out is None:
                 out=cv2.VideoWriter(output_path,fourcc,effective_fps,(w,h))
 
             res=pose.process(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
@@ -341,8 +347,11 @@ def run_pullup_analysis(video_path,
             if not res.pose_landmarks:
                 nopose_frames_since_any_rep = (nopose_frames_since_any_rep+1) if rep_count>0 else 0
                 if rep_count>0 and nopose_frames_since_any_rep>=NOPOSE_STOP_FRAMES: break
-                if create_video and out is not None:
+                
+                # SLOW PATH: Write frame with overlay
+                if slow_path and out is not None:
                     out.write(draw_overlay(frame,reps=rep_count,feedback=(rt_fb_msg if rt_fb_hold>0 else None),height_pct=0.0))
+                
                 if rt_fb_hold>0: rt_fb_hold-=1
                 continue
 
@@ -363,12 +372,7 @@ def run_pullup_analysis(video_path,
             head_ema=_ema(head_ema,head_raw,HEAD_EMA_ALPHA)
             head_y=head_ema; elbow_angle=elbow_ema
             if baseline_head_y_global is None: baseline_head_y_global=head_y
-            
-            current_height=float(np.clip((baseline_head_y_global-head_y)/max(0.12,HEAD_MIN_ASCENT*1.2),0.0,1.0))
-            
-            # height_live רק למצב וידאו
-            if create_video:
-                height_live = current_height
+            height_live=float(np.clip((baseline_head_y_global-head_y)/max(0.12,HEAD_MIN_ASCENT*1.2),0.0,1.0))
 
             torso_cx=np.mean([lms[LSH].x,lms[RSH].x,lms[LH].x,lms[RH].x])*w
             torso_dx_norm=0.0 if prev_torso_cx is None else abs(torso_cx-prev_torso_cx)/max(1.0,w)
@@ -384,6 +388,7 @@ def run_pullup_analysis(video_path,
             else:
                 offbar_streak+=1; onbar_streak=0
 
+            # Enter onbar
             if (not onbar) and onbar_streak>=ONBAR_MIN_FRAMES:
                 onbar=True
                 asc_base_head=None; allow_new_peak=True; swing_streak=0
@@ -396,6 +401,7 @@ def run_pullup_analysis(video_path,
                 phase_start_frame=None
                 phase_type=None
 
+            # Exit onbar
             if onbar and offbar_streak>=OFFBAR_MIN_FRAMES:
                 if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
                     cycle_tip_bottom = True
@@ -431,6 +437,7 @@ def run_pullup_analysis(video_path,
             head_vel=0.0 if head_prev is None else (head_y-head_prev)
             cur_rt=None
 
+            # Micro-burst
             if BURST_ENABLED and onbar and (asc_base_head is not None):
                 near_inflect = (abs(head_vel) <= INFLECT_VEL_THR)
                 sign_flip = (head_vel_prev is not None) and ((head_vel_prev > 0 and head_vel <= 0) or (head_vel_prev < 0 and head_vel >= 0))
@@ -440,6 +447,7 @@ def run_pullup_analysis(video_path,
             head_vel_prev = head_vel
 
             if onbar and vis_strict_ok:
+                # REP COUNTING
                 if asc_base_head is None:
                     if head_vel<-abs(HEAD_VEL_UP_TINY):
                         asc_base_head=head_y
@@ -452,10 +460,12 @@ def run_pullup_analysis(video_path,
                     cycle_peak_ascent=max(cycle_peak_ascent,(asc_base_head-head_y))
                     cycle_min_elbow=min(cycle_min_elbow,elbow_angle)
 
+                    # Track bottom metrics
                     max_elb_now = max(raw_elbow_L, raw_elbow_R)
                     if bottom_phase_max_elbow is None: bottom_phase_max_elbow = max_elb_now
                     else: bottom_phase_max_elbow = max(bottom_phase_max_elbow, max_elb_now)
 
+                    # Lockout distance
                     mid_sh = ((lms[LSH].x + lms[RSH].x)/2.0, (lms[LSH].y + lms[RSH].y)/2.0)
                     mid_hp = ((lms[LH].x + lms[RH].x)/2.0, (lms[LH].y + lms[RH].y)/2.0)
                     torso_len = _dist_xy(mid_sh, mid_hp) + 1e-6
@@ -469,6 +479,7 @@ def run_pullup_analysis(video_path,
                     reset_by_elb =(elbow_angle>=RESET_ELBOW)
                     
                     if reset_by_desc or reset_by_elb:
+                        # Eccentric phase ended → record timing
                         if phase_type == "eccentric" and phase_start_frame is not None:
                             eccentric_frames = processed_frame_count - phase_start_frame
                             eccentric_sec = frames_to_sec(eccentric_frames)
@@ -511,6 +522,7 @@ def run_pullup_analysis(video_path,
                 can_cnt=(frame_idx - last_peak_frame) >= REFRACTORY_FRAMES
 
                 if at_top and allow_new_peak and can_cnt and (not counted_this_cycle):
+                    # Concentric ended → record timing
                     if phase_type == "concentric" and phase_start_frame is not None:
                         concentric_frames = processed_frame_count - phase_start_frame
                         concentric_sec = frames_to_sec(concentric_frames)
@@ -535,6 +547,7 @@ def run_pullup_analysis(video_path,
                 if (allow_new_peak is False) and (last_peak_frame>0):
                     if head_prev is not None and (head_y - head_prev) > 0 and (asc_base_head is not None):
                         if (head_y - (asc_base_head - cycle_peak_ascent)) >= REARM_DESCENT_EFF:
+                            # Top hold ended → record timing
                             if phase_type == "top" and phase_start_frame is not None:
                                 top_hold_frames = processed_frame_count - phase_start_frame
                                 top_hold_sec = frames_to_sec(top_hold_frames)
@@ -545,6 +558,7 @@ def run_pullup_analysis(video_path,
                             
                             allow_new_peak=True
 
+                # Face detection (throttled)
                 face_check_counter += 1
                 if face_check_counter >= FACE_CHECK_INTERVAL:
                     face_check_counter = 0
@@ -591,6 +605,7 @@ def run_pullup_analysis(video_path,
                             cur_rt = FB_CUE_HIGHER
                             allow_new_peak = False
 
+                # Swing cue
                 if torso_dx_norm>SWING_THR: swing_streak+=1
                 else: swing_streak=max(0,swing_streak-1)
                 if (cur_rt is None) and (swing_streak>=SWING_MIN_STREAK) and (not cycle_tip_swing):
@@ -600,22 +615,22 @@ def run_pullup_analysis(video_path,
                 asc_base_head=None; allow_new_peak=True
                 swing_streak=0
 
-            # RT feedback רק במצב וידאו
-            if create_video:
-                if cur_rt:
-                    if cur_rt!=rt_fb_msg: rt_fb_msg=cur_rt; rt_fb_hold=RT_FB_HOLD_FRAMES
-                    else: rt_fb_hold=max(rt_fb_hold,RT_FB_HOLD_FRAMES)
-                else:
-                    if rt_fb_hold>0: rt_fb_hold-=1
+            # RT feedback hold
+            if cur_rt:
+                if cur_rt!=rt_fb_msg: rt_fb_msg=cur_rt; rt_fb_hold=RT_FB_HOLD_FRAMES
+                else: rt_fb_hold=max(rt_fb_hold,RT_FB_HOLD_FRAMES)
+            else:
+                if rt_fb_hold>0: rt_fb_hold-=1
 
-            # ציור רק במצב וידאו
-            if create_video and out is not None:
+            # ============ SLOW PATH: Draw and write frame ============
+            if slow_path and out is not None:
                 frame=draw_body_only(frame,lms)
                 frame=draw_overlay(frame,reps=rep_count,feedback=(rt_fb_msg if rt_fb_hold>0 else None),height_pct=height_live)
                 out.write(frame)
 
             if head_y is not None: head_prev=head_y
 
+    # EOF post-hoc
     if onbar and (not counted_this_cycle) and (cycle_peak_ascent>=HEAD_MIN_ASCENT) and (cycle_min_elbow<=ELBOW_TOP_ANGLE):
         if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
             cycle_tip_bottom = True
@@ -634,9 +649,11 @@ def run_pullup_analysis(video_path,
         else: good_reps+=1
 
     cap.release()
-    if create_video and out: out.release()
+    if slow_path and out: 
+        out.release()
     cv2.destroyAllWindows()
 
+    # ============ SESSION SCORE (feedback-based) ============
     if rep_count==0:
         technique_score=0.0
     elif all_scores:
@@ -649,6 +666,7 @@ def run_pullup_analysis(video_path,
             penalty = 0.0
         technique_score=_half_floor10(max(0.0,10.0-penalty))
 
+    # ============ FORM_TIP LOGIC (optimization, not score-based) ============
     form_tip = None
     
     if rep_count >= 2 and len(rep_phase_timings) >= 2:
@@ -688,11 +706,13 @@ def run_pullup_analysis(video_path,
             best_tip = max(tip_scores, key=tip_scores.get)
             form_tip = FORM_TIP_MESSAGES.get(best_tip)
 
+    # Build feedback list
     all_fb = set(session_feedback) if session_feedback else set()
     fb_list = [cue for cue in FEEDBACK_ORDER if cue in all_fb]
     if not fb_list and rep_count > 0 and bad_reps == 0:
         fb_list = ["Great form! Keep it up 💪"]
 
+    # Write feedback file
     try:
         with open(feedback_path,"w",encoding="utf-8") as f:
             f.write(f"Total Reps: {int(rep_count)}\n")
@@ -705,8 +725,9 @@ def run_pullup_analysis(video_path,
     except Exception:
         pass
 
+    # ============ SLOW PATH: Encode video ============
     final_path=""
-    if create_video and os.path.exists(output_path):
+    if slow_path and os.path.exists(output_path):
         encoded_path=output_path.replace(".mp4","_encoded.mp4")
         try:
             subprocess.run(["ffmpeg","-y","-i",output_path,"-c:v","libx264","-preset","medium",
@@ -729,7 +750,7 @@ def run_pullup_analysis(video_path,
         "feedback": fb_list,
         "tips": [],
         "reps": rep_reports,
-        "video_path": final_path if create_video else "",
+        "video_path": final_path if slow_path else "",
         "feedback_path": feedback_path
     }
     if form_tip is not None:
@@ -738,6 +759,7 @@ def run_pullup_analysis(video_path,
     return result
 
 def _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
+    """Returns True if bottom extension FAILED (needs tip)"""
     elbow_ok   = (bottom_phase_max_elbow is not None) and (bottom_phase_max_elbow >= BOTTOM_EXT_MIN_ANGLE)
     elbow_near = (bottom_phase_max_elbow is not None) and (bottom_phase_max_elbow >= (BOTTOM_EXT_MIN_ANGLE - BOTTOM_NEAR_DEG))
     lock_ok    = (bottom_lockout_max is not None) and (bottom_lockout_max >= LOCKOUT_DIST_MIN)
