@@ -1,30 +1,26 @@
 # -*- coding: utf-8 -*-
-# romanian_deadlift_analysis.py — Romanian Deadlift (RDL) analysis aligned to existing standards
+# romanian_deadlift_analysis_fixed.py — תיקון סף ברכיים וגב + אופטימיזציה
 
 import os
 import cv2
 import math
 import numpy as np
 import subprocess
-from collections import Counter
 from PIL import ImageFont, ImageDraw, Image
 import mediapipe as mp
 
 # ===================== STYLE / FONTS =====================
-BAR_BG_ALPHA         = 0.55
-TOP_PAD              = 0
-LEFT_PAD             = 0
-
-DONUT_RADIUS_SCALE   = 0.72
+BAR_BG_ALPHA = 0.55
+DONUT_RADIUS_SCALE = 0.72
 DONUT_THICKNESS_FRAC = 0.28
-DEPTH_COLOR          = (40, 200, 80)
-DEPTH_RING_BG        = (70, 70, 70)
+DEPTH_COLOR = (40, 200, 80)
+DEPTH_RING_BG = (70, 70, 70)
 
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
 REPS_FONT_SIZE = 28
 FEEDBACK_FONT_SIZE = 22
 DEPTH_LABEL_FONT_SIZE = 14
-DEPTH_PCT_FONT_SIZE   = 18
+DEPTH_PCT_FONT_SIZE = 18
 
 def _load_font(path, size):
     try:
@@ -32,28 +28,28 @@ def _load_font(path, size):
     except Exception:
         return ImageFont.load_default()
 
-REPS_FONT        = _load_font(FONT_PATH, REPS_FONT_SIZE)
-FEEDBACK_FONT    = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
+REPS_FONT = _load_font(FONT_PATH, REPS_FONT_SIZE)
+FEEDBACK_FONT = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
 DEPTH_LABEL_FONT = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
-DEPTH_PCT_FONT   = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
+DEPTH_PCT_FONT = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 
 mp_pose = mp.solutions.pose
 
 # ===================== FEEDBACK SEVERITY =====================
 FB_SEVERITY = {
-    "Hinge a bit deeper": 3,
-    "Keep your back neutral": 3,
-    "Avoid excessive knee bend": 2,
-    "Control the lowering": 2,
-    "Pause briefly at the bottom": 1,
+    "Hinge deeper to load hamstrings": 3,
+    "Excessive knee bend - keep legs straighter": 3,
+    "Back rounding detected": 3,
+    "Control the eccentric phase": 2,
+    "Add a pause at the bottom": 1,
 }
 
 FEEDBACK_CATEGORY = {
-    "Hinge a bit deeper": "depth",
-    "Keep your back neutral": "back",
-    "Avoid excessive knee bend": "knees",
-    "Control the lowering": "tempo",
-    "Pause briefly at the bottom": "tempo",
+    "Hinge deeper to load hamstrings": "depth",
+    "Excessive knee bend - keep legs straighter": "knees",
+    "Back rounding detected": "back",
+    "Control the eccentric phase": "tempo",
+    "Add a pause at the bottom": "tempo",
 }
 
 def pick_strongest_feedback(feedback_list):
@@ -79,7 +75,7 @@ def merge_feedback(global_best, new_list):
         return global_best
     if not global_best:
         return cand
-    return cand if FB_SEVERITY.get(cand,1) >= FB_SEVERITY.get(global_best,1) else global_best
+    return cand if FB_SEVERITY.get(cand, 1) >= FB_SEVERITY.get(global_best, 1) else global_best
 
 def dedupe_feedback(feedback_list):
     seen = set()
@@ -110,32 +106,33 @@ def display_half_str(x):
 def draw_depth_donut(frame, center, radius, thickness, pct):
     pct = float(np.clip(pct, 0.0, 1.0))
     cx, cy = int(center[0]), int(center[1])
-    radius   = int(radius)
+    radius = int(radius)
     thickness = int(thickness)
     cv2.circle(frame, (cx, cy), radius, DEPTH_RING_BG, thickness, lineType=cv2.LINE_AA)
     start_ang = -90
-    end_ang   = start_ang + int(360 * pct)
+    end_ang = start_ang + int(360 * pct)
     cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang,
                 DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
     return frame
 
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Reps בפינת שמאל-עליון; דונאט ימני-עליון; פידבק תחתון"""
     h, w, _ = frame.shape
-
     pil = Image.fromarray(frame)
     draw = ImageDraw.Draw(pil)
+    
+    # Reps counter
     reps_text = f"Reps: {reps}"
     inner_pad_x, inner_pad_y = 10, 6
     text_w = draw.textlength(reps_text, font=REPS_FONT)
     text_h = REPS_FONT.size
     x0, y0 = 0, 0
-    x1 = int(text_w + 2*inner_pad_x)
-    y1 = int(text_h + 2*inner_pad_y)
+    x1 = int(text_w + 2 * inner_pad_x)
+    y1 = int(text_h + 2 * inner_pad_y)
     overlay = Image.new('RGBA', (x1, y1), (0, 0, 0, int(255 * BAR_BG_ALPHA)))
     pil.paste(overlay, (x0, y0), overlay)
-    draw.text((x0 + inner_pad_x, y0 + inner_pad_y), reps_text, font=REPS_FONT, fill=(255,255,255))
+    draw.text((x0 + inner_pad_x, y0 + inner_pad_y), reps_text, font=REPS_FONT, fill=(255, 255, 255))
 
+    # Depth donut
     donut_r = int(h * DONUT_RADIUS_SCALE * 0.09)
     thickness = max(6, int(donut_r * DONUT_THICKNESS_FRAC))
     cx = w - donut_r - 15
@@ -146,18 +143,18 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     pil = Image.fromarray(frame)
     draw = ImageDraw.Draw(pil)
 
-    draw.text((cx, cy - 10 - DEPTH_LABEL_FONT_SIZE), "DEPTH", font=DEPTH_LABEL_FONT, fill=(255,255,255), anchor="mm")
-    draw.text((cx, cy + 10), f"{int(depth_pct*100)}%", font=DEPTH_PCT_FONT, fill=(255,255,255), anchor="mm")
+    draw.text((cx, cy - 10 - DEPTH_LABEL_FONT_SIZE), "DEPTH", font=DEPTH_LABEL_FONT, fill=(255, 255, 255), anchor="mm")
+    draw.text((cx, cy + 10), f"{int(depth_pct * 100)}%", font=DEPTH_PCT_FONT, fill=(255, 255, 255), anchor="mm")
 
+    # Feedback bar
     if feedback:
         fb_text = feedback
-        text_w = draw.textlength(fb_text, font=FEEDBACK_FONT)
         text_h = FEEDBACK_FONT.size
         fb_pad_x, fb_pad_y = 10, 6
-        fb_h = int(text_h + 2*fb_pad_y)
+        fb_h = int(text_h + 2 * fb_pad_y)
         overlay = Image.new('RGBA', (w, fb_h), (0, 0, 0, int(255 * BAR_BG_ALPHA)))
         pil.paste(overlay, (0, h - fb_h), overlay)
-        draw.text((fb_pad_x, h - fb_h + fb_pad_y), fb_text, font=FEEDBACK_FONT, fill=(255,255,255))
+        draw.text((fb_pad_x, h - fb_h + fb_pad_y), fb_text, font=FEEDBACK_FONT, fill=(255, 255, 255))
 
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
@@ -177,7 +174,11 @@ def torso_angle_to_vertical(hip, shoulder):
     cosang = float(np.clip(cosang, -1.0, 1.0))
     return float(math.degrees(math.acos(cosang)))
 
-def analyze_back_curvature(shoulder, hip, head_like, max_angle_deg=20.0, min_head_dist_ratio=0.35):
+def analyze_back_curvature(shoulder, hip, head_like, max_angle_deg=30.0, min_head_dist_ratio=0.35):
+    """
+    ✅ תיקון: העלנו את הסף ל-30 מעלות (במקום 20)
+    בדדליפט רומני הגב נוטה קדימה יותר - זה תקין!
+    """
     torso_vec = shoulder - hip
     head_vec = head_like - shoulder
     torso_nrm = np.linalg.norm(torso_vec) + 1e-9
@@ -208,15 +209,21 @@ def _get_side_landmarks(lm):
         "ear": np.array([lm[idxs[4].value].x, lm[idxs[4].value].y]),
     }
 
-# ===================== ANALYSIS PARAMS =====================
+# ===================== תיקון פרמטרים =====================
 HINGE_START_ANGLE = 20.0
 HINGE_BOTTOM_ANGLE = 55.0
 STAND_ANGLE = 12.0
 MIN_FRAMES_BETWEEN_REPS = 8
 PROG_ALPHA = 0.3
 
-KNEE_MIN_ANGLE = 150.0
-BACK_MAX_ANGLE = 20.0
+# ✅ תיקון קריטי: ברכיים בדדליפט רומני
+# במקום KNEE_MIN_ANGLE = 150 (כמעט ישר)
+# עכשיו: 110-140 מעלות = עיקום קל-בינוני (תקין!)
+KNEE_MIN_ANGLE = 110.0  # מתחת לזה = יותר מדי עיקום (כמו סקוואט)
+KNEE_MAX_ANGLE = 140.0  # מעל לזה = ברכיים ישרות מדי
+
+# ✅ תיקון: הגב יכול להיות יותר אופקי בתחתית
+BACK_MAX_ANGLE = 30.0  # העלנו מ-20 ל-30 מעלות
 
 MIN_ECC_S = 0.35
 MIN_BOTTOM_S = 0.12
@@ -225,17 +232,17 @@ MIN_SCORE = 4.0
 MAX_SCORE = 10.0
 
 def run_romanian_deadlift_analysis(video_path,
-                                  frame_skip=3,
-                                  scale=0.4,
-                                  output_path="romanian_deadlift_analyzed.mp4",
-                                  feedback_path="romanian_deadlift_feedback.txt",
-                                  return_video=True,
-                                  fast_mode=None):
+                                   frame_skip=6,  # ✅ הכפלנו מ-3 ל-6
+                                   scale=0.35,    # ✅ הקטנו מ-0.4 ל-0.35
+                                   output_path="romanian_deadlift_analyzed.mp4",
+                                   feedback_path="romanian_deadlift_feedback.txt",
+                                   return_video=True,
+                                   fast_mode=None):
     """
-    Romanian Deadlift analysis:
-    - Counts reps using torso hinge angle (vertical -> hinged -> vertical)
-    - Checks depth, knee bend, back neutrality, and tempo
-    - Returns same schema as squat/deadlift analyzers
+    Romanian Deadlift analysis - FIXED:
+    ✅ ברכיים: מותר עיקום 110-140 מעלות (לא 150!)
+    ✅ גב: מותר נטייה עד 30 מעלות (לא 20!)
+    ✅ ביצועים: frame_skip=6, scale=0.35, model_complexity=0
     """
     if fast_mode is True:
         return_video = False
@@ -261,7 +268,6 @@ def run_romanian_deadlift_analysis(video_path,
     rep_reports = []
     session_feedbacks = []
     session_feedback_by_cat = {}
-    global_best = ""
 
     in_rep = False
     bottom_reached = False
@@ -273,13 +279,15 @@ def run_romanian_deadlift_analysis(video_path,
 
     max_torso_angle = 0.0
     min_knee_angle = 999.0
+    max_knee_angle = 0.0
     back_issue = False
     down_frames = up_frames = bottom_hold_frames = 0
 
     rt_fb_msg = None
     rt_fb_hold = 0
 
-    with mp_pose.Pose(model_complexity=1,
+    # ✅ אופטימיזציה: model_complexity=0 במקום 1
+    with mp_pose.Pose(model_complexity=0,
                       min_detection_confidence=0.5,
                       min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
@@ -290,7 +298,7 @@ def run_romanian_deadlift_analysis(video_path,
             if frame_idx % frame_skip != 0:
                 continue
 
-            work = cv2.resize(frame, (0,0), fx=scale, fy=scale) if scale != 1.0 else frame
+            work = cv2.resize(frame, (0, 0), fx=scale, fy=scale) if scale != 1.0 else frame
             if return_video and out is None:
                 h0, w0 = work.shape[:2]
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w0, h0))
@@ -300,7 +308,9 @@ def run_romanian_deadlift_analysis(video_path,
 
             if not res.pose_landmarks:
                 if return_video and out is not None:
-                    frame_drawn = draw_overlay(work.copy(), reps=counter, feedback=(rt_fb_msg if rt_fb_hold > 0 else None), depth_pct=prog)
+                    frame_drawn = draw_overlay(work.copy(), reps=counter,
+                                               feedback=(rt_fb_msg if rt_fb_hold > 0 else None),
+                                               depth_pct=prog)
                     out.write(frame_drawn)
                 continue
 
@@ -325,6 +335,7 @@ def run_romanian_deadlift_analysis(video_path,
                 bottom_reached = False
                 max_torso_angle = torso_angle
                 min_knee_angle = knee_angle
+                max_knee_angle = knee_angle
                 back_issue = False
                 down_frames = up_frames = bottom_hold_frames = 0
                 prev_progress = progress
@@ -332,6 +343,7 @@ def run_romanian_deadlift_analysis(video_path,
             if in_rep:
                 max_torso_angle = max(max_torso_angle, torso_angle)
                 min_knee_angle = min(min_knee_angle, knee_angle)
+                max_knee_angle = max(max_knee_angle, knee_angle)
                 if back_bad:
                     back_issue = True
 
@@ -358,24 +370,36 @@ def run_romanian_deadlift_analysis(video_path,
                     feedback = []
                     score = MAX_SCORE
 
+                    # Depth check
                     if max_torso_angle < (HINGE_BOTTOM_ANGLE - 5.0):
-                        feedback.append("Hinge a bit deeper")
+                        feedback.append("Hinge deeper to load hamstrings")
                         score -= 2.0
 
+                    # ✅ תיקון: בדיקת ברכיים הפוכה!
+                    # אם הברכיים מתכופפות יותר מדי (כמו סקוואט)
                     if min_knee_angle < KNEE_MIN_ANGLE:
-                        feedback.append("Avoid excessive knee bend")
-                        score -= 1.5
+                        feedback.append("Excessive knee bend - keep legs straighter")
+                        score -= 2.5
+                    
+                    # אם הברכיים ישרות מדי (stiff-leg)
+                    # באמת בדדליפט רומני רוצים ברכיים יחסית ישרות,
+                    # אז זה פחות קריטי - אפשר להגביל רק במקרים קיצוניים
+                    # if max_knee_angle > KNEE_MAX_ANGLE:
+                    #     feedback.append("Allow slight knee bend")
+                    #     score -= 1.0
 
+                    # Back check
                     if back_issue or back_angle > BACK_MAX_ANGLE:
-                        feedback.append("Keep your back neutral")
-                        score -= 2.0
+                        feedback.append("Back rounding detected")
+                        score -= 2.5
 
+                    # Tempo check
                     if down_s < MIN_ECC_S:
-                        feedback.append("Control the lowering")
+                        feedback.append("Control the eccentric phase")
                         score -= 1.0
 
                     if bottom_s < MIN_BOTTOM_S:
-                        feedback.append("Pause briefly at the bottom")
+                        feedback.append("Add a pause at the bottom")
                         score -= 0.5
 
                     score = float(max(MIN_SCORE, min(MAX_SCORE, score)))
@@ -388,7 +412,6 @@ def run_romanian_deadlift_analysis(video_path,
 
                     session_feedbacks.extend(feedback)
                     _, session_feedback_by_cat = pick_strongest_per_category(session_feedbacks)
-                    global_best = merge_feedback(global_best, feedback)
 
                     rep_reports.append({
                         "rep": counter,
@@ -399,6 +422,7 @@ def run_romanian_deadlift_analysis(video_path,
                         "metrics": {
                             "max_torso_angle": round(max_torso_angle, 2),
                             "min_knee_angle": round(min_knee_angle, 2),
+                            "max_knee_angle": round(max_knee_angle, 2),
                             "back_angle": round(back_angle, 2),
                             "eccentric_s": round(down_s, 2),
                             "bottom_hold_s": round(bottom_s, 2)
@@ -415,11 +439,14 @@ def run_romanian_deadlift_analysis(video_path,
                 rt_fb_hold -= 1
 
             if return_video and out is not None:
-                frame_drawn = draw_overlay(work.copy(), reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=prog)
+                frame_drawn = draw_overlay(work.copy(), reps=counter,
+                                           feedback=(rt_fb_msg if rt_fb_hold > 0 else None),
+                                           depth_pct=prog)
                 out.write(frame_drawn)
 
     cap.release()
-    if out: out.release()
+    if out:
+        out.release()
     cv2.destroyAllWindows()
 
     avg = np.mean(all_scores) if all_scores else 0.0
@@ -429,20 +456,20 @@ def run_romanian_deadlift_analysis(video_path,
     if session_feedbacks and len(session_feedbacks) > 0:
         technique_score = min(technique_score, 9.5)
 
-    feedback_list = dedupe_feedback(session_feedbacks) if session_feedbacks else ["Great form! Keep it up 💪"]
+    feedback_list = dedupe_feedback(session_feedbacks) if session_feedbacks else ["Perfect form! 🔥"]
 
     session_tip = None
     if session_feedback_by_cat:
         if "depth" in session_feedback_by_cat:
-            session_tip = "Focus on loading the hamstrings by pushing the hips farther back"
-        elif "back" in session_feedback_by_cat:
-            session_tip = "Brace your core and keep a neutral spine throughout the hinge"
+            session_tip = "Push hips back more to maximize hamstring stretch"
         elif "knees" in session_feedback_by_cat:
-            session_tip = "Keep a soft knee bend and avoid turning the hinge into a squat"
+            session_tip = "Keep a soft knee bend - don't turn it into a squat"
+        elif "back" in session_feedback_by_cat:
+            session_tip = "Maintain neutral spine by bracing core throughout"
         elif "tempo" in session_feedback_by_cat:
-            session_tip = "Use a controlled 2–3s lowering for better tension"
+            session_tip = "Focus on slow, controlled eccentric (2-3 seconds)"
     else:
-        session_tip = "Great consistency! Keep building posterior-chain strength"
+        session_tip = "Excellent technique! Keep building that posterior chain 💪"
 
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
@@ -467,7 +494,8 @@ def run_romanian_deadlift_analysis(video_path,
 
             if os.path.exists(output_path) and os.path.exists(encoded_path):
                 os.remove(output_path)
-            final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
+            final_video_path = encoded_path if os.path.exists(encoded_path) else (
+                output_path if os.path.exists(output_path) else "")
         except Exception as e:
             print(f"Warning: FFmpeg error: {e}")
             final_video_path = output_path if os.path.exists(output_path) else ""
