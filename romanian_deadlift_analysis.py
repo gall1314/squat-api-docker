@@ -237,15 +237,29 @@ def run_romanian_deadlift_analysis(video_path,
                                    output_path="romanian_deadlift_analyzed.mp4",
                                    feedback_path="romanian_deadlift_feedback.txt",
                                    return_video=True,
-                                   fast_mode=None):
+                                   fast_mode=False):
     """
     Romanian Deadlift analysis - FIXED:
     ✅ ברכיים: מותר עיקום 110-140 מעלות (לא 150!)
     ✅ גב: מותר נטייה עד 30 מעלות (לא 20!)
     ✅ ביצועים: frame_skip=6, scale=0.35, model_complexity=0
+    ✅ fast_mode: במצב מהיר - רק JSON, ללא וידאו (פי 3-4 מהר יותר)
     """
+    # === אופטימיזציה למצב מהיר - כמו בקוד הסקוואט ===
     if fast_mode is True:
         return_video = False
+    create_video = bool(return_video) and (output_path is not None) and (output_path != "")
+    
+    # במצב מהיר: פי 2 פחות פריימים, model lite
+    if fast_mode:
+        effective_frame_skip = frame_skip * 2
+        effective_scale = scale * 0.85
+        model_complexity = 0
+        print(f"[FAST MODE RDL] frame_skip={effective_frame_skip} (2x), scale={effective_scale:.2f}, model=lite", flush=True)
+    else:
+        effective_frame_skip = frame_skip
+        effective_scale = scale
+        model_complexity = 1
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -260,7 +274,7 @@ def run_romanian_deadlift_analysis(video_path,
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
-    effective_fps = max(1.0, fps_in / max(1, frame_skip))
+    effective_fps = max(1.0, fps_in / max(1, effective_frame_skip))
     dt = 1.0 / float(effective_fps)
 
     counter = good_reps = bad_reps = 0
@@ -286,8 +300,8 @@ def run_romanian_deadlift_analysis(video_path,
     rt_fb_msg = None
     rt_fb_hold = 0
 
-    # ✅ אופטימיזציה: model_complexity=0 במקום 1
-    with mp_pose.Pose(model_complexity=0,
+    # ✅ אופטימיזציה: model_complexity משתנה לפי fast_mode
+    with mp_pose.Pose(model_complexity=model_complexity,
                       min_detection_confidence=0.5,
                       min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
@@ -295,11 +309,11 @@ def run_romanian_deadlift_analysis(video_path,
             if not ret:
                 break
             frame_idx += 1
-            if frame_idx % frame_skip != 0:
+            if frame_idx % effective_frame_skip != 0:
                 continue
 
-            work = cv2.resize(frame, (0, 0), fx=scale, fy=scale) if scale != 1.0 else frame
-            if return_video and out is None:
+            work = cv2.resize(frame, (0, 0), fx=effective_scale, fy=effective_scale) if effective_scale != 1.0 else frame
+            if create_video and out is None:
                 h0, w0 = work.shape[:2]
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w0, h0))
 
@@ -307,7 +321,7 @@ def run_romanian_deadlift_analysis(video_path,
             res = pose.process(rgb)
 
             if not res.pose_landmarks:
-                if return_video and out is not None:
+                if create_video and out is not None:
                     frame_drawn = draw_overlay(work.copy(), reps=counter,
                                                feedback=(rt_fb_msg if rt_fb_hold > 0 else None),
                                                depth_pct=prog)
@@ -438,7 +452,7 @@ def run_romanian_deadlift_analysis(video_path,
             if rt_fb_hold > 0:
                 rt_fb_hold -= 1
 
-            if return_video and out is not None:
+            if create_video and out is not None:
                 frame_drawn = draw_overlay(work.copy(), reps=counter,
                                            feedback=(rt_fb_msg if rt_fb_hold > 0 else None),
                                            depth_pct=prog)
@@ -483,7 +497,7 @@ def run_romanian_deadlift_analysis(video_path,
         print(f"Warning: Could not write feedback file: {e}")
 
     final_video_path = ""
-    if return_video and output_path:
+    if create_video and output_path:
         encoded_path = output_path.replace(".mp4", "_encoded.mp4")
         try:
             subprocess.run([
