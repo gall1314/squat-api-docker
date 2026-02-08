@@ -431,16 +431,16 @@ def run_romanian_deadlift_analysis(video_path,
                         feedback.append("Hinge deeper to load hamstrings")
                         score -= 2.0
 
-                    # ✅ תיקון: בדיקת ברכיים - הפוך מהקוד הקודם!
+                    # ✅ תיקון סופי: בדיקת ברכיים לפי הזווית הכי ישרה (max_knee_angle)
                     # בדדליפט רומני רוצים עיקום של 15-20 מעלות
-                    # אם הברכיים ישרות מדי → Stiff-Leg, לא RDL
+                    # אם max_knee_angle (הכי ישר) > 155° → הברכיים ישרות מדי
                     
-                    if min_knee_angle > KNEE_MIN_ANGLE:
-                        # ברכיים ישרות מדי (> 155°) = Stiff-Leg
+                    if max_knee_angle > KNEE_MIN_ANGLE:
+                        # ברכיים ישרות מדי (> 155°) = Stiff-Leg, לא RDL
                         feedback.append("Bend knees slightly more (15-20°) - this is stiff-leg, not RDL")
                         score -= 1.5
                     elif min_knee_angle < KNEE_MAX_ANGLE:
-                        # ברכיים מכופפות יותר מדי (< 140°) = כמו סקוואט
+                        # ברכיים מכופפות יותר מדי (< 140°) ברגע מסוים = כמו סקוואט
                         feedback.append("Keep knees straighter - too much bend")
                         score -= 2.0
 
@@ -484,6 +484,10 @@ def run_romanian_deadlift_analysis(video_path,
                             "bottom_hold_s": round(bottom_s, 2)
                         }
                     })
+                    
+                    # Debug: הדפסת זוויות לכל חזרה
+                    print(f"[RDL] Rep {counter}: min_knee={min_knee_angle:.1f}°, max_knee={max_knee_angle:.1f}°, torso={max_torso_angle:.1f}°", 
+                          file=sys.stderr, flush=True)
 
                     rt_fb_msg = pick_strongest_feedback(feedback)
                     rt_fb_hold = int(0.7 / dt)
