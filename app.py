@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# app.py — Fast/Slow dual-mode API
+# app.py — Fast/Slow dual-mode API with Stiff-Leg Deadlift support
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -18,6 +18,9 @@ EXERCISE_MAP = {
     "barbell squat": "squat", "barbell back squat": "squat", "squat": "squat",
     "deadlift": "deadlift",
     "romanian deadlift": "romanian_deadlift", "rdl": "romanian_deadlift",
+    "stiff leg deadlift": "stiff_leg_deadlift", "stiff-leg deadlift": "stiff_leg_deadlift",
+    "stiff leg": "stiff_leg_deadlift", "sldl": "stiff_leg_deadlift",
+    "straight leg deadlift": "stiff_leg_deadlift", "straight-leg deadlift": "stiff_leg_deadlift",
     "bulgarian split squat": "bulgarian", "split squat": "bulgarian",
     "pull-up": "pullup", "pull up": "pullup", "pullups": "pullup",
     "barbell bicep curl": "bicep_curl", "bicep curl": "bicep_curl",
@@ -142,6 +145,7 @@ def load_func_soft(module_name, *func_names):
 run_squat       = load_func_soft('squat_analysis', 'run_analysis', 'run_squat_analysis')
 run_deadlift    = load_func_soft('deadlift_analysis', 'run_deadlift_analysis', 'run_analysis')
 run_rdl         = load_func_soft('romanian_deadlift_analysis', 'run_romanian_deadlift_analysis', 'run_analysis')
+run_stiff_leg   = load_func_soft('stiff_leg_deadlift_analysis', 'run_stiff_leg_deadlift_analysis', 'run_analysis')
 run_bulgarian   = load_func_soft('bulgarian_split_squat_analysis', 'run_bulgarian_analysis', 'run_analysis')
 run_pullup      = load_func_soft('pullup_analysis', 'run_pullup_analysis', 'run_analysis')
 run_bicep_curl  = load_func_soft('barbell_bicep_curl', 'run_barbell_bicep_curl_analysis', 'run_analysis')
@@ -188,6 +192,9 @@ def _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_mode: bool):
     elif resolved_type == 'romanian_deadlift':
         return _run_analyzer(run_rdl, raw_video_path, analyzed_path, fast_mode,
                            frame_skip=frame_skip, scale=scale)
+    elif resolved_type == 'stiff_leg_deadlift':
+        return _run_analyzer(run_stiff_leg, raw_video_path, analyzed_path, fast_mode,
+                           frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'bulgarian':
         return _run_analyzer(run_bulgarian, raw_video_path, analyzed_path, fast_mode,
                            frame_skip=frame_skip, scale=scale)
@@ -228,6 +235,11 @@ def analyze():
     - fast: boolean (optional, default=true) - מצב מהיר או מלא
       * fast=true:  רק JSON, ללא וידאו (10-15 שניות)
       * fast=false: JSON + וידאו מנותח (60 שניות)
+    
+    Supported exercise types:
+    - squat, deadlift, romanian deadlift (rdl), stiff leg deadlift (sldl)
+    - bulgarian split squat, pull-up, bicep curl, bent-over row
+    - good morning, dips, overhead press, push-up
     
     Returns:
     - result: object - תוצאות הניתוח (reps, scores, feedback)
