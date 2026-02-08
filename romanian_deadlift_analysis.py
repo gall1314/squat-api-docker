@@ -174,10 +174,11 @@ def torso_angle_to_vertical(hip, shoulder):
     cosang = float(np.clip(cosang, -1.0, 1.0))
     return float(math.degrees(math.acos(cosang)))
 
-def analyze_back_curvature(shoulder, hip, head_like, max_angle_deg=30.0, min_head_dist_ratio=0.35):
+def analyze_back_curvature(shoulder, hip, head_like, max_angle_deg=45.0, min_head_dist_ratio=0.35):
     """
-    ✅ תיקון: העלנו את הסף ל-30 מעלות (במקום 20)
-    בדדליפט רומני הגב נוטה קדימה יותר - זה תקין!
+    ✅ תיקון: העלנו את הסף ל-45 מעלות
+    MediaPipe לא מספיק מדויק לזיהוי back rounding עדין
+    רק במקרים קיצוניים זה יתריע
     """
     torso_vec = shoulder - hip
     head_vec = head_like - shoulder
@@ -217,13 +218,16 @@ MIN_FRAMES_BETWEEN_REPS = 8
 PROG_ALPHA = 0.3
 
 # ✅ תיקון קריטי: ברכיים בדדליפט רומני
-# במקום KNEE_MIN_ANGLE = 150 (כמעט ישר)
-# עכשיו: 110-140 מעלות = עיקום קל-בינוני (תקין!)
-KNEE_MIN_ANGLE = 110.0  # מתחת לזה = יותר מדי עיקום (כמו סקוואט)
-KNEE_MAX_ANGLE = 140.0  # מעל לזה = ברכיים ישרות מדי
+# בדדליפט רומני **צריך** עיקום של 15-20 מעלות!
+# ברכיים ישרות מדי = Stiff-Leg Deadlift (לא RDL)
 
-# ✅ תיקון: הגב יכול להיות יותר אופקי בתחתית
-BACK_MAX_ANGLE = 30.0  # העלנו מ-20 ל-30 מעלות
+KNEE_MIN_ANGLE = 155.0  # מעל לזה = ברכיים ישרות מדי (stiff-leg)
+KNEE_OPTIMAL_MIN = 160.0  # אופטימלי: 160-170 מעלות (15-20° כיפוף)
+KNEE_OPTIMAL_MAX = 170.0
+KNEE_MAX_ANGLE = 140.0  # מתחת לזה = יותר מדי כיפוף (כמו סקוואט)
+
+# ✅ תיקון: הגב - MediaPipe לא מדויק מספיק, נעלה את הסף
+BACK_MAX_ANGLE = 45.0  # העלנו מ-30 ל-45 מעלות (כמעט לא יתריע)
 
 MIN_ECC_S = 0.35
 MIN_BOTTOM_S = 0.12
@@ -251,8 +255,6 @@ def run_romanian_deadlift_analysis(video_path,
     print(f"[RDL] Starting analysis: fast_mode={fast_mode}, return_video={return_video}", file=sys.stderr, flush=True)
     print(f"[RDL] Video path: {video_path}", file=sys.stderr, flush=True)
     
-    mp_pose_mod = mp.solutions.pose
-
     # === רק זה משתנה: האם ליצור וידאו ===
     if fast_mode is True:
         return_video = False
@@ -291,21 +293,10 @@ def run_romanian_deadlift_analysis(video_path,
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
 
-    # במצב מהיר: שומרים על בדיקת פריימים זהה, scale מעט קטן יותר, model lite
-    if fast_mode:
-        effective_frame_skip = frame_skip
-        effective_scale = scale * 0.85
-        model_complexity = 0
-        print(f"[RDL FAST] frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=lite", file=sys.stderr, flush=True)
-    else:
-        effective_frame_skip = frame_skip
-        effective_scale = scale
-        model_complexity = 1
-
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
-    effective_fps = max(1.0, fps_in / max(1, effective_frame_skip))
+    effective_fps = max(1.0, fps_in / max(1, frame_skip))  # ✅ חזרנו לערך המקורי
     dt = 1.0 / float(effective_fps)
 
     counter = good_reps = bad_reps = 0
@@ -331,7 +322,7 @@ def run_romanian_deadlift_analysis(video_path,
     rt_fb_msg = None
     rt_fb_hold = 0
 
-    # מודל מהיר/איטי לפי fast_mode
+    # ✅ חזרנו למודל המקורי - model_complexity=1 תמיד
     print(f"[RDL] Starting pose detection loop", file=sys.stderr, flush=True)
     
     import time
@@ -339,9 +330,9 @@ def run_romanian_deadlift_analysis(video_path,
     MAX_PROCESSING_TIME = 180  # 3 דקות מקסימום
     frames_processed = 0
     
-    with mp_pose_mod.Pose(model_complexity=model_complexity,
-                          min_detection_confidence=0.5,
-                          min_tracking_confidence=0.5) as pose:
+    with mp_pose.Pose(model_complexity=1,  # ✅ לא משנים את המודל!
+                      min_detection_confidence=0.5,
+                      min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -354,7 +345,7 @@ def run_romanian_deadlift_analysis(video_path,
                 break
             
             frame_idx += 1
-            if frame_idx % effective_frame_skip != 0:
+            if frame_idx % frame_skip != 0:  # ✅ חזרנו ל-frame_skip המקורי
                 continue
             
             frames_processed += 1
@@ -363,7 +354,7 @@ def run_romanian_deadlift_analysis(video_path,
             if frames_processed % 30 == 0:
                 print(f"[RDL] Progress: {frames_processed} frames, {counter} reps, {elapsed:.1f}s", file=sys.stderr, flush=True)
 
-            work = cv2.resize(frame, (0, 0), fx=effective_scale, fy=effective_scale) if effective_scale != 1.0 else frame
+            work = cv2.resize(frame, (0, 0), fx=scale, fy=scale) if scale != 1.0 else frame  # ✅ חזרנו ל-scale המקורי
             if create_video and out is None:
                 h0, w0 = work.shape[:2]
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w0, h0))
@@ -440,18 +431,18 @@ def run_romanian_deadlift_analysis(video_path,
                         feedback.append("Hinge deeper to load hamstrings")
                         score -= 2.0
 
-                    # ✅ תיקון: בדיקת ברכיים הפוכה!
-                    # אם הברכיים מתכופפות יותר מדי (כמו סקוואט)
-                    if min_knee_angle < KNEE_MIN_ANGLE:
-                        feedback.append("Excessive knee bend - keep legs straighter")
-                        score -= 2.5
+                    # ✅ תיקון: בדיקת ברכיים - הפוך מהקוד הקודם!
+                    # בדדליפט רומני רוצים עיקום של 15-20 מעלות
+                    # אם הברכיים ישרות מדי → Stiff-Leg, לא RDL
                     
-                    # אם הברכיים ישרות מדי (stiff-leg)
-                    # באמת בדדליפט רומני רוצים ברכיים יחסית ישרות,
-                    # אז זה פחות קריטי - אפשר להגביל רק במקרים קיצוניים
-                    # if max_knee_angle > KNEE_MAX_ANGLE:
-                    #     feedback.append("Allow slight knee bend")
-                    #     score -= 1.0
+                    if min_knee_angle > KNEE_MIN_ANGLE:
+                        # ברכיים ישרות מדי (> 155°) = Stiff-Leg
+                        feedback.append("Bend knees slightly more (15-20°) - this is stiff-leg, not RDL")
+                        score -= 1.5
+                    elif min_knee_angle < KNEE_MAX_ANGLE:
+                        # ברכיים מכופפות יותר מדי (< 140°) = כמו סקוואט
+                        feedback.append("Keep knees straighter - too much bend")
+                        score -= 2.0
 
                     # Back check
                     if back_issue or back_angle > BACK_MAX_ANGLE:
