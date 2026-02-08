@@ -291,12 +291,12 @@ def run_romanian_deadlift_analysis(video_path,
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
 
-    # במצב מהיר: פי 2 פחות פריימים, scale מעט קטן יותר, model lite
+    # במצב מהיר: שומרים על בדיקת פריימים זהה, scale מעט קטן יותר, model lite
     if fast_mode:
-        effective_frame_skip = frame_skip * 2
+        effective_frame_skip = frame_skip
         effective_scale = scale * 0.85
         model_complexity = 0
-        print(f"[RDL FAST] frame_skip={effective_frame_skip} (2x), scale={effective_scale:.2f}, model=lite", file=sys.stderr, flush=True)
+        print(f"[RDL FAST] frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=lite", file=sys.stderr, flush=True)
     else:
         effective_frame_skip = frame_skip
         effective_scale = scale
