@@ -37,19 +37,19 @@ mp_pose = mp.solutions.pose
 
 # ===================== FEEDBACK SEVERITY =====================
 FB_SEVERITY = {
-    "Hinge deeper to load hamstrings": 3,
-    "Excessive knee bend - keep legs straighter": 3,
-    "Back rounding detected": 3,
-    "Control the eccentric phase": 2,
-    "Add a pause at the bottom": 1,
+    "Bend your knees a bit more": 3,
+    "Too much knee bend": 3,
+    "Try to keep your back neutral": 2,
+    "Control the lowering": 2,
+    "Pause at the bottom": 1,
 }
 
 FEEDBACK_CATEGORY = {
-    "Hinge deeper to load hamstrings": "depth",
-    "Excessive knee bend - keep legs straighter": "knees",
-    "Back rounding detected": "back",
-    "Control the eccentric phase": "tempo",
-    "Add a pause at the bottom": "tempo",
+    "Bend your knees a bit more": "knees",
+    "Too much knee bend": "knees",
+    "Try to keep your back neutral": "back",
+    "Control the lowering": "tempo",
+    "Pause at the bottom": "tempo",
 }
 
 def pick_strongest_feedback(feedback_list):
@@ -426,36 +426,31 @@ def run_romanian_deadlift_analysis(video_path,
                     feedback = []
                     score = MAX_SCORE
 
-                    # Depth check
-                    if max_torso_angle < (HINGE_BOTTOM_ANGLE - 5.0):
-                        feedback.append("Hinge deeper to load hamstrings")
-                        score -= 2.0
-
-                    # ✅ תיקון סופי: בדיקת ברכיים לפי הזווית הכי ישרה (max_knee_angle)
-                    # בדדליפט רומני רוצים עיקום של 15-20 מעלות
-                    # אם max_knee_angle (הכי ישר) > 155° → הברכיים ישרות מדי
+                    # Depth check - removed, focusing on knee bend instead
                     
+                    # ✅ תיקון סופי: בדיקת ברכיים - ניסוח פשוט וברור
                     if max_knee_angle > KNEE_MIN_ANGLE:
-                        # ברכיים ישרות מדי (> 155°) = Stiff-Leg, לא RDL
-                        feedback.append("Bend knees slightly more (15-20°) - this is stiff-leg, not RDL")
+                        # ברכיים ישרות מדי - צריך יותר כיפוף
+                        feedback.append("Bend your knees a bit more")
                         score -= 1.5
                     elif min_knee_angle < KNEE_MAX_ANGLE:
-                        # ברכיים מכופפות יותר מדי (< 140°) ברגע מסוים = כמו סקוואט
-                        feedback.append("Keep knees straighter - too much bend")
+                        # ברכיים מכופפות יותר מדי
+                        feedback.append("Too much knee bend")
                         score -= 2.0
 
-                    # Back check
-                    if back_issue or back_angle > BACK_MAX_ANGLE:
-                        feedback.append("Back rounding detected")
-                        score -= 2.5
+                    # Back check - רק במקרים קיצוניים (סף 45°)
+                    # ונרכך את הניסוח
+                    if back_issue and back_angle > BACK_MAX_ANGLE:
+                        feedback.append("Try to keep your back neutral")
+                        score -= 1.0  # הפחתנו את העונש מ-2.5 ל-1.0
 
                     # Tempo check
                     if down_s < MIN_ECC_S:
-                        feedback.append("Control the eccentric phase")
+                        feedback.append("Control the lowering")
                         score -= 1.0
 
                     if bottom_s < MIN_BOTTOM_S:
-                        feedback.append("Add a pause at the bottom")
+                        feedback.append("Pause at the bottom")
                         score -= 0.5
 
                     score = float(max(MIN_SCORE, min(MAX_SCORE, score)))
@@ -522,16 +517,14 @@ def run_romanian_deadlift_analysis(video_path,
 
     session_tip = None
     if session_feedback_by_cat:
-        if "depth" in session_feedback_by_cat:
-            session_tip = "Push hips back more to maximize hamstring stretch"
-        elif "knees" in session_feedback_by_cat:
-            session_tip = "Keep a soft knee bend - don't turn it into a squat"
+        if "knees" in session_feedback_by_cat:
+            session_tip = "Romanian deadlifts need a soft knee bend throughout the movement"
         elif "back" in session_feedback_by_cat:
-            session_tip = "Maintain neutral spine by bracing core throughout"
+            session_tip = "Keep your core tight and chest up"
         elif "tempo" in session_feedback_by_cat:
-            session_tip = "Focus on slow, controlled eccentric (2-3 seconds)"
+            session_tip = "Lower the bar slowly to maximize hamstring activation"
     else:
-        session_tip = "Excellent technique! Keep building that posterior chain 💪"
+        session_tip = "Great technique! Keep building that posterior chain 💪"
 
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
