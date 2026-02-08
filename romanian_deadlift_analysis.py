@@ -249,6 +249,7 @@ def run_romanian_deadlift_analysis(video_path,
     """
     import sys
     print(f"[RDL] Starting analysis: fast_mode={fast_mode}, return_video={return_video}", file=sys.stderr, flush=True)
+    print(f"[RDL] Video path: {video_path}", file=sys.stderr, flush=True)
     
     # === רק זה משתנה: האם ליצור וידאו ===
     if fast_mode is True:
@@ -259,11 +260,32 @@ def run_romanian_deadlift_analysis(video_path,
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
+        print(f"[RDL ERROR] Cannot open video: {video_path}", file=sys.stderr, flush=True)
         return {
             "squat_count": 0, "technique_score": 0.0,
             "technique_score_display": display_half_str(0.0),
             "technique_label": score_label(0.0),
             "good_reps": 0, "bad_reps": 0, "feedback": ["Could not open video"],
+            "reps": [], "video_path": "", "feedback_path": feedback_path
+        }
+    
+    # בדיקת sanity - האם זה באמת וידאו?
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    duration = total_frames / fps if fps > 0 else 0
+    
+    print(f"[RDL] Video info: {total_frames} frames, {fps:.1f} FPS, {duration:.1f}s duration", file=sys.stderr, flush=True)
+    
+    # אם יש פחות מ-10 פריימים, זו כנראה תמונה, לא וידאו
+    if total_frames < 10:
+        print(f"[RDL ERROR] File has only {total_frames} frames - this is not a valid video!", file=sys.stderr, flush=True)
+        cap.release()
+        return {
+            "squat_count": 0, "technique_score": 0.0,
+            "technique_score_display": display_half_str(0.0),
+            "technique_label": score_label(0.0),
+            "good_reps": 0, "bad_reps": 0, 
+            "feedback": [f"Invalid video file - only {total_frames} frame(s). Please upload an actual video."],
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
 
@@ -298,6 +320,12 @@ def run_romanian_deadlift_analysis(video_path,
 
     # ✅ חזרנו למודל המקורי - model_complexity=1 תמיד
     print(f"[RDL] Starting pose detection loop", file=sys.stderr, flush=True)
+    
+    import time
+    loop_start_time = time.time()
+    MAX_PROCESSING_TIME = 180  # 3 דקות מקסימום
+    frames_processed = 0
+    
     with mp_pose.Pose(model_complexity=1,  # ✅ לא משנים את המודל!
                       min_detection_confidence=0.5,
                       min_tracking_confidence=0.5) as pose:
@@ -305,9 +333,22 @@ def run_romanian_deadlift_analysis(video_path,
             ret, frame = cap.read()
             if not ret:
                 break
+            
+            # בדיקת timeout
+            elapsed = time.time() - loop_start_time
+            if elapsed > MAX_PROCESSING_TIME:
+                print(f"[RDL ERROR] Processing timeout after {elapsed:.1f}s (processed {frames_processed} frames)", file=sys.stderr, flush=True)
+                break
+            
             frame_idx += 1
             if frame_idx % frame_skip != 0:  # ✅ חזרנו ל-frame_skip המקורי
                 continue
+            
+            frames_processed += 1
+            
+            # הדפסת progress כל 30 פריימים
+            if frames_processed % 30 == 0:
+                print(f"[RDL] Progress: {frames_processed} frames, {counter} reps, {elapsed:.1f}s", file=sys.stderr, flush=True)
 
             work = cv2.resize(frame, (0, 0), fx=scale, fy=scale) if scale != 1.0 else frame  # ✅ חזרנו ל-scale המקורי
             if create_video and out is None:
