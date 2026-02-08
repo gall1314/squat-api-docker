@@ -232,8 +232,8 @@ MIN_SCORE = 4.0
 MAX_SCORE = 10.0
 
 def run_romanian_deadlift_analysis(video_path,
-                                   frame_skip=6,  # ✅ הכפלנו מ-3 ל-6
-                                   scale=0.35,    # ✅ הקטנו מ-0.4 ל-0.35
+                                   frame_skip=3,  # ✅ חזרנו לערך המקורי
+                                   scale=0.4,     # ✅ חזרנו לערך המקורי
                                    output_path="romanian_deadlift_analyzed.mp4",
                                    feedback_path="romanian_deadlift_feedback.txt",
                                    return_video=True,
@@ -242,24 +242,20 @@ def run_romanian_deadlift_analysis(video_path,
     Romanian Deadlift analysis - FIXED:
     ✅ ברכיים: מותר עיקום 110-140 מעלות (לא 150!)
     ✅ גב: מותר נטייה עד 30 מעלות (לא 20!)
-    ✅ ביצועים: frame_skip=6, scale=0.35, model_complexity=0
-    ✅ fast_mode: במצב מהיר - רק JSON, ללא וידאו (פי 3-4 מהר יותר)
+    ✅ fast_mode: במצב מהיר - אותה לוגיקה בדיוק, רק ללא ציור וידאו
+    
+    ** ההבדל בין fast ל-slow הוא רק האם מצייר overlay וכותב וידאו **
+    ** הלוגיקה של הניתוח זהה לחלוטין! **
     """
-    # === אופטימיזציה למצב מהיר - כמו בקוד הסקוואט ===
+    import sys
+    print(f"[RDL] Starting analysis: fast_mode={fast_mode}, return_video={return_video}", file=sys.stderr, flush=True)
+    
+    # === רק זה משתנה: האם ליצור וידאו ===
     if fast_mode is True:
         return_video = False
     create_video = bool(return_video) and (output_path is not None) and (output_path != "")
     
-    # במצב מהיר: פי 2 פחות פריימים, model lite
-    if fast_mode:
-        effective_frame_skip = frame_skip * 2
-        effective_scale = scale * 0.85
-        model_complexity = 0
-        print(f"[FAST MODE RDL] frame_skip={effective_frame_skip} (2x), scale={effective_scale:.2f}, model=lite", flush=True)
-    else:
-        effective_frame_skip = frame_skip
-        effective_scale = scale
-        model_complexity = 1
+    print(f"[RDL] create_video={create_video}", file=sys.stderr, flush=True)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -274,7 +270,7 @@ def run_romanian_deadlift_analysis(video_path,
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
-    effective_fps = max(1.0, fps_in / max(1, effective_frame_skip))
+    effective_fps = max(1.0, fps_in / max(1, frame_skip))  # ✅ חזרנו לערך המקורי
     dt = 1.0 / float(effective_fps)
 
     counter = good_reps = bad_reps = 0
@@ -300,8 +296,9 @@ def run_romanian_deadlift_analysis(video_path,
     rt_fb_msg = None
     rt_fb_hold = 0
 
-    # ✅ אופטימיזציה: model_complexity משתנה לפי fast_mode
-    with mp_pose.Pose(model_complexity=model_complexity,
+    # ✅ חזרנו למודל המקורי - model_complexity=1 תמיד
+    print(f"[RDL] Starting pose detection loop", file=sys.stderr, flush=True)
+    with mp_pose.Pose(model_complexity=1,  # ✅ לא משנים את המודל!
                       min_detection_confidence=0.5,
                       min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
@@ -309,10 +306,10 @@ def run_romanian_deadlift_analysis(video_path,
             if not ret:
                 break
             frame_idx += 1
-            if frame_idx % effective_frame_skip != 0:
+            if frame_idx % frame_skip != 0:  # ✅ חזרנו ל-frame_skip המקורי
                 continue
 
-            work = cv2.resize(frame, (0, 0), fx=effective_scale, fy=effective_scale) if effective_scale != 1.0 else frame
+            work = cv2.resize(frame, (0, 0), fx=scale, fy=scale) if scale != 1.0 else frame  # ✅ חזרנו ל-scale המקורי
             if create_video and out is None:
                 h0, w0 = work.shape[:2]
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w0, h0))
@@ -462,6 +459,8 @@ def run_romanian_deadlift_analysis(video_path,
     if out:
         out.release()
     cv2.destroyAllWindows()
+    
+    print(f"[RDL] Video processing complete. Reps={counter}", file=sys.stderr, flush=True)
 
     avg = np.mean(all_scores) if all_scores else 0.0
     if np.isnan(avg) or np.isinf(avg):
@@ -498,6 +497,7 @@ def run_romanian_deadlift_analysis(video_path,
 
     final_video_path = ""
     if create_video and output_path:
+        print(f"[RDL] Starting FFmpeg encoding", file=sys.stderr, flush=True)
         encoded_path = output_path.replace(".mp4", "_encoded.mp4")
         try:
             subprocess.run([
@@ -510,9 +510,12 @@ def run_romanian_deadlift_analysis(video_path,
                 os.remove(output_path)
             final_video_path = encoded_path if os.path.exists(encoded_path) else (
                 output_path if os.path.exists(output_path) else "")
+            print(f"[RDL] FFmpeg encoding complete", file=sys.stderr, flush=True)
         except Exception as e:
             print(f"Warning: FFmpeg error: {e}")
             final_video_path = output_path if os.path.exists(output_path) else ""
+    else:
+        print(f"[RDL] Skipping video encoding (create_video={create_video})", file=sys.stderr, flush=True)
 
     result = {
         "squat_count": int(counter),
@@ -527,6 +530,8 @@ def run_romanian_deadlift_analysis(video_path,
         "video_path": str(final_video_path),
         "feedback_path": str(feedback_path)
     }
+
+    print(f"[RDL] Returning result (video_path length={len(final_video_path)})", file=sys.stderr, flush=True)
 
     return result
 
