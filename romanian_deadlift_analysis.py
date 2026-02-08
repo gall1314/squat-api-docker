@@ -229,7 +229,7 @@ KNEE_MAX_ANGLE = 140.0  # מתחת לזה = יותר מדי כיפוף (כמו �
 # ✅ תיקון: הגב - MediaPipe לא מדויק מספיק, נעלה את הסף
 BACK_MAX_ANGLE = 45.0  # העלנו מ-30 ל-45 מעלות (כמעט לא יתריע)
 
-MIN_ECC_S = 0.35
+MIN_ECC_S = 0.25  # ✅ הפחתנו מ-0.35 ל-0.25 שניות (יותר סביר)
 MIN_BOTTOM_S = 0.12
 
 MIN_SCORE = 4.0
@@ -447,7 +447,7 @@ def run_romanian_deadlift_analysis(video_path,
                     # Tempo check
                     if down_s < MIN_ECC_S:
                         feedback.append("Control the lowering")
-                        score -= 1.0
+                        score -= 0.5  # ✅ הפחתנו מ-1.0 ל-0.5
 
                     if bottom_s < MIN_BOTTOM_S:
                         feedback.append("Pause at the bottom")
