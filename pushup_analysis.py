@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-# pushup_analysis.py — simple push-up rep counter with basic form feedback
+# pushup_analysis.py — complete push-up counter with form feedback
 
 import os, cv2, math, numpy as np, subprocess
+from collections import deque
 from PIL import ImageFont, ImageDraw, Image
 
 # ============ Styles ============
@@ -62,6 +63,9 @@ def _wrap_two_lines(draw, text, font, max_width):
 
 def _dyn_thickness(h):
     return max(2,int(round(h*0.002))), max(3,int(round(h*0.004)))
+
+def _dist_xy(a, b):
+    return math.hypot(a[0]-b[0], a[1]-b[1])
 
 # ============ Body-only skeleton ============
 _FACE_LMS=set(); _BODY_CONNECTIONS=tuple(); _BODY_POINTS=tuple()
@@ -127,53 +131,76 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     return cv2.cvtColor(np.array(pil),cv2.COLOR_RGB2BGR)
 
 # ============ Push-up Parameters ============
-BOTTOM_ELBOW_MAX = 95.0
-TOP_ELBOW_MIN = 160.0
-REFRACTORY_FRAMES = 3
+# ספירת חזרות
+ELBOW_BENT_ANGLE = 90.0          # זווית מרפק מקסימלית למטה (90° = עומק מלא)
+SHOULDER_MIN_DESCENT = 0.055     # כתף צריכה לרדת לפחות 5.5% מגובה המסך
+RESET_ASCENT = 0.030             # כתף צריכה לעלות חזרה 3% כדי לאפס
+RESET_ELBOW = 160.0              # זווית מרפק מינימלית בחזרה למעלה
+REFRACTORY_FRAMES = 3            # מסגרות המתנה בין חזרות
 
+# EMA smoothing
 ELBOW_EMA_ALPHA = 0.35
-BODY_EMA_ALPHA = 0.30
+SHOULDER_EMA_ALPHA = 0.30
 
+# זיהוי תנוחת פלנק (גוף אופקי, ידיים על הרצפה)
 VIS_THR_STRICT = 0.30
-
-DEPTH_MIN_ANGLE = 105.0
-DEPTH_NEAR_DEG = 8.0
-LOCKOUT_MIN_ANGLE = 165.0
-LOCKOUT_NEAR_DEG = 6.0
-BODY_LINE_MIN = 160.0
-BODY_LINE_NEAR_DEG = 6.0
-
-DEPTH_FAIL_MIN_REPS = 2
-LOCKOUT_FAIL_MIN_REPS = 2
-BODY_LINE_FAIL_MIN_REPS = 2
+PLANK_BODY_ANGLE_MAX = 25.0      # זווית מקסימלית של הגוף מהאופקי
+HANDS_BELOW_SHOULDERS = 0.03     # שורשי ידיים צריכים להיות מתחת לכתפיים (במצב למעלה)
+ONPUSHUP_MIN_FRAMES = 3
+OFFPUSHUP_MIN_FRAMES = 6
+AUTO_STOP_AFTER_EXIT_SEC = 1.5
+TAIL_NOPOSE_STOP_SEC = 1.0
 
 # ============ Feedback Cues & Weights ============
-FB_CUE_DEPTH = "Lower your chest closer to the floor"
-FB_CUE_LOCKOUT = "Press to full elbow lockout"
-FB_CUE_BODY = "Keep your body in a straight line"
+FB_CUE_DEEPER = "Go deeper (elbows to 90°)"
+FB_CUE_HIPS = "Keep hips level (don't sag or pike)"
+FB_CUE_LOCKOUT = "Fully extend arms at top"
+FB_CUE_ELBOWS_IN = "Keep elbows at 45° (not flared)"
 
-FB_W_DEPTH = float(os.getenv("FB_W_DEPTH", "1.0"))
+FB_W_DEEPER = float(os.getenv("FB_W_DEEPER", "1.0"))
+FB_W_HIPS = float(os.getenv("FB_W_HIPS", "0.9"))
 FB_W_LOCKOUT = float(os.getenv("FB_W_LOCKOUT", "0.8"))
-FB_W_BODY = float(os.getenv("FB_W_BODY", "0.7"))
+FB_W_ELBOWS_IN = float(os.getenv("FB_W_ELBOWS_IN", "0.6"))
 
 FB_WEIGHTS = {
-    FB_CUE_DEPTH: FB_W_DEPTH,
+    FB_CUE_DEEPER: FB_W_DEEPER,
+    FB_CUE_HIPS: FB_W_HIPS,
     FB_CUE_LOCKOUT: FB_W_LOCKOUT,
-    FB_CUE_BODY: FB_W_BODY,
+    FB_CUE_ELBOWS_IN: FB_W_ELBOWS_IN,
 }
 FB_DEFAULT_WEIGHT = 0.5
 PENALTY_MIN_IF_ANY = 0.5
-FORM_TIP_PRIORITY = [FB_CUE_DEPTH, FB_CUE_LOCKOUT, FB_CUE_BODY]
+FORM_TIP_PRIORITY = [FB_CUE_DEEPER, FB_CUE_LOCKOUT, FB_CUE_HIPS, FB_CUE_ELBOWS_IN]
 
-def _pick_side_dyn(lms):
-    LSH=mp_pose.PoseLandmark.LEFT_SHOULDER.value;  RSH=mp_pose.PoseLandmark.RIGHT_SHOULDER.value
-    LE =mp_pose.PoseLandmark.LEFT_ELBOW.value;     RE =mp_pose.PoseLandmark.RIGHT_ELBOW.value
-    LW =mp_pose.PoseLandmark.LEFT_WRIST.value;     RW =mp_pose.PoseLandmark.RIGHT_WRIST.value
-    vL=lms[LSH].visibility+lms[LE].visibility+lms[LW].visibility
-    vR=lms[RSH].visibility+lms[RE].visibility+lms[RW].visibility
-    return ("LEFT",LSH,LE,LW) if vL>=vR else ("RIGHT",RSH,RE,RW)
+# ============ Form Detection Thresholds ============
+# Depth
+DEPTH_MIN_ANGLE = 95.0           # זווית מרפק מינימלית לעומק טוב
+DEPTH_NEAR_DEG = 8.0             # טווח "קרוב מספיק"
 
-# ============ Main Analyzer ============
+# Hip alignment (sag or pike)
+HIP_ALIGNMENT_MAX = 15.0         # סטייה מקסימלית של ירכיים מקו הגוף
+HIP_ALIGNMENT_NEAR = 5.0         # טווח "קרוב מספיק"
+
+# Lockout
+LOCKOUT_MIN_ANGLE = 165.0        # זווית מרפק מינימלית בנעילה
+LOCKOUT_NEAR_DEG = 8.0           # טווח "קרוב מספיק"
+
+# Elbow flare
+ELBOW_FLARE_MAX = 60.0           # זווית מקסימלית של מרפקים מהגוף (אידיאל: 45°)
+FLARE_NEAR_DEG = 10.0            # טווח "קרוב מספיק"
+
+# Minimum reps before session feedback
+DEPTH_FAIL_MIN_REPS = 2
+HIPS_FAIL_MIN_REPS = 2
+LOCKOUT_FAIL_MIN_REPS = 2
+FLARE_FAIL_MIN_REPS = 2
+
+# ============ Micro-burst ============
+BURST_FRAMES = int(os.getenv("BURST_FRAMES", "2"))
+INFLECT_VEL_THR = float(os.getenv("INFLECT_VEL_THR", "0.0008"))
+
+DEBUG_ONPUSHUP = bool(int(os.getenv("DEBUG_ONPUSHUP", "0")))
+
 def run_pushup_analysis(video_path,
                         frame_skip=3,
                         scale=0.4,
@@ -186,17 +213,13 @@ def run_pushup_analysis(video_path,
     if mp_pose is None:
         return _ret_err("Mediapipe not available", feedback_path)
 
-    fast_path = (fast_mode is True)
-    slow_path = not fast_path
-    if fast_path:
+    model_complexity = 0 if fast_mode else 1
+    if fast_mode:
         return_video = False
-
-    effective_frame_skip = frame_skip
-    effective_scale = scale
-    model_complexity = 0 if fast_path else 1
+        scale = min(scale, 0.35)
 
     if preserve_quality:
-        effective_scale=1.0; effective_frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
+        scale=1.0; frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
     else:
         encode_crf=23 if encode_crf is None else encode_crf
 
@@ -204,162 +227,320 @@ def run_pushup_analysis(video_path,
     if not cap.isOpened(): return _ret_err("Could not open video", feedback_path)
 
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
+    effective_fps=max(1.0, fps_in/max(1,frame_skip))
+    sec_to_frames=lambda s: max(1,int(s*effective_fps))
 
-    out=None
-    if slow_path:
-        fourcc=cv2.VideoWriter_fourcc(*'mp4v')
+    fourcc=cv2.VideoWriter_fourcc(*'mp4v')
+    out=None; frame_idx=0
 
-    frame_idx=0
+    # Counters
     rep_count=0; good_reps=0; bad_reps=0; rep_reports=[]; all_scores=[]
 
+    # Landmarks
     LSH=mp_pose.PoseLandmark.LEFT_SHOULDER.value;  RSH=mp_pose.PoseLandmark.RIGHT_SHOULDER.value
+    LE =mp_pose.PoseLandmark.LEFT_ELBOW.value;     RE =mp_pose.PoseLandmark.RIGHT_ELBOW.value
+    LW =mp_pose.PoseLandmark.LEFT_WRIST.value;     RW =mp_pose.PoseLandmark.RIGHT_WRIST.value
     LH =mp_pose.PoseLandmark.LEFT_HIP.value;       RH =mp_pose.PoseLandmark.RIGHT_HIP.value
-    LK =mp_pose.PoseLandmark.LEFT_KNEE.value;      RK =mp_pose.PoseLandmark.RIGHT_KNEE.value
+    LA =mp_pose.PoseLandmark.LEFT_ANKLE.value;     RA =mp_pose.PoseLandmark.RIGHT_ANKLE.value
 
-    elbow_ema=None; body_ema=None
-    in_bottom=False; refractory=0
-    min_elbow=None; max_elbow=None; min_body=None
+    def _pick_side_dyn(lms):
+        vL=lms[LSH].visibility+lms[LE].visibility+lms[LW].visibility
+        vR=lms[RSH].visibility+lms[RE].visibility+lms[RW].visibility
+        return ("LEFT",LSH,LE,LW) if vL>=vR else ("RIGHT",RSH,RE,RW)
 
+    # State
+    elbow_ema=None; shoulder_ema=None; shoulder_prev=None; shoulder_vel_prev=None
+    baseline_shoulder_y=None
+    desc_base_shoulder=None; allow_new_bottom=True; last_bottom_frame=-10**9
+    cycle_max_descent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
+
+    onpushup=False; onpushup_streak=0; offpushup_streak=0
+    offpushup_frames_since_any_rep=0; nopose_frames_since_any_rep=0
+
+    # Feedback state
     session_feedback=set()
-    depth_fail_count=0; lockout_fail_count=0; body_fail_count=0
-    depth_already_reported=False; lockout_already_reported=False; body_already_reported=False
-
     rt_fb_msg=None; rt_fb_hold=0
 
-    with mp_pose.Pose(model_complexity=model_complexity, enable_segmentation=False,
-                      min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
+    # Per-cycle trackers
+    cycle_tip_deeper=False; cycle_tip_hips=False; cycle_tip_lockout=False; cycle_tip_elbows=False
+    depth_fail_count=0; hips_fail_count=0; lockout_fail_count=0; flare_fail_count=0
+    depth_already_reported=False; hips_already_reported=False
+    lockout_already_reported=False; flare_already_reported=False
+
+    # Phase trackers
+    bottom_phase_min_elbow=None
+    top_phase_max_elbow=None
+    cycle_max_hip_misalign=None
+    cycle_max_flare=None
+
+    OFFPUSHUP_STOP_FRAMES=sec_to_frames(AUTO_STOP_AFTER_EXIT_SEC)
+    NOPOSE_STOP_FRAMES=sec_to_frames(TAIL_NOPOSE_STOP_SEC)
+    RT_FB_HOLD_FRAMES=sec_to_frames(0.8)
+
+    REARM_ASCENT_EFF=max(RESET_ASCENT*0.60, 0.015)
+
+    # Micro-burst
+    burst_cntr=0
+
+    with mp_pose.Pose(model_complexity=model_complexity, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while True:
             ret, frame = cap.read()
             if not ret: break
             frame_idx += 1
-            if effective_frame_skip>1 and (frame_idx % effective_frame_skip)!=0: continue
 
-            if effective_scale and effective_scale!=1.0:
-                frame=cv2.resize(frame,None,fx=effective_scale,fy=effective_scale)
+            process_now = (burst_cntr > 0) or (frame_idx % max(1, frame_skip) == 0)
+            if not process_now:
+                continue
+            if burst_cntr > 0:
+                burst_cntr -= 1
 
+            if scale != 1.0:
+                frame=cv2.resize(frame,(0,0),fx=scale,fy=scale)
             h,w=frame.shape[:2]
-            rgb=cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
-            res=pose.process(rgb)
 
-            depth_pct=0.0
+            if return_video and out is None:
+                out=cv2.VideoWriter(output_path,fourcc,effective_fps,(w,h))
+
+            res=pose.process(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
+            depth_live=0.0
+
             if not res.pose_landmarks:
-                if return_video and out:
-                    frame=draw_overlay(frame,reps=rep_count,feedback=(rt_fb_msg if rt_fb_hold>0 else None),depth_pct=depth_pct)
-                    out.write(frame)
+                nopose_frames_since_any_rep = (nopose_frames_since_any_rep+1) if rep_count>0 else 0
+                if rep_count>0 and nopose_frames_since_any_rep>=NOPOSE_STOP_FRAMES: break
+                if return_video and out is not None:
+                    out.write(draw_overlay(frame,reps=rep_count,feedback=(rt_fb_msg if rt_fb_hold>0 else None),depth_pct=0.0))
+                if rt_fb_hold>0: rt_fb_hold-=1
                 continue
 
+            nopose_frames_since_any_rep=0
             lms=res.pose_landmarks.landmark
+            side,S,E,W=_pick_side_dyn(lms)
 
-            if out is None and return_video:
-                out=cv2.VideoWriter(output_path,fourcc,max(1.0, fps_in/max(1,effective_frame_skip)),(w,h))
+            min_vis=min(lms[S].visibility,lms[E].visibility,lms[W].visibility,lms[LH].visibility,lms[RH].visibility)
+            vis_strict_ok=(min_vis>=VIS_THR_STRICT)
 
-            side,SH,EL,WR = _pick_side_dyn(lms)
-            vis_ok = (lms[SH].visibility>VIS_THR_STRICT and lms[EL].visibility>VIS_THR_STRICT and lms[WR].visibility>VIS_THR_STRICT)
+            shoulder_raw=float(lms[S].y)
+            raw_elbow_L=_ang((lms[LSH].x,lms[LSH].y),(lms[LE].x,lms[LE].y),(lms[LW].x,lms[LW].y))
+            raw_elbow_R=_ang((lms[RSH].x,lms[RSH].y),(lms[RE].x,lms[RE].y),(lms[RW].x,lms[RW].y))
+            raw_elbow=raw_elbow_L if side=="LEFT" else raw_elbow_R
+            raw_elbow_min=min(raw_elbow_L,raw_elbow_R)
 
-            if not vis_ok:
-                if return_video and out:
-                    frame=draw_overlay(frame,reps=rep_count,feedback=(rt_fb_msg if rt_fb_hold>0 else None),depth_pct=depth_pct)
-                    out.write(frame)
-                continue
+            elbow_ema=_ema(elbow_ema,raw_elbow,ELBOW_EMA_ALPHA)
+            shoulder_ema=_ema(shoulder_ema,shoulder_raw,SHOULDER_EMA_ALPHA)
+            shoulder_y=shoulder_ema; elbow_angle=elbow_ema
+            
+            if baseline_shoulder_y is None: baseline_shoulder_y=shoulder_y
+            depth_live=float(np.clip((shoulder_y-baseline_shoulder_y)/max(0.10,SHOULDER_MIN_DESCENT*1.2),0.0,1.0))
 
-            sh=(lms[SH].x, lms[SH].y); el=(lms[EL].x, lms[EL].y); wr=(lms[WR].x, lms[WR].y)
-            elbow_angle=_ang(sh, el, wr)
-            elbow_ema=_ema(elbow_ema, elbow_angle, ELBOW_EMA_ALPHA)
+            # Check plank position (horizontal body, hands on ground)
+            body_angle = _calculate_body_angle(lms, LSH, RSH, LH, RH, LA, RA)
+            hands_position = (lms[LW].y > lms[LSH].y - HANDS_BELOW_SHOULDERS) and (lms[RW].y > lms[RSH].y - HANDS_BELOW_SHOULDERS)
+            in_plank = (body_angle <= PLANK_BODY_ANGLE_MAX) and hands_position
 
-            hip_idx = LH if side == "LEFT" else RH
-            knee_idx = LK if side == "LEFT" else RK
-            vis_body = (lms[hip_idx].visibility>VIS_THR_STRICT and lms[knee_idx].visibility>VIS_THR_STRICT)
-            body_angle=None
-            if vis_body:
-                hip=(lms[hip_idx].x, lms[hip_idx].y); knee=(lms[knee_idx].x, lms[knee_idx].y)
-                body_angle=_ang(sh, hip, knee)
-                body_ema=_ema(body_ema, body_angle, BODY_EMA_ALPHA)
-
-            if elbow_ema is not None:
-                depth_pct=float(np.clip((TOP_ELBOW_MIN - elbow_ema)/(TOP_ELBOW_MIN - BOTTOM_ELBOW_MAX), 0.0, 1.0))
-
-            if elbow_ema is not None:
-                min_elbow = elbow_ema if min_elbow is None else min(min_elbow, elbow_ema)
-                max_elbow = elbow_ema if max_elbow is None else max(max_elbow, elbow_ema)
-            if body_ema is not None:
-                min_body = body_ema if min_body is None else min(min_body, body_ema)
-
-            bottom_cond = (elbow_ema is not None and elbow_ema <= BOTTOM_ELBOW_MAX)
-            top_cond = (elbow_ema is not None and elbow_ema >= TOP_ELBOW_MIN)
-
-            if not in_bottom:
-                if bottom_cond:
-                    in_bottom = True
+            if vis_strict_ok and in_plank:
+                onpushup_streak+=1; offpushup_streak=0
             else:
-                if top_cond and refractory==0:
-                    rep_count += 1
-                    rep_feedback=set()
-                    rep_penalty=0.0
+                offpushup_streak+=1; onpushup_streak=0
 
-                    depth_ok = (min_elbow is not None and min_elbow <= DEPTH_MIN_ANGLE)
-                    depth_near = (min_elbow is not None and min_elbow <= (DEPTH_MIN_ANGLE + DEPTH_NEAR_DEG))
-                    if not (depth_ok or depth_near):
-                        rep_feedback.add(FB_CUE_DEPTH)
-                        rep_penalty += FB_WEIGHTS.get(FB_CUE_DEPTH, FB_DEFAULT_WEIGHT)
+            if DEBUG_ONPUSHUP and frame_idx % 10 == 0:
+                print(f"[DBG] f={frame_idx} onpushup={onpushup} vis={min_vis:.2f} bodyAngle={body_angle:.1f} handsPos={hands_position}")
+
+            # Enter pushup position
+            if (not onpushup) and onpushup_streak>=ONPUSHUP_MIN_FRAMES:
+                onpushup=True
+                desc_base_shoulder=None; allow_new_bottom=True
+                cycle_max_descent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
+                cycle_tip_deeper=False; cycle_tip_hips=False; cycle_tip_lockout=False; cycle_tip_elbows=False
+                bottom_phase_min_elbow=None
+                top_phase_max_elbow=None
+                cycle_max_hip_misalign=None
+                cycle_max_flare=None
+
+            # Exit pushup position → post-hoc
+            if onpushup and offpushup_streak>=OFFPUSHUP_MIN_FRAMES:
+                # Evaluate form at cycle end
+                _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
+                                   cycle_max_hip_misalign, cycle_max_flare,
+                                   depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
+                                   depth_already_reported, hips_already_reported,
+                                   lockout_already_reported, flare_already_reported,
+                                   session_feedback, locals())
+
+                # Count rep if valid
+                if (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and (cycle_min_elbow<=ELBOW_BENT_ANGLE):
+                    rep_has_tip = cycle_tip_deeper or cycle_tip_hips or cycle_tip_lockout or cycle_tip_elbows
+                    _count_rep(rep_reports,rep_count,cycle_min_elbow,
+                               desc_base_shoulder if desc_base_shoulder is not None else shoulder_y,
+                               baseline_shoulder_y+cycle_max_descent if baseline_shoulder_y is not None else shoulder_y,
+                               all_scores, rep_has_tip)
+                    rep_count+=1
+                    if rep_has_tip: bad_reps+=1
+                    else: good_reps+=1
+
+                onpushup=False; offpushup_frames_since_any_rep=0
+                desc_base_shoulder=None; cycle_max_descent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
+                cycle_tip_deeper=False; cycle_tip_hips=False; cycle_tip_lockout=False; cycle_tip_elbows=False
+                bottom_phase_min_elbow=None
+                top_phase_max_elbow=None
+                cycle_max_hip_misalign=None
+                cycle_max_flare=None
+
+            if (not onpushup) and rep_count>0:
+                offpushup_frames_since_any_rep+=1
+                if offpushup_frames_since_any_rep>=OFFPUSHUP_STOP_FRAMES: break
+
+            shoulder_vel=0.0 if shoulder_prev is None else (shoulder_y-shoulder_prev)
+            cur_rt=None
+
+            # Micro-burst near inflection
+            if onpushup and (desc_base_shoulder is not None):
+                near_inflect = (abs(shoulder_vel) <= INFLECT_VEL_THR)
+                sign_flip = (shoulder_vel_prev is not None) and ((shoulder_vel_prev < 0 and shoulder_vel >= 0) or (shoulder_vel_prev > 0 and shoulder_vel <= 0))
+                if near_inflect or sign_flip:
+                    burst_cntr = max(burst_cntr, BURST_FRAMES)
+            shoulder_vel_prev = shoulder_vel
+
+            if onpushup and vis_strict_ok:
+                # REP COUNTING
+                if desc_base_shoulder is None:
+                    if shoulder_vel>abs(INFLECT_VEL_THR):  # Moving down
+                        desc_base_shoulder=shoulder_y
+                        cycle_max_descent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
+                        bottom_phase_min_elbow=None
+                        top_phase_max_elbow=None
+                        cycle_max_hip_misalign=None
+                        cycle_max_flare=None
+                else:
+                    cycle_max_descent=max(cycle_max_descent,(shoulder_y-desc_base_shoulder))
+                    cycle_min_elbow=min(cycle_min_elbow,elbow_angle)
+
+                    # Track bottom phase (deepest point)
+                    min_elb_now = min(raw_elbow_L, raw_elbow_R)
+                    if bottom_phase_min_elbow is None: bottom_phase_min_elbow = min_elb_now
+                    else: bottom_phase_min_elbow = min(bottom_phase_min_elbow, min_elb_now)
+
+                    # Track top phase (highest point)
+                    max_elb_now = max(raw_elbow_L, raw_elbow_R)
+                    if top_phase_max_elbow is None: top_phase_max_elbow = max_elb_now
+                    else: top_phase_max_elbow = max(top_phase_max_elbow, max_elb_now)
+
+                    # Track hip alignment (sag or pike)
+                    hip_misalign = _calculate_hip_misalignment(lms, LSH, RSH, LH, RH, LA, RA)
+                    if cycle_max_hip_misalign is None: cycle_max_hip_misalign = hip_misalign
+                    else: cycle_max_hip_misalign = max(cycle_max_hip_misalign, hip_misalign)
+
+                    # Track elbow flare
+                    elbow_flare = _calculate_elbow_flare(lms, LSH, RSH, LE, RE, LW, RW)
+                    if cycle_max_flare is None: cycle_max_flare = elbow_flare
+                    else: cycle_max_flare = max(cycle_max_flare, elbow_flare)
+
+                    reset_by_asc=(desc_base_shoulder is not None) and ((desc_base_shoulder-shoulder_y)>=RESET_ASCENT)
+                    reset_by_elb =(elbow_angle>=RESET_ELBOW)
+                    
+                    if reset_by_asc or reset_by_elb:
+                        # Evaluate form
+                        _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
+                                           cycle_max_hip_misalign, cycle_max_flare,
+                                           depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
+                                           depth_already_reported, hips_already_reported,
+                                           lockout_already_reported, flare_already_reported,
+                                           session_feedback, locals())
+
+                        # Count rep
+                        if (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and (cycle_min_elbow<=ELBOW_BENT_ANGLE):
+                            rep_has_tip = cycle_tip_deeper or cycle_tip_hips or cycle_tip_lockout or cycle_tip_elbows
+                            _count_rep(rep_reports,rep_count,cycle_min_elbow,
+                                       desc_base_shoulder,
+                                       baseline_shoulder_y+cycle_max_descent if baseline_shoulder_y is not None else shoulder_y,
+                                       all_scores, rep_has_tip)
+                            rep_count+=1
+                            if rep_has_tip: bad_reps+=1
+                            else: good_reps+=1
+
+                        # Reset for next cycle
+                        desc_base_shoulder=shoulder_y
+                        cycle_max_descent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
+                        allow_new_bottom=True
+                        bottom_phase_min_elbow=None
+                        top_phase_max_elbow=None
+                        cycle_max_hip_misalign=None
+                        cycle_max_flare=None
+                        cycle_tip_deeper=False; cycle_tip_hips=False; cycle_tip_lockout=False; cycle_tip_elbows=False
+
+                descent_amt=0.0 if desc_base_shoulder is None else (shoulder_y-desc_base_shoulder)
+
+                at_bottom=(elbow_angle<=ELBOW_BENT_ANGLE) and (descent_amt>=SHOULDER_MIN_DESCENT)
+                raw_bottom=(raw_elbow_min<=(ELBOW_BENT_ANGLE+5.0)) and (descent_amt>=SHOULDER_MIN_DESCENT*0.92)
+                at_bottom=at_bottom or raw_bottom
+                can_cnt=(frame_idx - last_bottom_frame) >= REFRACTORY_FRAMES
+
+                if at_bottom and allow_new_bottom and can_cnt and (not counted_this_cycle):
+                    rep_has_tip = cycle_tip_deeper or cycle_tip_hips or cycle_tip_lockout or cycle_tip_elbows
+                    _count_rep(rep_reports,rep_count,elbow_angle,
+                               desc_base_shoulder if desc_base_shoulder is not None else shoulder_y, shoulder_y,
+                               all_scores, rep_has_tip)
+                    rep_count+=1
+                    if rep_has_tip: bad_reps+=1
+                    else: good_reps+=1
+                    last_bottom_frame=frame_idx; allow_new_bottom=False; counted_this_cycle=True
+                    top_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
+
+                if (allow_new_bottom is False) and (last_bottom_frame>0):
+                    if shoulder_prev is not None and (shoulder_prev - shoulder_y) > 0 and (desc_base_shoulder is not None):
+                        if ((desc_base_shoulder + cycle_max_descent) - shoulder_y) >= REARM_ASCENT_EFF:
+                            allow_new_bottom=True
+
+                # Real-time feedback at bottom
+                if at_bottom and not cycle_tip_deeper:
+                    if bottom_phase_min_elbow and bottom_phase_min_elbow > DEPTH_MIN_ANGLE:
+                        cycle_tip_deeper = True
                         depth_fail_count += 1
-                        if depth_fail_count>=DEPTH_FAIL_MIN_REPS: depth_already_reported=True
+                        if depth_fail_count >= DEPTH_FAIL_MIN_REPS and not depth_already_reported:
+                            session_feedback.add(FB_CUE_DEEPER)
+                            depth_already_reported = True
+                            cur_rt = FB_CUE_DEEPER
 
-                    lockout_ok = (max_elbow is not None and max_elbow >= LOCKOUT_MIN_ANGLE)
-                    lockout_near = (max_elbow is not None and max_elbow >= (LOCKOUT_MIN_ANGLE - LOCKOUT_NEAR_DEG))
-                    if not (lockout_ok or lockout_near):
-                        rep_feedback.add(FB_CUE_LOCKOUT)
-                        rep_penalty += FB_WEIGHTS.get(FB_CUE_LOCKOUT, FB_DEFAULT_WEIGHT)
-                        lockout_fail_count += 1
-                        if lockout_fail_count>=LOCKOUT_FAIL_MIN_REPS: lockout_already_reported=True
+            else:
+                desc_base_shoulder=None; allow_new_bottom=True
 
-                    body_ok = (min_body is not None and min_body >= BODY_LINE_MIN)
-                    body_near = (min_body is not None and min_body >= (BODY_LINE_MIN - BODY_LINE_NEAR_DEG))
-                    if not (body_ok or body_near):
-                        rep_feedback.add(FB_CUE_BODY)
-                        rep_penalty += FB_WEIGHTS.get(FB_CUE_BODY, FB_DEFAULT_WEIGHT)
-                        body_fail_count += 1
-                        if body_fail_count>=BODY_LINE_FAIL_MIN_REPS: body_already_reported=True
+            # RT hold
+            if cur_rt:
+                if cur_rt!=rt_fb_msg: rt_fb_msg=cur_rt; rt_fb_hold=RT_FB_HOLD_FRAMES
+                else: rt_fb_hold=max(rt_fb_hold,RT_FB_HOLD_FRAMES)
+            else:
+                if rt_fb_hold>0: rt_fb_hold-=1
 
-                    if depth_already_reported: session_feedback.add(FB_CUE_DEPTH)
-                    if lockout_already_reported: session_feedback.add(FB_CUE_LOCKOUT)
-                    if body_already_reported: session_feedback.add(FB_CUE_BODY)
-
-                    rep_score=max(0.0, 10.0-rep_penalty)
-                    rep_good = rep_score >= 9.0
-                    good_reps += 1 if rep_good else 0
-                    bad_reps += 0 if rep_good else 1
-                    all_scores.append(rep_score)
-                    rep_reports.append({
-                        "rep_index": int(rep_count),
-                        "score": float(rep_score),
-                        "good": bool(rep_good),
-                        "min_elbow": float(min_elbow) if min_elbow is not None else 0.0,
-                        "max_elbow": float(max_elbow) if max_elbow is not None else 0.0,
-                        "min_body": float(min_body) if min_body is not None else 0.0
-                    })
-
-                    if rep_feedback:
-                        rt_fb_msg = next((m for m in FORM_TIP_PRIORITY if m in rep_feedback), None)
-                        rt_fb_hold = int(max(1.0, fps_in/max(1,effective_frame_skip)) * 0.8)
-
-                    in_bottom=False
-                    refractory=REFRACTORY_FRAMES
-                    min_elbow=None; max_elbow=None; min_body=None
-
-            if refractory>0:
-                refractory -= 1
-            if rt_fb_hold>0:
-                rt_fb_hold -= 1
-
-            if return_video and out:
-                frame=draw_body_only(frame, lms)
-                frame=draw_overlay(frame,reps=rep_count,feedback=(rt_fb_msg if rt_fb_hold>0 else None),depth_pct=depth_pct)
+            # Draw
+            if return_video and out is not None:
+                frame=draw_body_only(frame,lms)
+                frame=draw_overlay(frame,reps=rep_count,feedback=(rt_fb_msg if rt_fb_hold>0 else None),depth_pct=depth_live)
                 out.write(frame)
+
+            if shoulder_y is not None: shoulder_prev=shoulder_y
+
+    # EOF post-hoc
+    if onpushup and (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and (cycle_min_elbow<=ELBOW_BENT_ANGLE):
+        _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
+                           cycle_max_hip_misalign, cycle_max_flare,
+                           depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
+                           depth_already_reported, hips_already_reported,
+                           lockout_already_reported, flare_already_reported,
+                           session_feedback, locals())
+
+        rep_has_tip = cycle_tip_deeper or cycle_tip_hips or cycle_tip_lockout or cycle_tip_elbows
+        _count_rep(rep_reports,rep_count,cycle_min_elbow,
+                   desc_base_shoulder if desc_base_shoulder is not None else (baseline_shoulder_y or 0.0),
+                   (baseline_shoulder_y + cycle_max_descent) if baseline_shoulder_y is not None else (baseline_shoulder_y or 0.0),
+                   all_scores, rep_has_tip)
+        rep_count+=1
+        if rep_has_tip: bad_reps+=1
+        else: good_reps+=1
 
     cap.release()
     if return_video and out: out.release()
     cv2.destroyAllWindows()
 
+    # Session score
     if rep_count==0: technique_score=0.0
     else:
         if session_feedback:
@@ -369,6 +550,7 @@ def run_pushup_analysis(video_path,
             penalty = 0.0
         technique_score=_half_floor10(max(0.0,10.0-penalty))
 
+    # Build feedback
     all_fb = set(session_feedback) if session_feedback else set()
     fb_list = [cue for cue in FORM_TIP_PRIORITY if cue in all_fb]
 
@@ -377,6 +559,7 @@ def run_pushup_analysis(video_path,
         form_tip = max(all_fb, key=lambda m: (FB_WEIGHTS.get(m, FB_DEFAULT_WEIGHT),
                                               -FORM_TIP_PRIORITY.index(m) if m in FORM_TIP_PRIORITY else -999))
 
+    # Write feedback file
     try:
         with open(feedback_path,"w",encoding="utf-8") as f:
             f.write(f"Total Reps: {int(rep_count)}\n")
@@ -387,12 +570,13 @@ def run_pushup_analysis(video_path,
     except Exception:
         pass
 
+    # Encode video
     final_path=""
     if return_video and os.path.exists(output_path):
         encoded_path=output_path.replace(".mp4","_encoded.mp4")
         try:
             subprocess.run(["ffmpeg","-y","-i",output_path,"-c:v","libx264","-preset","medium",
-                            "-crf",str(int(encode_crf if encode_crf is not None else 23)),"-movflags","+faststart","-pix_fmt","yuv420p",
+                            "-crf",str(int(encode_crf if encode_crf is None else 23)),"-movflags","+faststart","-pix_fmt","yuv420p",
                             encoded_path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             final_path=encoded_path if os.path.exists(encoded_path) else output_path
             if os.path.exists(output_path) and os.path.exists(encoded_path):
@@ -411,13 +595,127 @@ def run_pushup_analysis(video_path,
         "feedback": fb_list,
         "tips": [],
         "reps": rep_reports,
-        "video_path": final_path if slow_path else "",
+        "video_path": final_path if return_video else "",
         "feedback_path": feedback_path
     }
     if form_tip is not None:
         result["form_tip"] = form_tip
 
     return result
+
+# ============ Helper Functions ============
+def _calculate_body_angle(lms, LSH, RSH, LH, RH, LA, RA):
+    """חישוב זווית הגוף מהאופקי (פלנק)"""
+    mid_sh = ((lms[LSH].x + lms[RSH].x)/2.0, (lms[LSH].y + lms[RSH].y)/2.0)
+    mid_hp = ((lms[LH].x + lms[RH].x)/2.0, (lms[LH].y + lms[RH].y)/2.0)
+    mid_ank = ((lms[LA].x + lms[RA].x)/2.0, (lms[LA].y + lms[RA].y)/2.0)
+    
+    # Vector from ankles to shoulders
+    dx = mid_sh[0] - mid_ank[0]
+    dy = mid_sh[1] - mid_ank[1]
+    
+    # Angle from horizontal (0° = perfectly horizontal)
+    angle = abs(math.degrees(math.atan2(abs(dy), abs(dx) + 1e-9)))
+    return angle
+
+def _calculate_hip_misalignment(lms, LSH, RSH, LH, RH, LA, RA):
+    """חישוב סטייה של ירכיים מקו ישר של הגוף (sag or pike)"""
+    mid_sh = ((lms[LSH].x + lms[RSH].x)/2.0, (lms[LSH].y + lms[RSH].y)/2.0)
+    mid_hp = ((lms[LH].x + lms[RH].x)/2.0, (lms[LH].y + lms[RH].y)/2.0)
+    mid_ank = ((lms[LA].x + lms[RA].x)/2.0, (lms[LA].y + lms[RA].y)/2.0)
+    
+    # Calculate angle at hip (shoulder-hip-ankle)
+    angle = _ang(mid_sh, mid_hp, mid_ank)
+    
+    # Deviation from 180° (straight line)
+    deviation = abs(180.0 - angle)
+    return deviation
+
+def _calculate_elbow_flare(lms, LSH, RSH, LE, RE, LW, RW):
+    """חישוב זווית התרחקות מרפקים מהגוף"""
+    mid_sh = ((lms[LSH].x + lms[RSH].x)/2.0, (lms[LSH].y + lms[RSH].y)/2.0)
+    
+    # Left elbow angle from body centerline
+    left_vec_sh = (mid_sh[0] - lms[LSH].x, mid_sh[1] - lms[LSH].y)
+    left_vec_elb = (lms[LE].x - lms[LSH].x, lms[LE].y - lms[LSH].y)
+    left_angle = abs(math.degrees(math.atan2(
+        left_vec_sh[0]*left_vec_elb[1] - left_vec_sh[1]*left_vec_elb[0],
+        left_vec_sh[0]*left_vec_elb[0] + left_vec_sh[1]*left_vec_elb[1]
+    )))
+    
+    # Right elbow angle from body centerline
+    right_vec_sh = (mid_sh[0] - lms[RSH].x, mid_sh[1] - lms[RSH].y)
+    right_vec_elb = (lms[RE].x - lms[RSH].x, lms[RE].y - lms[RSH].y)
+    right_angle = abs(math.degrees(math.atan2(
+        right_vec_sh[0]*right_vec_elb[1] - right_vec_sh[1]*right_vec_elb[0],
+        right_vec_sh[0]*right_vec_elb[0] + right_vec_sh[1]*right_vec_elb[1]
+    )))
+    
+    return max(left_angle, right_angle)
+
+def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
+                        cycle_max_hip_misalign, cycle_max_flare,
+                        depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
+                        depth_already_reported, hips_already_reported,
+                        lockout_already_reported, flare_already_reported,
+                        session_feedback, local_vars):
+    """הערכת פורם בסוף מחזור"""
+    
+    # Depth check
+    depth_ok = (bottom_phase_min_elbow is not None) and (bottom_phase_min_elbow <= DEPTH_MIN_ANGLE)
+    depth_near = (bottom_phase_min_elbow is not None) and (bottom_phase_min_elbow <= (DEPTH_MIN_ANGLE + DEPTH_NEAR_DEG))
+    
+    if not depth_ok and not depth_near:
+        local_vars['cycle_tip_deeper'] = True
+        local_vars['depth_fail_count'] += 1
+        if local_vars['depth_fail_count'] >= DEPTH_FAIL_MIN_REPS and not depth_already_reported:
+            session_feedback.add(FB_CUE_DEEPER)
+            local_vars['depth_already_reported'] = True
+
+    # Lockout check
+    lockout_ok = (top_phase_max_elbow is not None) and (top_phase_max_elbow >= LOCKOUT_MIN_ANGLE)
+    lockout_near = (top_phase_max_elbow is not None) and (top_phase_max_elbow >= (LOCKOUT_MIN_ANGLE - LOCKOUT_NEAR_DEG))
+    
+    if not lockout_ok and not lockout_near:
+        local_vars['cycle_tip_lockout'] = True
+        local_vars['lockout_fail_count'] += 1
+        if local_vars['lockout_fail_count'] >= LOCKOUT_FAIL_MIN_REPS and not lockout_already_reported:
+            session_feedback.add(FB_CUE_LOCKOUT)
+            local_vars['lockout_already_reported'] = True
+
+    # Hip alignment check
+    hips_ok = (cycle_max_hip_misalign is not None) and (cycle_max_hip_misalign <= HIP_ALIGNMENT_MAX)
+    hips_near = (cycle_max_hip_misalign is not None) and (cycle_max_hip_misalign <= (HIP_ALIGNMENT_MAX + HIP_ALIGNMENT_NEAR))
+    
+    if not hips_ok and not hips_near:
+        local_vars['cycle_tip_hips'] = True
+        local_vars['hips_fail_count'] += 1
+        if local_vars['hips_fail_count'] >= HIPS_FAIL_MIN_REPS and not hips_already_reported:
+            session_feedback.add(FB_CUE_HIPS)
+            local_vars['hips_already_reported'] = True
+
+    # Elbow flare check
+    flare_ok = (cycle_max_flare is not None) and (cycle_max_flare <= ELBOW_FLARE_MAX)
+    flare_near = (cycle_max_flare is not None) and (cycle_max_flare <= (ELBOW_FLARE_MAX + FLARE_NEAR_DEG))
+    
+    if not flare_ok and not flare_near:
+        local_vars['cycle_tip_elbows'] = True
+        local_vars['flare_fail_count'] += 1
+        if local_vars['flare_fail_count'] >= FLARE_FAIL_MIN_REPS and not flare_already_reported:
+            session_feedback.add(FB_CUE_ELBOWS_IN)
+            local_vars['flare_already_reported'] = True
+
+def _count_rep(rep_reports, rep_count, bottom_elbow, descent_from, bottom_shoulder_y, all_scores, rep_has_tip):
+    rep_score = 10.0 if not rep_has_tip else 9.5
+    all_scores.append(rep_score)
+    rep_reports.append({
+        "rep_index": int(rep_count+1),
+        "score": float(rep_score),
+        "good": bool(rep_score >= 10.0 - 1e-6),
+        "bottom_elbow": float(bottom_elbow),
+        "descent_from": float(descent_from),
+        "bottom_shoulder_y": float(bottom_shoulder_y)
+    })
 
 def _ret_err(msg, feedback_path):
     try:
