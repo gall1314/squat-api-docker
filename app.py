@@ -18,7 +18,7 @@ MEDIA_DIR = "media"
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
 # -------- Aliases → internal type --------
-EXERCISE_MAP = {
+_EXERCISE_MAP_RAW = {
     "barbell squat": "squat", "barbell back squat": "squat", "squat": "squat",
     "deadlift": "deadlift",
     "romanian deadlift": "romanian_deadlift", "rdl": "romanian_deadlift",
@@ -43,6 +43,9 @@ EXERCISE_MAP = {
     "push-up": "pushup", "push up": "pushup", "pushups": "pushup", "push ups": "pushup",
     "push-ups": "pushup", "regular push-up": "pushup", "standard push-up": "pushup",
 }
+
+# Create case-insensitive lookup by normalizing all keys to lowercase
+EXERCISE_MAP = {k.lower(): v for k, v in _EXERCISE_MAP_RAW.items()}
 
 # -------- Error handling & logging --------
 @app.errorhandler(Exception)
@@ -349,17 +352,23 @@ def analyze():
         print(f"FILES KEYS: {list(files.keys())}", file=sys.stderr, flush=True)
 
         exercise_type = form.get('exercise_type')
+        print(f"[MP] exercise_type from form: '{exercise_type}'", file=sys.stderr, flush=True)
         if not exercise_type:
+            print(f"[MP] ERROR: Missing exercise_type", file=sys.stderr, flush=True)
             return jsonify({"error": "Missing exercise_type"}), 400
 
         exercise_type = exercise_type.lower().strip()
+        print(f"[MP] normalized exercise_type: '{exercise_type}'", file=sys.stderr, flush=True)
         resolved_type = EXERCISE_MAP.get(exercise_type)
+        print(f"[MP] resolved_type: '{resolved_type}'", file=sys.stderr, flush=True)
         if not resolved_type:
+            print(f"[MP] ERROR: Unsupported exercise type: {exercise_type}", file=sys.stderr, flush=True)
             return jsonify({"error": f"Unsupported exercise type: {exercise_type}"}), 400
 
         # fast mode - default true
         fast_str = form.get('fast', 'true').lower()
         fast_mode = (fast_str == 'true')
+        print(f"[MP] fast_str='{fast_str}' -> fast_mode={fast_mode}", file=sys.stderr, flush=True)
         print(f"[MP] Resolved: {resolved_type} | fast_mode={fast_mode}", file=sys.stderr, flush=True)
 
         unique_id = str(uuid.uuid4())[:8]
