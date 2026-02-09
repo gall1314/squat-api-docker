@@ -68,8 +68,8 @@ DONUT_CEIL  = 100.0
 TORSO_IDEAL_MIN = 15.0    # deg above horizontal - nearly parallel to floor
 TORSO_IDEAL_MAX = 35.0    # deg above horizontal - acceptable range
 TORSO_HIGH_WARNING = 50.0 # deg above horizontal - too upright warning
-TORSO_DRIFT_MAX  = 12.0   # allowed change during a rep
-KNEE_DRIFT_MAX   = 10.0   # leg drive indicator
+TORSO_DRIFT_MAX  = 25.0   # allowed change during a rep (INCREASED - stable execution)
+KNEE_DRIFT_MAX   = 20.0   # leg drive indicator (INCREASED - stable execution)
 MIN_REP_SAMPLES  = 5      # minimum samples to trust drift/mean metrics
 MIN_DEPTH_PCT_FOR_STABILITY = 60.0  # only trust stability cues on meaningful ROM
 
@@ -100,6 +100,18 @@ def angle(a, b, c):
     cosang = (ba[0]*bc[0] + ba[1]*bc[1]) / (ba_len*bc_len + 1e-9)
     cosang = max(-1.0, min(1.0, cosang))
     return math.degrees(math.acos(cosang))
+
+def angle_between_vectors(v1, v2):
+    """Calculate angle between two 2D vectors in degrees."""
+    v1 = np.array(v1, dtype=float)
+    v2 = np.array(v2, dtype=float)
+    v1_len = np.linalg.norm(v1)
+    v2_len = np.linalg.norm(v2)
+    if v1_len == 0 or v2_len == 0:
+        return None
+    cosang = np.dot(v1, v2) / (v1_len * v2_len)
+    cosang = np.clip(cosang, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosang)))
 
 def ema(prev, val, alpha=EMA_ALPHA):
     if prev is None:
@@ -428,7 +440,15 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
             ankle    = pick(28,27)
 
             elbow_ang = angle(shoulder, elbow, wrist)
-            torso_ang = angle(shoulder, hip, knee)  # torso angle vs thigh (proxy); stable across frames for drift
+            
+            # Calculate ACTUAL torso angle relative to horizontal (ground)
+            # Vector from hip to shoulder
+            torso_vector = (shoulder[0] - hip[0], shoulder[1] - hip[1])
+            # Horizontal reference vector (right direction in image coords)
+            horizontal = (1.0, 0.0)
+            # Calculate angle between torso and horizontal
+            torso_ang = angle_between_vectors(torso_vector, horizontal) if shoulder is not None and hip is not None else None
+            
             knee_ang  = angle(hip, knee, ankle)
 
             # Update donut references
@@ -554,18 +574,28 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     # Technique label
     label = technique_label(score)
 
-    # Select best form tip (prioritize by severity) - FIXED
+    # Select best form tip (coaching advice - SEPARATE from feedback)
     form_tip = None
+    
+    # Generate coaching tip based on patterns, not just feedback
     if session_feedback:
-        form_tip = session_feedback[0]  # Most severe feedback
+        # If there's feedback, give actionable coaching
+        if any("torso" in fb.lower() or "horizontal" in fb.lower() for fb in session_feedback):
+            form_tip = "Focus on hip hinge — push your hips back to get more horizontal"
+        elif any("pull" in fb.lower() or "higher" in fb.lower() for fb in session_feedback):
+            form_tip = "Think 'elbows to ceiling' — drive them high and back"
+        elif any("momentum" in fb.lower() for fb in session_feedback):
+            form_tip = "Control the descent — lower the bar slowly over 2-3 seconds"
+        else:
+            form_tip = session_feedback[0]  # Fallback to first feedback
     elif session_tips:
-        form_tip = session_tips[0]  # Or first tip if no severe issues
+        form_tip = "Squeeze your shoulder blades together at the top"
     else:
-        # Default encouraging message if everything is good (like squat)
+        # No issues - give encouraging + progressive advice
         if good_reps == reps and reps > 0:
             form_tip = "Great form! Keep it up 💪"
         elif reps > 0:
-            form_tip = "Focus on consistent form across all reps"
+            form_tip = "Try slowing down the lowering phase for better control"
         else:
             form_tip = "Complete a full rep to get feedback"
 
