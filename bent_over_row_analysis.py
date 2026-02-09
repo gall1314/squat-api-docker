@@ -65,8 +65,9 @@ DONUT_FLOOR = 0.0
 DONUT_CEIL  = 100.0
 
 # Posture/quality thresholds
-TORSO_TARGET_MIN = 25.0   # deg above horizontal (roughly bent-over)
-TORSO_TARGET_MAX = 55.0
+TORSO_IDEAL_MIN = 15.0    # deg above horizontal - nearly parallel to floor
+TORSO_IDEAL_MAX = 35.0    # deg above horizontal - acceptable range
+TORSO_HIGH_WARNING = 50.0 # deg above horizontal - too upright warning
 TORSO_DRIFT_MAX  = 12.0   # allowed change during a rep
 KNEE_DRIFT_MAX   = 10.0   # leg drive indicator
 MIN_REP_SAMPLES  = 5      # minimum samples to trust drift/mean metrics
@@ -233,18 +234,34 @@ def analyze_rep(rep_metrics):
         penalty += ROM_PENALTY_LIGHT * 0.5
         feedback.append(("tip", "Aim for stronger elbow flexion at the top"))
 
+    # Torso angle check - MAIN FOCUS: is back horizontal enough?
+    if allow_stability_cues and rep_metrics["torso_mean"] is not None:
+        torso_mean = rep_metrics["torso_mean"]
+        
+        # Too upright (back angle too high) - THIS IS THE MAIN ISSUE
+        if torso_mean > TORSO_HIGH_WARNING:
+            penalty += MOMENTUM_PENALTY  # High penalty for very upright
+            feedback.append(("severe", "Lower your torso — get more horizontal"))
+            is_proper = False
+        elif torso_mean > TORSO_IDEAL_MAX:
+            penalty += TORSO_PENALTY
+            feedback.append(("medium", "Try to lower your torso closer to parallel"))
+        elif torso_mean < TORSO_IDEAL_MIN:
+            # Too low (rare, but possible)
+            feedback.append(("tip", "You can raise your torso slightly"))
+    
     # Momentum / torso drift - ONLY very severe marks as improper
     if allow_stability_cues:
         if rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > TORSO_DRIFT_MAX * 1.5:
             # Very severe momentum
-            penalty += MOMENTUM_PENALTY
+            penalty += MOMENTUM_PENALTY * 0.8  # Reduced - drift less critical than angle
             feedback.append(("severe", "Avoid using momentum — keep your torso still"))
             is_proper = False
         elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > TORSO_DRIFT_MAX:
             # Moderate momentum - counts as proper
-            penalty += TORSO_PENALTY
+            penalty += TORSO_PENALTY * 0.6
             feedback.append(("medium", "Keep your torso angle more consistent"))
-        elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > 0.6*TORSO_DRIFT_MAX:
+        elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > 0.7*TORSO_DRIFT_MAX:
             # Minor drift
             feedback.append(("tip", "Try to minimize torso movement"))
 
@@ -255,14 +272,6 @@ def analyze_rep(rep_metrics):
             feedback.append(("medium", "Minimize leg drive — keep knees steady"))
         elif rep_metrics["knee_drift"] is not None and rep_metrics["knee_drift"] > KNEE_DRIFT_MAX:
             feedback.append(("tip", "Try to keep your legs more stable"))
-
-    # Back angle tip (doesn't affect proper/improper)
-    if allow_stability_cues:
-        if rep_metrics["torso_mean"] is not None:
-            if rep_metrics["torso_mean"] < TORSO_TARGET_MIN - 5:
-                feedback.append(("tip", "Try to keep your back a bit more upright"))
-            elif rep_metrics["torso_mean"] > TORSO_TARGET_MAX + 5:
-                feedback.append(("tip", "Lean forward slightly more for better form"))
 
     # Choose one strongest message for video overlay:
     overlay_msg = None
