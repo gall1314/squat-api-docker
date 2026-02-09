@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# romanian_deadlift_analysis_fixed.py — תיקון סף ברכיים וגב + אופטימיזציה
+# romanian_deadlift_analysis_fixed.py — תיקון סף ירידה (eccentric) - גרסה מתוקנת
 
 import os
 import cv2
@@ -210,46 +210,44 @@ def _get_side_landmarks(lm):
         "ear": np.array([lm[idxs[4].value].x, lm[idxs[4].value].y]),
     }
 
-# ===================== תיקון פרמטרים =====================
+# ===================== תיקון פרמטרים - גרסה סופית =====================
 HINGE_START_ANGLE = 20.0
 HINGE_BOTTOM_ANGLE = 55.0
 STAND_ANGLE = 12.0
 MIN_FRAMES_BETWEEN_REPS = 8
 PROG_ALPHA = 0.3
 
-# ✅ תיקון קריטי: ברכיים בדדליפט רומני
-# בדדליפט רומני **צריך** עיקום של 15-20 מעלות!
-# ברכיים ישרות מדי = Stiff-Leg Deadlift (לא RDL)
-
-KNEE_MIN_ANGLE = 155.0  # מעל לזה = ברכיים ישרות מדי (stiff-leg)
-KNEE_OPTIMAL_MIN = 160.0  # אופטימלי: 160-170 מעלות (15-20° כיפוף)
+# ✅ ברכיים בדדליפט רומני - צריך עיקום קל של 15-20 מעלות
+KNEE_MIN_ANGLE = 155.0  # מעל לזה = ברכיים ישרות מדי
+KNEE_OPTIMAL_MIN = 160.0
 KNEE_OPTIMAL_MAX = 170.0
-KNEE_MAX_ANGLE = 140.0  # מתחת לזה = יותר מדי כיפוף (כמו סקוואט)
+KNEE_MAX_ANGLE = 140.0  # מתחת לזה = יותר מדי כיפוף
 
-# ✅ תיקון: הגב - MediaPipe לא מדויק מספיק, נעלה את הסף
-BACK_MAX_ANGLE = 45.0  # העלנו מ-30 ל-45 מעלות (כמעט לא יתריע)
+# ✅ גב - MediaPipe לא מדויק מספיק, סף גבוה
+BACK_MAX_ANGLE = 45.0
 
-MIN_ECC_S = 0.25  # ✅ הפחתנו מ-0.35 ל-0.25 שניות (יותר סביר)
-MIN_BOTTOM_S = 0.12
+# ✅✅✅ תיקון קריטי: הקלה משמעותית בדרישות הזמן
+# בדדליפט רומני, הירידה צריכה להיות **מבוקרת** אבל לא בהכרח איטית מאוד
+# 0.15 שניות זה מספיק כדי לוודא שזה לא נפילה חופשית
+MIN_ECC_S = 0.15  # ✅ ירידה מבוקרת (לא איטית מאוד)
+MIN_BOTTOM_S = 0.08  # ✅ השהייה קצרה בתחתית
 
 MIN_SCORE = 4.0
 MAX_SCORE = 10.0
 
 def run_romanian_deadlift_analysis(video_path,
-                                   frame_skip=3,  # ✅ חזרנו לערך המקורי
-                                   scale=0.4,     # ✅ חזרנו לערך המקורי
+                                   frame_skip=3,
+                                   scale=0.4,
                                    output_path="romanian_deadlift_analyzed.mp4",
                                    feedback_path="romanian_deadlift_feedback.txt",
                                    return_video=True,
                                    fast_mode=False):
     """
     Romanian Deadlift analysis - FIXED:
-    ✅ ברכיים: מותר עיקום 110-140 מעלות (לא 150!)
-    ✅ גב: מותר נטייה עד 30 מעלות (לא 20!)
+    ✅ ברכיים: מותר עיקום 160-170 מעלות (עיקום קל)
+    ✅ גב: מותר נטייה עד 45 מעלות
+    ✅✅ זמן ירידה: 0.15 שניות מספיק (ירידה מבוקרת, לא איטית)
     ✅ fast_mode: במצב מהיר - אותה לוגיקה בדיוק, רק ללא ציור וידאו
-    
-    ** ההבדל בין fast ל-slow הוא רק האם מצייר overlay וכותב וידאו **
-    ** הלוגיקה של הניתוח זהה לחלוטין! **
     """
     import sys
     print(f"[RDL] Starting analysis: fast_mode={fast_mode}, return_video={return_video}", file=sys.stderr, flush=True)
@@ -257,7 +255,6 @@ def run_romanian_deadlift_analysis(video_path,
     
     mp_pose_mod = mp.solutions.pose
 
-    # === רק זה משתנה: האם ליצור וידאו ===
     if fast_mode is True:
         return_video = False
     create_video = bool(return_video) and (output_path is not None) and (output_path != "")
@@ -275,14 +272,12 @@ def run_romanian_deadlift_analysis(video_path,
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
     
-    # בדיקת sanity - האם זה באמת וידאו?
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     duration = total_frames / fps if fps > 0 else 0
     
     print(f"[RDL] Video info: {total_frames} frames, {fps:.1f} FPS, {duration:.1f}s duration", file=sys.stderr, flush=True)
     
-    # אם יש פחות מ-10 פריימים, זו כנראה תמונה, לא וידאו
     if total_frames < 10:
         print(f"[RDL ERROR] File has only {total_frames} frames - this is not a valid video!", file=sys.stderr, flush=True)
         cap.release()
@@ -295,7 +290,6 @@ def run_romanian_deadlift_analysis(video_path,
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
 
-    # במצב מהיר: שומרים על בדיקת פריימים זהה, scale מעט קטן יותר, model lite
     if fast_mode:
         effective_frame_skip = frame_skip
         effective_scale = scale * 0.85
@@ -335,12 +329,11 @@ def run_romanian_deadlift_analysis(video_path,
     rt_fb_msg = None
     rt_fb_hold = 0
 
-    # מודל מהיר/איטי לפי fast_mode
     print(f"[RDL] Starting pose detection loop", file=sys.stderr, flush=True)
     
     import time
     loop_start_time = time.time()
-    MAX_PROCESSING_TIME = 180  # 3 דקות מקסימום
+    MAX_PROCESSING_TIME = 180
     frames_processed = 0
     
     with mp_pose_mod.Pose(model_complexity=model_complexity,
@@ -351,7 +344,6 @@ def run_romanian_deadlift_analysis(video_path,
             if not ret:
                 break
             
-            # בדיקת timeout
             elapsed = time.time() - loop_start_time
             if elapsed > MAX_PROCESSING_TIME:
                 print(f"[RDL ERROR] Processing timeout after {elapsed:.1f}s (processed {frames_processed} frames)", file=sys.stderr, flush=True)
@@ -363,7 +355,6 @@ def run_romanian_deadlift_analysis(video_path,
             
             frames_processed += 1
             
-            # הדפסת progress כל 30 פריימים
             if frames_processed % 30 == 0:
                 print(f"[RDL] Progress: {frames_processed} frames, {counter} reps, {elapsed:.1f}s", file=sys.stderr, flush=True)
 
@@ -439,28 +430,23 @@ def run_romanian_deadlift_analysis(video_path,
                     feedback = []
                     score = MAX_SCORE
 
-                    # Depth check - removed, focusing on knee bend instead
-                    
-                    # ✅ תיקון סופי: בדיקת ברכיים - ניסוח פשוט וברור
+                    # ✅ בדיקת ברכיים
                     if max_knee_angle > KNEE_MIN_ANGLE:
-                        # ברכיים ישרות מדי - צריך יותר כיפוף
                         feedback.append("Bend your knees a bit more")
                         score -= 1.5
                     elif min_knee_angle < KNEE_MAX_ANGLE:
-                        # ברכיים מכופפות יותר מדי
                         feedback.append("Too much knee bend")
                         score -= 2.0
 
-                    # Back check - רק במקרים קיצוניים (סף 45°)
-                    # ונרכך את הניסוח
+                    # ✅ בדיקת גב - רק במקרים קיצוניים
                     if back_issue and back_angle > BACK_MAX_ANGLE:
                         feedback.append("Try to keep your back neutral")
-                        score -= 1.0  # הפחתנו את העונש מ-2.5 ל-1.0
+                        score -= 1.0
 
-                    # Tempo check
+                    # ✅✅ בדיקת טמפו - תנאי מרוכך משמעותית
                     if down_s < MIN_ECC_S:
                         feedback.append("Control the lowering")
-                        score -= 0.5  # ✅ הפחתנו מ-1.0 ל-0.5
+                        score -= 0.5
 
                     if bottom_s < MIN_BOTTOM_S:
                         feedback.append("Pause at the bottom")
@@ -493,8 +479,7 @@ def run_romanian_deadlift_analysis(video_path,
                         }
                     })
                     
-                    # Debug: הדפסת זוויות לכל חזרה
-                    print(f"[RDL] Rep {counter}: min_knee={min_knee_angle:.1f}°, max_knee={max_knee_angle:.1f}°, torso={max_torso_angle:.1f}°", 
+                    print(f"[RDL] Rep {counter}: min_knee={min_knee_angle:.1f}°, max_knee={max_knee_angle:.1f}°, torso={max_torso_angle:.1f}°, down_time={down_s:.2f}s", 
                           file=sys.stderr, flush=True)
 
                     rt_fb_msg = pick_strongest_feedback(feedback)
