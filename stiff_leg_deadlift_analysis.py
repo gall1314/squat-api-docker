@@ -377,8 +377,8 @@ def run_stiff_leg_deadlift_analysis(video_path,
                 if torso_angle >= HINGE_BOTTOM_ANGLE:
                     bottom_reached = True
 
-                # ✅✅ תיקון ספירה: תנאי פשוט יותר - אם הגיע למטה וחזר למעלה (מתחת ל-25°)
-                if bottom_reached and torso_angle <= 25.0 and (frame_idx - last_rep_frame) >= MIN_FRAMES_BETWEEN_REPS:
+                # ✅✅ תיקון ספירה: זהה לדדליפט רומני - חזרה נספרת רק כשחוזרים ל-stand angle
+                if bottom_reached and torso_angle <= STAND_ANGLE and (frame_idx - last_rep_frame) >= MIN_FRAMES_BETWEEN_REPS:
                     last_rep_frame = frame_idx
                     counter += 1
 
@@ -459,7 +459,7 @@ def run_stiff_leg_deadlift_analysis(video_path,
     if session_feedbacks:
         technique_score = min(technique_score, 9.5)
 
-    feedback_list = dedupe_feedback(session_feedbacks) if session_feedbacks else ["Excellent form! 🔥"]
+    feedback_list = dedupe_feedback(session_feedbacks) if session_feedbacks else ["Great form! Keep it up 💪"]
 
     session_tip = None
     if session_feedback_by_cat:
