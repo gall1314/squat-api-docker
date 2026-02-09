@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# stiff_leg_deadlift_analysis.py — ניתוח Stiff-Leg Deadlift
+# stiff_leg_deadlift_analysis_fixed.py — ✅ גרסה מתוקנת עם תיקונים קריטיים
 
 import os
 import cv2
@@ -39,7 +39,7 @@ mp_pose = mp.solutions.pose
 FB_SEVERITY = {
     "Go deeper - lower the bar to shins": 3,
     "Knees bending too much - keep legs straighter": 3,
-    "Back rounding detected": 3,
+    "Back rounding detected": 2,  # ✅ הורדנו חומרה כי זה לא אמין
     "Control the lowering": 2,
     "Pause at the bottom": 1,
 }
@@ -174,9 +174,10 @@ def torso_angle_to_vertical(hip, shoulder):
     cosang = float(np.clip(cosang, -1.0, 1.0))
     return float(math.degrees(math.acos(cosang)))
 
-def analyze_back_curvature(shoulder, hip, head_like, max_angle_deg=45.0, min_head_dist_ratio=0.35):
+def analyze_back_curvature(shoulder, hip, head_like, max_angle_deg=60.0, min_head_dist_ratio=0.35):
     """
-    Back rounding detection - MediaPipe has limited accuracy
+    ✅ תיקון: העלנו את הסף ל-60 מעלות (במקום 45)
+    MediaPipe לא מספיק מדויק - רק במקרים קיצוניים ביותר זה יתריע
     """
     torso_vec = shoulder - hip
     head_vec = head_like - shoulder
@@ -208,22 +209,23 @@ def _get_side_landmarks(lm):
         "ear": np.array([lm[idxs[4].value].x, lm[idxs[4].value].y]),
     }
 
-# ===================== STIFF-LEG DEADLIFT PARAMS =====================
+# ===================== ✅✅ תיקונים קריטיים - STIFF-LEG DEADLIFT =====================
 HINGE_START_ANGLE = 20.0
-HINGE_BOTTOM_ANGLE = 65.0  # עמוק יותר מ-RDL (55°)
-STAND_ANGLE = 12.0
+HINGE_BOTTOM_ANGLE = 65.0  # עמוק יותר מ-RDL
+STAND_ANGLE = 18.0  # ✅ תיקון 1: הקלה מ-12° ל-18° כדי לספור יותר חזרות
 MIN_FRAMES_BETWEEN_REPS = 8
 PROG_ALPHA = 0.3
 
-# ✅ Stiff-Leg: ברכיים כמעט ישרות לחלוטין!
-KNEE_MIN_ANGLE = 165.0  # מינימום 165° (כמעט ישר)
-KNEE_MAX_ANGLE = 150.0  # מתחת ל-150° = יותר מדי כיפוף
+# ✅ תיקון 2: ברכיים - הקלה משמעותית
+KNEE_MIN_ANGLE = 155.0  # ✅ הורדנו מ-165° ל-155° - פחות קפדני
+KNEE_MAX_ANGLE = 145.0  # ✅ הורדנו מ-150° ל-145° - רק אם ממש כפוף
 
-# Back angle
-BACK_MAX_ANGLE = 45.0
+# ✅ תיקון 3: גב - סף גבוה יותר
+BACK_MAX_ANGLE = 60.0  # ✅ העלנו מ-45° ל-60° - רק מקרים קיצוניים
 
-MIN_ECC_S = 0.35
-MIN_BOTTOM_S = 0.12
+# ✅ תיקון 4: טמפו - כמו ב-RDL המתוקן
+MIN_ECC_S = 0.15  # ✅ הורדנו מ-0.35 ל-0.15 - ירידה מבוקרת, לא בהכרח איטית מאוד
+MIN_BOTTOM_S = 0.08  # ✅ השהייה קצרה בתחתית
 
 MIN_SCORE = 4.0
 MAX_SCORE = 10.0
@@ -236,13 +238,14 @@ def run_stiff_leg_deadlift_analysis(video_path,
                                      return_video=True,
                                      fast_mode=False):
     """
-    Stiff-Leg Deadlift analysis:
-    - ברכיים כמעט ישרות (165-175°)
-    - עומק גדול יותר (עד השוקיים)
-    - דומה ל-RDL אבל עם דרישות שונות
+    ✅ Stiff-Leg Deadlift analysis - FIXED VERSION:
+    1. ספירת חזרות: STAND_ANGLE=18° (במקום 12°) - פחות קפדני בחזרה למעלה
+    2. ברכיים: 155-175° (במקום 165-175°) - מאפשר קצת יותר כיפוף
+    3. גב: סף של 60° (במקום 45°) - רק מקרים קיצוניים
+    4. טמפו: 0.15s ירידה (במקום 0.35s) - ירידה מבוקרת, לא בהכרח איטית מאוד
     """
     import sys
-    print(f"[SLDL] Starting analysis: fast_mode={fast_mode}", file=sys.stderr, flush=True)
+    print(f"[SLDL FIXED] Starting analysis: fast_mode={fast_mode}", file=sys.stderr, flush=True)
     
     if fast_mode is True:
         return_video = False
@@ -368,6 +371,7 @@ def run_stiff_leg_deadlift_analysis(video_path,
                 if torso_angle >= HINGE_BOTTOM_ANGLE:
                     bottom_reached = True
 
+                # ✅ תיקון: תנאי סיום מקל יותר
                 if bottom_reached and torso_angle <= STAND_ANGLE and (frame_idx - last_rep_frame) >= MIN_FRAMES_BETWEEN_REPS:
                     last_rep_frame = frame_idx
                     counter += 1
@@ -383,20 +387,20 @@ def run_stiff_leg_deadlift_analysis(video_path,
                         feedback.append("Go deeper - lower the bar to shins")
                         score -= 2.0
 
-                    # ✅ Stiff-Leg: ברכיים צריכות להיות ישרות!
+                    # ✅ בדיקת ברכיים - מתוקן
                     if min_knee_angle < KNEE_MIN_ANGLE:
                         feedback.append("Knees bending too much - keep legs straighter")
                         score -= 2.0
 
-                    # Back check
-                    if back_issue or back_angle > BACK_MAX_ANGLE:
+                    # ✅ בדיקת גב - סף גבוה יותר
+                    if back_issue and back_angle > BACK_MAX_ANGLE:
                         feedback.append("Back rounding detected")
-                        score -= 2.5
+                        score -= 1.5  # ✅ הורדנו את הניקוד מ-2.5 ל-1.5
 
-                    # Tempo
+                    # ✅ בדיקת טמפו - מתוקן
                     if down_s < MIN_ECC_S:
                         feedback.append("Control the lowering")
-                        score -= 1.0
+                        score -= 0.5  # ✅ הורדנו מ-1.0 ל-0.5
 
                     if bottom_s < MIN_BOTTOM_S:
                         feedback.append("Pause at the bottom")
@@ -427,6 +431,9 @@ def run_stiff_leg_deadlift_analysis(video_path,
                             "bottom_hold_s": round(bottom_s, 2)
                         }
                     })
+                    
+                    print(f"[SLDL] Rep {counter}: min_knee={min_knee_angle:.1f}°, torso={max_torso_angle:.1f}°, down_time={down_s:.2f}s", 
+                          file=sys.stderr, flush=True)
 
                     rt_fb_msg = pick_strongest_feedback(feedback)
                     rt_fb_hold = int(0.7 / dt)
