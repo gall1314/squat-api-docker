@@ -38,18 +38,16 @@ mp_pose = mp.solutions.pose
 # ===================== FEEDBACK SEVERITY =====================
 FB_SEVERITY = {
     "Go deeper - lower the bar to shins": 3,
-    "Knees bending too much - keep legs straighter": 3,
-    "Back rounding detected": 2,  # ✅ הורדנו חומרה כי זה לא אמין
-    "Control the lowering": 2,
-    "Pause at the bottom": 1,
+    # ✅✅ REMOVED unreliable checks:
+    # "Knees bending too much - keep legs straighter"
+    # "Back rounding detected"
+    # "Control the lowering"
+    # "Pause at the bottom"
 }
 
 FEEDBACK_CATEGORY = {
     "Go deeper - lower the bar to shins": "depth",
-    "Knees bending too much - keep legs straighter": "knees",
-    "Back rounding detected": "back",
-    "Control the lowering": "tempo",
-    "Pause at the bottom": "tempo",
+    # ✅✅ REMOVED unreliable categories
 }
 
 def pick_strongest_feedback(feedback_list):
@@ -238,12 +236,19 @@ def run_stiff_leg_deadlift_analysis(video_path,
                                      return_video=True,
                                      fast_mode=False):
     """
-    ✅✅ Stiff-Leg Deadlift analysis - AGGRESSIVELY FIXED VERSION:
-    1. ספירת חזרות: STAND_ANGLE=20° - מאוד מקל בחזרה למעלה
-    2. ברכיים: 150-180° - מאפשר כיפוף ברכיים עד 150°
-    3. גב: סף של 60° + קנס קטן (0.5 נקודות)
-    4. טמפו: 0.1s ירידה - כמעט כל ירידה תעבור
-    5. קנסים: הופחתו משמעותית (ברכיים: 1.0, גב: 0.5, טמפו: 0.3)
+    ✅✅✅ Stiff-Leg Deadlift analysis - RADICALLY SIMPLIFIED:
+    
+    REMOVED ALL UNRELIABLE CHECKS:
+    - Knee angle (MediaPipe not accurate enough)
+    - Back rounding (MediaPipe can't detect this reliably)
+    - Tempo/control (too variable, not meaningful)
+    
+    KEEPING ONLY:
+    1. Rep counting: Torso reaches 65° forward, then returns to <25° upright
+    2. Depth check: Did the torso reach at least 60° forward?
+    3. Good rep = score 9+ AND no feedback
+    
+    This version focuses on what MediaPipe CAN reliably detect.
     """
     import sys
     print(f"[SLDL FIXED] Starting analysis: fast_mode={fast_mode}", file=sys.stderr, flush=True)
@@ -372,8 +377,8 @@ def run_stiff_leg_deadlift_analysis(video_path,
                 if torso_angle >= HINGE_BOTTOM_ANGLE:
                     bottom_reached = True
 
-                # ✅ תיקון: תנאי סיום מקל יותר
-                if bottom_reached and torso_angle <= STAND_ANGLE and (frame_idx - last_rep_frame) >= MIN_FRAMES_BETWEEN_REPS:
+                # ✅✅ תיקון ספירה: תנאי פשוט יותר - אם הגיע למטה וחזר למעלה (מתחת ל-25°)
+                if bottom_reached and torso_angle <= 25.0 and (frame_idx - last_rep_frame) >= MIN_FRAMES_BETWEEN_REPS:
                     last_rep_frame = frame_idx
                     counter += 1
 
@@ -388,29 +393,20 @@ def run_stiff_leg_deadlift_analysis(video_path,
                         feedback.append("Go deeper - lower the bar to shins")
                         score -= 2.0
 
-                    # ✅✅ בדיקת ברכיים - עם הסף החדש (150°) וקנס מופחת
-                    if min_knee_angle < KNEE_MIN_ANGLE:
-                        feedback.append("Knees bending too much - keep legs straighter")
-                        score -= 1.0  # ✅✅ הורדנו מ-2.0 ל-1.0
+                    # ✅✅ REMOVED: Knee angle check - not reliable with MediaPipe
+                    # MediaPipe's accuracy isn't good enough for precise knee angle detection
 
-                    # ✅✅ בדיקת גב - קנס מופחת עוד יותר
-                    if back_issue and back_angle > BACK_MAX_ANGLE:
-                        feedback.append("Back rounding detected")
-                        score -= 0.5  # ✅✅ הורדנו מ-1.5 ל-0.5
+                    # ✅✅ REMOVED: Back rounding check - not reliable with MediaPipe
+                    # MediaPipe can't accurately detect back rounding
 
-                    # ✅✅ בדיקת טמפו - קנס מופחת מאוד
-                    if down_s < MIN_ECC_S:
-                        feedback.append("Control the lowering")
-                        score -= 0.3  # ✅✅ הורדנו מ-0.5 ל-0.3
-
-                    if bottom_s < MIN_BOTTOM_S:
-                        feedback.append("Pause at the bottom")
-                        score -= 0.5
+                    # ✅✅ REMOVED: Tempo checks - too strict and not always accurate
+                    # Eccentric and bottom pause timing varies too much
 
                     score = float(max(MIN_SCORE, min(MAX_SCORE, score)))
                     all_scores.append(score)
 
-                    if score >= 9.0:
+                    # ✅✅ תיקון: Good Rep = ציון 9+ **וגם** בלי פידבק
+                    if score >= 9.0 and len(feedback) == 0:
                         good_reps += 1
                     else:
                         bad_reps += 1
@@ -469,12 +465,6 @@ def run_stiff_leg_deadlift_analysis(video_path,
     if session_feedback_by_cat:
         if "depth" in session_feedback_by_cat:
             session_tip = "Focus on hip mobility to lower the bar closer to the ground"
-        elif "knees" in session_feedback_by_cat:
-            session_tip = "Keep knees locked with minimal bend throughout"
-        elif "back" in session_feedback_by_cat:
-            session_tip = "Maintain neutral spine by engaging core"
-        elif "tempo" in session_feedback_by_cat:
-            session_tip = "Slow eccentric phase maximizes hamstring stretch"
     else:
         session_tip = "Perfect stiff-leg form! Great hamstring work 💪"
 
