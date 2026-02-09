@@ -71,7 +71,13 @@ def _is_analyzer_unavailable(result_dict):
 
 def _unavailable_response(result_dict):
     detail = result_dict.get("detail") if isinstance(result_dict, dict) else "Analyzer unavailable"
-    return jsonify({"error": "analyzer_unavailable", "detail": detail}), 501
+    payload = {"error": "analyzer_unavailable", "detail": detail}
+    if isinstance(result_dict, dict):
+        if result_dict.get("module"):
+            payload["module"] = result_dict["module"]
+        if result_dict.get("missing_functions"):
+            payload["missing_functions"] = result_dict["missing_functions"]
+    return jsonify(payload), 501
 
 def _normalize_analysis_fields(result_dict):
     """Ensure analyzer responses contain stable numeric fields for downstream UI."""
@@ -139,6 +145,8 @@ def _missing_stub(mod_name, fn_names):
         return {
             "error": "analyzer_unavailable",
             "detail": f"Module '{mod_name}' is missing or none of these functions exist: {', '.join(fn_names)}",
+            "module": mod_name,
+            "missing_functions": list(fn_names),
             "video_path": ""
         }
     return _stub
