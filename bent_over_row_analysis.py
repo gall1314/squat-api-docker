@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-bent_over_row_analysis.py
+bent_over_row_analysis.py - FIXED VERSION
 Bent-Over Barbell Row — analysis pipeline matching the Squat standard:
 - Same overlay look & return schema (incl. 'squat_count' key)
 - Rep counting with frame skipping + soft-start gating
 - Live donut progress, single feedback line, body-only skeleton
 - Faststart-encoded analyzed video output
-- FIXED: proper_reps now returns actual count instead of null
+- FIXED: proper_reps now counts correctly (not overly strict)
 - FIXED: form_tip now returns best tip instead of null
 """
 import os
@@ -76,10 +76,10 @@ MIN_DEPTH_PCT_FOR_STABILITY = 60.0  # only trust stability cues on meaningful RO
 MIN_SCORE = 4.0
 MAX_SCORE = 10.0
 ROM_PENALTY_STRONG = 3.0
-ROM_PENALTY_LIGHT  = 2.0
+ROM_PENALTY_LIGHT  = 1.5  # Reduced from 2.0
 MOMENTUM_PENALTY   = 2.0
-TORSO_PENALTY      = 1.5
-LEGDRIVE_PENALTY   = 1.0
+TORSO_PENALTY      = 1.0  # Reduced from 1.5
+LEGDRIVE_PENALTY   = 0.8  # Reduced from 1.0
 
 # ================== UTILS ==================
 def ensure_font():
@@ -207,44 +207,62 @@ def row_depth_from_elbow(elbow_angle, ext_ref, top_ref):
     return clamp(pct, DONUT_FLOOR, DONUT_CEIL)
 
 def analyze_rep(rep_metrics):
-    """Return penalties, feedbacks, and is_proper for a single rep based on collected metrics."""
+    """
+    Return penalties, feedbacks, and is_proper for a single rep based on collected metrics.
+    FIXED: Only mark is_proper=False for severe ROM issues
+    """
     feedback = []
     penalty = 0.0
-    is_proper = True  # Start assuming proper, mark False if severe issues
+    is_proper = True  # Start assuming proper
     depth_pct = rep_metrics.get("depth_pct") or 0.0
     allow_stability_cues = depth_pct >= MIN_DEPTH_PCT_FOR_STABILITY
 
-    # ROM check
-    if rep_metrics["min_elbow_angle"] is None or rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX + 5:
+    # ROM check - ONLY severe issues mark as improper
+    if rep_metrics["min_elbow_angle"] is None or rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX + 10:
+        # Very severe ROM issue
         penalty += ROM_PENALTY_STRONG
         feedback.append(("severe", "Pull higher — reach your torso"))
         is_proper = False
-    elif rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX:
+    elif rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX + 5:
+        # Moderate ROM issue - still counts as proper but with feedback
         penalty += ROM_PENALTY_LIGHT
-        feedback.append(("medium", "Stronger elbow flexion at the top"))
-        is_proper = False
+        feedback.append(("medium", "Try to pull a bit higher"))
+        # NOT marking as improper for moderate issues
+    elif rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX:
+        # Minor ROM issue - just a tip
+        penalty += ROM_PENALTY_LIGHT * 0.5
+        feedback.append(("tip", "Aim for stronger elbow flexion at the top"))
 
-    # Momentum / torso drift
+    # Momentum / torso drift - ONLY very severe marks as improper
     if allow_stability_cues:
-        if rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > TORSO_DRIFT_MAX:
+        if rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > TORSO_DRIFT_MAX * 1.5:
+            # Very severe momentum
             penalty += MOMENTUM_PENALTY
             feedback.append(("severe", "Avoid using momentum — keep your torso still"))
             is_proper = False
-        elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > 0.5*TORSO_DRIFT_MAX:
+        elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > TORSO_DRIFT_MAX:
+            # Moderate momentum - counts as proper
             penalty += TORSO_PENALTY
-            feedback.append(("medium", "Keep your torso angle consistent"))
+            feedback.append(("medium", "Keep your torso angle more consistent"))
+        elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > 0.6*TORSO_DRIFT_MAX:
+            # Minor drift
+            feedback.append(("tip", "Try to minimize torso movement"))
 
-    # Leg drive
+    # Leg drive - feedback only, doesn't mark improper
     if allow_stability_cues:
-        if rep_metrics["knee_drift"] is not None and rep_metrics["knee_drift"] > KNEE_DRIFT_MAX:
+        if rep_metrics["knee_drift"] is not None and rep_metrics["knee_drift"] > KNEE_DRIFT_MAX * 1.5:
             penalty += LEGDRIVE_PENALTY
             feedback.append(("medium", "Minimize leg drive — keep knees steady"))
+        elif rep_metrics["knee_drift"] is not None and rep_metrics["knee_drift"] > KNEE_DRIFT_MAX:
+            feedback.append(("tip", "Try to keep your legs more stable"))
 
-    # Back straighter (optional gentle cue): if torso mean outside target window
+    # Back angle tip (doesn't affect proper/improper)
     if allow_stability_cues:
-        if rep_metrics["torso_mean"] is not None and (rep_metrics["torso_mean"] < TORSO_TARGET_MIN or rep_metrics["torso_mean"] > TORSO_TARGET_MAX):
-            # tip only (no penalty)
-            feedback.append(("tip", "Try to keep your back a bit straighter"))
+        if rep_metrics["torso_mean"] is not None:
+            if rep_metrics["torso_mean"] < TORSO_TARGET_MIN - 5:
+                feedback.append(("tip", "Try to keep your back a bit more upright"))
+            elif rep_metrics["torso_mean"] > TORSO_TARGET_MAX + 5:
+                feedback.append(("tip", "Lean forward slightly more for better form"))
 
     # Choose one strongest message for video overlay:
     overlay_msg = None
@@ -336,7 +354,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
 
     # State
     reps = 0
-    proper_reps = 0  # NEW: Track proper reps
+    proper_reps = 0  # Track proper reps
     last_rep_frame = -9999
     frame_idx = -1
 
@@ -467,7 +485,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                     }
                     pen, ov_msg, sess_msgs, tips, is_proper = analyze_rep(rep_m)
                     
-                    # Count proper reps
+                    # Count proper reps - FIXED LOGIC
                     if is_proper:
                         proper_reps += 1
                     
@@ -519,7 +537,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     # Technique label
     label = technique_label(score)
 
-    # Select best form tip (prioritize by severity)
+    # Select best form tip (prioritize by severity) - FIXED
     form_tip = None
     if session_feedback:
         form_tip = session_feedback[0]  # Most severe feedback
@@ -543,7 +561,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
         "success": True,
         "squat_count": reps,                # keep same key name for UI compatibility
         "row_count": reps,
-        "proper_reps": 0 if proper_reps is None else int(proper_reps),
+        "proper_reps": int(proper_reps),    # FIXED: Now returns actual count
         "technique_score": float(score),
         "technique_score_display": f"{score:.1f}",
         "technique_label": label,
