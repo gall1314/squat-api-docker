@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# romanian_deadlift_analysis_fixed.py — תיקון סף ירידה (eccentric) - גרסה מתוקנת
+# romanian_deadlift_analysis_fixed.py — ללא בדיקת טמפו, עם בדיקת עומק
 
 import os
 import cv2
@@ -37,19 +37,17 @@ mp_pose = mp.solutions.pose
 
 # ===================== FEEDBACK SEVERITY =====================
 FB_SEVERITY = {
+    "Go deeper - hinge more at the hips": 3,
     "Bend your knees a bit more": 3,
     "Too much knee bend": 3,
     "Try to keep your back neutral": 2,
-    "Control the lowering": 2,
-    "Pause at the bottom": 1,
 }
 
 FEEDBACK_CATEGORY = {
+    "Go deeper - hinge more at the hips": "depth",
     "Bend your knees a bit more": "knees",
     "Too much knee bend": "knees",
     "Try to keep your back neutral": "back",
-    "Control the lowering": "tempo",
-    "Pause at the bottom": "tempo",
 }
 
 def pick_strongest_feedback(feedback_list):
@@ -210,9 +208,9 @@ def _get_side_landmarks(lm):
         "ear": np.array([lm[idxs[4].value].x, lm[idxs[4].value].y]),
     }
 
-# ===================== תיקון פרמטרים - גרסה סופית =====================
+# ===================== פרמטרים =====================
 HINGE_START_ANGLE = 20.0
-HINGE_BOTTOM_ANGLE = 55.0
+HINGE_BOTTOM_ANGLE = 55.0  # ✅ זווית מינימלית לעומק תקין
 STAND_ANGLE = 12.0
 MIN_FRAMES_BETWEEN_REPS = 8
 PROG_ALPHA = 0.3
@@ -226,11 +224,6 @@ KNEE_MAX_ANGLE = 140.0  # מתחת לזה = יותר מדי כיפוף
 # ✅ גב - MediaPipe לא מדויק מספיק, סף גבוה
 BACK_MAX_ANGLE = 45.0
 
-# ✅✅✅ תיקון קריטי: הקלה מקסימלית בדרישות הזמן
-# רק נתריע במקרים של נפילה ממש חופשית (כמעט אף פעם)
-MIN_ECC_S = 0.04  # ✅ סף נמוך מאוד - רק נגד נפילה חופשית ממש
-MIN_BOTTOM_S = 0.02  # ✅ סף נמוך מאוד
-
 MIN_SCORE = 4.0
 MAX_SCORE = 10.0
 
@@ -242,11 +235,11 @@ def run_romanian_deadlift_analysis(video_path,
                                    return_video=True,
                                    fast_mode=False):
     """
-    Romanian Deadlift analysis - FIXED:
-    ✅ ברכיים: מותר עיקום 160-170 מעלות (עיקום קל)
-    ✅ גב: מותר נטייה עד 45 מעלות
-    ✅✅✅ זמן ירידה: סף מינימלי ביותר + 4 פריימים (רק נגד נפילה חופשית ממש)
-    ✅ fast_mode: במצב מהיר - אותה לוגיקה בדיוק, רק ללא ציור וידאו
+    Romanian Deadlift analysis:
+    ✅ בדיקת עומק: האם הגו הגיע לזווית מינימלית
+    ✅ בדיקת ברכיים: עיקום קל 160-170 מעלות
+    ✅ בדיקת גב: מותר נטייה עד 45 מעלות
+    ❌ ללא בדיקת טמפו - לא אמין מספיק
     """
     import sys
     print(f"[RDL] Starting analysis: fast_mode={fast_mode}, return_video={return_video}", file=sys.stderr, flush=True)
@@ -323,7 +316,6 @@ def run_romanian_deadlift_analysis(video_path,
     min_knee_angle = 999.0
     max_knee_angle = 0.0
     back_issue = False
-    down_frames = up_frames = bottom_hold_frames = 0
 
     rt_fb_msg = None
     rt_fb_hold = 0
@@ -396,7 +388,6 @@ def run_romanian_deadlift_analysis(video_path,
                 min_knee_angle = knee_angle
                 max_knee_angle = knee_angle
                 back_issue = False
-                down_frames = up_frames = bottom_hold_frames = 0
                 prev_progress = progress
 
             if in_rep:
@@ -406,16 +397,6 @@ def run_romanian_deadlift_analysis(video_path,
                 if back_bad:
                     back_issue = True
 
-                if prev_progress is not None:
-                    if progress > prev_progress + 1e-4:
-                        down_frames += 1
-                    elif progress < prev_progress - 1e-4:
-                        up_frames += 1
-                    else:
-                        if progress >= 0.98:
-                            bottom_hold_frames += 1
-                prev_progress = progress
-
                 if torso_angle >= HINGE_BOTTOM_ANGLE:
                     bottom_reached = True
 
@@ -423,11 +404,13 @@ def run_romanian_deadlift_analysis(video_path,
                     last_rep_frame = frame_idx
                     counter += 1
 
-                    down_s = down_frames * dt if down_frames else 0.0
-                    bottom_s = bottom_hold_frames * dt if bottom_hold_frames else 0.0
-
                     feedback = []
                     score = MAX_SCORE
+
+                    # ✅ בדיקת עומק - האם הגעת מספיק עמוק?
+                    if max_torso_angle < HINGE_BOTTOM_ANGLE:
+                        feedback.append("Go deeper - hinge more at the hips")
+                        score -= 2.0
 
                     # ✅ בדיקת ברכיים
                     if max_knee_angle > KNEE_MIN_ANGLE:
@@ -441,17 +424,6 @@ def run_romanian_deadlift_analysis(video_path,
                     if back_issue and back_angle > BACK_MAX_ANGLE:
                         feedback.append("Try to keep your back neutral")
                         score -= 1.0
-
-                    # ✅✅✅ בדיקת טמפו - תנאי רגוע מאוד (רק נגד נפילה חופשית ממש)
-                    # דורש לפחות 4 פריימים של ירידה, או סף זמן מינימלי ביותר
-                    min_ecc_s = max(MIN_ECC_S, 4 * dt)
-                    if down_s < min_ecc_s:
-                        feedback.append("Control the lowering")
-                        score -= 0.02  # ✅ עונש סימבולי
-
-                    if bottom_s < MIN_BOTTOM_S:
-                        feedback.append("Pause at the bottom")
-                        score -= 0.05  # ✅ עונש סימבולי
 
                     score = float(max(MIN_SCORE, min(MAX_SCORE, score)))
                     all_scores.append(score)
@@ -475,12 +447,10 @@ def run_romanian_deadlift_analysis(video_path,
                             "min_knee_angle": round(min_knee_angle, 2),
                             "max_knee_angle": round(max_knee_angle, 2),
                             "back_angle": round(back_angle, 2),
-                            "eccentric_s": round(down_s, 2),
-                            "bottom_hold_s": round(bottom_s, 2)
                         }
                     })
                     
-                    print(f"[RDL] Rep {counter}: min_knee={min_knee_angle:.1f}°, max_knee={max_knee_angle:.1f}°, torso={max_torso_angle:.1f}°, down_time={down_s:.2f}s", 
+                    print(f"[RDL] Rep {counter}: min_knee={min_knee_angle:.1f}°, max_knee={max_knee_angle:.1f}°, torso={max_torso_angle:.1f}°", 
                           file=sys.stderr, flush=True)
 
                     rt_fb_msg = pick_strongest_feedback(feedback)
@@ -516,12 +486,12 @@ def run_romanian_deadlift_analysis(video_path,
 
     session_tip = None
     if session_feedback_by_cat:
-        if "knees" in session_feedback_by_cat:
+        if "depth" in session_feedback_by_cat:
+            session_tip = "Focus on pushing your hips back further to reach full depth"
+        elif "knees" in session_feedback_by_cat:
             session_tip = "Romanian deadlifts need a soft knee bend throughout the movement"
         elif "back" in session_feedback_by_cat:
             session_tip = "Keep your core tight and chest up"
-        elif "tempo" in session_feedback_by_cat:
-            session_tip = "Lower the bar slowly to maximize hamstring activation"
     else:
         session_tip = "Great technique! Keep building that posterior chain 💪"
 
