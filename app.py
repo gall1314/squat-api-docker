@@ -276,12 +276,20 @@ def analyze():
         # ---------- RAW upload path (video/* or application/octet-stream in body) ----------
         if ctype.startswith("video/") or ctype == "application/octet-stream":
             exercise_type = (request.args.get('exercise_type') or "").strip().lower()
-            if not exercise_type:
-                return jsonify({"error": "Missing exercise_type (use query param)"}), 400
+            
+            # Handle "null" string or empty value
+            if not exercise_type or exercise_type == 'null':
+                return jsonify({
+                    "error": "Missing exercise_type",
+                    "detail": "Query parameter 'exercise_type' is required. Supported types: squat, deadlift, rdl, sldl, bulgarian, pullup, bicep_curl, bent_row, good_morning, dips, overhead_press, pushup"
+                }), 400
             
             resolved_type = EXERCISE_MAP.get(exercise_type)
             if not resolved_type:
-                return jsonify({"error": f"Unsupported exercise type: {exercise_type}"}), 400
+                return jsonify({
+                    "error": f"Unsupported exercise type: {exercise_type}",
+                    "detail": f"Supported types: {', '.join(sorted(set(EXERCISE_MAP.values())))}"
+                }), 400
 
             # fast mode - default true
             fast_str = request.args.get('fast', 'true').lower()
@@ -353,9 +361,14 @@ def analyze():
 
         exercise_type = form.get('exercise_type')
         print(f"[MP] exercise_type from form: '{exercise_type}'", file=sys.stderr, flush=True)
-        if not exercise_type:
-            print(f"[MP] ERROR: Missing exercise_type", file=sys.stderr, flush=True)
-            return jsonify({"error": "Missing exercise_type"}), 400
+        
+        # Handle "null" string from client
+        if not exercise_type or exercise_type == 'null':
+            print(f"[MP] ERROR: Missing or invalid exercise_type (got: '{exercise_type}')", file=sys.stderr, flush=True)
+            return jsonify({
+                "error": "Missing exercise_type",
+                "detail": "The 'exercise_type' field is required and cannot be null. Supported types: squat, deadlift, rdl, sldl, bulgarian, pullup, bicep_curl, bent_row, good_morning, dips, overhead_press, pushup"
+            }), 400
 
         exercise_type = exercise_type.lower().strip()
         print(f"[MP] normalized exercise_type: '{exercise_type}'", file=sys.stderr, flush=True)
@@ -363,7 +376,10 @@ def analyze():
         print(f"[MP] resolved_type: '{resolved_type}'", file=sys.stderr, flush=True)
         if not resolved_type:
             print(f"[MP] ERROR: Unsupported exercise type: {exercise_type}", file=sys.stderr, flush=True)
-            return jsonify({"error": f"Unsupported exercise type: {exercise_type}"}), 400
+            return jsonify({
+                "error": f"Unsupported exercise type: {exercise_type}",
+                "detail": f"Supported types: {', '.join(sorted(set(EXERCISE_MAP.values())))}"
+            }), 400
 
         # fast mode - default true
         fast_str = form.get('fast', 'true').lower()
