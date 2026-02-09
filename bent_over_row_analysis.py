@@ -69,6 +69,8 @@ TORSO_TARGET_MIN = 25.0   # deg above horizontal (roughly bent-over)
 TORSO_TARGET_MAX = 55.0
 TORSO_DRIFT_MAX  = 12.0   # allowed change during a rep
 KNEE_DRIFT_MAX   = 10.0   # leg drive indicator
+MIN_REP_SAMPLES  = 5      # minimum samples to trust drift/mean metrics
+MIN_DEPTH_PCT_FOR_STABILITY = 60.0  # only trust stability cues on meaningful ROM
 
 # Scoring
 MIN_SCORE = 4.0
@@ -209,6 +211,8 @@ def analyze_rep(rep_metrics):
     feedback = []
     penalty = 0.0
     is_proper = True  # Start assuming proper, mark False if severe issues
+    depth_pct = rep_metrics.get("depth_pct") or 0.0
+    allow_stability_cues = depth_pct >= MIN_DEPTH_PCT_FOR_STABILITY
 
     # ROM check
     if rep_metrics["min_elbow_angle"] is None or rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX + 5:
@@ -221,23 +225,26 @@ def analyze_rep(rep_metrics):
         is_proper = False
 
     # Momentum / torso drift
-    if rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > TORSO_DRIFT_MAX:
-        penalty += MOMENTUM_PENALTY
-        feedback.append(("severe", "Avoid using momentum — keep your torso still"))
-        is_proper = False
-    elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > 0.5*TORSO_DRIFT_MAX:
-        penalty += TORSO_PENALTY
-        feedback.append(("medium", "Keep your torso angle consistent"))
+    if allow_stability_cues:
+        if rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > TORSO_DRIFT_MAX:
+            penalty += MOMENTUM_PENALTY
+            feedback.append(("severe", "Avoid using momentum — keep your torso still"))
+            is_proper = False
+        elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > 0.5*TORSO_DRIFT_MAX:
+            penalty += TORSO_PENALTY
+            feedback.append(("medium", "Keep your torso angle consistent"))
 
     # Leg drive
-    if rep_metrics["knee_drift"] is not None and rep_metrics["knee_drift"] > KNEE_DRIFT_MAX:
-        penalty += LEGDRIVE_PENALTY
-        feedback.append(("medium", "Minimize leg drive — keep knees steady"))
+    if allow_stability_cues:
+        if rep_metrics["knee_drift"] is not None and rep_metrics["knee_drift"] > KNEE_DRIFT_MAX:
+            penalty += LEGDRIVE_PENALTY
+            feedback.append(("medium", "Minimize leg drive — keep knees steady"))
 
     # Back straighter (optional gentle cue): if torso mean outside target window
-    if rep_metrics["torso_mean"] is not None and (rep_metrics["torso_mean"] < TORSO_TARGET_MIN or rep_metrics["torso_mean"] > TORSO_TARGET_MAX):
-        # tip only (no penalty)
-        feedback.append(("tip", "Try to keep your back a bit straighter"))
+    if allow_stability_cues:
+        if rep_metrics["torso_mean"] is not None and (rep_metrics["torso_mean"] < TORSO_TARGET_MIN or rep_metrics["torso_mean"] > TORSO_TARGET_MAX):
+            # tip only (no penalty)
+            feedback.append(("tip", "Try to keep your back a bit straighter"))
 
     # Choose one strongest message for video overlay:
     overlay_msg = None
@@ -258,6 +265,18 @@ def analyze_rep(rep_metrics):
     tips = [msg for (s,msg) in feedback if s == "tip"]
 
     return penalty, overlay_msg, session_msgs, tips, is_proper
+
+def _robust_range(values, min_samples=MIN_REP_SAMPLES):
+    if not values or len(values) < min_samples:
+        return None
+    low = np.percentile(values, 10)
+    high = np.percentile(values, 90)
+    return float(high - low)
+
+def _safe_mean(values, min_samples=MIN_REP_SAMPLES):
+    if not values or len(values) < min_samples:
+        return None
+    return float(sum(values) / len(values))
 
 def faststart_remux(in_path):
     """Remux MP4 with moov at start (faststart). Returns output path."""
@@ -432,9 +451,9 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                     reps += 1
                     last_rep_frame = frame_idx
 
-                    torso_drift = (max(torso_vals)-min(torso_vals)) if torso_vals else None
-                    knee_drift  = (max(knee_vals)-min(knee_vals)) if knee_vals else None
-                    torso_mean  = (sum(torso_vals)/len(torso_vals)) if torso_vals else None
+                    torso_drift = _robust_range(torso_vals)
+                    knee_drift  = _robust_range(knee_vals)
+                    torso_mean  = _safe_mean(torso_vals)
 
                     rep_m = {
                         "start_frame": rep_start,
@@ -524,7 +543,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
         "success": True,
         "squat_count": reps,                # keep same key name for UI compatibility
         "row_count": reps,
-        "proper_reps": proper_reps,         # FIXED: Now returns actual count
+        "proper_reps": 0 if proper_reps is None else int(proper_reps),
         "technique_score": float(score),
         "technique_score_display": f"{score:.1f}",
         "technique_label": label,
