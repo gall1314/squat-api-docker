@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# pushup_analysis.py — complete push-up counter with form feedback
+# pushup_analysis.py — complete push-up counter with adaptive frame processing
 
 import os, cv2, math, numpy as np, subprocess
 from collections import deque
@@ -130,22 +130,116 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
             draw.text((tx,ty),ln,font=FEEDBACK_FONT,fill=(255,255,255)); ty+=line_h+4
     return cv2.cvtColor(np.array(pil),cv2.COLOR_RGB2BGR)
 
+# ============ Adaptive Frame Processing ============
+BASE_FRAME_SKIP = 3              # דילוג רגיל במנוחה
+ACTIVE_FRAME_SKIP = 1            # דילוג במצב אקטיבי
+MOTION_DETECTION_WINDOW = 6      # חלון לזיהוי תנועה
+MOTION_VEL_THRESHOLD = 0.0015    # סף מהירות לזיהוי תנועה מהירה
+MOTION_ACCEL_THRESHOLD = 0.0010  # סף תאוצה
+ELBOW_CHANGE_THRESHOLD = 8.0     # שינוי במעלות במרפק
+COOLDOWN_FRAMES = 18             # פריימים של דגימה אחרי זיהוי תנועה
+
+class MotionDetector:
+    def __init__(self):
+        self.shoulder_history = deque(maxlen=MOTION_DETECTION_WINDOW)
+        self.elbow_history = deque(maxlen=MOTION_DETECTION_WINDOW)
+        self.velocity_history = deque(maxlen=MOTION_DETECTION_WINDOW)
+        self.is_active = False
+        self.cooldown_counter = 0
+        self.last_process_frame = -999
+        self.activation_count = 0  # למעקב
+        
+    def add_sample(self, shoulder_y, elbow_angle, frame_idx):
+        """הוסף דגימה ובדוק אם יש תנועה מהירה"""
+        self.shoulder_history.append(shoulder_y)
+        self.elbow_history.append(elbow_angle)
+        
+        motion_detected = False
+        
+        # בדיקה 1: מהירות כתף
+        if len(self.shoulder_history) >= 2:
+            vel = abs(self.shoulder_history[-1] - self.shoulder_history[-2])
+            self.velocity_history.append(vel)
+            
+            if len(self.velocity_history) >= 2:
+                max_vel = max(self.velocity_history)
+                avg_vel = sum(self.velocity_history) / len(self.velocity_history)
+                accel = abs(self.velocity_history[-1] - self.velocity_history[-2])
+                
+                if max_vel > MOTION_VEL_THRESHOLD or accel > MOTION_ACCEL_THRESHOLD:
+                    motion_detected = True
+        
+        # בדיקה 2: שינוי חד במרפק
+        if len(self.elbow_history) >= 3:
+            elbow_change = abs(self.elbow_history[-1] - self.elbow_history[-3])
+            if elbow_change > ELBOW_CHANGE_THRESHOLD:
+                motion_detected = True
+        
+        # בדיקה 3: זיהוי "צלילה" (ירידה ועליה מהירה)
+        if len(self.shoulder_history) >= 4:
+            # בדוק אם היה שינוי כיוון
+            diffs = [self.shoulder_history[i+1] - self.shoulder_history[i] 
+                    for i in range(len(self.shoulder_history)-1)]
+            if len(diffs) >= 3:
+                # זיהוי היפוך כיוון (+ ← -)
+                sign_changes = sum(1 for i in range(len(diffs)-1) 
+                                 if diffs[i] * diffs[i+1] < 0)
+                if sign_changes >= 1 and max(abs(d) for d in diffs) > MOTION_VEL_THRESHOLD * 0.5:
+                    motion_detected = True
+        
+        # הפעל מצב אקטיבי אם זוהתה תנועה
+        if motion_detected:
+            self.activate()
+        
+        # עדכן cooldown
+        if self.cooldown_counter > 0:
+            self.cooldown_counter -= 1
+            if self.cooldown_counter == 0:
+                self.is_active = False
+    
+    def activate(self):
+        """הפעל מצב דגימה אינטנסיבית"""
+        if not self.is_active:
+            self.is_active = True
+            self.activation_count += 1
+        self.cooldown_counter = COOLDOWN_FRAMES
+    
+    def should_process(self, frame_idx):
+        """החלט אם לעבד את הפריים הנוכחי"""
+        if self.is_active or self.cooldown_counter > 0:
+            skip = ACTIVE_FRAME_SKIP
+        else:
+            skip = BASE_FRAME_SKIP
+        
+        should = (frame_idx - self.last_process_frame) >= skip
+        if should:
+            self.last_process_frame = frame_idx
+        return should
+    
+    def get_stats(self):
+        """החזר סטטיסטיקות למעקב"""
+        return {
+            "is_active": self.is_active,
+            "cooldown": self.cooldown_counter,
+            "activations": self.activation_count
+        }
+
 # ============ Push-up Parameters ============
-# ספירת חזרות
-ELBOW_BENT_ANGLE = 90.0          # זווית מרפק מקסימלית למטה (90° = עומק מלא)
-SHOULDER_MIN_DESCENT = 0.055     # כתף צריכה לרדת לפחות 5.5% מגובה המסך
-RESET_ASCENT = 0.030             # כתף צריכה לעלות חזרה 3% כדי לאפס
-RESET_ELBOW = 160.0              # זווית מרפק מינימלית בחזרה למעלה
-REFRACTORY_FRAMES = 3            # מסגרות המתנה בין חזרות
+# ספירת חזרות - הרחבנו את הסטטיסטיקה
+ELBOW_BENT_ANGLE = 100.0         # ↑ מ-90 - מרווח רחב יותר
+SHOULDER_MIN_DESCENT = 0.045     # ↓ מ-0.055 - דרישה נמוכה יותר
+RESET_ASCENT = 0.030
+RESET_ELBOW = 160.0
+REFRACTORY_FRAMES = 3
 
-# EMA smoothing
-ELBOW_EMA_ALPHA = 0.35
-SHOULDER_EMA_ALPHA = 0.30
+# EMA smoothing - מהיר יותר לתנועות מהירות
+ELBOW_EMA_ALPHA = 0.65           # ↑ מ-0.35 - תגובה מהירה
+SHOULDER_EMA_ALPHA = 0.60        # ↑ מ-0.30 - תגובה מהירה
 
-# זיהוי תנוחת פלנק (גוף אופקי, ידיים על הרצפה)
+# זיהוי תנוחת פלנק
 VIS_THR_STRICT = 0.30
-PLANK_BODY_ANGLE_MAX = 25.0      # זווית מקסימלית של הגוף מהאופקי
-HANDS_BELOW_SHOULDERS = 0.03     # שורשי ידיים צריכים להיות מתחת לכתפיים (במצב למעלה)
+PLANK_BODY_ANGLE_MAX = 25.0
+HANDS_BELOW_SHOULDERS = 0.03
 ONPUSHUP_MIN_FRAMES = 3
 OFFPUSHUP_MIN_FRAMES = 6
 AUTO_STOP_AFTER_EXIT_SEC = 1.5
@@ -173,36 +267,32 @@ PENALTY_MIN_IF_ANY = 0.5
 FORM_TIP_PRIORITY = [FB_CUE_DEEPER, FB_CUE_LOCKOUT, FB_CUE_HIPS, FB_CUE_ELBOWS_IN]
 
 # ============ Form Detection Thresholds ============
-# Depth
-DEPTH_MIN_ANGLE = 95.0           # זווית מרפק מינימלית לעומק טוב
-DEPTH_NEAR_DEG = 8.0             # טווח "קרוב מספיק"
+DEPTH_MIN_ANGLE = 105.0          # ↑ מ-95 - יותר סלחני
+DEPTH_NEAR_DEG = 10.0            # ↑ מ-8
 
-# Hip alignment (sag or pike)
-HIP_ALIGNMENT_MAX = 15.0         # סטייה מקסימלית של ירכיים מקו הגוף
-HIP_ALIGNMENT_NEAR = 5.0         # טווח "קרוב מספיק"
+HIP_ALIGNMENT_MAX = 15.0
+HIP_ALIGNMENT_NEAR = 5.0
 
-# Lockout
-LOCKOUT_MIN_ANGLE = 165.0        # זווית מרפק מינימלית בנעילה
-LOCKOUT_NEAR_DEG = 8.0           # טווח "קרוב מספיק"
+LOCKOUT_MIN_ANGLE = 165.0
+LOCKOUT_NEAR_DEG = 8.0
 
-# Elbow flare
-ELBOW_FLARE_MAX = 60.0           # זווית מקסימלית של מרפקים מהגוף (אידיאל: 45°)
-FLARE_NEAR_DEG = 10.0            # טווח "קרוב מספיק"
+ELBOW_FLARE_MAX = 60.0
+FLARE_NEAR_DEG = 10.0
 
-# Minimum reps before session feedback
 DEPTH_FAIL_MIN_REPS = 2
 HIPS_FAIL_MIN_REPS = 2
 LOCKOUT_FAIL_MIN_REPS = 2
 FLARE_FAIL_MIN_REPS = 2
 
-# ============ Micro-burst ============
-BURST_FRAMES = int(os.getenv("BURST_FRAMES", "2"))
-INFLECT_VEL_THR = float(os.getenv("INFLECT_VEL_THR", "0.0008"))
+# ============ Enhanced Micro-burst ============
+BURST_FRAMES = 6                 # ↑ מ-2 - יותר דגימות
+INFLECT_VEL_THR = 0.0020         # ↑ מ-0.0008 - תופס יותר
 
 DEBUG_ONPUSHUP = bool(int(os.getenv("DEBUG_ONPUSHUP", "0")))
+DEBUG_MOTION = bool(int(os.getenv("DEBUG_MOTION", "0")))  # דיבוג חדש
 
 def run_pushup_analysis(video_path,
-                        frame_skip=3,
+                        frame_skip=None,  # נשתמש ב-adaptive במקום ערך קבוע
                         scale=0.4,
                         output_path="pushup_analyzed.mp4",
                         feedback_path="pushup_feedback.txt",
@@ -219,7 +309,7 @@ def run_pushup_analysis(video_path,
         scale = min(scale, 0.35)
 
     if preserve_quality:
-        scale=1.0; frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
+        scale=1.0; encode_crf=18 if encode_crf is None else encode_crf
     else:
         encode_crf=23 if encode_crf is None else encode_crf
 
@@ -227,7 +317,8 @@ def run_pushup_analysis(video_path,
     if not cap.isOpened(): return _ret_err("Could not open video", feedback_path)
 
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
-    effective_fps=max(1.0, fps_in/max(1,frame_skip))
+    # effective_fps מבוסס על BASE_FRAME_SKIP כברירת מחדל
+    effective_fps=max(1.0, fps_in/max(1, BASE_FRAME_SKIP))
     sec_to_frames=lambda s: max(1,int(s*effective_fps))
 
     fourcc=cv2.VideoWriter_fourcc(*'mp4v')
@@ -235,6 +326,11 @@ def run_pushup_analysis(video_path,
 
     # Counters
     rep_count=0; good_reps=0; bad_reps=0; rep_reports=[]; all_scores=[]
+
+    # Motion detector - החידוש!
+    motion_detector = MotionDetector()
+    frames_processed = 0
+    frames_skipped = 0
 
     # Landmarks
     LSH=mp_pose.PoseLandmark.LEFT_SHOULDER.value;  RSH=mp_pose.PoseLandmark.RIGHT_SHOULDER.value
@@ -288,11 +384,24 @@ def run_pushup_analysis(video_path,
             if not ret: break
             frame_idx += 1
 
-            process_now = (burst_cntr > 0) or (frame_idx % max(1, frame_skip) == 0)
-            if not process_now:
-                continue
+            # ===== ADAPTIVE PROCESSING DECISION =====
+            # תמיד מריץ זיהוי מהיר (לפני עיבוד מלא)
+            process_now = False
+            
+            # Micro-burst יש עדיפות עליונה
             if burst_cntr > 0:
+                process_now = True
                 burst_cntr -= 1
+            # אחרת, שאל את ה-MotionDetector
+            elif motion_detector.should_process(frame_idx):
+                process_now = True
+            
+            if not process_now:
+                frames_skipped += 1
+                continue
+            
+            frames_processed += 1
+            # ========================================
 
             if scale != 1.0:
                 frame=cv2.resize(frame,(0,0),fx=scale,fy=scale)
@@ -329,10 +438,20 @@ def run_pushup_analysis(video_path,
             shoulder_ema=_ema(shoulder_ema,shoulder_raw,SHOULDER_EMA_ALPHA)
             shoulder_y=shoulder_ema; elbow_angle=elbow_ema
             
+            # ===== עדכן את Motion Detector =====
+            motion_detector.add_sample(shoulder_y, elbow_angle, frame_idx)
+            
+            if DEBUG_MOTION and frame_idx % 20 == 0:
+                stats = motion_detector.get_stats()
+                print(f"[MOTION] f={frame_idx} active={stats['is_active']} "
+                      f"cooldown={stats['cooldown']} activations={stats['activations']} "
+                      f"processed={frames_processed} skipped={frames_skipped}")
+            # ====================================
+            
             if baseline_shoulder_y is None: baseline_shoulder_y=shoulder_y
             depth_live=float(np.clip((shoulder_y-baseline_shoulder_y)/max(0.10,SHOULDER_MIN_DESCENT*1.2),0.0,1.0))
 
-            # Check plank position (horizontal body, hands on ground)
+            # Check plank position
             body_angle = _calculate_body_angle(lms, LSH, RSH, LH, RH, LA, RA)
             hands_position = (lms[LW].y > lms[LSH].y - HANDS_BELOW_SHOULDERS) and (lms[RW].y > lms[RSH].y - HANDS_BELOW_SHOULDERS)
             in_plank = (body_angle <= PLANK_BODY_ANGLE_MAX) and hands_position
@@ -355,10 +474,11 @@ def run_pushup_analysis(video_path,
                 top_phase_max_elbow=None
                 cycle_max_hip_misalign=None
                 cycle_max_flare=None
+                # הפעל דגימה אינטנסיבית
+                motion_detector.activate()
 
-            # Exit pushup position → post-hoc
+            # Exit pushup position
             if onpushup and offpushup_streak>=OFFPUSHUP_MIN_FRAMES:
-                # Evaluate form at cycle end
                 _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                                    cycle_max_hip_misalign, cycle_max_flare,
                                    depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
@@ -366,7 +486,6 @@ def run_pushup_analysis(video_path,
                                    lockout_already_reported, flare_already_reported,
                                    session_feedback, locals())
 
-                # Count rep if valid
                 if (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and (cycle_min_elbow<=ELBOW_BENT_ANGLE):
                     rep_has_tip = cycle_tip_deeper or cycle_tip_hips or cycle_tip_lockout or cycle_tip_elbows
                     _count_rep(rep_reports,rep_count,cycle_min_elbow,
@@ -392,44 +511,42 @@ def run_pushup_analysis(video_path,
             shoulder_vel=0.0 if shoulder_prev is None else (shoulder_y-shoulder_prev)
             cur_rt=None
 
-            # Micro-burst near inflection
+            # Enhanced Micro-burst
             if onpushup and (desc_base_shoulder is not None):
                 near_inflect = (abs(shoulder_vel) <= INFLECT_VEL_THR)
                 sign_flip = (shoulder_vel_prev is not None) and ((shoulder_vel_prev < 0 and shoulder_vel >= 0) or (shoulder_vel_prev > 0 and shoulder_vel <= 0))
                 if near_inflect or sign_flip:
                     burst_cntr = max(burst_cntr, BURST_FRAMES)
+                    motion_detector.activate()  # הפעל גם את הדטקטור
             shoulder_vel_prev = shoulder_vel
 
             if onpushup and vis_strict_ok:
                 # REP COUNTING
                 if desc_base_shoulder is None:
-                    if shoulder_vel>abs(INFLECT_VEL_THR):  # Moving down
+                    if shoulder_vel>abs(INFLECT_VEL_THR):
                         desc_base_shoulder=shoulder_y
                         cycle_max_descent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
                         bottom_phase_min_elbow=None
                         top_phase_max_elbow=None
                         cycle_max_hip_misalign=None
                         cycle_max_flare=None
+                        motion_detector.activate()  # התחלת ירידה
                 else:
                     cycle_max_descent=max(cycle_max_descent,(shoulder_y-desc_base_shoulder))
                     cycle_min_elbow=min(cycle_min_elbow,elbow_angle)
 
-                    # Track bottom phase (deepest point)
                     min_elb_now = min(raw_elbow_L, raw_elbow_R)
                     if bottom_phase_min_elbow is None: bottom_phase_min_elbow = min_elb_now
                     else: bottom_phase_min_elbow = min(bottom_phase_min_elbow, min_elb_now)
 
-                    # Track top phase (highest point)
                     max_elb_now = max(raw_elbow_L, raw_elbow_R)
                     if top_phase_max_elbow is None: top_phase_max_elbow = max_elb_now
                     else: top_phase_max_elbow = max(top_phase_max_elbow, max_elb_now)
 
-                    # Track hip alignment (sag or pike)
                     hip_misalign = _calculate_hip_misalignment(lms, LSH, RSH, LH, RH, LA, RA)
                     if cycle_max_hip_misalign is None: cycle_max_hip_misalign = hip_misalign
                     else: cycle_max_hip_misalign = max(cycle_max_hip_misalign, hip_misalign)
 
-                    # Track elbow flare
                     elbow_flare = _calculate_elbow_flare(lms, LSH, RSH, LE, RE, LW, RW)
                     if cycle_max_flare is None: cycle_max_flare = elbow_flare
                     else: cycle_max_flare = max(cycle_max_flare, elbow_flare)
@@ -438,7 +555,6 @@ def run_pushup_analysis(video_path,
                     reset_by_elb =(elbow_angle>=RESET_ELBOW)
                     
                     if reset_by_asc or reset_by_elb:
-                        # Evaluate form
                         _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                                            cycle_max_hip_misalign, cycle_max_flare,
                                            depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
@@ -446,7 +562,6 @@ def run_pushup_analysis(video_path,
                                            lockout_already_reported, flare_already_reported,
                                            session_feedback, locals())
 
-                        # Count rep
                         if (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and (cycle_min_elbow<=ELBOW_BENT_ANGLE):
                             rep_has_tip = cycle_tip_deeper or cycle_tip_hips or cycle_tip_lockout or cycle_tip_elbows
                             _count_rep(rep_reports,rep_count,cycle_min_elbow,
@@ -457,7 +572,6 @@ def run_pushup_analysis(video_path,
                             if rep_has_tip: bad_reps+=1
                             else: good_reps+=1
 
-                        # Reset for next cycle
                         desc_base_shoulder=shoulder_y
                         cycle_max_descent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
                         allow_new_bottom=True
@@ -466,6 +580,7 @@ def run_pushup_analysis(video_path,
                         cycle_max_hip_misalign=None
                         cycle_max_flare=None
                         cycle_tip_deeper=False; cycle_tip_hips=False; cycle_tip_lockout=False; cycle_tip_elbows=False
+                        motion_detector.activate()  # איפוס מחזור
 
                 descent_amt=0.0 if desc_base_shoulder is None else (shoulder_y-desc_base_shoulder)
 
@@ -484,6 +599,7 @@ def run_pushup_analysis(video_path,
                     else: good_reps+=1
                     last_bottom_frame=frame_idx; allow_new_bottom=False; counted_this_cycle=True
                     top_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
+                    motion_detector.activate()  # ספירת חזרה
 
                 if (allow_new_bottom is False) and (last_bottom_frame>0):
                     if shoulder_prev is not None and (shoulder_prev - shoulder_y) > 0 and (desc_base_shoulder is not None):
@@ -559,13 +675,23 @@ def run_pushup_analysis(video_path,
         form_tip = max(all_fb, key=lambda m: (FB_WEIGHTS.get(m, FB_DEFAULT_WEIGHT),
                                               -FORM_TIP_PRIORITY.index(m) if m in FORM_TIP_PRIORITY else -999))
 
+    # Print efficiency stats
+    total_frames = frames_processed + frames_skipped
+    efficiency = (frames_skipped / total_frames * 100) if total_frames > 0 else 0
+    if DEBUG_MOTION or True:  # תמיד הדפס
+        print(f"\n[EFFICIENCY] Processed: {frames_processed}, Skipped: {frames_skipped}, "
+              f"Total: {total_frames}, Saved: {efficiency:.1f}%")
+        print(f"[EFFICIENCY] Motion activations: {motion_detector.activation_count}")
+
     # Write feedback file
     try:
         with open(feedback_path,"w",encoding="utf-8") as f:
             f.write(f"Total Reps: {int(rep_count)}\n")
             f.write(f"Technique Score: {display_half_str(technique_score)} / 10  ({score_label(technique_score)})\n")
+            f.write(f"\nProcessing Efficiency: {efficiency:.1f}% frames skipped\n")
+            f.write(f"Motion Detection Activations: {motion_detector.activation_count}\n")
             if fb_list:
-                f.write("Feedback:\n")
+                f.write("\nFeedback:\n")
                 for ln in fb_list: f.write(f"- {ln}\n")
     except Exception:
         pass
@@ -596,7 +722,13 @@ def run_pushup_analysis(video_path,
         "tips": [],
         "reps": rep_reports,
         "video_path": final_path if return_video else "",
-        "feedback_path": feedback_path
+        "feedback_path": feedback_path,
+        "processing_stats": {
+            "frames_processed": frames_processed,
+            "frames_skipped": frames_skipped,
+            "efficiency_percent": round(efficiency, 1),
+            "motion_activations": motion_detector.activation_count
+        }
     }
     if form_tip is not None:
         result["form_tip"] = form_tip
@@ -610,32 +742,26 @@ def _calculate_body_angle(lms, LSH, RSH, LH, RH, LA, RA):
     mid_hp = ((lms[LH].x + lms[RH].x)/2.0, (lms[LH].y + lms[RH].y)/2.0)
     mid_ank = ((lms[LA].x + lms[RA].x)/2.0, (lms[LA].y + lms[RA].y)/2.0)
     
-    # Vector from ankles to shoulders
     dx = mid_sh[0] - mid_ank[0]
     dy = mid_sh[1] - mid_ank[1]
     
-    # Angle from horizontal (0° = perfectly horizontal)
     angle = abs(math.degrees(math.atan2(abs(dy), abs(dx) + 1e-9)))
     return angle
 
 def _calculate_hip_misalignment(lms, LSH, RSH, LH, RH, LA, RA):
-    """חישוב סטייה של ירכיים מקו ישר של הגוף (sag or pike)"""
+    """חישוב סטייה של ירכיים מקו ישר"""
     mid_sh = ((lms[LSH].x + lms[RSH].x)/2.0, (lms[LSH].y + lms[RSH].y)/2.0)
     mid_hp = ((lms[LH].x + lms[RH].x)/2.0, (lms[LH].y + lms[RH].y)/2.0)
     mid_ank = ((lms[LA].x + lms[RA].x)/2.0, (lms[LA].y + lms[RA].y)/2.0)
     
-    # Calculate angle at hip (shoulder-hip-ankle)
     angle = _ang(mid_sh, mid_hp, mid_ank)
-    
-    # Deviation from 180° (straight line)
     deviation = abs(180.0 - angle)
     return deviation
 
 def _calculate_elbow_flare(lms, LSH, RSH, LE, RE, LW, RW):
-    """חישוב זווית התרחקות מרפקים מהגוף"""
+    """חישוב זווית התרחקות מרפקים"""
     mid_sh = ((lms[LSH].x + lms[RSH].x)/2.0, (lms[LSH].y + lms[RSH].y)/2.0)
     
-    # Left elbow angle from body centerline
     left_vec_sh = (mid_sh[0] - lms[LSH].x, mid_sh[1] - lms[LSH].y)
     left_vec_elb = (lms[LE].x - lms[LSH].x, lms[LE].y - lms[LSH].y)
     left_angle = abs(math.degrees(math.atan2(
@@ -643,7 +769,6 @@ def _calculate_elbow_flare(lms, LSH, RSH, LE, RE, LW, RW):
         left_vec_sh[0]*left_vec_elb[0] + left_vec_sh[1]*left_vec_elb[1]
     )))
     
-    # Right elbow angle from body centerline
     right_vec_sh = (mid_sh[0] - lms[RSH].x, mid_sh[1] - lms[RSH].y)
     right_vec_elb = (lms[RE].x - lms[RSH].x, lms[RE].y - lms[RSH].y)
     right_angle = abs(math.degrees(math.atan2(
@@ -661,7 +786,6 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                         session_feedback, local_vars):
     """הערכת פורם בסוף מחזור"""
     
-    # Depth check
     depth_ok = (bottom_phase_min_elbow is not None) and (bottom_phase_min_elbow <= DEPTH_MIN_ANGLE)
     depth_near = (bottom_phase_min_elbow is not None) and (bottom_phase_min_elbow <= (DEPTH_MIN_ANGLE + DEPTH_NEAR_DEG))
     
@@ -672,7 +796,6 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
             session_feedback.add(FB_CUE_DEEPER)
             local_vars['depth_already_reported'] = True
 
-    # Lockout check
     lockout_ok = (top_phase_max_elbow is not None) and (top_phase_max_elbow >= LOCKOUT_MIN_ANGLE)
     lockout_near = (top_phase_max_elbow is not None) and (top_phase_max_elbow >= (LOCKOUT_MIN_ANGLE - LOCKOUT_NEAR_DEG))
     
@@ -683,7 +806,6 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
             session_feedback.add(FB_CUE_LOCKOUT)
             local_vars['lockout_already_reported'] = True
 
-    # Hip alignment check
     hips_ok = (cycle_max_hip_misalign is not None) and (cycle_max_hip_misalign <= HIP_ALIGNMENT_MAX)
     hips_near = (cycle_max_hip_misalign is not None) and (cycle_max_hip_misalign <= (HIP_ALIGNMENT_MAX + HIP_ALIGNMENT_NEAR))
     
@@ -694,7 +816,6 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
             session_feedback.add(FB_CUE_HIPS)
             local_vars['hips_already_reported'] = True
 
-    # Elbow flare check
     flare_ok = (cycle_max_flare is not None) and (cycle_max_flare <= ELBOW_FLARE_MAX)
     flare_near = (cycle_max_flare is not None) and (cycle_max_flare <= (ELBOW_FLARE_MAX + FLARE_NEAR_DEG))
     
