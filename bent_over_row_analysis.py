@@ -354,7 +354,8 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
 
     # State
     reps = 0
-    proper_reps = 0  # Track proper reps
+    good_reps = 0  # Track good reps (like squat)
+    bad_reps = 0   # Track bad reps (like squat)
     last_rep_frame = -9999
     frame_idx = -1
 
@@ -485,9 +486,16 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                     }
                     pen, ov_msg, sess_msgs, tips, is_proper = analyze_rep(rep_m)
                     
-                    # Count proper reps - FIXED LOGIC
-                    if is_proper:
-                        proper_reps += 1
+                    # Count good/bad reps like squat (9.5+ = good)
+                    # Calculate score for this rep
+                    rep_score = MAX_SCORE - pen
+                    rep_score = clamp(rep_score, MIN_SCORE, MAX_SCORE)
+                    rep_score = round_to_half(rep_score)
+                    
+                    if rep_score >= 9.5:
+                        good_reps += 1
+                    else:
+                        bad_reps += 1
                     
                     # Keep one overlay message at a time
                     overlay_msg = ov_msg or overlay_msg
@@ -544,9 +552,9 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     elif session_tips:
         form_tip = session_tips[0]  # Or first tip if no severe issues
     else:
-        # Default encouraging message if everything is good
-        if proper_reps == reps and reps > 0:
-            form_tip = "Great form! Keep it up"
+        # Default encouraging message if everything is good (like squat)
+        if good_reps == reps and reps > 0:
+            form_tip = "Great form! Keep it up 💪"
         elif reps > 0:
             form_tip = "Focus on consistent form across all reps"
         else:
@@ -561,7 +569,8 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
         "success": True,
         "squat_count": reps,                # keep same key name for UI compatibility
         "row_count": reps,
-        "proper_reps": int(proper_reps),    # FIXED: Now returns actual count
+        "good_reps": int(good_reps),        # FIXED: Now matches squat exactly
+        "bad_reps": int(bad_reps),          # FIXED: Added like squat
         "technique_score": float(score),
         "technique_score_display": f"{score:.1f}",
         "technique_label": label,
