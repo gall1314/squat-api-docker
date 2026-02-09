@@ -69,7 +69,7 @@ TORSO_IDEAL_MIN = 15.0    # deg above horizontal - nearly parallel to floor
 TORSO_IDEAL_MAX = 35.0    # deg above horizontal - acceptable range
 TORSO_HIGH_WARNING = 50.0 # deg above horizontal - too upright warning
 TORSO_DRIFT_MAX  = 25.0   # allowed change during a rep (INCREASED - stable execution)
-KNEE_DRIFT_MAX   = 20.0   # leg drive indicator (INCREASED - stable execution)
+KNEE_EXTENSION_THRESHOLD = 8.0  # deg of knee straightening = leg drive
 MIN_REP_SAMPLES  = 5      # minimum samples to trust drift/mean metrics
 MIN_DEPTH_PCT_FOR_STABILITY = 60.0  # only trust stability cues on meaningful ROM
 
@@ -277,13 +277,14 @@ def analyze_rep(rep_metrics):
             # Minor drift
             feedback.append(("tip", "Try to minimize torso movement"))
 
-    # Leg drive - feedback only, doesn't mark improper
+    # Leg drive - detect ACTUAL knee extension (straightening), not just movement
     if allow_stability_cues:
-        if rep_metrics["knee_drift"] is not None and rep_metrics["knee_drift"] > KNEE_DRIFT_MAX * 1.5:
+        knee_ext = rep_metrics.get("knee_extension")
+        if knee_ext is not None and knee_ext > 8.0:  # Significant straightening = leg drive
             penalty += LEGDRIVE_PENALTY
             feedback.append(("medium", "Minimize leg drive — keep knees steady"))
-        elif rep_metrics["knee_drift"] is not None and rep_metrics["knee_drift"] > KNEE_DRIFT_MAX:
-            feedback.append(("tip", "Try to keep your legs more stable"))
+        elif knee_ext is not None and knee_ext > 5.0:
+            feedback.append(("tip", "Try to keep your knee angle constant throughout"))
 
     # Choose one strongest message for video overlay:
     overlay_msg = None
@@ -502,6 +503,19 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                     torso_drift = _robust_range(torso_vals)
                     knee_drift  = _robust_range(knee_vals)
                     torso_mean  = _safe_mean(torso_vals)
+                    knee_mean   = _safe_mean(knee_vals)
+                    
+                    # Detect ACTUAL leg drive: knee extension (angle increasing during pull)
+                    # Compare knee angle at start vs during pull
+                    knee_extension = None
+                    if knee_vals and len(knee_vals) >= MIN_REP_SAMPLES:
+                        # Find if knees straightened significantly during the pull
+                        knee_start = knee_vals[:len(knee_vals)//3]  # first third
+                        knee_mid = knee_vals[len(knee_vals)//3:]     # rest of rep
+                        if knee_start and knee_mid:
+                            start_avg = sum(knee_start) / len(knee_start)
+                            mid_avg = sum(knee_mid) / len(knee_mid)
+                            knee_extension = mid_avg - start_avg  # positive = straightening = leg drive
 
                     rep_m = {
                         "start_frame": rep_start,
@@ -510,6 +524,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                         "max_elbow_angle": elbow_max,
                         "torso_drift": torso_drift,
                         "knee_drift": knee_drift,
+                        "knee_extension": knee_extension,  # NEW: actual leg drive metric
                         "torso_mean": torso_mean,
                         "depth_pct": row_depth_from_elbow(elbow_min, ext_ref, top_ref)
                     }
