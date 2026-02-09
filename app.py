@@ -63,6 +63,19 @@ def _standardize_video_path(result_dict):
             result_dict["video_path"] = result_dict["analyzed_video_path"]
     return result_dict
 
+def _normalize_analysis_fields(result_dict):
+    """Ensure analyzer responses contain stable numeric fields for downstream UI."""
+    if not isinstance(result_dict, dict):
+        return result_dict
+    if result_dict.get("proper_reps") is None:
+        result_dict["proper_reps"] = 0
+    else:
+        try:
+            result_dict["proper_reps"] = int(result_dict["proper_reps"])
+        except (TypeError, ValueError):
+            result_dict["proper_reps"] = 0
+    return result_dict
+
 def _supports_arg(func, name: str) -> bool:
     try:
         return name in inspect.signature(func).parameters
@@ -188,45 +201,47 @@ def _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_mode: bool):
     scale = 0.4
     
     if resolved_type == 'squat':
-        return _run_analyzer(run_squat, raw_video_path, analyzed_path, fast_mode,
-                           frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_squat, raw_video_path, analyzed_path, fast_mode,
+                             frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'deadlift':
-        return _run_analyzer(run_deadlift, raw_video_path, analyzed_path, fast_mode,
-                           frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_deadlift, raw_video_path, analyzed_path, fast_mode,
+                             frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'romanian_deadlift':
-        return _run_analyzer(run_rdl, raw_video_path, analyzed_path, fast_mode,
-                           frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_rdl, raw_video_path, analyzed_path, fast_mode,
+                             frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'stiff_leg_deadlift':
-        return _run_analyzer(run_stiff_leg, raw_video_path, analyzed_path, fast_mode,
-                           frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_stiff_leg, raw_video_path, analyzed_path, fast_mode,
+                             frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'bulgarian':
-        return _run_analyzer(run_bulgarian, raw_video_path, analyzed_path, fast_mode,
-                           frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_bulgarian, raw_video_path, analyzed_path, fast_mode,
+                             frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'pullup':
-        return _run_analyzer(run_pullup, raw_video_path, analyzed_path, fast_mode,
-                           frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_pullup, raw_video_path, analyzed_path, fast_mode,
+                             frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'bicep_curl':
-        return _run_analyzer(run_bicep_curl, raw_video_path, analyzed_path, fast_mode,
-                           frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_bicep_curl, raw_video_path, analyzed_path, fast_mode,
+                             frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'bent_row':
         result = _run_analyzer(run_bent_row, raw_video_path, analyzed_path, fast_mode,
-                             frame_skip=frame_skip, scale=scale, 
-                             extra={"output_dir": MEDIA_DIR})
-        return _standardize_video_path(result)
+                               frame_skip=frame_skip, scale=scale,
+                               extra={"output_dir": MEDIA_DIR})
+        result = _standardize_video_path(result)
     elif resolved_type == 'good_morning':
-        return _run_analyzer(run_good_morning, raw_video_path, analyzed_path, fast_mode,
-                           frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_good_morning, raw_video_path, analyzed_path, fast_mode,
+                             frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'dips':
-        return _run_analyzer(run_dips, raw_video_path, analyzed_path, fast_mode,
-                           frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_dips, raw_video_path, analyzed_path, fast_mode,
+                             frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'overhead_press':
-        return _run_analyzer(run_overhead_press, raw_video_path, analyzed_path, fast_mode,
-                           frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_overhead_press, raw_video_path, analyzed_path, fast_mode,
+                             frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'pushup':
-        return _run_analyzer(run_pushup, raw_video_path, analyzed_path, fast_mode,
-                           frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_pushup, raw_video_path, analyzed_path, fast_mode,
+                             frame_skip=frame_skip, scale=scale)
     else:
-        return {"error": f"Unhandled exercise type: {resolved_type}", "video_path": ""}
+        result = {"error": f"Unhandled exercise type: {resolved_type}", "video_path": ""}
+
+    return _normalize_analysis_fields(result)
 
 # -------- API --------
 @app.route('/analyze', methods=['POST'])

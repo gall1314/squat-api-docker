@@ -70,6 +70,7 @@ TORSO_TARGET_MAX = 55.0
 TORSO_DRIFT_MAX  = 12.0   # allowed change during a rep
 KNEE_DRIFT_MAX   = 10.0   # leg drive indicator
 MIN_REP_SAMPLES  = 5      # minimum samples to trust drift/mean metrics
+MIN_DEPTH_PCT_FOR_STABILITY = 60.0  # only trust stability cues on meaningful ROM
 
 # Scoring
 MIN_SCORE = 4.0
@@ -210,6 +211,8 @@ def analyze_rep(rep_metrics):
     feedback = []
     penalty = 0.0
     is_proper = True  # Start assuming proper, mark False if severe issues
+    depth_pct = rep_metrics.get("depth_pct") or 0.0
+    allow_stability_cues = depth_pct >= MIN_DEPTH_PCT_FOR_STABILITY
 
     # ROM check
     if rep_metrics["min_elbow_angle"] is None or rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX + 5:
@@ -222,23 +225,26 @@ def analyze_rep(rep_metrics):
         is_proper = False
 
     # Momentum / torso drift
-    if rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > TORSO_DRIFT_MAX:
-        penalty += MOMENTUM_PENALTY
-        feedback.append(("severe", "Avoid using momentum — keep your torso still"))
-        is_proper = False
-    elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > 0.5*TORSO_DRIFT_MAX:
-        penalty += TORSO_PENALTY
-        feedback.append(("medium", "Keep your torso angle consistent"))
+    if allow_stability_cues:
+        if rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > TORSO_DRIFT_MAX:
+            penalty += MOMENTUM_PENALTY
+            feedback.append(("severe", "Avoid using momentum — keep your torso still"))
+            is_proper = False
+        elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > 0.5*TORSO_DRIFT_MAX:
+            penalty += TORSO_PENALTY
+            feedback.append(("medium", "Keep your torso angle consistent"))
 
     # Leg drive
-    if rep_metrics["knee_drift"] is not None and rep_metrics["knee_drift"] > KNEE_DRIFT_MAX:
-        penalty += LEGDRIVE_PENALTY
-        feedback.append(("medium", "Minimize leg drive — keep knees steady"))
+    if allow_stability_cues:
+        if rep_metrics["knee_drift"] is not None and rep_metrics["knee_drift"] > KNEE_DRIFT_MAX:
+            penalty += LEGDRIVE_PENALTY
+            feedback.append(("medium", "Minimize leg drive — keep knees steady"))
 
     # Back straighter (optional gentle cue): if torso mean outside target window
-    if rep_metrics["torso_mean"] is not None and (rep_metrics["torso_mean"] < TORSO_TARGET_MIN or rep_metrics["torso_mean"] > TORSO_TARGET_MAX):
-        # tip only (no penalty)
-        feedback.append(("tip", "Try to keep your back a bit straighter"))
+    if allow_stability_cues:
+        if rep_metrics["torso_mean"] is not None and (rep_metrics["torso_mean"] < TORSO_TARGET_MIN or rep_metrics["torso_mean"] > TORSO_TARGET_MAX):
+            # tip only (no penalty)
+            feedback.append(("tip", "Try to keep your back a bit straighter"))
 
     # Choose one strongest message for video overlay:
     overlay_msg = None
