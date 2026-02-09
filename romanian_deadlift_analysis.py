@@ -226,11 +226,10 @@ KNEE_MAX_ANGLE = 140.0  # מתחת לזה = יותר מדי כיפוף
 # ✅ גב - MediaPipe לא מדויק מספיק, סף גבוה
 BACK_MAX_ANGLE = 45.0
 
-# ✅✅✅ תיקון קריטי: הקלה משמעותית בדרישות הזמן
-# בדדליפט רומני, הירידה צריכה להיות **מבוקרת** אבל לא בהכרח איטית מאוד
-# התנאי הרגוע יותר יתריע רק על נפילה חופשית ממש
-MIN_ECC_S = 0.12  # ✅ ירידה מבוקרת (רק נגד נפילה חופשית)
-MIN_BOTTOM_S = 0.05  # ✅ השהייה מינימלית בתחתית
+# ✅✅✅ תיקון קריטי: הקלה עוד יותר משמעותית בדרישות הזמן
+# רק נתריע במקרים קיצוניים של נפילה חופשית ממש
+MIN_ECC_S = 0.08  # ✅ ירידה מבוקרת (רק נגד נפילה חופשית קיצונית)
+MIN_BOTTOM_S = 0.03  # ✅ השהייה מינימלית בתחתית
 
 MIN_SCORE = 4.0
 MAX_SCORE = 10.0
@@ -246,7 +245,7 @@ def run_romanian_deadlift_analysis(video_path,
     Romanian Deadlift analysis - FIXED:
     ✅ ברכיים: מותר עיקום 160-170 מעלות (עיקום קל)
     ✅ גב: מותר נטייה עד 45 מעלות
-    ✅✅✅ זמן ירידה: סף מינימלי + 2 פריימים (רק נגד נפילה חופשית)
+    ✅✅✅ זמן ירידה: סף מינימלי מאוד + 3 פריימים (רק נגד נפילה חופשית קיצונית)
     ✅ fast_mode: במצב מהיר - אותה לוגיקה בדיוק, רק ללא ציור וידאו
     """
     import sys
@@ -443,16 +442,16 @@ def run_romanian_deadlift_analysis(video_path,
                         feedback.append("Try to keep your back neutral")
                         score -= 1.0
 
-                    # ✅✅ בדיקת טמפו - תנאי מרוכך מאוד (רק נגד נפילה חופשית)
-                    # דורש לפחות שני פריימים של ירידה, או סף זמן מינימלי
-                    min_ecc_s = max(MIN_ECC_S, 2 * dt)
+                    # ✅✅✅ בדיקת טמפו - תנאי עוד יותר רגוע (רק נגד נפילה חופשית קיצונית)
+                    # דורש לפחות 3 פריימים של ירידה, או סף זמן מינימלי מאוד
+                    min_ecc_s = max(MIN_ECC_S, 3 * dt)
                     if down_s < min_ecc_s:
                         feedback.append("Control the lowering")
-                        score -= 0.1  # ✅ עונש מינימלי
+                        score -= 0.05  # ✅ עונש מינימלי מאוד
 
                     if bottom_s < MIN_BOTTOM_S:
                         feedback.append("Pause at the bottom")
-                        score -= 0.3  # ✅ עונש מינימלי
+                        score -= 0.15  # ✅ עונש מינימלי
 
                     score = float(max(MIN_SCORE, min(MAX_SCORE, score)))
                     all_scores.append(score)
