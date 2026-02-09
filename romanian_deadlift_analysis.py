@@ -226,11 +226,10 @@ KNEE_MAX_ANGLE = 140.0  # מתחת לזה = יותר מדי כיפוף
 # ✅ גב - MediaPipe לא מדויק מספיק, סף גבוה
 BACK_MAX_ANGLE = 45.0
 
-# ✅✅✅ תיקון קריטי: הקלה משמעותית בדרישות הזמן
-# בדדליפט רומני, הירידה צריכה להיות **מבוקרת** אבל לא בהכרח איטית מאוד
-# התנאי הרגוע יותר יתריע רק על נפילה חופשית ממש
-MIN_ECC_S = 0.01  # ✅ כמעט לא יתריע - רק נפילה חופשית ממש
-MIN_BOTTOM_S = 0.01  # ✅ כמעט ללא דרישת השהייה
+# ✅✅✅ תיקון קריטי: הקלה מקסימלית בדרישות הזמן
+# רק נתריע במקרים של נפילה ממש חופשית (כמעט אף פעם)
+MIN_ECC_S = 0.04  # ✅ סף נמוך מאוד - רק נגד נפילה חופשית ממש
+MIN_BOTTOM_S = 0.02  # ✅ סף נמוך מאוד
 
 MIN_SCORE = 4.0
 MAX_SCORE = 10.0
@@ -246,8 +245,7 @@ def run_romanian_deadlift_analysis(video_path,
     Romanian Deadlift analysis - FIXED:
     ✅ ברכיים: מותר עיקום 160-170 מעלות (עיקום קל)
     ✅ גב: מותר נטייה עד 45 מעלות
-    ✅✅✅ שליטה על ירידה: מבוסס מהירות (לא זמן) - יותר אמין!
-    ✅ התמקדות בטכניקה - זוויות ברכיים, גב, ומהירות ירידה
+    ✅✅✅ זמן ירידה: סף מינימלי ביותר + 4 פריימים (רק נגד נפילה חופשית ממש)
     ✅ fast_mode: במצב מהיר - אותה לוגיקה בדיוק, רק ללא ציור וידאו
     """
     import sys
@@ -326,7 +324,6 @@ def run_romanian_deadlift_analysis(video_path,
     max_knee_angle = 0.0
     back_issue = False
     down_frames = up_frames = bottom_hold_frames = 0
-    max_descent_velocity = 0.0  # ✅ מהירות ירידה מקסימלית
 
     rt_fb_msg = None
     rt_fb_hold = 0
@@ -400,7 +397,6 @@ def run_romanian_deadlift_analysis(video_path,
                 max_knee_angle = knee_angle
                 back_issue = False
                 down_frames = up_frames = bottom_hold_frames = 0
-                max_descent_velocity = 0.0  # ✅ איפוס מהירות
                 prev_progress = progress
 
             if in_rep:
@@ -410,15 +406,10 @@ def run_romanian_deadlift_analysis(video_path,
                 if back_bad:
                     back_issue = True
 
-                # ✅ מדידת מהירות ירידה - גישה פשוטה ואמינה
                 if prev_progress is not None:
-                    progress_change = progress - prev_progress
-                    if progress_change > 1e-4:  # יורד
+                    if progress > prev_progress + 1e-4:
                         down_frames += 1
-                        # מהירות ירידה = שינוי ב-progress / זמן
-                        descent_velocity = progress_change / dt
-                        max_descent_velocity = max(max_descent_velocity, descent_velocity)
-                    elif progress_change < -1e-4:  # עולה
+                    elif progress < prev_progress - 1e-4:
                         up_frames += 1
                     else:
                         if progress >= 0.98:
@@ -451,19 +442,16 @@ def run_romanian_deadlift_analysis(video_path,
                         feedback.append("Try to keep your back neutral")
                         score -= 1.0
 
-                    # ✅ בדיקת שליטה על הירידה - מבוסס מהירות
-                    # במקום לספור זמן, בודקים אם המהירות לא מוגזמת
-                    # מהירות גבוהה מדי = נפילה חופשית
-                    MAX_DESCENT_VELOCITY = 3.5  # ערך סביר למהירות מקסימלית
-                    
-                    if max_descent_velocity > MAX_DESCENT_VELOCITY:
+                    # ✅✅✅ בדיקת טמפו - תנאי רגוע מאוד (רק נגד נפילה חופשית ממש)
+                    # דורש לפחות 4 פריימים של ירידה, או סף זמן מינימלי ביותר
+                    min_ecc_s = max(MIN_ECC_S, 4 * dt)
+                    if down_s < min_ecc_s:
                         feedback.append("Control the lowering")
-                        score -= 0.5
-                    
-                    # בדיקת השהייה בתחתית - רק אם ממש לא היה
-                    if bottom_hold_frames == 0:
+                        score -= 0.02  # ✅ עונש סימבולי
+
+                    if bottom_s < MIN_BOTTOM_S:
                         feedback.append("Pause at the bottom")
-                        score -= 0.3
+                        score -= 0.05  # ✅ עונש סימבולי
 
                     score = float(max(MIN_SCORE, min(MAX_SCORE, score)))
                     all_scores.append(score)
@@ -488,12 +476,11 @@ def run_romanian_deadlift_analysis(video_path,
                             "max_knee_angle": round(max_knee_angle, 2),
                             "back_angle": round(back_angle, 2),
                             "eccentric_s": round(down_s, 2),
-                            "bottom_hold_s": round(bottom_s, 2),
-                            "max_descent_velocity": round(max_descent_velocity, 2)
+                            "bottom_hold_s": round(bottom_s, 2)
                         }
                     })
                     
-                    print(f"[RDL] Rep {counter}: min_knee={min_knee_angle:.1f}°, max_knee={max_knee_angle:.1f}°, torso={max_torso_angle:.1f}°, descent_vel={max_descent_velocity:.2f}", 
+                    print(f"[RDL] Rep {counter}: min_knee={min_knee_angle:.1f}°, max_knee={max_knee_angle:.1f}°, torso={max_torso_angle:.1f}°, down_time={down_s:.2f}s", 
                           file=sys.stderr, flush=True)
 
                     rt_fb_msg = pick_strongest_feedback(feedback)
