@@ -10,6 +10,10 @@ from werkzeug.exceptions import BadRequest, ClientDisconnected
 app = Flask(__name__)
 CORS(app)
 
+# ✅ הגדלת גבולות לסרטונים גדולים
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+
 MEDIA_DIR = "media"
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
@@ -388,4 +392,5 @@ def healthz():
     return "ok", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    # Development server - for production use: gunicorn -c gunicorn_config.py app:app
+    app.run(host="0.0.0.0", port=8080, threaded=True)
