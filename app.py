@@ -108,10 +108,10 @@ def _run_analyzer(func, src_path, out_video_path, fast_mode: bool, *, frame_skip
         kwargs["return_video"] = (not fast_mode)
         print(f"[_run_analyzer] return_video={not fast_mode}", file=sys.stderr, flush=True)
     
-    # output_path - רק במצב איטי (עם וידאו)
-    if not fast_mode and _supports_arg(func, "output_path") and out_video_path:
-        kwargs["output_path"] = out_video_path
-        print(f"[_run_analyzer] output_path={out_video_path}", file=sys.stderr, flush=True)
+    # output_path - רק במצב איטי (עם וידאו) - FIX: תמיד העבר גם אם None
+    if not fast_mode and _supports_arg(func, "output_path"):
+        kwargs["output_path"] = out_video_path or ""
+        print(f"[_run_analyzer] output_path={out_video_path or ''}", file=sys.stderr, flush=True)
     
     if _supports_arg(func, "output_dir"):
         kwargs["output_dir"] = os.path.dirname(out_video_path) if out_video_path else MEDIA_DIR
