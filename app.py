@@ -66,6 +66,13 @@ def _standardize_video_path(result_dict):
             result_dict["video_path"] = result_dict["analyzed_video_path"]
     return result_dict
 
+def _is_analyzer_unavailable(result_dict):
+    return isinstance(result_dict, dict) and result_dict.get("error") == "analyzer_unavailable"
+
+def _unavailable_response(result_dict):
+    detail = result_dict.get("detail") if isinstance(result_dict, dict) else "Analyzer unavailable"
+    return jsonify({"error": "analyzer_unavailable", "detail": detail}), 501
+
 def _normalize_analysis_fields(result_dict):
     """Ensure analyzer responses contain stable numeric fields for downstream UI."""
     if not isinstance(result_dict, dict):
@@ -311,6 +318,8 @@ def analyze():
                 result = {"error": "invalid_result", 
                          "detail": "Analyzer did not return a dict", 
                          "video_path": ""}
+            if _is_analyzer_unavailable(result):
+                return _unavailable_response(result)
 
             result = _standardize_video_path(result)
             output_path = result.get("video_path") or ""
@@ -405,6 +414,8 @@ def analyze():
             result = {"error": "invalid_result", 
                      "detail": "Analyzer did not return a dict", 
                      "video_path": ""}
+        if _is_analyzer_unavailable(result):
+            return _unavailable_response(result)
 
         result = _standardize_video_path(result)
         output_path = result.get("video_path") or ""
