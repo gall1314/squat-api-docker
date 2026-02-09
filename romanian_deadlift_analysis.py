@@ -255,6 +255,8 @@ def run_romanian_deadlift_analysis(video_path,
     print(f"[RDL] Starting analysis: fast_mode={fast_mode}, return_video={return_video}", file=sys.stderr, flush=True)
     print(f"[RDL] Video path: {video_path}", file=sys.stderr, flush=True)
     
+    mp_pose_mod = mp.solutions.pose
+
     # === רק זה משתנה: האם ליצור וידאו ===
     if fast_mode is True:
         return_video = False
@@ -293,10 +295,21 @@ def run_romanian_deadlift_analysis(video_path,
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
 
+    # במצב מהיר: שומרים על בדיקת פריימים זהה, scale מעט קטן יותר, model lite
+    if fast_mode:
+        effective_frame_skip = frame_skip
+        effective_scale = scale * 0.85
+        model_complexity = 0
+        print(f"[RDL FAST] frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=lite", file=sys.stderr, flush=True)
+    else:
+        effective_frame_skip = frame_skip
+        effective_scale = scale
+        model_complexity = 1
+
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
-    effective_fps = max(1.0, fps_in / max(1, frame_skip))  # ✅ חזרנו לערך המקורי
+    effective_fps = max(1.0, fps_in / max(1, effective_frame_skip))
     dt = 1.0 / float(effective_fps)
 
     counter = good_reps = bad_reps = 0
@@ -322,7 +335,7 @@ def run_romanian_deadlift_analysis(video_path,
     rt_fb_msg = None
     rt_fb_hold = 0
 
-    # ✅ חזרנו למודל המקורי - model_complexity=1 תמיד
+    # מודל מהיר/איטי לפי fast_mode
     print(f"[RDL] Starting pose detection loop", file=sys.stderr, flush=True)
     
     import time
@@ -330,9 +343,9 @@ def run_romanian_deadlift_analysis(video_path,
     MAX_PROCESSING_TIME = 180  # 3 דקות מקסימום
     frames_processed = 0
     
-    with mp_pose.Pose(model_complexity=1,  # ✅ לא משנים את המודל!
-                      min_detection_confidence=0.5,
-                      min_tracking_confidence=0.5) as pose:
+    with mp_pose_mod.Pose(model_complexity=model_complexity,
+                          min_detection_confidence=0.5,
+                          min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -345,7 +358,7 @@ def run_romanian_deadlift_analysis(video_path,
                 break
             
             frame_idx += 1
-            if frame_idx % frame_skip != 0:  # ✅ חזרנו ל-frame_skip המקורי
+            if frame_idx % effective_frame_skip != 0:
                 continue
             
             frames_processed += 1
@@ -354,7 +367,7 @@ def run_romanian_deadlift_analysis(video_path,
             if frames_processed % 30 == 0:
                 print(f"[RDL] Progress: {frames_processed} frames, {counter} reps, {elapsed:.1f}s", file=sys.stderr, flush=True)
 
-            work = cv2.resize(frame, (0, 0), fx=scale, fy=scale) if scale != 1.0 else frame  # ✅ חזרנו ל-scale המקורי
+            work = cv2.resize(frame, (0, 0), fx=effective_scale, fy=effective_scale) if effective_scale != 1.0 else frame
             if create_video and out is None:
                 h0, w0 = work.shape[:2]
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w0, h0))
