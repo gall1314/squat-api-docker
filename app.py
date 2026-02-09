@@ -300,11 +300,11 @@ def analyze():
                   file=sys.stderr, flush=True)
             return jsonify({
                 "error": "client_disconnected",
-                "detail": "Upload interrupted before the multipart payload was fully received",
+                "detail": "Upload interrupted before the multipart payload was fully received (client/proxy timeout or connection drop)",
                 "content_length": content_length,
                 "size_mb": size_mb,
                 "hint": "Client/proxy timed out during upload. Retry on better network, send smaller/compressed video, or use raw video upload (Content-Type: video/mp4 with ?exercise_type=...&fast=true)."
-            }), 400
+            }), 408
 
         video_file = files.get('video')
         if not video_file:
