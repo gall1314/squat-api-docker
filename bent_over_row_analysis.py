@@ -69,6 +69,7 @@ TORSO_TARGET_MIN = 25.0   # deg above horizontal (roughly bent-over)
 TORSO_TARGET_MAX = 55.0
 TORSO_DRIFT_MAX  = 12.0   # allowed change during a rep
 KNEE_DRIFT_MAX   = 10.0   # leg drive indicator
+MIN_REP_SAMPLES  = 5      # minimum samples to trust drift/mean metrics
 
 # Scoring
 MIN_SCORE = 4.0
@@ -259,6 +260,18 @@ def analyze_rep(rep_metrics):
 
     return penalty, overlay_msg, session_msgs, tips, is_proper
 
+def _robust_range(values, min_samples=MIN_REP_SAMPLES):
+    if not values or len(values) < min_samples:
+        return None
+    low = np.percentile(values, 10)
+    high = np.percentile(values, 90)
+    return float(high - low)
+
+def _safe_mean(values, min_samples=MIN_REP_SAMPLES):
+    if not values or len(values) < min_samples:
+        return None
+    return float(sum(values) / len(values))
+
 def faststart_remux(in_path):
     """Remux MP4 with moov at start (faststart). Returns output path."""
     base, ext = os.path.splitext(in_path)
@@ -432,9 +445,9 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                     reps += 1
                     last_rep_frame = frame_idx
 
-                    torso_drift = (max(torso_vals)-min(torso_vals)) if torso_vals else None
-                    knee_drift  = (max(knee_vals)-min(knee_vals)) if knee_vals else None
-                    torso_mean  = (sum(torso_vals)/len(torso_vals)) if torso_vals else None
+                    torso_drift = _robust_range(torso_vals)
+                    knee_drift  = _robust_range(knee_vals)
+                    torso_mean  = _safe_mean(torso_vals)
 
                     rep_m = {
                         "start_frame": rep_start,
@@ -524,7 +537,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
         "success": True,
         "squat_count": reps,                # keep same key name for UI compatibility
         "row_count": reps,
-        "proper_reps": proper_reps,         # FIXED: Now returns actual count
+        "proper_reps": 0 if proper_reps is None else int(proper_reps),
         "technique_score": float(score),
         "technique_score_display": f"{score:.1f}",
         "technique_label": label,
