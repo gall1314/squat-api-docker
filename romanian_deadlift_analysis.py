@@ -229,7 +229,7 @@ BACK_MAX_ANGLE = 45.0
 # ✅✅✅ תיקון קריטי: הקלה משמעותית בדרישות הזמן
 # בדדליפט רומני, הירידה צריכה להיות **מבוקרת** אבל לא בהכרח איטית מאוד
 # התנאי הרגוע יותר יתריע רק על נפילה חופשית ממש
-MIN_ECC_S = 0.08  # ✅ ירידה מבוקרת (רק נגד נפילה חופשית)
+MIN_ECC_S = 0.03  # ✅ ירידה מבוקרת (רק נגד נפילה חופשית)
 MIN_BOTTOM_S = 0.05  # ✅ השהייה מינימלית בתחתית
 
 MIN_SCORE = 4.0
@@ -446,7 +446,7 @@ def run_romanian_deadlift_analysis(video_path,
                     # ✅✅ בדיקת טמפו - תנאי מרוכך מאוד (רק נגד נפילה חופשית)
                     if down_s < MIN_ECC_S:
                         feedback.append("Control the lowering")
-                        score -= 0.3  # ✅ עונש מינימלי
+                        score -= 0.1  # ✅ עונש מינימלי
 
                     if bottom_s < MIN_BOTTOM_S:
                         feedback.append("Pause at the bottom")
