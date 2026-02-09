@@ -208,9 +208,10 @@ def _get_side_landmarks(lm):
     }
 
 # ===================== ✅✅ תיקונים קריטיים - STIFF-LEG DEADLIFT =====================
+# יישור מלא ללוגיקת הספירה של RDL (אותם ספי זוויות)
 HINGE_START_ANGLE = 20.0
-HINGE_BOTTOM_ANGLE = 65.0  # עמוק יותר מ-RDL
-STAND_ANGLE = 20.0  # ✅✅ תיקון 1: הקלה עוד יותר - מ-18° ל-20° כדי לספור כל חזרה
+HINGE_BOTTOM_ANGLE = 55.0
+STAND_ANGLE = 12.0
 MIN_FRAMES_BETWEEN_REPS = 8
 PROG_ALPHA = 0.3
 
@@ -244,8 +245,8 @@ def run_stiff_leg_deadlift_analysis(video_path,
     - Tempo/control (too variable, not meaningful)
     
     KEEPING ONLY:
-    1. Rep counting: Torso reaches 65° forward, then returns to <25° upright
-    2. Depth check: Did the torso reach at least 60° forward?
+    1. Rep counting: Torso reaches 55° forward, then returns to 12° upright
+    2. Depth check: Did the torso reach at least 50° forward?
     3. Good rep = score 9+ AND no feedback
     
     This version focuses on what MediaPipe CAN reliably detect.
@@ -377,8 +378,8 @@ def run_stiff_leg_deadlift_analysis(video_path,
                 if torso_angle >= HINGE_BOTTOM_ANGLE:
                     bottom_reached = True
 
-                # ✅✅ תיקון ספירה: תנאי פשוט יותר - אם הגיע למטה וחזר למעלה (מתחת ל-25°)
-                if bottom_reached and torso_angle <= 25.0 and (frame_idx - last_rep_frame) >= MIN_FRAMES_BETWEEN_REPS:
+                # ✅✅ תיקון ספירה: זהה לדדליפט רומני - חזרה נספרת רק כשחוזרים ל-stand angle
+                if bottom_reached and torso_angle <= STAND_ANGLE and (frame_idx - last_rep_frame) >= MIN_FRAMES_BETWEEN_REPS:
                     last_rep_frame = frame_idx
                     counter += 1
 
@@ -459,7 +460,7 @@ def run_stiff_leg_deadlift_analysis(video_path,
     if session_feedbacks:
         technique_score = min(technique_score, 9.5)
 
-    feedback_list = dedupe_feedback(session_feedbacks) if session_feedbacks else ["Excellent form! 🔥"]
+    feedback_list = dedupe_feedback(session_feedbacks) if session_feedbacks else ["Great form! Keep it up 💪"]
 
     session_tip = None
     if session_feedback_by_cat:
