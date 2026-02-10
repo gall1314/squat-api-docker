@@ -324,13 +324,13 @@ FLARE_FAIR = 65.0
 FLARE_POOR = 75.0
 
 DESCENT_SPEED_IDEAL = 0.0010
-DESCENT_SPEED_FAST = 0.0015          # ✅ יותר רגיש (היה 0.0025)
+DESCENT_SPEED_FAST = 0.0012          # ✅ אולטרה רגיש (היה 0.0015)
 
 DEPTH_FAIL_MIN_REPS = 1              # דווח מיד
 HIPS_FAIL_MIN_REPS = 2               # ירכיים - אפשר 2
 LOCKOUT_FAIL_MIN_REPS = 1            # דווח מיד
 FLARE_FAIL_MIN_REPS = 2              # מרפקים - אפשר 2
-TEMPO_CHECK_MIN_REPS = 2             # ✅ מהר יותר (היה 4)
+TEMPO_CHECK_MIN_REPS = 1             # ✅ מיידי (היה 2)
 
 BURST_FRAMES = 8                    # קצת יותר אגרסיבי
 INFLECT_VEL_THR = 0.0027
@@ -567,7 +567,11 @@ def run_pushup_analysis(video_path,
                     cycle_min_elbow=min(cycle_min_elbow,elbow_angle)
                     
                     vel_abs = abs(shoulder_vel)
+                    # ✅ Track velocity during descent (both EMA and raw)
                     if shoulder_vel > 0 and in_descent_phase:
+                        cycle_max_descent_vel = max(cycle_max_descent_vel, vel_abs)
+                    # ✅ Also track ANY significant movement
+                    if vel_abs > 0.0005:  # Any movement
                         cycle_max_descent_vel = max(cycle_max_descent_vel, vel_abs)
 
                     min_elb_now = min(raw_elbow_L, raw_elbow_R)
@@ -895,10 +899,18 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
     if rep_count >= TEMPO_CHECK_MIN_REPS and not tempo_already_reported:
         if cycle_max_descent_vel > DESCENT_SPEED_FAST:
             local_vars['fast_descent_count'] += 1
-            if local_vars['fast_descent_count'] >= 2:  # ✅ רגיש יותר (היה 3)
+            if DEBUG_GRADING:
+                print(f"[TEMPO] Rep {rep_count+1}: descent_vel={cycle_max_descent_vel:.5f}, "
+                      f"count={local_vars['fast_descent_count']}")
+            if local_vars['fast_descent_count'] >= 1:  # ✅ מיידי! (היה 2)
                 session_perf_tips.add(PERF_TIP_SLOW_DOWN)
                 session_perf_tips.add(PERF_TIP_TEMPO)
                 local_vars['tempo_already_reported'] = True
+                if DEBUG_GRADING:
+                    print(f"[TEMPO] ✅ Tempo tip added!")
+        elif DEBUG_GRADING and rep_count < 5:
+            print(f"[TEMPO] Rep {rep_count+1}: descent_vel={cycle_max_descent_vel:.5f} "
+                  f"< threshold {DESCENT_SPEED_FAST:.5f}")
     
     # ✅ Return whether this cycle had issues
     return has_depth_issue or has_lockout_issue or has_hips_issue or has_flare_issue
