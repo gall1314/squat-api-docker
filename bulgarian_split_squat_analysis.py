@@ -324,6 +324,7 @@ class BulgarianRepCounter:
         self._down_frames = 0
         self._last_depth_for_ui = 0.0
         self._last_rep_end_frame = -100
+        self._last_standing_knee = 170.0
 
         # Adaptive thresholds (start with defaults, may be calibrated)
         self._down_thresh = ANGLE_DOWN_THRESH
@@ -424,11 +425,14 @@ class BulgarianRepCounter:
         knee_angle < down_thresh → entering descent
         knee_angle > up_thresh AND was down → rep complete (if valid)
         """
+        if knee_angle > self._up_thresh:
+            self._last_standing_knee = max(self._last_standing_knee, float(knee_angle))
+
         # === ENTER DOWN ===
         if knee_angle < self._down_thresh:
             if self.stage != 'down':
                 self.stage = 'down'
-                if not self._start_rep(frame_no, knee_angle):
+                if not self._start_rep(frame_no, self._last_standing_knee):
                     self.stage = 'up'
                     return
             self._down_frames += 1
@@ -445,6 +449,7 @@ class BulgarianRepCounter:
                 score, fb, depth = self.evaluate_form()
                 self.count += 1
                 self._finish_rep(frame_no, score, fb, extra={"depth_pct": float(depth)})
+                self._last_standing_knee = float(knee_angle)
             else:
                 # Reset without counting
                 self._last_depth_for_ui = 0.0
