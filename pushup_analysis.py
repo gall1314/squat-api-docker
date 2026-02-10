@@ -791,17 +791,15 @@ def run_pushup_analysis(video_path,
         }
     }
     
-    # ✅ Form Tip להצגה ב-UI: מעדיף errors, אבל מציג גם tips
-    if primary_form_error:
-        result["form_tip"] = primary_form_error  # ⚠️ Form error takes priority
-    elif primary_perf_tip:
-        result["form_tip"] = primary_perf_tip    # 💡 Performance tip if no error
+    # ✅ Form Tip = רק Performance Tips (לא Form Errors!)
+    if primary_perf_tip:
+        result["form_tip"] = primary_perf_tip    # 💡 רק טיפים לביצוע!
     
     # שמירת ההפרדה המלאה ב-JSON
     if primary_form_error:
-        result["primary_form_error"] = primary_form_error
+        result["primary_form_error"] = primary_form_error  # ⚠️ בנפרד
     if primary_perf_tip:
-        result["primary_perf_tip"] = primary_perf_tip
+        result["primary_perf_tip"] = primary_perf_tip      # 💡 בנפרד
 
     return result
 
