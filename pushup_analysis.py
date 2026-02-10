@@ -510,7 +510,7 @@ def run_pushup_analysis(video_path,
                 motion_detector.activate("enter_plank")
 
             if onpushup and offpushup_streak>=OFFPUSHUP_MIN_FRAMES:
-                _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
+                cycle_has_issues = _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                                    cycle_max_hip_misalign, cycle_max_flare,
                                    cycle_max_descent_vel,
                                    depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
@@ -520,15 +520,14 @@ def run_pushup_analysis(video_path,
                                    session_form_errors, session_perf_tips, rep_count, locals())
 
                 if (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and (cycle_min_elbow<=ELBOW_BENT_ANGLE):
-                    rep_has_tip = cycle_tip_deeper or cycle_tip_hips or cycle_tip_lockout or cycle_tip_elbows
                     _count_rep(rep_reports,rep_count,cycle_min_elbow,
                                desc_base_shoulder if desc_base_shoulder is not None else shoulder_y,
                                baseline_shoulder_y+cycle_max_descent if baseline_shoulder_y is not None else shoulder_y,
-                               all_scores, rep_has_tip,
+                               all_scores, cycle_has_issues,  # ✅ Use return value
                                bottom_phase_min_elbow, top_phase_max_elbow, 
                                cycle_max_hip_misalign, cycle_max_flare)
                     rep_count+=1
-                    if rep_has_tip: bad_reps+=1
+                    if cycle_has_issues: bad_reps+=1  # ✅ Use return value
                     else: good_reps+=1
 
                 onpushup=False; offpushup_frames_since_any_rep=0
@@ -594,7 +593,7 @@ def run_pushup_analysis(video_path,
                         in_descent_phase = False
                     
                     if reset_by_asc or reset_by_elb:
-                        _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
+                        cycle_has_issues = _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                                            cycle_max_hip_misalign, cycle_max_flare,
                                            cycle_max_descent_vel,
                                            depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
@@ -604,15 +603,14 @@ def run_pushup_analysis(video_path,
                                            session_form_errors, session_perf_tips, rep_count, locals())
 
                         if (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and (cycle_min_elbow<=ELBOW_BENT_ANGLE):
-                            rep_has_tip = cycle_tip_deeper or cycle_tip_hips or cycle_tip_lockout or cycle_tip_elbows
                             _count_rep(rep_reports,rep_count,cycle_min_elbow,
                                        desc_base_shoulder,
                                        baseline_shoulder_y+cycle_max_descent if baseline_shoulder_y is not None else shoulder_y,
-                                       all_scores, rep_has_tip,
+                                       all_scores, cycle_has_issues,  # ✅
                                        bottom_phase_min_elbow, top_phase_max_elbow,
                                        cycle_max_hip_misalign, cycle_max_flare)
                             rep_count+=1
-                            if rep_has_tip: bad_reps+=1
+                            if cycle_has_issues: bad_reps+=1  # ✅
                             else: good_reps+=1
 
                         desc_base_shoulder=shoulder_y
@@ -633,16 +631,26 @@ def run_pushup_analysis(video_path,
                 can_cnt=(frame_idx - last_bottom_frame) >= REFRACTORY_FRAMES
 
                 if at_bottom and allow_new_bottom and can_cnt and (not counted_this_cycle):
-                    rep_has_tip = cycle_tip_deeper or cycle_tip_hips or cycle_tip_lockout or cycle_tip_elbows
+                    # ✅ Calculate if has issues based on current measurements
+                    rep_has_issues = False
+                    if bottom_phase_min_elbow and bottom_phase_min_elbow > DEPTH_FAIR_ANGLE:
+                        rep_has_issues = True
+                    if top_phase_max_elbow and top_phase_max_elbow < LOCKOUT_GOOD:
+                        rep_has_issues = True
+                    if cycle_max_hip_misalign and cycle_max_hip_misalign > HIP_FAIR:
+                        rep_has_issues = True
+                    if cycle_max_flare and cycle_max_flare > FLARE_FAIR:
+                        rep_has_issues = True
+                    
                     _count_rep(rep_reports,rep_count,elbow_angle,
                                desc_base_shoulder if desc_base_shoulder is not None else shoulder_y, shoulder_y,
-                               all_scores, rep_has_tip,
+                               all_scores, rep_has_issues,  # ✅
                                bottom_phase_min_elbow if bottom_phase_min_elbow else raw_elbow_min,
                                top_phase_max_elbow if top_phase_max_elbow else max(raw_elbow_L, raw_elbow_R),
                                cycle_max_hip_misalign if cycle_max_hip_misalign else 0.0,
                                cycle_max_flare if cycle_max_flare else 0.0)
                     rep_count+=1
-                    if rep_has_tip: bad_reps+=1
+                    if rep_has_issues: bad_reps+=1  # ✅
                     else: good_reps+=1
                     last_bottom_frame=frame_idx; allow_new_bottom=False; counted_this_cycle=True
                     top_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
@@ -680,7 +688,7 @@ def run_pushup_analysis(video_path,
             if shoulder_y is not None: shoulder_prev=shoulder_y
 
     if onpushup and (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and (cycle_min_elbow<=ELBOW_BENT_ANGLE):
-        _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
+        cycle_has_issues = _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                            cycle_max_hip_misalign, cycle_max_flare,
                            cycle_max_descent_vel,
                            depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
@@ -689,15 +697,14 @@ def run_pushup_analysis(video_path,
                            lockout_already_reported, flare_already_reported, tempo_already_reported,
                            session_form_errors, session_perf_tips, rep_count, locals())
 
-        rep_has_tip = cycle_tip_deeper or cycle_tip_hips or cycle_tip_lockout or cycle_tip_elbows
         _count_rep(rep_reports,rep_count,cycle_min_elbow,
                    desc_base_shoulder if desc_base_shoulder is not None else (baseline_shoulder_y or 0.0),
                    (baseline_shoulder_y + cycle_max_descent) if baseline_shoulder_y is not None else (baseline_shoulder_y or 0.0),
-                   all_scores, rep_has_tip,
+                   all_scores, cycle_has_issues,  # ✅
                    bottom_phase_min_elbow, top_phase_max_elbow,
                    cycle_max_hip_misalign, cycle_max_flare)
         rep_count+=1
-        if rep_has_tip: bad_reps+=1
+        if cycle_has_issues: bad_reps+=1  # ✅
         else: good_reps+=1
 
     cap.release()
@@ -784,11 +791,17 @@ def run_pushup_analysis(video_path,
         }
     }
     
-    # ✅ תיקון קריטי: Form Tip = Performance Tip!
-    if primary_perf_tip:
-        result["form_tip"] = primary_perf_tip  # 💡 זה מופיע ב-UI
+    # ✅ Form Tip להצגה ב-UI: מעדיף errors, אבל מציג גם tips
     if primary_form_error:
-        result["form_error"] = primary_form_error  # ⚠️ זה נפרד
+        result["form_tip"] = primary_form_error  # ⚠️ Form error takes priority
+    elif primary_perf_tip:
+        result["form_tip"] = primary_perf_tip    # 💡 Performance tip if no error
+    
+    # שמירת ההפרדה המלאה ב-JSON
+    if primary_form_error:
+        result["primary_form_error"] = primary_form_error
+    if primary_perf_tip:
+        result["primary_perf_tip"] = primary_perf_tip
 
     return result
 
@@ -837,9 +850,16 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                         lockout_already_reported, flare_already_reported, tempo_already_reported,
                         session_form_errors, session_perf_tips, rep_count, local_vars):
     
+    # Track tips for this cycle
+    has_depth_issue = False
+    has_lockout_issue = False
+    has_hips_issue = False
+    has_flare_issue = False
+    
     # Form errors - מורידים נקודות
     if bottom_phase_min_elbow is not None:
         if bottom_phase_min_elbow > DEPTH_FAIR_ANGLE:
+            has_depth_issue = True  # ✅
             local_vars['cycle_tip_deeper'] = True
             local_vars['depth_fail_count'] += 1
             if local_vars['depth_fail_count'] >= DEPTH_FAIL_MIN_REPS and not depth_already_reported:
@@ -847,7 +867,8 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                 local_vars['depth_already_reported'] = True
 
     if top_phase_max_elbow is not None:
-        if top_phase_max_elbow < LOCKOUT_GOOD:  # ✅ קפדני יותר - צריך 170° (היה LOCKOUT_FAIR 165°)
+        if top_phase_max_elbow < LOCKOUT_GOOD:
+            has_lockout_issue = True  # ✅
             local_vars['cycle_tip_lockout'] = True
             local_vars['lockout_fail_count'] += 1
             if local_vars['lockout_fail_count'] >= LOCKOUT_FAIL_MIN_REPS and not lockout_already_reported:
@@ -856,6 +877,7 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
 
     if cycle_max_hip_misalign is not None:
         if cycle_max_hip_misalign > HIP_FAIR:
+            has_hips_issue = True  # ✅
             local_vars['cycle_tip_hips'] = True
             local_vars['hips_fail_count'] += 1
             if local_vars['hips_fail_count'] >= HIPS_FAIL_MIN_REPS and not hips_already_reported:
@@ -864,6 +886,7 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
 
     if cycle_max_flare is not None:
         if cycle_max_flare > FLARE_FAIR:
+            has_flare_issue = True  # ✅
             local_vars['cycle_tip_elbows'] = True
             local_vars['flare_fail_count'] += 1
             if local_vars['flare_fail_count'] >= FLARE_FAIL_MIN_REPS and not flare_already_reported:
@@ -878,6 +901,9 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                 session_perf_tips.add(PERF_TIP_SLOW_DOWN)
                 session_perf_tips.add(PERF_TIP_TEMPO)
                 local_vars['tempo_already_reported'] = True
+    
+    # ✅ Return whether this cycle had issues
+    return has_depth_issue or has_lockout_issue or has_hips_issue or has_flare_issue
 
 def _count_rep(rep_reports, rep_count, bottom_elbow, descent_from, bottom_shoulder_y, all_scores, rep_has_tip,
                bottom_phase_min_elbow, top_phase_max_elbow, cycle_max_hip_misalign, cycle_max_flare):
