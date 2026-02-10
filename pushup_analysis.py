@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# pushup_analysis.py — WORKING VERSION (51 reps) + FIXED FEEDBACK SEPARATION
+# pushup_analysis.py — FINAL: Better fast detection + Correct tip/feedback separation
 
 import os, cv2, math, numpy as np, subprocess
 from collections import deque
@@ -127,15 +127,15 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
             draw.text((tx,ty),ln,font=FEEDBACK_FONT,fill=(255,255,255)); ty+=line_h+4
     return cv2.cvtColor(np.array(pil),cv2.COLOR_RGB2BGR)
 
-# ============ Motion Detection (ORIGINAL - שעבד!) ============
+# ============ IMPROVED Motion Detection for Fast Reps ============
 BASE_FRAME_SKIP = 3
 ACTIVE_FRAME_SKIP = 1
 MOTION_DETECTION_WINDOW = 8
-MOTION_VEL_THRESHOLD = 0.0012
-MOTION_ACCEL_THRESHOLD = 0.0008
-ELBOW_CHANGE_THRESHOLD = 6.0
-COOLDOWN_FRAMES = 22
-MIN_VEL_FOR_MOTION = 0.0005
+MOTION_VEL_THRESHOLD = 0.0010        # ↓ יותר רגיש
+MOTION_ACCEL_THRESHOLD = 0.0006      # ↓ יותר רגיש
+ELBOW_CHANGE_THRESHOLD = 5.0         # ↓ יותר רגיש
+COOLDOWN_FRAMES = 24                 # ↑ זמן ארוך יותר
+MIN_VEL_FOR_MOTION = 0.0004          # ↓ סף נמוך יותר
 
 class MotionDetector:
     def __init__(self):
@@ -157,6 +157,7 @@ class MotionDetector:
         motion_detected = False
         reason = ""
         
+        # בדיקה 1: מהירות כתף
         if len(self.shoulder_history) >= 2:
             vel = abs(self.shoulder_history[-1] - self.shoulder_history[-2])
             self.velocity_history.append(vel)
@@ -172,38 +173,42 @@ class MotionDetector:
                 elif accel > MOTION_ACCEL_THRESHOLD:
                     motion_detected = True
                     reason = f"accel({accel:.4f})"
-                elif recent_avg > MOTION_VEL_THRESHOLD * 0.7:
+                elif recent_avg > MOTION_VEL_THRESHOLD * 0.65:
                     motion_detected = True
                     reason = f"sustained({recent_avg:.4f})"
         
+        # בדיקה 2: שינוי במרפק
         if len(self.elbow_history) >= 3:
             elbow_change = abs(self.elbow_history[-1] - self.elbow_history[-3])
             elbow_vel = abs(self.elbow_history[-1] - self.elbow_history[-2])
             if elbow_change > ELBOW_CHANGE_THRESHOLD:
                 motion_detected = True
                 reason = f"elbow_change({elbow_change:.1f}°)"
-            elif elbow_vel > ELBOW_CHANGE_THRESHOLD * 0.6:
+            elif elbow_vel > ELBOW_CHANGE_THRESHOLD * 0.55:
                 motion_detected = True
                 reason = f"elbow_vel({elbow_vel:.1f}°)"
         
+        # בדיקה 3: שינוי גולמי במרפק (קריטי למהירות!)
         if len(self.raw_elbow_history) >= 3:
             raw_change = abs(self.raw_elbow_history[-1] - self.raw_elbow_history[-3])
             raw_vel = abs(self.raw_elbow_history[-1] - self.raw_elbow_history[-2])
-            if raw_change > 12.0:
+            if raw_change > 10.0:  # ↓ סף נמוך יותר
                 motion_detected = True
                 reason = f"raw_spike({raw_change:.1f}°)"
-            elif raw_vel > 8.0:
+            elif raw_vel > 6.0:  # ↓ סף נמוך יותר
                 motion_detected = True
                 reason = f"raw_vel({raw_vel:.1f}°)"
         
+        # בדיקה 4: תבנית V
         if len(self.raw_elbow_history) >= 5:
             elbows = list(self.raw_elbow_history)
-            went_down = elbows[-5] - elbows[-3] > 15
-            went_up = elbows[-1] - elbows[-3] > 15
+            went_down = elbows[-5] - elbows[-3] > 12  # ↓ סף נמוך יותר
+            went_up = elbows[-1] - elbows[-3] > 12
             if went_down and went_up:
                 motion_detected = True
                 reason = f"V_pattern"
         
+        # בדיקה 5: שינוי כיוון
         if len(self.shoulder_history) >= 5:
             diffs = [self.shoulder_history[i+1] - self.shoulder_history[i] 
                     for i in range(len(self.shoulder_history)-1)]
@@ -250,32 +255,32 @@ class MotionDetector:
             "last_reason": self.last_activation_reason
         }
 
-# ============ Push-up Parameters (ORIGINAL - שעבד!) ============
-ELBOW_BENT_ANGLE = 105.0
-SHOULDER_MIN_DESCENT = 0.040
-RESET_ASCENT = 0.025
-RESET_ELBOW = 155.0
-REFRACTORY_FRAMES = 2
+# ============ RELAXED Parameters for Fast Reps ============
+ELBOW_BENT_ANGLE = 108.0             # ↑ יותר סלחני
+SHOULDER_MIN_DESCENT = 0.037         # ↓ פחות מינימום
+RESET_ASCENT = 0.023                 # ↓ איפוס מהיר
+RESET_ELBOW = 153.0                  # ↓ איפוס מהיר
+REFRACTORY_FRAMES = 1                # ↓ כמעט אפס
 
-ELBOW_EMA_ALPHA = 0.70
-SHOULDER_EMA_ALPHA = 0.65
+ELBOW_EMA_ALPHA = 0.73               # ↑ מהיר יותר
+SHOULDER_EMA_ALPHA = 0.68            # ↑ מהיר יותר
 
-VIS_THR_STRICT = 0.30
-PLANK_BODY_ANGLE_MAX = 25.0
-HANDS_BELOW_SHOULDERS = 0.03
-ONPUSHUP_MIN_FRAMES = 3
-OFFPUSHUP_MIN_FRAMES = 6
+VIS_THR_STRICT = 0.28
+PLANK_BODY_ANGLE_MAX = 26.0
+HANDS_BELOW_SHOULDERS = 0.035
+ONPUSHUP_MIN_FRAMES = 2
+OFFPUSHUP_MIN_FRAMES = 5
 AUTO_STOP_AFTER_EXIT_SEC = 1.5
 TAIL_NOPOSE_STOP_SEC = 1.0
 
-# ============ Feedback System - FIXED! ============
-# Form Errors - מורידים נקודות (מופיעים ב-"feedback")
+# ============ CORRECT Feedback System! ============
+# Form Errors - מורידים נקודות (מופיעים רק ב-"feedback" עם ⚠️)
 FB_ERROR_DEPTH = "Go deeper (elbows to 90°)"
 FB_ERROR_HIPS = "Keep hips level (don't sag or pike)"
 FB_ERROR_LOCKOUT = "Fully extend arms at top"
 FB_ERROR_ELBOWS = "Keep elbows at 45° (not flared)"
 
-# Performance Tips - לא מורידים נקודות (מופיעים ב-"tips")
+# Performance Tips - לא מורידים נקודות (מופיעים רק ב-"form_tip" עם 💡)
 PERF_TIP_SLOW_DOWN = "Lower slowly for better control"
 PERF_TIP_TEMPO = "Try 2-1-2 tempo (down-pause-up)"
 PERF_TIP_BREATHING = "Breathe: inhale down, exhale up"
@@ -327,8 +332,8 @@ LOCKOUT_FAIL_MIN_REPS = 2
 FLARE_FAIL_MIN_REPS = 3
 TEMPO_CHECK_MIN_REPS = 4
 
-BURST_FRAMES = 7
-INFLECT_VEL_THR = 0.0025
+BURST_FRAMES = 8                     # ↑ יותר אגרסיבי
+INFLECT_VEL_THR = 0.0027
 
 DEBUG_ONPUSHUP = bool(int(os.getenv("DEBUG_ONPUSHUP", "0")))
 DEBUG_MOTION = bool(int(os.getenv("DEBUG_MOTION", "0")))
@@ -391,9 +396,9 @@ def run_pushup_analysis(video_path,
     onpushup=False; onpushup_streak=0; offpushup_streak=0
     offpushup_frames_since_any_rep=0; nopose_frames_since_any_rep=0
 
-    # ✅ FIXED: הפרדה מלאה
-    session_form_errors=set()       # רק שגיאות פורם
-    session_perf_tips=set()         # רק טיפים לביצוע
+    # ✅ CORRECT: הפרדה מוחלטת!
+    session_form_errors=set()        # ⚠️ רק שגיאות פורם שמורידות ציון
+    session_perf_tips=set()          # 💡 רק טיפים לשיפור שלא מורידים ציון
     rt_fb_msg=None; rt_fb_hold=0
 
     cycle_tip_deeper=False; cycle_tip_hips=False; cycle_tip_lockout=False; cycle_tip_elbows=False
@@ -414,7 +419,7 @@ def run_pushup_analysis(video_path,
     OFFPUSHUP_STOP_FRAMES=sec_to_frames(AUTO_STOP_AFTER_EXIT_SEC)
     NOPOSE_STOP_FRAMES=sec_to_frames(TAIL_NOPOSE_STOP_SEC)
     RT_FB_HOLD_FRAMES=sec_to_frames(0.8)
-    REARM_ASCENT_EFF=max(RESET_ASCENT*0.60, 0.015)
+    REARM_ASCENT_EFF=max(RESET_ASCENT*0.55, 0.013)
 
     burst_cntr=0
 
@@ -623,7 +628,7 @@ def run_pushup_analysis(video_path,
                 descent_amt=0.0 if desc_base_shoulder is None else (shoulder_y-desc_base_shoulder)
 
                 at_bottom=(elbow_angle<=ELBOW_BENT_ANGLE) and (descent_amt>=SHOULDER_MIN_DESCENT)
-                raw_bottom=(raw_elbow_min<=(ELBOW_BENT_ANGLE+8.0)) and (descent_amt>=SHOULDER_MIN_DESCENT*0.88)
+                raw_bottom=(raw_elbow_min<=(ELBOW_BENT_ANGLE+10.0)) and (descent_amt>=SHOULDER_MIN_DESCENT*0.85)
                 at_bottom=at_bottom or raw_bottom
                 can_cnt=(frame_idx - last_bottom_frame) >= REFRACTORY_FRAMES
 
@@ -654,7 +659,7 @@ def run_pushup_analysis(video_path,
                         cycle_tip_deeper = True
                         depth_fail_count += 1
                         if depth_fail_count >= DEPTH_FAIL_MIN_REPS and not depth_already_reported:
-                            session_form_errors.add(FB_ERROR_DEPTH)  # ✅ רק errors
+                            session_form_errors.add(FB_ERROR_DEPTH)  # ✅ שגיאת פורם
                             depth_already_reported = True
                             cur_rt = FB_ERROR_DEPTH
 
@@ -702,17 +707,18 @@ def run_pushup_analysis(video_path,
     if rep_count==0: 
         technique_score=0.0
     else:
-        if session_form_errors:  # ✅ רק errors
+        if session_form_errors:  # ✅ רק errors מורידים ציון
             penalty = sum(FB_WEIGHTS.get(m,FB_DEFAULT_WEIGHT) for m in set(session_form_errors))
             penalty = max(PENALTY_MIN_IF_ANY, penalty)
         else:
             penalty = 0.0
         technique_score=_half_floor10(max(0.0,10.0-penalty))
 
-    # ✅ הפרדה מוחלטת
+    # ✅ CRITICAL: הפרדה מוחלטת!
     form_errors_list = [err for err in FORM_ERROR_PRIORITY if err in session_form_errors]
     perf_tips_list = [tip for tip in PERF_TIP_PRIORITY if tip in session_perf_tips]
 
+    # אם אין שגיאות פורם אבל יש טיפים - הציון נשאר גבוה!
     primary_form_error = form_errors_list[0] if form_errors_list else None
     primary_perf_tip = perf_tips_list[0] if perf_tips_list else None
 
@@ -727,8 +733,8 @@ def run_pushup_analysis(video_path,
         if all_scores:
             print(f"[GRADING] Average score: {sum(all_scores)/len(all_scores):.1f}")
         print(f"[GRADING] Technique score: {technique_score:.1f}")
-        print(f"[GRADING] Form errors: {form_errors_list}")
-        print(f"[GRADING] Performance tips: {perf_tips_list}")
+        print(f"[GRADING] Form errors (⚠️ affecting score): {form_errors_list}")
+        print(f"[GRADING] Performance tips (💡 NOT affecting score): {perf_tips_list}")
 
     try:
         with open(feedback_path,"w",encoding="utf-8") as f:
@@ -741,7 +747,7 @@ def run_pushup_analysis(video_path,
                 f.write("\n⚠️ Form Corrections (affecting score):\n")
                 for ln in form_errors_list: f.write(f"- {ln}\n")
             if perf_tips_list:
-                f.write("\n💡 Performance Tips (not affecting score):\n")
+                f.write("\n💡 Performance Tips (NOT affecting score):\n")
                 for ln in perf_tips_list: f.write(f"• {ln}\n")
     except Exception:
         pass
@@ -767,8 +773,8 @@ def run_pushup_analysis(video_path,
         "technique_label": score_label(technique_score),
         "good_reps": int(good_reps),
         "bad_reps": int(bad_reps),
-        "feedback": form_errors_list,      # ⚠️ רק form errors
-        "tips": perf_tips_list,            # 💡 רק performance tips
+        "feedback": form_errors_list,      # ⚠️ רק Form Errors - מורידים ציון
+        "tips": perf_tips_list,            # 💡 רק Performance Tips - לא מורידים ציון
         "reps": rep_reports,
         "video_path": final_path if return_video else "",
         "feedback_path": feedback_path,
@@ -780,11 +786,14 @@ def run_pushup_analysis(video_path,
         }
     }
     
-    # ✅ נפרד לגמרי
-    if primary_form_error:
-        result["form_tip"] = primary_form_error
+    # ✅ CRITICAL: הפרדה נכונה ב-UI!
+    # Form Tip = Performance Tip (💡 לא מוריד ציון)
+    # Feedback = Form Error (⚠️ מוריד ציון)
     if primary_perf_tip:
-        result["performance_tip"] = primary_perf_tip
+        result["form_tip"] = primary_perf_tip  # 💡 זה יופיע כ-"Form Tip" בUI
+    if primary_form_error:
+        # ⚠️ זה יופיע ב-"Feedback" (אזהרה) בUI
+        pass
 
     return result
 
@@ -833,13 +842,13 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                         lockout_already_reported, flare_already_reported, tempo_already_reported,
                         session_form_errors, session_perf_tips, rep_count, local_vars):
     
-    # ✅ Form errors - מורידים נקודות
+    # ✅ Form errors - מורידים ציון (⚠️ מופיעים ב-feedback)
     if bottom_phase_min_elbow is not None:
         if bottom_phase_min_elbow > DEPTH_FAIR_ANGLE:
             local_vars['cycle_tip_deeper'] = True
             local_vars['depth_fail_count'] += 1
             if local_vars['depth_fail_count'] >= DEPTH_FAIL_MIN_REPS and not depth_already_reported:
-                session_form_errors.add(FB_ERROR_DEPTH)
+                session_form_errors.add(FB_ERROR_DEPTH)  # ⚠️
                 local_vars['depth_already_reported'] = True
 
     if top_phase_max_elbow is not None:
@@ -847,7 +856,7 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
             local_vars['cycle_tip_lockout'] = True
             local_vars['lockout_fail_count'] += 1
             if local_vars['lockout_fail_count'] >= LOCKOUT_FAIL_MIN_REPS and not lockout_already_reported:
-                session_form_errors.add(FB_ERROR_LOCKOUT)
+                session_form_errors.add(FB_ERROR_LOCKOUT)  # ⚠️
                 local_vars['lockout_already_reported'] = True
 
     if cycle_max_hip_misalign is not None:
@@ -855,7 +864,7 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
             local_vars['cycle_tip_hips'] = True
             local_vars['hips_fail_count'] += 1
             if local_vars['hips_fail_count'] >= HIPS_FAIL_MIN_REPS and not hips_already_reported:
-                session_form_errors.add(FB_ERROR_HIPS)
+                session_form_errors.add(FB_ERROR_HIPS)  # ⚠️
                 local_vars['hips_already_reported'] = True
 
     if cycle_max_flare is not None:
@@ -863,16 +872,16 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
             local_vars['cycle_tip_elbows'] = True
             local_vars['flare_fail_count'] += 1
             if local_vars['flare_fail_count'] >= FLARE_FAIL_MIN_REPS and not flare_already_reported:
-                session_form_errors.add(FB_ERROR_ELBOWS)
+                session_form_errors.add(FB_ERROR_ELBOWS)  # ⚠️
                 local_vars['flare_already_reported'] = True
     
-    # ✅ Performance tips - לא מורידים נקודות
+    # ✅ Performance tips - לא מורידים ציון (💡 מופיעים ב-form_tip)
     if rep_count >= TEMPO_CHECK_MIN_REPS and not tempo_already_reported:
         if cycle_max_descent_vel > DESCENT_SPEED_FAST:
             local_vars['fast_descent_count'] += 1
             if local_vars['fast_descent_count'] >= 3:
-                session_perf_tips.add(PERF_TIP_SLOW_DOWN)
-                session_perf_tips.add(PERF_TIP_TEMPO)
+                session_perf_tips.add(PERF_TIP_SLOW_DOWN)  # 💡
+                session_perf_tips.add(PERF_TIP_TEMPO)      # 💡
                 local_vars['tempo_already_reported'] = True
 
 def _count_rep(rep_reports, rep_count, bottom_elbow, descent_from, bottom_shoulder_y, all_scores, rep_has_tip,
