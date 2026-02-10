@@ -114,6 +114,10 @@ class BulgarianConfig:
     skeleton_quality_thr: float = 0.55
     skeleton_jump_thr: float = 0.12
 
+    # --- Debug ---
+    debug_log: bool = True
+    debug_log_path: str = "bulgarian_debug.log"
+
 
 # ========================== ENUMS & TYPES ==========================
 
@@ -343,9 +347,14 @@ class RepStateMachine:
         self._thresh_lockout = 0.0
         self._update_thresholds()
 
+        # Debug log
+        self._debug_lines: List[str] = []
+
     def set_standing_angle(self, angle: float):
         self._standing_angle = angle
         self._update_thresholds()
+        self._log(f"CALIBRATED standing={angle:.1f}, descent_entry={self._thresh_descent_entry:.1f}, "
+                  f"bottom_zone={self._thresh_bottom_zone:.1f}, lockout={self._thresh_lockout:.1f}")
 
     def _update_thresholds(self):
         s = self._standing_angle
@@ -355,6 +364,9 @@ class RepStateMachine:
         self._thresh_ascent_confirm = 0  # dynamic, based on rep's min angle
         self._thresh_lockout = s - c.lockout_offset
 
+    def _log(self, msg: str):
+        self._debug_lines.append(msg)
+
     def update(self, knee_angle: float, knee_velocity: float,
                torso_angle: float, valgus_ok: bool,
                frame_no: int, current_time: float,
@@ -362,9 +374,11 @@ class RepStateMachine:
         """
         Process one frame. Returns a rep report dict if a rep was just completed.
         """
+        prev_phase = self.phase
+
         if movement_blocked:
-            # If walking, cancel any in-progress rep
             if self.phase in (Phase.DESCENDING, Phase.BOTTOM):
+                self._log(f"F{frame_no}: CANCEL rep – movement blocked during {self.phase.name}")
                 self._cancel_rep()
             return None
 
@@ -387,6 +401,17 @@ class RepStateMachine:
         # Update live depth
         self._update_depth_live(knee_angle)
 
+        # Log phase transitions
+        if self.phase != prev_phase:
+            self._log(f"F{frame_no}: {prev_phase.name} → {self.phase.name} "
+                      f"(knee={knee_angle:.1f}, vel={knee_velocity:.1f})")
+
+        # Periodic logging every 5 frames
+        if frame_no % 5 == 0:
+            self._log(f"F{frame_no}: phase={self.phase.name}, knee={knee_angle:.1f}, "
+                      f"vel={knee_velocity:.1f}, torso={torso_angle:.1f}, "
+                      f"blocked={movement_blocked}, still={is_still}, count={self.count}")
+
         return result
 
     def _handle_idle(self, knee_angle, knee_velocity, frame_no, current_time):
@@ -402,6 +427,8 @@ class RepStateMachine:
                 start_time=current_time,
                 descent_start_angle=knee_angle
             )
+            self._log(f"F{frame_no}: REP START (knee={knee_angle:.1f}, vel={knee_velocity:.1f}, "
+                      f"thresh={self._thresh_descent_entry:.1f})")
         return None
 
     def _handle_descending(self, knee_angle, knee_velocity, torso_angle,
@@ -517,15 +544,18 @@ class RepStateMachine:
         # Validation checks
         duration = current_time - rep.start_time
         if duration < self.cfg.min_rep_duration_sec:
+            self._log(f"F{frame_no}: REJECT rep – too short ({duration:.2f}s)")
             self._cancel_rep()
             return None
 
         rom = rep.descent_start_angle - rep.min_knee_angle
         if rom < self.cfg.min_depth_degrees:
+            self._log(f"F{frame_no}: REJECT rep – ROM too small ({rom:.1f}° < {self.cfg.min_depth_degrees}°)")
             self._cancel_rep()
             return None
 
         if rep.bottom_frames < self.cfg.min_bottom_frames:
+            self._log(f"F{frame_no}: REJECT rep – too few bottom frames ({rep.bottom_frames})")
             self._cancel_rep()
             return None
 
@@ -566,6 +596,9 @@ class RepStateMachine:
         self._last_lockout_frame = frame_no
         self._last_lockout_time = current_time
         self.current_rep = None
+
+        self._log(f"F{frame_no}: ✓ REP #{self.count} COUNTED! score={score_q}, "
+                  f"ROM={rom:.1f}°, depth={int(depth_pct*100)}%, dur={duration:.2f}s")
 
         return report
 
@@ -965,6 +998,22 @@ def run_bulgarian_analysis(video_path: str,
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
+    # Setup debug log file
+    debug_file = None
+    if cfg.debug_log:
+        debug_path = cfg.debug_log_path
+        if os.path.dirname(output_path):
+            debug_path = os.path.join(os.path.dirname(output_path), debug_path)
+        try:
+            debug_file = open(debug_path, "w", encoding="utf-8")
+            debug_file.write("=== Bulgarian Split Squat Debug Log ===\n")
+        except Exception:
+            debug_file = None
+
+    def dlog(msg):
+        if debug_file:
+            debug_file.write(msg + "\n")
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {"error": f"Cannot open video: {video_path}", "squat_count": 0,
@@ -974,6 +1023,14 @@ def run_bulgarian_analysis(video_path: str,
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25.0
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
     dt = 1.0 / effective_fps
+
+    dlog(f"Video: {video_path}, FPS: {fps_in}, frame_skip: {frame_skip}, effective_fps: {effective_fps}")
+    dlog(f"Config: standing={cfg.fallback_standing_angle}, descent_offset={cfg.descent_trigger_offset}, "
+         f"bottom_offset={cfg.bottom_zone_offset}, lockout_offset={cfg.lockout_offset}")
+    dlog(f"Velocity: descent={cfg.min_descent_velocity}, ascent={cfg.min_ascent_velocity}")
+    dlog(f"Validation: min_depth={cfg.min_depth_degrees}°, min_bottom={cfg.min_bottom_frames}f, "
+         f"min_dur={cfg.min_rep_duration_sec}s")
+    dlog("")
 
     # Load fonts
     fonts = {
@@ -1011,6 +1068,9 @@ def run_bulgarian_analysis(video_path: str,
     rt_fb_msg: Optional[str] = None
     rt_fb_hold = 0
 
+    pose_detected_count = 0
+    no_pose_total = 0
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -1038,6 +1098,7 @@ def run_bulgarian_analysis(video_path: str,
 
         if not results.pose_landmarks:
             # No pose detected
+            no_pose_total += 1
             if state_machine.count > 0:
                 nopose_consecutive += 1
             if state_machine.count > 0 and nopose_consecutive >= nopose_stop_frames:
@@ -1052,6 +1113,7 @@ def run_bulgarian_analysis(video_path: str,
                 rt_fb_msg = None
         else:
             nopose_consecutive = 0
+            pose_detected_count += 1
             lms = results.pose_landmarks.landmark
 
             # Detect active leg (robust voting)
@@ -1085,6 +1147,15 @@ def run_bulgarian_analysis(video_path: str,
             knee_angle = smoothed['knee']
             torso_angle = smoothed['torso']
             knee_velocity = smoother.velocity('knee')  # deg/sec, negative = descending
+
+            # Per-frame debug log (every 10 frames)
+            if frame_no % 10 == 0:
+                dlog(f"F{frame_no} t={current_time:.2f}: leg={side}, raw_knee={knee_angle_raw:.1f}, "
+                     f"smooth_knee={knee_angle:.1f}, vel={knee_velocity:.1f}°/s, "
+                     f"torso={torso_angle:.1f}, blocked={movement_blocked}, still={is_still}, "
+                     f"phase={state_machine.phase.name}, "
+                     f"hip_vel={movement_filter.hip_vel_ema:.4f}, "
+                     f"ankle_vel={movement_filter.ankle_vel_ema:.4f}")
 
             # Valgus check
             v_ok = check_valgus(lms, side, cfg.valgus_x_tol)
@@ -1153,6 +1224,18 @@ def run_bulgarian_analysis(video_path: str,
     # Build result
     result = state_machine.result()
 
+    # Write debug summary
+    dlog(f"\n=== FINAL SUMMARY ===")
+    dlog(f"Total frames: {frame_no}, Pose detected: {pose_detected_count}/{frame_no}")
+    dlog(f"Calibrated standing: {calibrator.get_standing_angle():.1f}° (done={calibrator.is_done})")
+    dlog(f"Active leg: {active_leg}")
+    dlog(f"Final count: {state_machine.count}, Good: {state_machine.good_reps}, Bad: {state_machine.bad_reps}")
+    dlog(f"\nState machine log:")
+    for line in state_machine._debug_lines:
+        dlog(f"  {line}")
+    if debug_file:
+        debug_file.close()
+
     # Session tip
     session_tip = choose_session_tip(state_machine.all_feedback)
     result["tips"] = [session_tip]
@@ -1160,6 +1243,17 @@ def run_bulgarian_analysis(video_path: str,
 
     # Calibration info
     result["calibrated_standing_angle"] = round(calibrator.get_standing_angle(), 1)
+
+    # Diagnostic info
+    result["_debug"] = {
+        "total_frames": frame_no,
+        "pose_detected_frames": pose_detected_count,
+        "no_pose_frames": no_pose_total,
+        "active_leg": active_leg,
+        "calibrated_standing": round(calibrator.get_standing_angle(), 1),
+        "calibration_done": calibrator.is_done,
+        "debug_log_path": cfg.debug_log_path if cfg.debug_log else None
+    }
 
     # Write feedback file
     try:
