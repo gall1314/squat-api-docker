@@ -645,11 +645,13 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
             # --- Calibration (first ~10 stable frames) ---
             vis = getattr(lms[getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value], 'visibility', 0) or 0
-            counter.calibrate_standing(knee_angle, vis > 0.5 and not movement_block)
+            counter.calibrate_standing(knee_angle, vis > 0.5)
 
-            # --- Update counter (only when not walking) ---
-            if not movement_block or movement_free_streak >= MOVEMENT_CLEAR_FRAMES:
-                counter.update(knee_angle, torso_angle, v_ok, frame_no)
+            # --- Update counter ---
+            # IMPORTANT: do not block rep counting by the walking filter.
+            # In real videos, hip/ankle velocity can stay above threshold even during valid reps,
+            # which previously led to never calling `counter.update(...)` and reporting 0 reps.
+            counter.update(knee_angle, torso_angle, v_ok, frame_no)
 
             # --- Live depth ---
             if knee_angle > counter._up_thresh - 5 and movement_free_streak >= 1:
