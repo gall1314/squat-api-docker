@@ -324,6 +324,7 @@ class BulgarianRepCounter:
         self._down_frames = 0
         self._last_depth_for_ui = 0.0
         self._last_rep_end_frame = -100
+        self._last_standing_knee = 170.0
 
         # Adaptive thresholds (start with defaults, may be calibrated)
         self._down_thresh = ANGLE_DOWN_THRESH
@@ -424,11 +425,14 @@ class BulgarianRepCounter:
         knee_angle < down_thresh → entering descent
         knee_angle > up_thresh AND was down → rep complete (if valid)
         """
+        if knee_angle > self._up_thresh:
+            self._last_standing_knee = max(self._last_standing_knee, float(knee_angle))
+
         # === ENTER DOWN ===
         if knee_angle < self._down_thresh:
             if self.stage != 'down':
                 self.stage = 'down'
-                if not self._start_rep(frame_no, knee_angle):
+                if not self._start_rep(frame_no, self._last_standing_knee):
                     self.stage = 'up'
                     return
             self._down_frames += 1
@@ -445,6 +449,7 @@ class BulgarianRepCounter:
                 score, fb, depth = self.evaluate_form()
                 self.count += 1
                 self._finish_rep(frame_no, score, fb, extra={"depth_pct": float(depth)})
+                self._last_standing_knee = float(knee_angle)
             else:
                 # Reset without counting
                 self._last_depth_for_ui = 0.0
@@ -640,11 +645,13 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
             # --- Calibration (first ~10 stable frames) ---
             vis = getattr(lms[getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value], 'visibility', 0) or 0
-            counter.calibrate_standing(knee_angle, vis > 0.5 and not movement_block)
+            counter.calibrate_standing(knee_angle, vis > 0.5)
 
-            # --- Update counter (only when not walking) ---
-            if not movement_block or movement_free_streak >= MOVEMENT_CLEAR_FRAMES:
-                counter.update(knee_angle, torso_angle, v_ok, frame_no)
+            # --- Update counter ---
+            # IMPORTANT: do not block rep counting by the walking filter.
+            # In real videos, hip/ankle velocity can stay above threshold even during valid reps,
+            # which previously led to never calling `counter.update(...)` and reporting 0 reps.
+            counter.update(knee_angle, torso_angle, v_ok, frame_no)
 
             # --- Live depth ---
             if knee_angle > counter._up_thresh - 5 and movement_free_streak >= 1:
