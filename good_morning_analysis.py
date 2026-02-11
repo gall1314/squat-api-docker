@@ -42,7 +42,6 @@ mp_pose = mp.solutions.pose
 # ===================== FEEDBACK SEVERITY =====================
 FB_SEVERITY = {
     "Hinge a bit deeper": 3,
-    "Keep your back neutral": 3,
     "Avoid excessive knee bend": 2,
     "Control the lowering": 2,
     "Pause briefly at the bottom": 1,
@@ -50,7 +49,6 @@ FB_SEVERITY = {
 
 FEEDBACK_CATEGORY = {
     "Hinge a bit deeper": "depth",
-    "Keep your back neutral": "back",
     "Avoid excessive knee bend": "knees",
     "Control the lowering": "tempo",
     "Pause briefly at the bottom": "tempo",
@@ -167,27 +165,11 @@ def torso_angle_to_vertical(hip, shoulder):
     cosang = float(np.clip(cosang, -1.0, 1.0))
     return float(math.degrees(math.acos(cosang)))
 
-def analyze_back_curvature(shoulder, hip, head_like, max_angle_deg=35.0, min_head_dist_ratio=0.35):
-    """
-    Fixed: Increased max_angle_deg from 20.0 to 35.0 to be less sensitive.
-    This allows for more natural head/neck position during Good Mornings.
-    """
-    torso_vec = shoulder - hip
-    head_vec = head_like - shoulder
-    torso_nrm = np.linalg.norm(torso_vec) + 1e-9
-    head_nrm = np.linalg.norm(head_vec) + 1e-9
-    if head_nrm < (min_head_dist_ratio * torso_nrm):
-        return 0.0, False
-    cosang = float(np.dot(torso_vec, head_vec) / (torso_nrm * head_nrm))
-    cosang = float(np.clip(cosang, -1.0, 1.0))
-    angle_deg = math.degrees(math.acos(cosang))
-    return angle_deg, angle_deg > max_angle_deg
-
 def _get_side_landmarks(lm):
     PL = mp_pose.PoseLandmark
     sides = {
-        "left": [PL.LEFT_SHOULDER, PL.LEFT_HIP, PL.LEFT_KNEE, PL.LEFT_ANKLE, PL.LEFT_EAR],
-        "right": [PL.RIGHT_SHOULDER, PL.RIGHT_HIP, PL.RIGHT_KNEE, PL.RIGHT_ANKLE, PL.RIGHT_EAR],
+        "left": [PL.LEFT_SHOULDER, PL.LEFT_HIP, PL.LEFT_KNEE, PL.LEFT_ANKLE],
+        "right": [PL.RIGHT_SHOULDER, PL.RIGHT_HIP, PL.RIGHT_KNEE, PL.RIGHT_ANKLE],
     }
     vis = {}
     for side, idxs in sides.items():
@@ -199,7 +181,6 @@ def _get_side_landmarks(lm):
         "hip": np.array([lm[idxs[1].value].x, lm[idxs[1].value].y]),
         "knee": np.array([lm[idxs[2].value].x, lm[idxs[2].value].y]),
         "ankle": np.array([lm[idxs[3].value].x, lm[idxs[3].value].y]),
-        "ear": np.array([lm[idxs[4].value].x, lm[idxs[4].value].y]),
     }
 
 # ===================== ANALYSIS PARAMS =====================
@@ -210,7 +191,6 @@ MIN_FRAMES_BETWEEN_REPS = 8
 PROG_ALPHA = 0.3
 
 KNEE_MIN_ANGLE = 150.0
-BACK_MAX_ANGLE = 35.0  # Fixed: Increased from 20.0 to match analyze_back_curvature
 
 MIN_ECC_S = 0.35
 MIN_BOTTOM_S = 0.12
@@ -228,12 +208,12 @@ def run_good_morning_analysis(video_path,
     """
     Good Morning analysis:
     - Counts reps using torso hinge angle (vertical -> hinged -> vertical)
-    - Checks hinge depth, knee bend, back neutrality, and tempo
+    - Checks hinge depth, knee bend, and tempo
     - Returns same schema as squat/deadlift analyzers
-    
-    Fixed issues:
-    1. Back neutrality check less sensitive (35° instead of 20°)
-    2. Feedback deduplicated - each message appears only once
+
+    Notes:
+    1. Back-rounding detection was removed (not reliable enough with MediaPipe landmarks)
+    2. Feedback is deduplicated so each message appears only once
     """
     if fast_mode is True:
         return_video = False
@@ -271,7 +251,6 @@ def run_good_morning_analysis(video_path,
 
     max_torso_angle = 0.0
     min_knee_angle = 999.0
-    back_issue = False
     down_frames = up_frames = bottom_hold_frames = 0
 
     rt_fb_msg = None
@@ -308,11 +287,9 @@ def run_good_morning_analysis(video_path,
             hip = pts["hip"]
             knee = pts["knee"]
             ankle = pts["ankle"]
-            ear = pts["ear"]
 
             torso_angle = torso_angle_to_vertical(hip, shoulder)
             knee_angle = angle_deg(hip, knee, ankle)
-            back_angle, back_bad = analyze_back_curvature(shoulder, hip, ear, max_angle_deg=BACK_MAX_ANGLE)
 
             progress = (torso_angle - STAND_ANGLE) / max(1e-6, (HINGE_BOTTOM_ANGLE - STAND_ANGLE))
             progress = float(np.clip(progress, 0.0, 1.0))
@@ -323,15 +300,12 @@ def run_good_morning_analysis(video_path,
                 bottom_reached = False
                 max_torso_angle = torso_angle
                 min_knee_angle = knee_angle
-                back_issue = False
                 down_frames = up_frames = bottom_hold_frames = 0
                 prev_progress = progress
 
             if in_rep:
                 max_torso_angle = max(max_torso_angle, torso_angle)
                 min_knee_angle = min(min_knee_angle, knee_angle)
-                if back_bad:
-                    back_issue = True
 
                 if prev_progress is not None:
                     if progress > prev_progress + 1e-4:
@@ -364,10 +338,6 @@ def run_good_morning_analysis(video_path,
                         feedback.append("Avoid excessive knee bend")
                         score -= 1.5
 
-                    if back_issue or back_angle > BACK_MAX_ANGLE:
-                        feedback.append("Keep your back neutral")
-                        score -= 2.0
-
                     if down_s < MIN_ECC_S:
                         feedback.append("Control the lowering")
                         score -= 1.0
@@ -398,7 +368,6 @@ def run_good_morning_analysis(video_path,
                         "metrics": {
                             "max_torso_angle": round(max_torso_angle, 2),
                             "min_knee_angle": round(min_knee_angle, 2),
-                            "back_angle": round(back_angle, 2),
                             "eccentric_s": round(down_s, 2),
                             "bottom_hold_s": round(bottom_s, 2)
                         }
@@ -437,8 +406,6 @@ def run_good_morning_analysis(video_path,
     if session_feedback_by_cat:
         if "depth" in session_feedback_by_cat:
             session_tip = "Push the hips farther back to load the hamstrings"
-        elif "back" in session_feedback_by_cat:
-            session_tip = "Brace your core and keep a neutral spine"
         elif "knees" in session_feedback_by_cat:
             session_tip = "Maintain a soft knee bend to keep it a hinge"
         elif "tempo" in session_feedback_by_cat:
