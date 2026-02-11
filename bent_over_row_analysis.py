@@ -56,7 +56,7 @@ GLOBAL_MOTION_LOCK_FRAMES = 4 # frames to wait when motion spikes
 # Rep logic (Row-specific, but conservative to match squat reliability)
 ELBOW_EXTENDED_MIN = 160.0    # start from nearly straight
 ELBOW_PULL_START   = 150.0    # crossing below -> start pull
-ELBOW_TOP_MAX      = 75.0     # top position must be ≤ this to count ROM
+ELBOW_TOP_MAX      = 80.0     # top position must be ≤ this to count ROM (more tolerant for torso-contact reps)
 MIN_FRAMES_BETWEEN_REPS = 6
 
 # ROM donut normalization
@@ -69,7 +69,8 @@ TORSO_IDEAL_MIN = 15.0    # deg above horizontal - nearly parallel to floor
 TORSO_IDEAL_MAX = 35.0    # deg above horizontal - acceptable range
 TORSO_HIGH_WARNING = 50.0 # deg above horizontal - too upright warning
 TORSO_DRIFT_MAX  = 25.0   # allowed change during a rep (INCREASED - stable execution)
-KNEE_EXTENSION_THRESHOLD = 8.0  # deg of knee straightening = leg drive
+KNEE_EXTENSION_THRESHOLD = 12.0  # deg of knee straightening = meaningful leg drive
+KNEE_EXTENSION_TIP_THRESHOLD = 9.0  # mild straightening gets tip only
 MIN_REP_SAMPLES  = 5      # minimum samples to trust drift/mean metrics
 MIN_DEPTH_PCT_FOR_STABILITY = 60.0  # only trust stability cues on meaningful ROM
 
@@ -230,26 +231,28 @@ def analyze_rep(rep_metrics):
     depth_pct = rep_metrics.get("depth_pct") or 0.0
     allow_stability_cues = depth_pct >= MIN_DEPTH_PCT_FOR_STABILITY
 
-    # ROM check - ONLY severe issues mark as improper
+    torso_mean = rep_metrics.get("torso_mean")
+    torso_is_upright = torso_mean is not None and torso_mean > TORSO_IDEAL_MAX
+
+    # ROM check - ONLY severe issues mark as improper.
+    # If torso is already too upright, prioritize torso correction and avoid noisy "pull higher" cue.
     if rep_metrics["min_elbow_angle"] is None or rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX + 10:
         # Very severe ROM issue
         penalty += ROM_PENALTY_STRONG
         feedback.append(("severe", "Pull higher — reach your torso"))
         is_proper = False
-    elif rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX + 5:
+    elif rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX + 5 and not torso_is_upright:
         # Moderate ROM issue - still counts as proper but with feedback
         penalty += ROM_PENALTY_LIGHT
         feedback.append(("medium", "Try to pull a bit higher"))
         # NOT marking as improper for moderate issues
-    elif rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX:
+    elif rep_metrics["min_elbow_angle"] > ELBOW_TOP_MAX and not torso_is_upright:
         # Minor ROM issue - just a tip
         penalty += ROM_PENALTY_LIGHT * 0.5
         feedback.append(("tip", "Aim for stronger elbow flexion at the top"))
 
     # Torso angle check - MAIN FOCUS: is back horizontal enough?
-    if allow_stability_cues and rep_metrics["torso_mean"] is not None:
-        torso_mean = rep_metrics["torso_mean"]
-        
+    if allow_stability_cues and torso_mean is not None:
         # Too upright (back angle too high) - THIS IS THE MAIN ISSUE
         if torso_mean > TORSO_HIGH_WARNING:
             penalty += MOMENTUM_PENALTY  # High penalty for very upright
@@ -280,10 +283,10 @@ def analyze_rep(rep_metrics):
     # Leg drive - detect ACTUAL knee extension (straightening), not just movement
     if allow_stability_cues:
         knee_ext = rep_metrics.get("knee_extension")
-        if knee_ext is not None and knee_ext > 8.0:  # Significant straightening = leg drive
+        if knee_ext is not None and knee_ext > KNEE_EXTENSION_THRESHOLD:  # Significant straightening = leg drive
             penalty += LEGDRIVE_PENALTY
             feedback.append(("medium", "Minimize leg drive — keep knees steady"))
-        elif knee_ext is not None and knee_ext > 5.0:
+        elif knee_ext is not None and knee_ext > KNEE_EXTENSION_TIP_THRESHOLD:
             feedback.append(("tip", "Try to keep your knee angle constant throughout"))
 
     # Choose one strongest message for video overlay:
