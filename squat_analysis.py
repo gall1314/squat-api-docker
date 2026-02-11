@@ -243,6 +243,7 @@ STAND_KNEE_ANGLE    = 155.0
 MIN_FRAMES_BETWEEN_REPS_SQ = 6
 REP_FINISH_KNEE_MARGIN = 6.0
 REP_FINISH_DEPTH_MAX = 0.20
+REP_FINISH_ALLOW_MOVING_DEPTH_MAX = 0.10
 
 # --------- תנועה גלובלית ---------
 HIP_VEL_THRESH_PCT    = 0.014
@@ -527,7 +528,12 @@ def run_squat_analysis(video_path,
                     or (knee_angle > (STAND_KNEE_ANGLE - REP_FINISH_KNEE_MARGIN) and current_depth <= REP_FINISH_DEPTH_MAX)
                 )
 
-                if rep_finished_posture and (stage == "down") and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
+                rep_finish_gate_ok = (
+                    movement_free_streak >= MOVEMENT_CLEAR_FRAMES
+                    or current_depth <= REP_FINISH_ALLOW_MOVING_DEPTH_MAX
+                )
+
+                if rep_finished_posture and (stage == "down") and rep_finish_gate_ok:
                     if not is_valid_rep:
                         stage = "up"
                         start_knee_angle = None
