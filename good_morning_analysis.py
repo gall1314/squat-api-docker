@@ -167,7 +167,11 @@ def torso_angle_to_vertical(hip, shoulder):
     cosang = float(np.clip(cosang, -1.0, 1.0))
     return float(math.degrees(math.acos(cosang)))
 
-def analyze_back_curvature(shoulder, hip, head_like, max_angle_deg=20.0, min_head_dist_ratio=0.35):
+def analyze_back_curvature(shoulder, hip, head_like, max_angle_deg=35.0, min_head_dist_ratio=0.35):
+    """
+    Fixed: Increased max_angle_deg from 20.0 to 35.0 to be less sensitive.
+    This allows for more natural head/neck position during Good Mornings.
+    """
     torso_vec = shoulder - hip
     head_vec = head_like - shoulder
     torso_nrm = np.linalg.norm(torso_vec) + 1e-9
@@ -206,7 +210,7 @@ MIN_FRAMES_BETWEEN_REPS = 8
 PROG_ALPHA = 0.3
 
 KNEE_MIN_ANGLE = 150.0
-BACK_MAX_ANGLE = 20.0
+BACK_MAX_ANGLE = 35.0  # Fixed: Increased from 20.0 to match analyze_back_curvature
 
 MIN_ECC_S = 0.35
 MIN_BOTTOM_S = 0.12
@@ -226,6 +230,10 @@ def run_good_morning_analysis(video_path,
     - Counts reps using torso hinge angle (vertical -> hinged -> vertical)
     - Checks hinge depth, knee bend, back neutrality, and tempo
     - Returns same schema as squat/deadlift analyzers
+    
+    Fixed issues:
+    1. Back neutrality check less sensitive (35° instead of 20°)
+    2. Feedback deduplicated - each message appears only once
     """
     if fast_mode is True:
         return_video = False
@@ -249,7 +257,7 @@ def run_good_morning_analysis(video_path,
     counter = good_reps = bad_reps = 0
     all_scores = []
     rep_reports = []
-    session_feedbacks = []
+    session_feedbacks = []  # Will be deduplicated at the end
     session_feedback_by_cat = {}
     global_best = ""
 
@@ -376,6 +384,7 @@ def run_good_morning_analysis(video_path,
                     else:
                         bad_reps += 1
 
+                    # Add feedback to session list (will be deduplicated later)
                     session_feedbacks.extend(feedback)
                     _, session_feedback_by_cat = pick_strongest_per_category(session_feedbacks)
                     global_best = merge_feedback(global_best, feedback)
@@ -419,7 +428,10 @@ def run_good_morning_analysis(video_path,
     if session_feedbacks and len(session_feedbacks) > 0:
         technique_score = min(technique_score, 9.5)
 
-    feedback_list = session_feedbacks if session_feedbacks else ["Great form! Keep it up 💪"]
+    # Fixed: Deduplicate feedback - each message appears only once
+    # Use dict.fromkeys() to preserve order while removing duplicates
+    unique_feedbacks = list(dict.fromkeys(session_feedbacks))
+    feedback_list = unique_feedbacks if unique_feedbacks else ["Great form! Keep it up 💪"]
 
     session_tip = None
     if session_feedback_by_cat:
