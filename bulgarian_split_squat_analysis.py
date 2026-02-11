@@ -22,35 +22,35 @@ mp_pose = mp.solutions.pose
 # --- These are tuned for frame_skip=3, scale=0.4 ---
 
 # Rep detection thresholds
-ANGLE_DOWN_THRESH   = 105     # knee angle below this = "down"
-ANGLE_UP_THRESH     = 150     # knee angle above this = "up"
-MIN_RANGE_DELTA_DEG = 10      # min ROM to count
-MIN_DOWN_FRAMES     = 2       # with skip=3 → only ~3-5 frames in descent
+ANGLE_DOWN_THRESH   = 105     # knee angle below this = "down" (wider than 95 for noisy data)
+ANGLE_UP_THRESH     = 150     # knee angle above this = "up" (lower than 160 for noisy data)
+MIN_RANGE_DELTA_DEG = 10      # min ROM to count (lower than 12 for skip=3)
+MIN_DOWN_FRAMES     = 2       # with skip=3 at 30fps → only ~3-5 frames in descent
 
 # Form scoring
 GOOD_REP_MIN_SCORE  = 8.0
 PERFECT_MIN_KNEE    = 70
 TORSO_LEAN_MIN      = 135
 TORSO_MARGIN_DEG    = 3
-TORSO_BAD_MIN_FRAMES = 3
+TORSO_BAD_MIN_FRAMES = 3       # lower for skip=3
 VALGUS_X_TOL        = 0.03
-VALGUS_BAD_MIN_FRAMES = 2
+VALGUS_BAD_MIN_FRAMES = 2      # lower for skip=3
 
 # Smoothing
-EMA_ALPHA           = 0.7     # higher = more responsive with few frames
+EMA_ALPHA           = 0.7     # higher = more responsive (less lag with few frames)
 
 # Debounce
-REP_DEBOUNCE_FRAMES = 3
+REP_DEBOUNCE_FRAMES = 3       # lower for skip=3 (each frame = 3 real frames)
 
 # Walking filter
-HIP_VEL_THRESH_PCT   = 0.018
+HIP_VEL_THRESH_PCT   = 0.018  # more lenient (noisy at low res)
 ANKLE_VEL_THRESH_PCT  = 0.022
 MOTION_EMA_ALPHA      = 0.55
-MOVEMENT_CLEAR_FRAMES = 1
+MOVEMENT_CLEAR_FRAMES = 1     # just 1 clean frame needed at low fps
 
 # Early exit
 NOPOSE_STOP_SEC       = 1.5
-NO_MOVEMENT_STOP_SEC  = 3.0   # raised: don't exit if user pauses between reps
+NO_MOVEMENT_STOP_SEC  = 1.5
 
 # Overlay style
 BAR_BG_ALPHA         = 0.55
@@ -319,16 +319,12 @@ class BulgarianRepCounter:
         self._curr_max_knee = -999.0
         self._curr_min_torso = 999.0
         self._curr_valgus_bad = 0
-        self._torso_bad_total = 0      # FIX: total bad frames in rep (not consecutive)
-        self._torso_bad_consec = 0     # FIX: consecutive counter (for RT feedback)
+        self._torso_bad_frames = 0
         self._valgus_bad_frames = 0
         self._down_frames = 0
         self._last_depth_for_ui = 0.0
         self._last_rep_end_frame = -100
-
-        # Standing angle tracking: EMA that decays toward current standing angle
-        self._standing_knee_ema = None
-        _STANDING_EMA_ALPHA = 0.25     # slow-moving average of standing knee angle
+        self._last_standing_knee = 170.0
 
         # Adaptive thresholds (start with defaults, may be calibrated)
         self._down_thresh = ANGLE_DOWN_THRESH
@@ -347,28 +343,13 @@ class BulgarianRepCounter:
             self._cal_samples.append(knee_angle)
         if len(self._cal_samples) >= 10:
             self._standing_angle = float(np.median(self._cal_samples))
-            new_down = self._standing_angle - 65
-            new_up = self._standing_angle - 15
+            # Adjust thresholds based on actual standing angle
+            new_down = self._standing_angle - 65   # e.g. 170-65=105
+            new_up = self._standing_angle - 15     # e.g. 170-15=155
+            # Clamp to sane range
             self._down_thresh = float(np.clip(new_down, 75, 120))
             self._up_thresh = float(np.clip(new_up, 140, 170))
-            self._standing_knee_ema = self._standing_angle
             self._cal_done = True
-
-    def _update_standing_ema(self, knee_angle):
-        """Track standing angle with slow EMA — resets per-rep instead of drifting up."""
-        if knee_angle > self._up_thresh:
-            if self._standing_knee_ema is None:
-                self._standing_knee_ema = float(knee_angle)
-            else:
-                self._standing_knee_ema = 0.25 * knee_angle + 0.75 * self._standing_knee_ema
-
-    def _get_standing_angle(self):
-        """Best estimate of current standing knee angle."""
-        if self._standing_knee_ema is not None:
-            return self._standing_knee_ema
-        if self._standing_angle is not None:
-            return self._standing_angle
-        return 170.0
 
     def _start_rep(self, frame_no, start_knee_angle):
         if frame_no - self._last_rep_end_frame < REP_DEBOUNCE_FRAMES:
@@ -379,8 +360,7 @@ class BulgarianRepCounter:
         self._curr_max_knee = -999.0
         self._curr_min_torso = 999.0
         self._curr_valgus_bad = 0
-        self._torso_bad_total = 0
-        self._torso_bad_consec = 0
+        self._torso_bad_frames = 0
         self._valgus_bad_frames = 0
         self._down_frames = 0
         return True
@@ -418,7 +398,7 @@ class BulgarianRepCounter:
     def evaluate_form(self):
         feedback = []
         score = 10.0
-        start = self._start_knee_angle or self._get_standing_angle()
+        start = self._start_knee_angle or 170
         min_k = self._curr_min_knee if self._curr_min_knee < 900 else start
         denom = max(10.0, start - PERFECT_MIN_KNEE)
         depth_pct = float(np.clip((start - min_k) / denom, 0, 1))
@@ -430,8 +410,7 @@ class BulgarianRepCounter:
         elif depth_pct < 0.9:
             score -= 0.5
 
-        # FIX: use total bad frames, not consecutive
-        if self._torso_bad_total >= TORSO_BAD_MIN_FRAMES:
+        if self._torso_bad_frames >= TORSO_BAD_MIN_FRAMES:
             feedback.append("Keep your back straight"); score -= 2
 
         if self._curr_valgus_bad >= VALGUS_BAD_MIN_FRAMES:
@@ -446,15 +425,14 @@ class BulgarianRepCounter:
         knee_angle < down_thresh → entering descent
         knee_angle > up_thresh AND was down → rep complete (if valid)
         """
-        # Track standing angle (only when standing)
-        self._update_standing_ema(knee_angle)
+        if knee_angle > self._up_thresh:
+            self._last_standing_knee = max(self._last_standing_knee, float(knee_angle))
 
         # === ENTER DOWN ===
         if knee_angle < self._down_thresh:
             if self.stage != 'down':
                 self.stage = 'down'
-                # FIX: use EMA-tracked standing angle instead of max-only
-                if not self._start_rep(frame_no, self._get_standing_angle()):
+                if not self._start_rep(frame_no, self._last_standing_knee):
                     self.stage = 'up'
                     return
             self._down_frames += 1
@@ -471,6 +449,7 @@ class BulgarianRepCounter:
                 score, fb, depth = self.evaluate_form()
                 self.count += 1
                 self._finish_rep(frame_no, score, fb, extra={"depth_pct": float(depth)})
+                self._last_standing_knee = float(knee_angle)
             else:
                 # Reset without counting
                 self._last_depth_for_ui = 0.0
@@ -484,12 +463,10 @@ class BulgarianRepCounter:
             self._curr_max_knee = max(self._curr_max_knee, knee_angle)
             self._curr_min_torso = min(self._curr_min_torso, torso_angle)
 
-            # FIX: track both consecutive (for RT feedback) and total (for scoring)
             if torso_angle < (TORSO_LEAN_MIN - TORSO_MARGIN_DEG):
-                self._torso_bad_consec += 1
-                self._torso_bad_total += 1
+                self._torso_bad_frames += 1
             else:
-                self._torso_bad_consec = 0
+                self._torso_bad_frames = 0
 
             if not valgus_ok_flag:
                 self._valgus_bad_frames += 1
@@ -557,6 +534,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
     counter = BulgarianRepCounter()
     frame_no = 0
+    active_leg = None
     out = None
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     pose = mp_pose.Pose(model_complexity=1, min_detection_confidence=0.5,
@@ -567,11 +545,6 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
     dt = 1.0 / float(effective_fps)
-
-    # FIX: robust leg detection with voting over first N frames
-    leg_votes = []
-    active_leg = None
-    LEG_VOTE_FRAMES = 8
 
     # Early exit
     NOPOSE_STOP_FRAMES = int(NOPOSE_STOP_SEC * effective_fps)
@@ -592,9 +565,6 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
     prev_hip = prev_la = prev_ra = None
     hip_vel_ema = ankle_vel_ema = 0.0
     movement_free_streak = 0
-
-    # FIX: skip first rep if video starts mid-movement
-    _first_stable_standing_seen = False
 
     def _euclid(a, b, norm):
         return math.hypot(a[0]-b[0], a[1]-b[1]) / max(1, norm)
@@ -632,42 +602,8 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             nopose_since_rep = 0
             lms = results.pose_landmarks.landmark
 
-            # FIX: robust leg detection with voting
             if active_leg is None:
-                vote = detect_active_leg(lms)
-                leg_votes.append(vote)
-                if len(leg_votes) >= LEG_VOTE_FRAMES:
-                    left_c = leg_votes.count('left')
-                    right_c = leg_votes.count('right')
-                    active_leg = 'left' if left_c >= right_c else 'right'
-                else:
-                    # Use current best guess while collecting votes
-                    left_c = leg_votes.count('left')
-                    right_c = leg_votes.count('right')
-                    active_leg_temp = 'left' if left_c >= right_c else 'right'
-                    side = "RIGHT" if active_leg_temp == "right" else "LEFT"
-                    # Still process the frame but don't lock in the leg yet
-                    # (we'll re-enter this block next frame)
-                    active_leg = None  # keep voting
-
-                    # Process angles with temp leg for calibration
-                    hip = lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_HIP").value, w, h)
-                    knee_pt = lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value, w, h)
-                    ankle_pt = lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value, w, h)
-                    knee_angle_raw = angle_3pt(hip, knee_pt, ankle_pt)
-                    ka, _ = ema.update(knee_angle_raw, 160)
-                    vis = getattr(lms[getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value], 'visibility', 0) or 0
-                    counter.calibrate_standing(ka, vis > 0.5)
-                    stab_lms = lm_stab.stabilize(lms)
-
-                    if return_video:
-                        if stab_lms:
-                            frame = draw_body_only(frame, stab_lms)
-                        frame = draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0)
-                        if out is not None:
-                            out.write(frame)
-                    continue
-
+                active_leg = detect_active_leg(lms)
             side = "RIGHT" if active_leg == "right" else "LEFT"
 
             # --- Walking filter ---
@@ -707,18 +643,15 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             knee_angle, torso_angle = ema.update(knee_angle_raw, torso_angle_raw)
             v_ok = check_valgus(lms, side, VALGUS_X_TOL)
 
-            # --- Calibration ---
+            # --- Calibration (first ~10 stable frames) ---
             vis = getattr(lms[getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value], 'visibility', 0) or 0
             counter.calibrate_standing(knee_angle, vis > 0.5)
 
-            # --- FIX: require seeing at least one standing frame before counting ---
-            if not _first_stable_standing_seen:
-                if knee_angle > counter._up_thresh:
-                    _first_stable_standing_seen = True
-
-            # --- Update counter (always — walking filter is too aggressive for BSS) ---
-            if _first_stable_standing_seen:
-                counter.update(knee_angle, torso_angle, v_ok, frame_no)
+            # --- Update counter ---
+            # IMPORTANT: do not block rep counting by the walking filter.
+            # In real videos, hip/ankle velocity can stay above threshold even during valid reps,
+            # which previously led to never calling `counter.update(...)` and reporting 0 reps.
+            counter.update(knee_angle, torso_angle, v_ok, frame_no)
 
             # --- Live depth ---
             if knee_angle > counter._up_thresh - 5 and movement_free_streak >= 1:
@@ -733,8 +666,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             # --- RT feedback ---
             live_msgs = []
             if counter.stage == 'down':
-                # FIX: use consecutive counter for RT feedback (responsive)
-                if counter._torso_bad_consec >= TORSO_BAD_MIN_FRAMES:
+                if counter._torso_bad_frames >= TORSO_BAD_MIN_FRAMES:
                     live_msgs.append("Keep your back straight")
                 if counter._valgus_bad_frames >= VALGUS_BAD_MIN_FRAMES:
                     live_msgs.append("Avoid knee collapse")
