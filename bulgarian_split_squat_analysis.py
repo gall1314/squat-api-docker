@@ -31,9 +31,9 @@ FAST_REP_MIN_DEPTH_DELTA = 18 # allow faster reps if there is clear ROM
 # Form scoring
 GOOD_REP_MIN_SCORE  = 8.0
 PERFECT_MIN_KNEE    = 70
-TORSO_LEAN_MIN      = 135
+TORSO_LEAN_MIN      = 122
 TORSO_MARGIN_DEG    = 3
-TORSO_BAD_MIN_FRAMES = 3       # lower for skip=3
+TORSO_BAD_MIN_FRAMES = 5       # require clearer sustained torso collapse before flagging
 VALGUS_X_TOL        = 0.03
 VALGUS_BAD_MIN_FRAMES = 2      # lower for skip=3
 
@@ -490,7 +490,7 @@ class BulgarianRepCounter:
     def result(self):
         avg = np.mean([float(r["score"]) for r in self.rep_reports]) if self.rep_reports else 0.0
         ts = round(float(avg) * 2) / 2.0
-        aggregated_feedback = list(self.all_feedback.elements())
+        aggregated_feedback = list(self.all_feedback.keys())
         return {
             "squat_count": self.count,
             "technique_score": float(ts),
