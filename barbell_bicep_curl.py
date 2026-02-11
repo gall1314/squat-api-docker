@@ -197,6 +197,11 @@ TOP_FLEXION_MAX_ANGLE      = 130.0 # תקרה כדי לא להיות רך מדי
 TOP_FLEXION_MARGIN_DEG     = 12.0  # מרווח נוסף לפני שמתריעים
 TOP_FLEXION_TRIGGER_FRAMES = 6     # כמה פריימים רצופים לפני RT alert
 ECC_SLOW_MIN_SEC           = 0.25
+ANGLE_EMA_ALPHA            = 0.45
+UP_START_DERIV_THR         = -0.9
+DOWN_START_DERIV_THR       = 0.45
+DIRECTION_STREAK_FRAMES    = 2
+REP_END_ANGLE_THR          = ELBOW_EXT_END_THR - 3.0
 
 def _top_flexion_threshold(bottom_ref):
     bottom_ref = float(bottom_ref)
@@ -274,7 +279,11 @@ def run_barbell_bicep_curl_analysis(video_path,
     rep_max_elbow_angle = -999.0
     top_index = None
     last_angle = None
+    elbow_angle_ema = None
     top_flex_bad_frames = 0
+    up_motion_streak = 0
+    down_motion_streak = 0
+    saw_descent_after_top = False
 
     # RT feedback
     rt_fb_msg = None
@@ -351,7 +360,11 @@ def run_barbell_bicep_curl_analysis(video_path,
                     if out is not None:
                         out.write(frame)
                 continue
-            elbow_angle = float(np.mean(angles))
+            elbow_angle_raw = float(np.mean(angles))
+            elbow_angle_ema = elbow_angle_raw if elbow_angle_ema is None else (
+                ANGLE_EMA_ALPHA * elbow_angle_raw + (1.0 - ANGLE_EMA_ALPHA) * elbow_angle_ema
+            )
+            elbow_angle = float(elbow_angle_ema)
 
             # EMA ליישור תחתית (כמו סקוואט — מתעדכן רק כשהיד כמעט ישרה ושקט תנועתי)
             if (elbow_angle > ELBOW_EXT_END_THR) and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
@@ -371,8 +384,19 @@ def run_barbell_bicep_curl_analysis(video_path,
                 deriv = elbow_angle - last_angle  # >0 ירידה (אקצנטרי), <0 עלייה (קונצנטרי)
             last_angle = elbow_angle
 
+            if deriv is not None:
+                if deriv < UP_START_DERIV_THR:
+                    up_motion_streak += 1
+                else:
+                    up_motion_streak = 0
+
+                if deriv > DOWN_START_DERIV_THR:
+                    down_motion_streak += 1
+                else:
+                    down_motion_streak = 0
+
             # התחלת רפ — מלמטה מתחילים לעלות (קונצנטרי)
-            if (stage is None or stage == "down") and (deriv is not None) and (deriv < -1.5) \
+            if (stage is None or stage == "down") and (deriv is not None) and (up_motion_streak >= DIRECTION_STREAK_FRAMES) \
                and (elbow_angle <= ELBOW_EXT_END_THR) and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
                 stage = "up"
                 rep_start_frame = frame_idx
@@ -381,6 +405,7 @@ def run_barbell_bicep_curl_analysis(video_path,
                 rep_max_elbow_angle = -999.0
                 top_index = None
                 top_flex_bad_frames = 0
+                saw_descent_after_top = False
                 rt_fb_msg = None
                 rt_fb_hold = 0
 
@@ -389,9 +414,10 @@ def run_barbell_bicep_curl_analysis(video_path,
                 rep_min_elbow_angle = min(rep_min_elbow_angle, elbow_angle)
                 rep_max_elbow_angle = max(rep_max_elbow_angle, elbow_angle)
                 # מעבר לטופ → מתחילה ירידה
-                if stage == "up" and (deriv is not None) and deriv > 0.8:
+                if stage == "up" and (deriv is not None) and (down_motion_streak >= DIRECTION_STREAK_FRAMES):
                     stage = "down"
                     top_index = frame_idx
+                    saw_descent_after_top = True
 
                 # RT-feedback: לא מספיק גבוה למעלה
                 if stage == "up":
@@ -411,7 +437,7 @@ def run_barbell_bicep_curl_analysis(video_path,
                     if rt_fb_hold > 0: rt_fb_hold -= 1
 
             # סיום רפ — חזרה ליישור + שקט תנועתי
-            if (stage in ("up","down")) and (elbow_angle >= ELBOW_EXT_END_THR) and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
+            if (stage in ("up","down")) and (elbow_angle >= REP_END_ANGLE_THR) and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES) and saw_descent_after_top:
                 if frame_idx - (rep_start_frame or frame_idx) > 3:
                     feedbacks = []
                     penalty = 0.0
@@ -479,6 +505,9 @@ def run_barbell_bicep_curl_analysis(video_path,
                     rep_max_elbow_angle = -999.0
                     top_index = None
                     top_flex_bad_frames = 0
+                    up_motion_streak = 0
+                    down_motion_streak = 0
+                    saw_descent_after_top = False
                     rt_fb_msg = None
                     rt_fb_hold = 0
 
