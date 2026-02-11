@@ -26,13 +26,14 @@ ANGLE_DOWN_THRESH   = 105     # knee angle below this = "down" (wider than 95 fo
 ANGLE_UP_THRESH     = 150     # knee angle above this = "up" (lower than 160 for noisy data)
 MIN_RANGE_DELTA_DEG = 10      # min ROM to count (lower than 12 for skip=3)
 MIN_DOWN_FRAMES     = 2       # with skip=3 at 30fps → only ~3-5 frames in descent
+FAST_REP_MIN_DEPTH_DELTA = 18 # allow faster reps if there is clear ROM
 
 # Form scoring
 GOOD_REP_MIN_SCORE  = 8.0
 PERFECT_MIN_KNEE    = 70
-TORSO_LEAN_MIN      = 135
+TORSO_LEAN_MIN      = 112
 TORSO_MARGIN_DEG    = 3
-TORSO_BAD_MIN_FRAMES = 3       # lower for skip=3
+TORSO_BAD_MIN_FRAMES = 8       # much stricter persistence to avoid natural-lean false positives
 VALGUS_X_TOL        = 0.03
 VALGUS_BAD_MIN_FRAMES = 2      # lower for skip=3
 
@@ -408,7 +409,7 @@ class BulgarianRepCounter:
         elif depth_pct < 0.8:
             feedback.append("Go a bit deeper"); score -= 1.5
         elif depth_pct < 0.9:
-            score -= 0.5
+            feedback.append("Try to reach a bit more depth for full ROM"); score -= 0.5
 
         if self._torso_bad_frames >= TORSO_BAD_MIN_FRAMES:
             feedback.append("Keep your back straight"); score -= 2
@@ -417,6 +418,8 @@ class BulgarianRepCounter:
             feedback.append("Avoid knee collapse"); score -= 2
 
         score = float(np.clip(score, 0, 10))
+        if score < 10.0 and not feedback:
+            feedback.append("Good rep, but there is still room for cleaner form")
         return score, feedback, depth_pct
 
     def update(self, knee_angle, torso_angle, valgus_ok_flag, frame_no):
@@ -438,12 +441,15 @@ class BulgarianRepCounter:
             self._down_frames += 1
 
         # === ENTER UP (potential rep complete) ===
-        elif knee_angle > self._up_thresh and self.stage == 'down':
+        elif knee_angle > (self._up_thresh - 5) and self.stage == 'down':
             start_angle = self._start_knee_angle or 0
             min_knee = self._curr_min_knee if self._curr_min_knee < 900 else 0
             depth_delta = start_angle - min_knee
             moved_enough = depth_delta >= MIN_RANGE_DELTA_DEG
-            enough_frames = self._down_frames >= MIN_DOWN_FRAMES
+            enough_frames = (
+                self._down_frames >= MIN_DOWN_FRAMES
+                or (self._down_frames >= 1 and depth_delta >= FAST_REP_MIN_DEPTH_DELTA)
+            )
 
             if enough_frames and moved_enough:
                 score, fb, depth = self.evaluate_form()
@@ -484,6 +490,7 @@ class BulgarianRepCounter:
     def result(self):
         avg = np.mean([float(r["score"]) for r in self.rep_reports]) if self.rep_reports else 0.0
         ts = round(float(avg) * 2) / 2.0
+        aggregated_feedback = list(self.all_feedback.keys())
         return {
             "squat_count": self.count,
             "technique_score": float(ts),
@@ -491,7 +498,7 @@ class BulgarianRepCounter:
             "technique_label": _score_label(ts),
             "good_reps": self.good_reps,
             "bad_reps": self.bad_reps,
-            "feedback": list(self.all_feedback.elements()) if self.bad_reps > 0 else ["Great form! Keep it up 💪"],
+            "feedback": aggregated_feedback if aggregated_feedback else ["Great form! Keep it up 💪"],
             "reps": self.rep_reports,
         }
 
