@@ -31,9 +31,9 @@ FAST_REP_MIN_DEPTH_DELTA = 18 # allow faster reps if there is clear ROM
 # Form scoring
 GOOD_REP_MIN_SCORE  = 8.0
 PERFECT_MIN_KNEE    = 70
-TORSO_LEAN_MIN      = 122
+TORSO_LEAN_MIN      = 112
 TORSO_MARGIN_DEG    = 3
-TORSO_BAD_MIN_FRAMES = 5       # require clearer sustained torso collapse before flagging
+TORSO_BAD_MIN_FRAMES = 8       # much stricter persistence to avoid natural-lean false positives
 VALGUS_X_TOL        = 0.03
 VALGUS_BAD_MIN_FRAMES = 2      # lower for skip=3
 
