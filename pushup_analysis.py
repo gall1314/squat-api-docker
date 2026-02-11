@@ -587,10 +587,16 @@ def run_pushup_analysis(video_path,
                         cycle_max_descent_vel = max(cycle_max_descent_vel, vel_abs)
 
                     min_elb_now = min(raw_elbow_L, raw_elbow_R)
+                    cycle_bottom_samples.append(min_elb_now)
+                    if len(cycle_bottom_samples) > 40:
+                        cycle_bottom_samples.pop(0)
                     if bottom_phase_min_elbow is None: bottom_phase_min_elbow = min_elb_now
                     else: bottom_phase_min_elbow = min(bottom_phase_min_elbow, min_elb_now)
 
                     max_elb_now = max(raw_elbow_L, raw_elbow_R)
+                    cycle_top_samples.append(max_elb_now)
+                    if len(cycle_top_samples) > 40:
+                        cycle_top_samples.pop(0)
                     if top_phase_max_elbow is None: top_phase_max_elbow = max_elb_now
                     else: top_phase_max_elbow = max(top_phase_max_elbow, max_elb_now)
 
