@@ -128,13 +128,13 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     return cv2.cvtColor(np.array(pil),cv2.COLOR_RGB2BGR)
 
 # ============ IMPROVED Motion Detection - better for fast speeds ============
-BASE_FRAME_SKIP = 3
+BASE_FRAME_SKIP = 1
 ACTIVE_FRAME_SKIP = 1
 MOTION_DETECTION_WINDOW = 8
-MOTION_VEL_THRESHOLD = 0.0011       # מעט יותר רגיש
-MOTION_ACCEL_THRESHOLD = 0.0007     # מעט יותר רגיש
-ELBOW_CHANGE_THRESHOLD = 5.5        # מעט יותר רגיש
-COOLDOWN_FRAMES = 23                # קצת יותר זמן
+MOTION_VEL_THRESHOLD = 0.0010       # יותר רגיש לתנועה מהירה
+MOTION_ACCEL_THRESHOLD = 0.0006     # יותר רגיש לשינויי קצב
+ELBOW_CHANGE_THRESHOLD = 5.0        # יותר רגיש לשינוי בזווית מרפק
+COOLDOWN_FRAMES = 26                # שומר חלון פעילות מעט ארוך יותר
 MIN_VEL_FOR_MOTION = 0.0004
 
 class MotionDetector:
@@ -256,8 +256,8 @@ class MotionDetector:
         }
 
 # ============ Slightly More Forgiving Parameters - BUT STRICTER DEPTH ============
-ELBOW_BENT_ANGLE = 100.0            # ✅ סף ספירה קפדני יותר (היה 107)
-SHOULDER_MIN_DESCENT = 0.039        # קצת פחות
+ELBOW_BENT_ANGLE = 102.0            # מעט סלחני יותר כדי לא לפספס חזרות מהירות
+SHOULDER_MIN_DESCENT = 0.036        # סף ירידה מעט נמוך יותר לחזרות מהירות
 RESET_ASCENT = 0.024                # קצת מהיר יותר
 RESET_ELBOW = 153.0                 # קצת מהיר יותר
 REFRACTORY_FRAMES = 1               # מינימום
@@ -268,7 +268,7 @@ SHOULDER_EMA_ALPHA = 0.67           # קצת יותר מהיר
 VIS_THR_STRICT = 0.29
 PLANK_BODY_ANGLE_MAX = 26.0
 HANDS_BELOW_SHOULDERS = 0.035
-ONPUSHUP_MIN_FRAMES = 2
+ONPUSHUP_MIN_FRAMES = 1
 OFFPUSHUP_MIN_FRAMES = 5
 AUTO_STOP_AFTER_EXIT_SEC = 1.5
 TAIL_NOPOSE_STOP_SEC = 1.0
@@ -339,6 +339,13 @@ DEBUG_ONPUSHUP = bool(int(os.getenv("DEBUG_ONPUSHUP", "0")))
 DEBUG_MOTION = bool(int(os.getenv("DEBUG_MOTION", "0")))
 DEBUG_GRADING = bool(int(os.getenv("DEBUG_GRADING", "1")))
 
+MIN_CYCLE_ELBOW_SAMPLES = 4
+ROBUST_BOTTOM_PERCENTILE = 15
+ROBUST_TOP_PERCENTILE = 85
+BOTTOM_SAMPLE_DESCENT_RATIO = 0.55
+TOP_SAMPLE_ASCENT_RATIO = 0.40
+
+
 def run_pushup_analysis(video_path,
                         frame_skip=None,
                         scale=0.4,
@@ -402,6 +409,7 @@ def run_pushup_analysis(video_path,
     rt_fb_msg=None; rt_fb_hold=0
 
     cycle_tip_deeper=False; cycle_tip_hips=False; cycle_tip_lockout=False; cycle_tip_elbows=False
+    cycle_bottom_samples=[]; cycle_top_samples=[]
     depth_fail_count=0; hips_fail_count=0; lockout_fail_count=0; flare_fail_count=0
     depth_already_reported=False; hips_already_reported=False
     lockout_already_reported=False; flare_already_reported=False
@@ -503,6 +511,7 @@ def run_pushup_analysis(video_path,
                 desc_base_shoulder=None; allow_new_bottom=True
                 cycle_max_descent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
                 cycle_tip_deeper=False; cycle_tip_hips=False; cycle_tip_lockout=False; cycle_tip_elbows=False
+                cycle_bottom_samples=[]; cycle_top_samples=[]
                 bottom_phase_min_elbow=None; top_phase_max_elbow=None
                 cycle_max_hip_misalign=None; cycle_max_flare=None
                 cycle_max_descent_vel=0.0
@@ -510,7 +519,8 @@ def run_pushup_analysis(video_path,
                 motion_detector.activate("enter_plank")
 
             if onpushup and offpushup_streak>=OFFPUSHUP_MIN_FRAMES:
-                cycle_has_issues = _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
+                robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow)
+                cycle_has_issues = _evaluate_cycle_form(lms, robust_bottom_elbow, robust_top_elbow,
                                    cycle_max_hip_misalign, cycle_max_flare,
                                    cycle_max_descent_vel,
                                    depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
@@ -524,7 +534,7 @@ def run_pushup_analysis(video_path,
                                desc_base_shoulder if desc_base_shoulder is not None else shoulder_y,
                                baseline_shoulder_y+cycle_max_descent if baseline_shoulder_y is not None else shoulder_y,
                                all_scores, cycle_has_issues,  # ✅ Use return value
-                               bottom_phase_min_elbow, top_phase_max_elbow, 
+                               robust_bottom_elbow, robust_top_elbow, 
                                cycle_max_hip_misalign, cycle_max_flare)
                     rep_count+=1
                     if cycle_has_issues: bad_reps+=1  # ✅ Use return value
@@ -533,6 +543,7 @@ def run_pushup_analysis(video_path,
                 onpushup=False; offpushup_frames_since_any_rep=0
                 desc_base_shoulder=None; cycle_max_descent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
                 cycle_tip_deeper=False; cycle_tip_hips=False; cycle_tip_lockout=False; cycle_tip_elbows=False
+                cycle_bottom_samples=[]; cycle_top_samples=[]
                 bottom_phase_min_elbow=None; top_phase_max_elbow=None
                 cycle_max_hip_misalign=None; cycle_max_flare=None
                 cycle_max_descent_vel=0.0
@@ -557,6 +568,7 @@ def run_pushup_analysis(video_path,
                     if shoulder_vel>abs(INFLECT_VEL_THR):
                         desc_base_shoulder=shoulder_y
                         cycle_max_descent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
+                        cycle_bottom_samples=[]; cycle_top_samples=[]
                         bottom_phase_min_elbow=None; top_phase_max_elbow=None
                         cycle_max_hip_misalign=None; cycle_max_flare=None
                         cycle_max_descent_vel=0.0
@@ -582,6 +594,21 @@ def run_pushup_analysis(video_path,
                     if top_phase_max_elbow is None: top_phase_max_elbow = max_elb_now
                     else: top_phase_max_elbow = max(top_phase_max_elbow, max_elb_now)
 
+                    # Collect depth samples only near the lower portion of the rep
+                    descent_ratio = 0.0 if SHOULDER_MIN_DESCENT <= 1e-9 else (cycle_max_descent / SHOULDER_MIN_DESCENT)
+                    if in_descent_phase and (descent_ratio >= BOTTOM_SAMPLE_DESCENT_RATIO or min_elb_now <= (ELBOW_BENT_ANGLE + 18.0)):
+                        cycle_bottom_samples.append(min_elb_now)
+                        if len(cycle_bottom_samples) > 30:
+                            cycle_bottom_samples.pop(0)
+
+                    # Collect lockout samples near the top (during ascent / reset)
+                    ascent_progress = max(0.0, (desc_base_shoulder + cycle_max_descent) - shoulder_y)
+                    ascent_ratio = 0.0 if SHOULDER_MIN_DESCENT <= 1e-9 else (ascent_progress / SHOULDER_MIN_DESCENT)
+                    if (not in_descent_phase) and (ascent_ratio >= TOP_SAMPLE_ASCENT_RATIO or max_elb_now >= (LOCKOUT_POOR - 3.0)):
+                        cycle_top_samples.append(max_elb_now)
+                        if len(cycle_top_samples) > 30:
+                            cycle_top_samples.pop(0)
+
                     hip_misalign = _calculate_hip_misalignment(lms, LSH, RSH, LH, RH, LA, RA)
                     if cycle_max_hip_misalign is None: cycle_max_hip_misalign = hip_misalign
                     else: cycle_max_hip_misalign = max(cycle_max_hip_misalign, hip_misalign)
@@ -597,7 +624,10 @@ def run_pushup_analysis(video_path,
                         in_descent_phase = False
                     
                     if reset_by_asc or reset_by_elb:
-                        cycle_has_issues = _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
+                        robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(
+                            cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow
+                        )
+                        cycle_has_issues = _evaluate_cycle_form(lms, robust_bottom_elbow, robust_top_elbow,
                                            cycle_max_hip_misalign, cycle_max_flare,
                                            cycle_max_descent_vel,
                                            depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
@@ -610,16 +640,17 @@ def run_pushup_analysis(video_path,
                             _count_rep(rep_reports,rep_count,cycle_min_elbow,
                                        desc_base_shoulder,
                                        baseline_shoulder_y+cycle_max_descent if baseline_shoulder_y is not None else shoulder_y,
-                                       all_scores, cycle_has_issues,  # ✅
-                                       bottom_phase_min_elbow, top_phase_max_elbow,
+                                       all_scores, cycle_has_issues,
+                                       robust_bottom_elbow, robust_top_elbow,
                                        cycle_max_hip_misalign, cycle_max_flare)
                             rep_count+=1
-                            if cycle_has_issues: bad_reps+=1  # ✅
+                            if cycle_has_issues: bad_reps+=1
                             else: good_reps+=1
 
                         desc_base_shoulder=shoulder_y
                         cycle_max_descent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
                         allow_new_bottom=True
+                        cycle_bottom_samples=[]; cycle_top_samples=[]
                         bottom_phase_min_elbow=None; top_phase_max_elbow=None
                         cycle_max_hip_misalign=None; cycle_max_flare=None
                         cycle_max_descent_vel=0.0
@@ -637,9 +668,10 @@ def run_pushup_analysis(video_path,
                 if at_bottom and allow_new_bottom and can_cnt and (not counted_this_cycle):
                     # ✅ Calculate if has issues based on current measurements
                     rep_has_issues = False
-                    if bottom_phase_min_elbow and bottom_phase_min_elbow > DEPTH_FAIR_ANGLE:
+                    robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow)
+                    if robust_bottom_elbow and robust_bottom_elbow > DEPTH_FAIR_ANGLE:
                         rep_has_issues = True
-                    if top_phase_max_elbow and top_phase_max_elbow < LOCKOUT_GOOD:
+                    if robust_top_elbow and robust_top_elbow < LOCKOUT_GOOD:
                         rep_has_issues = True
                     if cycle_max_hip_misalign and cycle_max_hip_misalign > HIP_FAIR:
                         rep_has_issues = True
@@ -649,15 +681,14 @@ def run_pushup_analysis(video_path,
                     _count_rep(rep_reports,rep_count,elbow_angle,
                                desc_base_shoulder if desc_base_shoulder is not None else shoulder_y, shoulder_y,
                                all_scores, rep_has_issues,  # ✅
-                               bottom_phase_min_elbow if bottom_phase_min_elbow else raw_elbow_min,
-                               top_phase_max_elbow if top_phase_max_elbow else max(raw_elbow_L, raw_elbow_R),
+                               robust_bottom_elbow if robust_bottom_elbow else raw_elbow_min,
+                               robust_top_elbow if robust_top_elbow else max(raw_elbow_L, raw_elbow_R),
                                cycle_max_hip_misalign if cycle_max_hip_misalign else 0.0,
                                cycle_max_flare if cycle_max_flare else 0.0)
                     rep_count+=1
                     if rep_has_issues: bad_reps+=1  # ✅
                     else: good_reps+=1
                     last_bottom_frame=frame_idx; allow_new_bottom=False; counted_this_cycle=True
-                    top_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
                     in_descent_phase=False
                     motion_detector.activate("count_rep")
 
@@ -665,9 +696,15 @@ def run_pushup_analysis(video_path,
                     if shoulder_prev is not None and (shoulder_prev - shoulder_y) > 0 and (desc_base_shoulder is not None):
                         if ((desc_base_shoulder + cycle_max_descent) - shoulder_y) >= REARM_ASCENT_EFF:
                             allow_new_bottom=True
+                    max_elb_now = max(raw_elbow_L, raw_elbow_R)
+                    if max_elb_now >= (LOCKOUT_POOR - 3.0):
+                        cycle_top_samples.append(max_elb_now)
+                        if len(cycle_top_samples) > 30:
+                            cycle_top_samples.pop(0)
 
                 if at_bottom and not cycle_tip_deeper:
-                    if bottom_phase_min_elbow and bottom_phase_min_elbow > DEPTH_GOOD_ANGLE:
+                    robust_bottom_elbow, _ = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow)
+                    if robust_bottom_elbow and robust_bottom_elbow > DEPTH_GOOD_ANGLE:
                         cycle_tip_deeper = True
                         depth_fail_count += 1
                         if depth_fail_count >= DEPTH_FAIL_MIN_REPS and not depth_already_reported:
@@ -692,7 +729,8 @@ def run_pushup_analysis(video_path,
             if shoulder_y is not None: shoulder_prev=shoulder_y
 
     if onpushup and (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and (cycle_min_elbow<=ELBOW_BENT_ANGLE):
-        cycle_has_issues = _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
+        robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow)
+        cycle_has_issues = _evaluate_cycle_form(lms, robust_bottom_elbow, robust_top_elbow,
                            cycle_max_hip_misalign, cycle_max_flare,
                            cycle_max_descent_vel,
                            depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
@@ -705,7 +743,7 @@ def run_pushup_analysis(video_path,
                    desc_base_shoulder if desc_base_shoulder is not None else (baseline_shoulder_y or 0.0),
                    (baseline_shoulder_y + cycle_max_descent) if baseline_shoulder_y is not None else (baseline_shoulder_y or 0.0),
                    all_scores, cycle_has_issues,  # ✅
-                   bottom_phase_min_elbow, top_phase_max_elbow,
+                   robust_bottom_elbow, robust_top_elbow,
                    cycle_max_hip_misalign, cycle_max_flare)
         rep_count+=1
         if cycle_has_issues: bad_reps+=1  # ✅
@@ -808,6 +846,25 @@ def run_pushup_analysis(video_path,
     return result
 
 # ============ Helper Functions ============
+
+def _robust_cycle_elbows(bottom_samples, top_samples, fallback_bottom=None, fallback_top=None):
+    robust_bottom = fallback_bottom
+    robust_top = fallback_top
+
+    if bottom_samples:
+        arr = np.array(bottom_samples, dtype=np.float32)
+        robust_bottom = float(np.percentile(arr, ROBUST_BOTTOM_PERCENTILE))
+    if top_samples:
+        arr = np.array(top_samples, dtype=np.float32)
+        robust_top = float(np.percentile(arr, ROBUST_TOP_PERCENTILE))
+
+    # Guardrail: avoid impossible overlap from noisy short windows
+    if robust_bottom is not None and robust_top is not None and robust_top < robust_bottom:
+        robust_bottom = min(float(robust_bottom), float(fallback_bottom) if fallback_bottom is not None else float(robust_bottom))
+        robust_top = max(float(robust_top), float(fallback_top) if fallback_top is not None else float(robust_top))
+
+    return robust_bottom, robust_top
+
 def _calculate_body_angle(lms, LSH, RSH, LH, RH, LA, RA):
     mid_sh = ((lms[LSH].x + lms[RSH].x)/2.0, (lms[LSH].y + lms[RSH].y)/2.0)
     mid_ank = ((lms[LA].x + lms[RA].x)/2.0, (lms[LA].y + lms[RA].y)/2.0)
@@ -859,7 +916,7 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
     has_flare_issue = False
     
     # Form errors - מורידים נקודות
-    if bottom_phase_min_elbow is not None:
+    if bottom_phase_min_elbow is not None and local_vars.get("cycle_bottom_samples") and len(local_vars["cycle_bottom_samples"]) >= MIN_CYCLE_ELBOW_SAMPLES:
         if bottom_phase_min_elbow > DEPTH_FAIR_ANGLE:
             has_depth_issue = True  # ✅
             local_vars['cycle_tip_deeper'] = True
@@ -868,7 +925,7 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                 session_form_errors.add(FB_ERROR_DEPTH)
                 local_vars['depth_already_reported'] = True
 
-    if top_phase_max_elbow is not None:
+    if top_phase_max_elbow is not None and local_vars.get("cycle_top_samples") and len(local_vars["cycle_top_samples"]) >= MIN_CYCLE_ELBOW_SAMPLES:
         if top_phase_max_elbow < LOCKOUT_GOOD:
             has_lockout_issue = True  # ✅
             local_vars['cycle_tip_lockout'] = True
