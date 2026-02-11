@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 # squat_analysis.py — מהיר ואיטי עם לוגיקה זהה מובטחת
+# v2 — ספירת חזרות חדה יותר + סינון תנועות לא-רלוונטיות
 import os
 import cv2
 import math
 import numpy as np
 import subprocess
-from collections import Counter
+from collections import Counter, deque
 from PIL import ImageFont, ImageDraw, Image
 import mediapipe as mp
 
@@ -282,6 +283,159 @@ def calculate_depth_robust(mid_hip, mid_knee, mid_ankle, knee_angle, mid_shoulde
     return float(np.clip(depth_score, 0, 1))
 
 
+# ===================== REP VALIDATION SYSTEM =====================
+class RepValidator:
+    """
+    מערכת אימות חזרות רב-שכבתית:
+    
+    שכבה 1 - "צורת סקווט": הברכיים חייבות לכופף מספיק + לחזור למעלה.
+                           מעקב אחרי מסלול זווית הברך (צריך לראות ירידה ועלייה ברורה).
+    
+    שכבה 2 - "סימטריה אנכית": בסקווט אמיתי, האגן יורד ועולה *אנכית*.
+                               הליכה / הרמת מוט = תנועה אופקית דומיננטית.
+    
+    שכבה 3 - "יציבות רגליים": בסקווט הרגליים לא זזות הרבה מהמקום.
+                              הליכה = קרסוליים זזים אופקית בצורה משמעותית.
+    
+    שכבה 4 - "מינימום זמן": חזרה אמיתית לוקחת לפחות X פריימים.
+                            תנועה מהירה מדי (כמו כיפוף קל) = לא סקווט.
+    
+    שכבה 5 - "מסלול אגן": מעקב אחרי ה-Y של האגן לאורך החזרה.
+                           בסקווט אמיתי יש מסלול ∪ ברור (ירידה ועלייה).
+                           בהליכה או הרמת מוט, ה-Y לא עושה ∪ נקי.
+    """
+    
+    # --- מינימום ירידת ברך ---
+    MIN_KNEE_BEND_DEG = 35.0        # הברך חייבת לרדת לפחות 35 מעלות מהעמידה
+    
+    # --- יחס תנועה אנכית vs אופקית ---
+    MIN_VERTICAL_DOMINANCE = 1.2    # התנועה האנכית חייבת להיות לפחות 1.2x מהאופקית
+    
+    # --- יציבות קרסוליים ---
+    MAX_ANKLE_DRIFT_PCT = 0.12      # הקרסוליים לא זזים יותר מ-12% מגובה הגוף
+    
+    # --- מינימום פריימים לחזרה ---
+    MIN_REP_FRAMES = 4              # לפחות 4 פריימים מתחילת ירידה עד עלייה
+    
+    # --- מסלול אגן: מינימום עומק Y ---
+    MIN_HIP_DROP_PCT = 0.04         # האגן חייב לרדת לפחות 4% מגובה הפריים
+    
+    # --- knee angle range (בדיקת ROM) ---
+    MIN_KNEE_ROM = 25.0             # לפחות 25 מעלות טווח תנועה בברך
+    
+    def __init__(self):
+        self.reset()
+    
+    def reset(self):
+        """איפוס לתחילת חזרה חדשה"""
+        self.hip_y_history = []         # מעקב Y של האגן (normalized)
+        self.hip_x_history = []         # מעקב X של האגן
+        self.ankle_x_start_left = None  # מיקום התחלתי קרסול שמאל
+        self.ankle_x_start_right = None # מיקום התחלתי קרסול ימין
+        self.ankle_x_history_left = []
+        self.ankle_x_history_right = []
+        self.knee_angle_history = []    # מעקב זווית ברך
+        self.frame_count = 0
+        self.start_hip_y = None         # Y של האגן בתחילת החזרה
+        self.standing_knee_angle = None # זווית ברך בעמידה (לפני ירידה)
+    
+    def start_rep(self, mid_hip, l_ankle_x, r_ankle_x, knee_angle):
+        """התחלת מעקב חזרה חדשה"""
+        self.reset()
+        self.start_hip_y = mid_hip[1]
+        self.ankle_x_start_left = l_ankle_x
+        self.ankle_x_start_right = r_ankle_x
+        self.standing_knee_angle = knee_angle
+        self._add_frame(mid_hip, l_ankle_x, r_ankle_x, knee_angle)
+    
+    def _add_frame(self, mid_hip, l_ankle_x, r_ankle_x, knee_angle):
+        """הוספת מדידה מפריים"""
+        self.hip_y_history.append(mid_hip[1])
+        self.hip_x_history.append(mid_hip[0])
+        self.ankle_x_history_left.append(l_ankle_x)
+        self.ankle_x_history_right.append(r_ankle_x)
+        self.knee_angle_history.append(knee_angle)
+        self.frame_count += 1
+    
+    def update(self, mid_hip, l_ankle_x, r_ankle_x, knee_angle):
+        """עדכון פריים חדש"""
+        self._add_frame(mid_hip, l_ankle_x, r_ankle_x, knee_angle)
+    
+    def validate(self, frame_h=1.0):
+        """
+        בדיקה האם החזרה היא סקווט אמיתי.
+        מחזיר (is_valid, reason_if_rejected)
+        """
+        if self.frame_count < self.MIN_REP_FRAMES:
+            return False, "too_short"
+        
+        if len(self.knee_angle_history) < 2:
+            return False, "no_data"
+        
+        # --- בדיקה 1: טווח תנועה בברך ---
+        max_knee = max(self.knee_angle_history)
+        min_knee = min(self.knee_angle_history)
+        knee_rom = max_knee - min_knee
+        
+        if knee_rom < self.MIN_KNEE_ROM:
+            return False, "insufficient_knee_rom"
+        
+        # בדיקת כיפוף מספיק ביחס לעמידה
+        standing = self.standing_knee_angle or max_knee
+        max_bend = standing - min_knee
+        if max_bend < self.MIN_KNEE_BEND_DEG:
+            return False, "insufficient_knee_bend"
+        
+        # --- בדיקה 2: מסלול אגן - חייב להיות ∪ shape ---
+        hip_ys = np.array(self.hip_y_history)
+        hip_max_y = np.max(hip_ys)   # הנקודה הכי נמוכה (y גדול = למטה)
+        hip_start_y = hip_ys[0]
+        hip_end_y = hip_ys[-1]
+        hip_drop = hip_max_y - hip_start_y  # כמה האגן ירד (חיובי = ירד)
+        
+        if hip_drop < self.MIN_HIP_DROP_PCT:
+            return False, "insufficient_hip_drop"
+        
+        # בדיקת ∪ shape: הנקודה הנמוכה ביותר צריכה להיות באמצע (לא בקצוות)
+        peak_idx = np.argmax(hip_ys)
+        total = len(hip_ys)
+        # הנקודה הנמוכה ביותר צריכה להיות בין 15%-85% מהחזרה
+        relative_peak_pos = peak_idx / max(1, total - 1)
+        if relative_peak_pos < 0.10 or relative_peak_pos > 0.92:
+            return False, "no_u_shape_hip_path"
+        
+        # --- בדיקה 3: תנועה אנכית דומיננטית על אופקית ---
+        hip_xs = np.array(self.hip_x_history)
+        vertical_range = hip_drop  # כמה האגן ירד
+        horizontal_range = np.max(np.abs(hip_xs - hip_xs[0]))  # כמה האגן זז לצדדים
+        
+        if horizontal_range > 1e-6:
+            vh_ratio = vertical_range / horizontal_range
+        else:
+            vh_ratio = 999.0  # אין תנועה אופקית כלל - מעולה
+        
+        if vh_ratio < self.MIN_VERTICAL_DOMINANCE:
+            return False, "too_much_horizontal_movement"
+        
+        # --- בדיקה 4: יציבות קרסוליים ---
+        if self.ankle_x_start_left is not None and self.ankle_x_start_right is not None:
+            la_drift = np.max(np.abs(np.array(self.ankle_x_history_left) - self.ankle_x_start_left))
+            ra_drift = np.max(np.abs(np.array(self.ankle_x_history_right) - self.ankle_x_start_right))
+            max_ankle_drift = max(la_drift, ra_drift)
+            
+            # normalize by frame height (approximate body height)
+            if max_ankle_drift > self.MAX_ANKLE_DRIFT_PCT:
+                return False, "feet_moved_too_much"
+        
+        # --- בדיקה 5: ברכיים חזרו למעלה (לא נתקעו למטה) ---
+        # החלק האחרון של ה-knee_angle_history צריך להיות גבוה (ברכיים ישרות)
+        last_quarter = self.knee_angle_history[-(max(1, len(self.knee_angle_history)//4)):]
+        if np.mean(last_quarter) < min_knee + 15:
+            return False, "knees_stayed_bent"
+        
+        return True, "valid"
+
+
 # ===================== MAIN =====================
 def run_squat_analysis(video_path,
                        frame_skip=3,
@@ -351,10 +505,8 @@ def run_squat_analysis(video_path,
     rep_max_depth = 0.0
     rep_had_back_feedback = False
     
-    rep_start_hip_x = None
-    rep_start_ankle_x = None
-    rep_max_horizontal_movement = 0.0
-    rep_max_asymmetry = 0.0
+    # --- RepValidator ---
+    rep_validator = RepValidator()
 
     depth_live = 0.0
 
@@ -368,6 +520,11 @@ def run_squat_analysis(video_path,
     RT_FB_HOLD_SEC = 0.8
     rt_fb_msg = None
     rt_fb_hold = 0
+    
+    # --- מעקב עמידה יציבה (baseline) ---
+    # שומרים את זווית הברך בעמידה כ-baseline
+    standing_knee_buffer = deque(maxlen=15)
+    baseline_knee_angle = 165.0  # default
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
@@ -435,6 +592,12 @@ def run_squat_analysis(video_path,
                 knee_angle   = calculate_angle(hip, knee, ankle)
                 back_angle   = angle_between_vectors(mid_shoulder - mid_hip, np.array([0.0, -1.0]))
 
+                # --- עדכון baseline עמידה ---
+                if stage != "down" and knee_angle > 150:
+                    standing_knee_buffer.append(knee_angle)
+                    if len(standing_knee_buffer) >= 5:
+                        baseline_knee_angle = float(np.median(list(standing_knee_buffer)))
+
                 soft_start_ok = (hip_vel_ema < HIP_VEL_THRESH_PCT * 1.2) and (ankle_vel_ema < ANKLE_VEL_THRESH_PCT * 1.2)
                 knee_going_down = (stage != "down")
                 
@@ -451,13 +614,13 @@ def run_squat_analysis(video_path,
                     rep_start_frame = frame_idx
                     rep_down_start_idx = frame_idx
                     
-                    rep_start_hip_x = mid_hip[0]
-                    rep_start_ankle_x = mid_ankle[0]
-                    rep_max_horizontal_movement = 0.0
-                    
-                    rep_start_left_knee = calculate_angle(l_hip, l_knee, l_ankle)
-                    rep_start_right_knee = knee_angle
-                    rep_max_asymmetry = 0.0
+                    # --- אתחול validator ---
+                    rep_validator.start_rep(
+                        mid_hip, 
+                        l_ankle[0],  # normalized x
+                        ankle[0],    # normalized x
+                        baseline_knee_angle  # זווית עמידה כ-reference
+                    )
                     
                     stage = "down"
 
@@ -472,17 +635,10 @@ def run_squat_analysis(video_path,
                     rep_max_knee_angle   = max(rep_max_knee_angle, knee_angle)
                     rep_max_depth = max(rep_max_depth, current_depth)
                     
-                    if rep_start_hip_x is not None and rep_start_ankle_x is not None:
-                        horizontal_movement = max(
-                            abs(mid_hip[0] - rep_start_hip_x),
-                            abs(mid_ankle[0] - rep_start_ankle_x)
-                        )
-                        rep_max_horizontal_movement = max(rep_max_horizontal_movement, horizontal_movement)
+                    # --- עדכון validator ---
+                    rep_validator.update(mid_hip, l_ankle[0], ankle[0], knee_angle)
                     
                     left_knee_angle = calculate_angle(l_hip, l_knee, l_ankle)
-                    right_knee_angle = knee_angle
-                    current_asymmetry = abs(left_knee_angle - right_knee_angle)
-                    rep_max_asymmetry = max(rep_max_asymmetry, current_asymmetry)
                     
                     if current_depth < 0.35:
                         rep_max_back_angle_top = max(rep_max_back_angle_top, back_angle)
@@ -508,27 +664,19 @@ def run_squat_analysis(video_path,
                             if rt_fb_hold > 0:
                                 rt_fb_hold -= 1
 
-                max_horizontal_allowed = 0.25
-                has_excessive_horizontal = rep_max_horizontal_movement > max_horizontal_allowed
-                
-                max_asymmetry_allowed = 35
-                has_excessive_asymmetry = rep_max_asymmetry > max_asymmetry_allowed
-                
                 min_depth_for_rep = 0.12
                 has_minimal_depth = rep_max_depth >= min_depth_for_rep
                 
-                is_pickup_motion = has_excessive_horizontal and has_excessive_asymmetry
-                is_valid_rep = (not is_pickup_motion) and has_minimal_depth
-                
                 if (knee_angle > STAND_KNEE_ANGLE) and (stage == "down") and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
-                    if not is_valid_rep:
+                    
+                    # === שכבת אימות חדשה ===
+                    is_valid, reject_reason = rep_validator.validate(frame_h=1.0)
+                    
+                    if not is_valid or not has_minimal_depth:
                         stage = "up"
                         start_knee_angle = None
                         rep_down_start_idx = None
-                        rep_start_hip_x = None
-                        rep_start_ankle_x = None
-                        rep_max_horizontal_movement = 0.0
-                        rep_max_asymmetry = 0.0
+                        rep_validator.reset()
                         continue
                     
                     feedbacks = []
@@ -599,10 +747,7 @@ def run_squat_analysis(video_path,
 
                     start_knee_angle = None
                     rep_down_start_idx = None
-                    rep_start_hip_x = None
-                    rep_start_ankle_x = None
-                    rep_max_horizontal_movement = 0.0
-                    rep_max_asymmetry = 0.0
+                    rep_validator.reset()
                     stage = "up"
 
                     if frame_idx - last_rep_frame > MIN_FRAMES_BETWEEN_REPS_SQ:
