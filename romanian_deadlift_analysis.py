@@ -619,7 +619,7 @@ class RepCounter:
 
 # ===================== PARAMETERS =====================
 HINGE_BOTTOM_ANGLE = 55.0  # For depth quality check
-KNEE_MIN_ANGLE = 168.0
+KNEE_MIN_ANGLE = 172.0
 KNEE_OPTIMAL_MIN = 160.0
 KNEE_OPTIMAL_MAX = 170.0
 KNEE_MAX_ANGLE = 125.0
