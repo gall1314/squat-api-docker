@@ -403,6 +403,7 @@ class RepCounter:
     MIN_PEAK_FOR_REP = 0.40      # שיא מינימלי כדי לספור חזרה
     GOOD_DEPTH_PEAK = 0.55       # שיא שנחשב לעומק טוב
     MIN_FRAMES_BETWEEN = 8       # מינימום פריימים בין חזרות
+    MAX_REP_FRAMES = 120         # timeout safety for noisy / oblique angles
 
     def __init__(self):
         self.state = "standing"  # standing | descending | ascending
@@ -412,6 +413,7 @@ class RepCounter:
         self.last_rep_frame = -999
         self.signal_history = []  # for smoothing
         self.smoothed = 0.0
+        self.rep_start_frame = -1
 
         # Per-rep metrics
         self.rep_max_torso_2d = 0.0
@@ -425,12 +427,27 @@ class RepCounter:
         self.calibration_signals = []
         self.calibrated = False
         self.standing_baseline = 0.0
+        self.dynamic_floor = 0.0
+        self.dynamic_ceil = 0.6
 
     def _smooth(self, raw_signal):
         """EMA smoothing to reduce noise."""
         alpha = 0.35
         self.smoothed = self.smoothed + alpha * (raw_signal - self.smoothed)
         return self.smoothed
+
+    def _normalize_by_session_range(self, smoothed_signal):
+        """
+        Normalize by evolving floor/ceiling so counting works better
+        when camera angle compresses the raw signal range.
+        """
+        # Slow floor update, slightly faster ceiling update.
+        self.dynamic_floor = 0.98 * self.dynamic_floor + 0.02 * min(self.dynamic_floor, smoothed_signal)
+        self.dynamic_ceil = 0.95 * self.dynamic_ceil + 0.05 * max(self.dynamic_ceil, smoothed_signal)
+
+        rng = max(0.20, self.dynamic_ceil - self.dynamic_floor)
+        normalized = (smoothed_signal - self.dynamic_floor) / rng
+        return float(np.clip(normalized, 0.0, 1.0))
 
     def _calibrate(self, signal):
         """
@@ -442,10 +459,24 @@ class RepCounter:
         if len(self.calibration_signals) >= 15:
             # Standing baseline = minimum of first signals (likely standing)
             self.standing_baseline = float(np.percentile(self.calibration_signals, 25))
+            self.dynamic_floor = self.standing_baseline
+            self.dynamic_ceil = max(self.standing_baseline + 0.35, float(np.percentile(self.calibration_signals, 90)))
             # Adjust thresholds relative to baseline
             self.ENTER_THRESHOLD = max(0.15, self.standing_baseline + 0.15)
             self.EXIT_THRESHOLD = max(0.10, self.standing_baseline + 0.08)
             self.calibrated = True
+
+    def _start_rep_tracking(self, signal_data, frame_idx, smoothed):
+        self.state = "descending"
+        self.current_peak = smoothed
+        self.frames_in_state = 0
+        self.rep_start_frame = frame_idx
+        self.rep_max_torso_2d = signal_data.get("torso_2d_angle", 0)
+        self.rep_max_torso_3d = signal_data.get("torso_3d_angle", 0)
+        self.rep_min_knee = signal_data.get("knee_angle", 170)
+        self.rep_max_knee = signal_data.get("knee_angle", 170)
+        self.rep_back_issue = False
+        self.rep_back_angle = 0.0
 
     def update(self, signal_data, frame_idx):
         """
@@ -455,6 +486,7 @@ class RepCounter:
         raw = signal_data["composite"]
         self._calibrate(raw)
         smoothed = self._smooth(raw)
+        normalized = self._normalize_by_session_range(smoothed)
         self.frames_in_state += 1
 
         # Track per-rep metrics regardless of state
@@ -466,30 +498,31 @@ class RepCounter:
             self.rep_max_knee = max(self.rep_max_knee, knee_ang)
 
         if self.state == "standing":
-            if smoothed >= self.ENTER_THRESHOLD:
-                self.state = "descending"
-                self.current_peak = smoothed
-                self.frames_in_state = 0
-                # Reset per-rep metrics
-                self.rep_max_torso_2d = signal_data.get("torso_2d_angle", 0)
-                self.rep_max_torso_3d = signal_data.get("torso_3d_angle", 0)
-                self.rep_min_knee = signal_data.get("knee_angle", 170)
-                self.rep_max_knee = signal_data.get("knee_angle", 170)
-                self.rep_back_issue = False
-                self.rep_back_angle = 0.0
+            normalized_enter = normalized >= 0.38
+            if smoothed >= self.ENTER_THRESHOLD or normalized_enter:
+                self._start_rep_tracking(signal_data, frame_idx, smoothed)
 
         elif self.state == "descending":
             if smoothed > self.current_peak:
                 self.current_peak = smoothed
             # If signal starts dropping, we're now ascending
-            if smoothed < self.current_peak - 0.05 and self.frames_in_state >= 3:
+            # In some camera angles, peak-to-drop is shallow, so allow smaller drop
+            if smoothed < self.current_peak - 0.03 and self.frames_in_state >= 3:
                 self.state = "ascending"
                 self.frames_in_state = 0
 
+            if self.rep_start_frame > 0 and (frame_idx - self.rep_start_frame) > self.MAX_REP_FRAMES:
+                self.state = "standing"
+                self.frames_in_state = 0
+                self.current_peak = 0.0
+                self.rep_start_frame = -1
+
         elif self.state == "ascending":
-            if smoothed <= self.EXIT_THRESHOLD and (frame_idx - self.last_rep_frame) >= self.MIN_FRAMES_BETWEEN:
+            normalized_exit = normalized <= 0.24
+            if (smoothed <= self.EXIT_THRESHOLD or normalized_exit) and (frame_idx - self.last_rep_frame) >= self.MIN_FRAMES_BETWEEN:
                 # Rep completed — check if peak was deep enough
-                if self.current_peak >= self.MIN_PEAK_FOR_REP:
+                normalized_peak = (self.current_peak - self.dynamic_floor) / max(0.20, self.dynamic_ceil - self.dynamic_floor)
+                if self.current_peak >= self.MIN_PEAK_FOR_REP or normalized_peak >= 0.62:
                     self.count += 1
                     self.last_rep_frame = frame_idx
                     self.state = "standing"
@@ -507,18 +540,26 @@ class RepCounter:
                         "back_angle": self.rep_back_angle,
                     }
                     self.current_peak = 0.0
+                    self.rep_start_frame = -1
                     return rep_info
                 else:
                     # Not deep enough — reset without counting
                     self.state = "standing"
                     self.frames_in_state = 0
                     self.current_peak = 0.0
+                    self.rep_start_frame = -1
 
             # Handle case where person goes back down without fully standing
             if smoothed > self.current_peak:
                 self.current_peak = smoothed
                 self.state = "descending"
                 self.frames_in_state = 0
+
+            if self.rep_start_frame > 0 and (frame_idx - self.rep_start_frame) > self.MAX_REP_FRAMES:
+                self.state = "standing"
+                self.frames_in_state = 0
+                self.current_peak = 0.0
+                self.rep_start_frame = -1
 
         return None
 
