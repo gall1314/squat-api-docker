@@ -542,6 +542,12 @@ class RepCounter:
             if self.rep_start_frame > 0 and (frame_idx - self.rep_start_frame) > self.MAX_REP_FRAMES:
                 self._reset_to_standing()
 
+            if self.rep_start_frame > 0 and (frame_idx - self.rep_start_frame) > self.MAX_REP_FRAMES:
+                self.state = "standing"
+                self.frames_in_state = 0
+                self.current_peak = 0.0
+                self.rep_start_frame = -1
+
         elif self.state == "ascending":
             self.ascent_valley = min(self.ascent_valley, smoothed)
             normalized_exit = normalized <= 0.24
