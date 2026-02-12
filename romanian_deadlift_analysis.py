@@ -402,12 +402,12 @@ class RepCounter:
     EXIT_THRESHOLD = 0.15        # סיגנל מתחת לזה = חזרה לעמידה
     MIN_PEAK_FOR_REP = 0.40      # שיא מינימלי כדי לספור חזרה
     GOOD_DEPTH_PEAK = 0.55       # שיא שנחשב לעומק טוב
-    MIN_FRAMES_BETWEEN = 6       # מינימום פריימים בין חזרות
+    MIN_FRAMES_BETWEEN = 4       # מינימום פריימים בין חזרות
     MAX_REP_FRAMES = 120         # timeout safety for noisy / oblique angles
     REBOUND_DELTA = 0.015        # rise after valley means movement turned down again
-    MIN_RETURN_FROM_PEAK = 0.06  # require partial return toward top between reps
+    MIN_RETURN_FROM_PEAK = 0.04  # require partial return toward top between reps
     NORMALIZED_PEAK_THRESHOLD = 0.58
-    NORMALIZED_DROP_THRESHOLD = 0.16
+    NORMALIZED_DROP_THRESHOLD = 0.10
 
     def __init__(self):
         self.state = "standing"  # standing | descending | ascending
@@ -507,6 +507,28 @@ class RepCounter:
         self.rep_start_frame = -1
         self.ascent_valley = 1.0
 
+    def finalize_pending_rep(self, frame_idx):
+        """
+        Count a likely last rep when video ends mid-ascent.
+        Useful when the last lockout is cut off by the clip ending.
+        """
+        if self.state != "ascending":
+            return None
+
+        valley_drop = self.current_peak - self.ascent_valley
+        normalized_drop = valley_drop / max(0.20, self.dynamic_ceil - self.dynamic_floor)
+        is_valid_peak = (self.current_peak >= self.MIN_PEAK_FOR_REP) or (self._normalized_peak() >= self.NORMALIZED_PEAK_THRESHOLD)
+        has_return = (valley_drop >= self.MIN_RETURN_FROM_PEAK * 0.7) or (normalized_drop >= self.NORMALIZED_DROP_THRESHOLD * 0.8)
+
+        if is_valid_peak and has_return and (frame_idx - self.last_rep_frame) >= self.MIN_FRAMES_BETWEEN:
+            self.count += 1
+            self.last_rep_frame = frame_idx
+            rep_info = self._build_rep_info()
+            self._reset_to_standing()
+            return rep_info
+
+        return None
+
     def update(self, signal_data, frame_idx):
         """
         מעדכן את ה-state machine עם סיגנל חדש.
@@ -536,7 +558,7 @@ class RepCounter:
                 self.current_peak = smoothed
 
             # If signal starts dropping, we're now ascending.
-            if smoothed < self.current_peak - 0.02 and self.frames_in_state >= 2:
+            if smoothed < self.current_peak - 0.015 and self.frames_in_state >= 2:
                 self.state = "ascending"
                 self.frames_in_state = 0
                 self.ascent_valley = smoothed
@@ -586,11 +608,11 @@ class RepCounter:
 
 # ===================== PARAMETERS =====================
 HINGE_BOTTOM_ANGLE = 55.0  # For depth quality check
-KNEE_MIN_ANGLE = 155.0
+KNEE_MIN_ANGLE = 168.0
 KNEE_OPTIMAL_MIN = 160.0
 KNEE_OPTIMAL_MAX = 170.0
-KNEE_MAX_ANGLE = 140.0
-BACK_MAX_ANGLE = 45.0
+KNEE_MAX_ANGLE = 125.0
+BACK_MAX_ANGLE = 60.0
 
 MIN_SCORE = 4.0
 MAX_SCORE = 10.0
@@ -774,7 +796,7 @@ def run_romanian_deadlift_analysis(video_path,
                     score -= 2.0
 
                 # Back check
-                if rep_result["back_issue"] and rep_result["back_angle"] > BACK_MAX_ANGLE:
+                if rep_result["back_issue"] and rep_result["back_angle"] > (BACK_MAX_ANGLE + 5.0):
                     feedback.append("Try to keep your back neutral")
                     score -= 1.0
 
@@ -826,6 +848,55 @@ def run_romanian_deadlift_analysis(video_path,
                                            depth_pct=prog)
                 out.write(frame_drawn)
 
+    # Finalize likely last rep if video ended mid-lockout
+    rep_result = rep_counter.finalize_pending_rep(frame_idx)
+    if rep_result is not None:
+        feedback = []
+        score = MAX_SCORE
+
+        best_torso = max(rep_result["max_torso_2d"], rep_result["max_torso_3d"])
+        if not rep_result["good_depth"] and best_torso < HINGE_BOTTOM_ANGLE:
+            feedback.append("Go deeper - hinge more at the hips")
+            score -= 2.0
+
+        if rep_result["max_knee"] > KNEE_MIN_ANGLE:
+            feedback.append("Bend your knees a bit more")
+            score -= 1.5
+        elif rep_result["min_knee"] < KNEE_MAX_ANGLE:
+            feedback.append("Too much knee bend")
+            score -= 2.0
+
+        if rep_result["back_issue"] and rep_result["back_angle"] > (BACK_MAX_ANGLE + 5.0):
+            feedback.append("Try to keep your back neutral")
+            score -= 1.0
+
+        score = float(max(MIN_SCORE, min(MAX_SCORE, score)))
+        all_scores.append(score)
+        if score >= 9.0:
+            good_reps += 1
+        else:
+            bad_reps += 1
+
+        session_feedbacks.extend(feedback)
+        _, session_feedback_by_cat = pick_strongest_per_category(session_feedbacks)
+
+        rep_reports.append({
+            "rep": rep_result["rep"],
+            "score": round(score, 2),
+            "score_display": display_half_str(score),
+            "label": score_label(score),
+            "feedback": feedback,
+            "metrics": {
+                "peak_signal": round(rep_result["peak_signal"], 3),
+                "max_torso_2d_angle": round(rep_result["max_torso_2d"], 2),
+                "max_torso_3d_angle": round(rep_result["max_torso_3d"], 2),
+                "min_knee_angle": round(rep_result["min_knee"], 2),
+                "max_knee_angle": round(rep_result["max_knee"], 2),
+                "back_angle": round(rep_result["back_angle"], 2),
+                "view_type": "end_of_clip",
+            }
+        })
+
     cap.release()
     if out:
         out.release()
@@ -841,7 +912,7 @@ def run_romanian_deadlift_analysis(video_path,
     if session_feedbacks and len(session_feedbacks) > 0:
         technique_score = min(technique_score, 9.5)
 
-    feedback_list = dedupe_feedback(session_feedbacks) if session_feedbacks else ["Perfect form! 🔥"]
+    feedback_list = dedupe_feedback(list(session_feedback_by_cat.values())) if session_feedback_by_cat else (["Perfect form! 🔥"] if not session_feedbacks else dedupe_feedback(session_feedbacks))
 
     session_tip = None
     if session_feedback_by_cat:
