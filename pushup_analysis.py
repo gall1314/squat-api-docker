@@ -128,7 +128,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     return cv2.cvtColor(np.array(pil),cv2.COLOR_RGB2BGR)
 
 # ============ IMPROVED Motion Detection - better for fast speeds ============
-BASE_FRAME_SKIP = 2
+BASE_FRAME_SKIP = 1
 ACTIVE_FRAME_SKIP = 1
 MOTION_DETECTION_WINDOW = 8
 MOTION_VEL_THRESHOLD = 0.0010       # יותר רגיש לתנועה מהירה
@@ -268,7 +268,7 @@ SHOULDER_EMA_ALPHA = 0.67           # קצת יותר מהיר
 VIS_THR_STRICT = 0.29
 PLANK_BODY_ANGLE_MAX = 26.0
 HANDS_BELOW_SHOULDERS = 0.035
-ONPUSHUP_MIN_FRAMES = 2
+ONPUSHUP_MIN_FRAMES = 1
 OFFPUSHUP_MIN_FRAMES = 5
 AUTO_STOP_AFTER_EXIT_SEC = 1.5
 TAIL_NOPOSE_STOP_SEC = 1.0
@@ -345,8 +345,10 @@ DEBUG_MOTION = bool(int(os.getenv("DEBUG_MOTION", "0")))
 DEBUG_GRADING = bool(int(os.getenv("DEBUG_GRADING", "1")))
 
 MIN_CYCLE_ELBOW_SAMPLES = 4
-ROBUST_BOTTOM_PERCENTILE = 25
-ROBUST_TOP_PERCENTILE = 75
+ROBUST_BOTTOM_PERCENTILE = 15
+ROBUST_TOP_PERCENTILE = 85
+BOTTOM_SAMPLE_DESCENT_RATIO = 0.55
+TOP_SAMPLE_ASCENT_RATIO = 0.40
 
 
 def run_pushup_analysis(video_path,
@@ -603,6 +605,21 @@ def run_pushup_analysis(video_path,
                     if top_phase_max_elbow is None: top_phase_max_elbow = max_elb_now
                     else: top_phase_max_elbow = max(top_phase_max_elbow, max_elb_now)
 
+                    # Collect depth samples only near the lower portion of the rep
+                    descent_ratio = 0.0 if SHOULDER_MIN_DESCENT <= 1e-9 else (cycle_max_descent / SHOULDER_MIN_DESCENT)
+                    if in_descent_phase and (descent_ratio >= BOTTOM_SAMPLE_DESCENT_RATIO or min_elb_now <= (ELBOW_BENT_ANGLE + 18.0)):
+                        cycle_bottom_samples.append(min_elb_now)
+                        if len(cycle_bottom_samples) > 30:
+                            cycle_bottom_samples.pop(0)
+
+                    # Collect lockout samples near the top (during ascent / reset)
+                    ascent_progress = max(0.0, (desc_base_shoulder + cycle_max_descent) - shoulder_y)
+                    ascent_ratio = 0.0 if SHOULDER_MIN_DESCENT <= 1e-9 else (ascent_progress / SHOULDER_MIN_DESCENT)
+                    if (not in_descent_phase) and (ascent_ratio >= TOP_SAMPLE_ASCENT_RATIO or max_elb_now >= (LOCKOUT_POOR - 3.0)):
+                        cycle_top_samples.append(max_elb_now)
+                        if len(cycle_top_samples) > 30:
+                            cycle_top_samples.pop(0)
+
                     hip_misalign = _calculate_hip_misalignment(lms, LSH, RSH, LH, RH, LA, RA)
                     if cycle_max_hip_misalign is None: cycle_max_hip_misalign = hip_misalign
                     else: cycle_max_hip_misalign = max(cycle_max_hip_misalign, hip_misalign)
@@ -683,7 +700,6 @@ def run_pushup_analysis(video_path,
                     if rep_has_issues: bad_reps+=1  # ✅
                     else: good_reps+=1
                     last_bottom_frame=frame_idx; allow_new_bottom=False; counted_this_cycle=True
-                    top_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
                     in_descent_phase=False
                     motion_detector.activate("count_rep")
 
@@ -691,6 +707,11 @@ def run_pushup_analysis(video_path,
                     if shoulder_prev is not None and (shoulder_prev - shoulder_y) > 0 and (desc_base_shoulder is not None):
                         if ((desc_base_shoulder + cycle_max_descent) - shoulder_y) >= REARM_ASCENT_EFF:
                             allow_new_bottom=True
+                    max_elb_now = max(raw_elbow_L, raw_elbow_R)
+                    if max_elb_now >= (LOCKOUT_POOR - 3.0):
+                        cycle_top_samples.append(max_elb_now)
+                        if len(cycle_top_samples) > 30:
+                            cycle_top_samples.pop(0)
 
                 if at_bottom and not cycle_tip_deeper:
                     robust_bottom_elbow, _ = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow)
@@ -847,6 +868,11 @@ def _robust_cycle_elbows(bottom_samples, top_samples, fallback_bottom=None, fall
     if top_samples:
         arr = np.array(top_samples, dtype=np.float32)
         robust_top = float(np.percentile(arr, ROBUST_TOP_PERCENTILE))
+
+    # Guardrail: avoid impossible overlap from noisy short windows
+    if robust_bottom is not None and robust_top is not None and robust_top < robust_bottom:
+        robust_bottom = min(float(robust_bottom), float(fallback_bottom) if fallback_bottom is not None else float(robust_bottom))
+        robust_top = max(float(robust_top), float(fallback_top) if fallback_top is not None else float(robust_top))
 
     return robust_bottom, robust_top
 
