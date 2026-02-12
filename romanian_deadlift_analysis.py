@@ -402,10 +402,12 @@ class RepCounter:
     EXIT_THRESHOLD = 0.15        # סיגנל מתחת לזה = חזרה לעמידה
     MIN_PEAK_FOR_REP = 0.40      # שיא מינימלי כדי לספור חזרה
     GOOD_DEPTH_PEAK = 0.55       # שיא שנחשב לעומק טוב
-    MIN_FRAMES_BETWEEN = 8       # מינימום פריימים בין חזרות
+    MIN_FRAMES_BETWEEN = 6       # מינימום פריימים בין חזרות
     MAX_REP_FRAMES = 120         # timeout safety for noisy / oblique angles
-    REBOUND_DELTA = 0.02         # rise after valley means movement turned down again
-    MIN_RETURN_FROM_PEAK = 0.08  # require partial return toward top between reps
+    REBOUND_DELTA = 0.015        # rise after valley means movement turned down again
+    MIN_RETURN_FROM_PEAK = 0.06  # require partial return toward top between reps
+    NORMALIZED_PEAK_THRESHOLD = 0.58
+    NORMALIZED_DROP_THRESHOLD = 0.16
 
     def __init__(self):
         self.state = "standing"  # standing | descending | ascending
@@ -525,7 +527,7 @@ class RepCounter:
             self.rep_max_knee = max(self.rep_max_knee, knee_ang)
 
         if self.state == "standing":
-            normalized_enter = normalized >= 0.38
+            normalized_enter = normalized >= 0.34
             if smoothed >= self.ENTER_THRESHOLD or normalized_enter:
                 self._start_rep_tracking(signal_data, frame_idx, smoothed)
 
@@ -534,7 +536,7 @@ class RepCounter:
                 self.current_peak = smoothed
 
             # If signal starts dropping, we're now ascending.
-            if smoothed < self.current_peak - 0.03 and self.frames_in_state >= 3:
+            if smoothed < self.current_peak - 0.02 and self.frames_in_state >= 2:
                 self.state = "ascending"
                 self.frames_in_state = 0
                 self.ascent_valley = smoothed
@@ -542,19 +544,13 @@ class RepCounter:
             if self.rep_start_frame > 0 and (frame_idx - self.rep_start_frame) > self.MAX_REP_FRAMES:
                 self._reset_to_standing()
 
-            if self.rep_start_frame > 0 and (frame_idx - self.rep_start_frame) > self.MAX_REP_FRAMES:
-                self.state = "standing"
-                self.frames_in_state = 0
-                self.current_peak = 0.0
-                self.rep_start_frame = -1
-
         elif self.state == "ascending":
             self.ascent_valley = min(self.ascent_valley, smoothed)
-            normalized_exit = normalized <= 0.24
+            normalized_exit = normalized <= 0.28
 
             # Standard completion by returning near standing.
             if (smoothed <= self.EXIT_THRESHOLD or normalized_exit) and (frame_idx - self.last_rep_frame) >= self.MIN_FRAMES_BETWEEN:
-                if self.current_peak >= self.MIN_PEAK_FOR_REP or self._normalized_peak() >= 0.62:
+                if self.current_peak >= self.MIN_PEAK_FOR_REP or self._normalized_peak() >= self.NORMALIZED_PEAK_THRESHOLD:
                     self.count += 1
                     self.last_rep_frame = frame_idx
                     rep_info = self._build_rep_info()
@@ -566,8 +562,8 @@ class RepCounter:
             valley_drop = self.current_peak - self.ascent_valley
             if smoothed > (self.ascent_valley + self.REBOUND_DELTA) and self.frames_in_state >= 2:
                 normalized_drop = valley_drop / max(0.20, self.dynamic_ceil - self.dynamic_floor)
-                is_valid_peak = (self.current_peak >= self.MIN_PEAK_FOR_REP) or (self._normalized_peak() >= 0.62)
-                has_return = (valley_drop >= self.MIN_RETURN_FROM_PEAK) or (normalized_drop >= 0.22)
+                is_valid_peak = (self.current_peak >= self.MIN_PEAK_FOR_REP) or (self._normalized_peak() >= self.NORMALIZED_PEAK_THRESHOLD)
+                has_return = (valley_drop >= self.MIN_RETURN_FROM_PEAK) or (normalized_drop >= self.NORMALIZED_DROP_THRESHOLD)
 
                 if is_valid_peak and has_return and (frame_idx - self.last_rep_frame) >= self.MIN_FRAMES_BETWEEN:
                     self.count += 1
