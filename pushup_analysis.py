@@ -326,11 +326,16 @@ FLARE_POOR = 75.0
 DESCENT_SPEED_IDEAL = 0.0010
 DESCENT_SPEED_FAST = 0.0012          # ✅ אולטרה רגיש (היה 0.0015)
 
-DEPTH_FAIL_MIN_REPS = 1              # דווח מיד
+DEPTH_FAIL_MIN_REPS = 2              # דורש עקביות לפני הערה
 HIPS_FAIL_MIN_REPS = 2               # ירכיים - אפשר 2
-LOCKOUT_FAIL_MIN_REPS = 1            # דווח מיד
+LOCKOUT_FAIL_MIN_REPS = 2            # דורש עקביות לפני הערה
 FLARE_FAIL_MIN_REPS = 2              # מרפקים - אפשר 2
 TEMPO_CHECK_MIN_REPS = 1             # ✅ מיידי (היה 2)
+
+# Error-report thresholds are intentionally more forgiving than scoring buckets
+# to reduce false positives from camera angle / landmark noise.
+DEPTH_ERROR_ANGLE = 110.0
+LOCKOUT_ERROR_ANGLE = 165.0
 
 BURST_FRAMES = 8                    # קצת יותר אגרסיבי
 INFLECT_VEL_THR = 0.0027
@@ -658,9 +663,9 @@ def run_pushup_analysis(video_path,
                     # ✅ Calculate if has issues based on current measurements
                     rep_has_issues = False
                     robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow)
-                    if robust_bottom_elbow and robust_bottom_elbow > DEPTH_FAIR_ANGLE:
+                    if robust_bottom_elbow and robust_bottom_elbow > DEPTH_ERROR_ANGLE:
                         rep_has_issues = True
-                    if robust_top_elbow and robust_top_elbow < LOCKOUT_GOOD:
+                    if robust_top_elbow and robust_top_elbow < LOCKOUT_ERROR_ANGLE:
                         rep_has_issues = True
                     if cycle_max_hip_misalign and cycle_max_hip_misalign > HIP_FAIR:
                         rep_has_issues = True
@@ -689,7 +694,7 @@ def run_pushup_analysis(video_path,
 
                 if at_bottom and not cycle_tip_deeper:
                     robust_bottom_elbow, _ = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow)
-                    if robust_bottom_elbow and robust_bottom_elbow > DEPTH_GOOD_ANGLE:
+                    if robust_bottom_elbow and robust_bottom_elbow > DEPTH_ERROR_ANGLE:
                         cycle_tip_deeper = True
                         depth_fail_count += 1
                         if depth_fail_count >= DEPTH_FAIL_MIN_REPS and not depth_already_reported:
@@ -897,7 +902,7 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
     
     # Form errors - מורידים נקודות
     if bottom_phase_min_elbow is not None and local_vars.get("cycle_bottom_samples") and len(local_vars["cycle_bottom_samples"]) >= MIN_CYCLE_ELBOW_SAMPLES:
-        if bottom_phase_min_elbow > DEPTH_FAIR_ANGLE:
+        if bottom_phase_min_elbow > DEPTH_ERROR_ANGLE:
             has_depth_issue = True  # ✅
             local_vars['cycle_tip_deeper'] = True
             local_vars['depth_fail_count'] += 1
@@ -906,7 +911,7 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                 local_vars['depth_already_reported'] = True
 
     if top_phase_max_elbow is not None and local_vars.get("cycle_top_samples") and len(local_vars["cycle_top_samples"]) >= MIN_CYCLE_ELBOW_SAMPLES:
-        if top_phase_max_elbow < LOCKOUT_GOOD:
+        if top_phase_max_elbow < LOCKOUT_ERROR_ANGLE:
             has_lockout_issue = True  # ✅
             local_vars['cycle_tip_lockout'] = True
             local_vars['lockout_fail_count'] += 1
