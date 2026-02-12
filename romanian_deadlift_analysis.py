@@ -402,12 +402,15 @@ class RepCounter:
     EXIT_THRESHOLD = 0.15        # סיגנל מתחת לזה = חזרה לעמידה
     MIN_PEAK_FOR_REP = 0.40      # שיא מינימלי כדי לספור חזרה
     GOOD_DEPTH_PEAK = 0.55       # שיא שנחשב לעומק טוב
-    MIN_FRAMES_BETWEEN = 4       # מינימום פריימים בין חזרות
+    MIN_FRAMES_BETWEEN = 5       # מינימום פריימים בין חזרות
     MAX_REP_FRAMES = 120         # timeout safety for noisy / oblique angles
     REBOUND_DELTA = 0.015        # rise after valley means movement turned down again
     MIN_RETURN_FROM_PEAK = 0.04  # require partial return toward top between reps
     NORMALIZED_PEAK_THRESHOLD = 0.58
     NORMALIZED_DROP_THRESHOLD = 0.10
+    MIN_REP_DURATION_FRAMES = 6
+    MIN_PEAK_DELTA = 0.07
+    MIN_NORMALIZED_PEAK_DELTA = 0.18
 
     def __init__(self):
         self.state = "standing"  # standing | descending | ascending
@@ -419,6 +422,7 @@ class RepCounter:
         self.smoothed = 0.0
         self.rep_start_frame = -1
         self.ascent_valley = 1.0
+        self.rep_start_signal = 0.0
 
         # Per-rep metrics
         self.rep_max_torso_2d = 0.0
@@ -477,6 +481,7 @@ class RepCounter:
         self.frames_in_state = 0
         self.rep_start_frame = frame_idx
         self.ascent_valley = smoothed
+        self.rep_start_signal = smoothed
         self.rep_max_torso_2d = signal_data.get("torso_2d_angle", 0)
         self.rep_max_torso_3d = signal_data.get("torso_3d_angle", 0)
         self.rep_min_knee = signal_data.get("knee_angle", 170)
@@ -486,6 +491,11 @@ class RepCounter:
 
     def _normalized_peak(self):
         return (self.current_peak - self.dynamic_floor) / max(0.20, self.dynamic_ceil - self.dynamic_floor)
+
+    def _has_meaningful_excursion(self):
+        peak_delta = self.current_peak - self.rep_start_signal
+        normalized_delta = peak_delta / max(0.20, self.dynamic_ceil - self.dynamic_floor)
+        return (peak_delta >= self.MIN_PEAK_DELTA) or (normalized_delta >= self.MIN_NORMALIZED_PEAK_DELTA)
 
     def _build_rep_info(self):
         return {
@@ -506,6 +516,7 @@ class RepCounter:
         self.current_peak = 0.0
         self.rep_start_frame = -1
         self.ascent_valley = 1.0
+        self.rep_start_signal = 0.0
 
     def finalize_pending_rep(self, frame_idx):
         """
@@ -520,7 +531,7 @@ class RepCounter:
         is_valid_peak = (self.current_peak >= self.MIN_PEAK_FOR_REP) or (self._normalized_peak() >= self.NORMALIZED_PEAK_THRESHOLD)
         has_return = (valley_drop >= self.MIN_RETURN_FROM_PEAK * 0.7) or (normalized_drop >= self.NORMALIZED_DROP_THRESHOLD * 0.8)
 
-        if is_valid_peak and has_return and (frame_idx - self.last_rep_frame) >= self.MIN_FRAMES_BETWEEN:
+        if is_valid_peak and has_return and self._has_meaningful_excursion() and (frame_idx - self.last_rep_frame) >= self.MIN_FRAMES_BETWEEN and (frame_idx - self.rep_start_frame) >= self.MIN_REP_DURATION_FRAMES:
             self.count += 1
             self.last_rep_frame = frame_idx
             rep_info = self._build_rep_info()
@@ -572,7 +583,7 @@ class RepCounter:
 
             # Standard completion by returning near standing.
             if (smoothed <= self.EXIT_THRESHOLD or normalized_exit) and (frame_idx - self.last_rep_frame) >= self.MIN_FRAMES_BETWEEN:
-                if self.current_peak >= self.MIN_PEAK_FOR_REP or self._normalized_peak() >= self.NORMALIZED_PEAK_THRESHOLD:
+                if (self.current_peak >= self.MIN_PEAK_FOR_REP or self._normalized_peak() >= self.NORMALIZED_PEAK_THRESHOLD) and self._has_meaningful_excursion() and (frame_idx - self.rep_start_frame) >= self.MIN_REP_DURATION_FRAMES:
                     self.count += 1
                     self.last_rep_frame = frame_idx
                     rep_info = self._build_rep_info()
@@ -587,7 +598,7 @@ class RepCounter:
                 is_valid_peak = (self.current_peak >= self.MIN_PEAK_FOR_REP) or (self._normalized_peak() >= self.NORMALIZED_PEAK_THRESHOLD)
                 has_return = (valley_drop >= self.MIN_RETURN_FROM_PEAK) or (normalized_drop >= self.NORMALIZED_DROP_THRESHOLD)
 
-                if is_valid_peak and has_return and (frame_idx - self.last_rep_frame) >= self.MIN_FRAMES_BETWEEN:
+                if is_valid_peak and has_return and self._has_meaningful_excursion() and (frame_idx - self.last_rep_frame) >= self.MIN_FRAMES_BETWEEN and (frame_idx - self.rep_start_frame) >= self.MIN_REP_DURATION_FRAMES:
                     self.count += 1
                     self.last_rep_frame = frame_idx
                     rep_info = self._build_rep_info()
