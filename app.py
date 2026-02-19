@@ -266,23 +266,40 @@ def _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_mode: bool):
 def analyze():
     """
     POST /analyze
-    
+
     Parameters:
     - exercise_type: string (required) - סוג התרגיל
     - fast: boolean (optional, default=true) - מצב מהיר או מלא
       * fast=true:  רק JSON, ללא וידאו (10-15 שניות)
       * fast=false: JSON + וידאו מנותח (60 שניות)
-    
+
     Supported exercise types:
     - squat, deadlift, romanian deadlift (rdl), stiff leg deadlift (sldl)
     - bulgarian split squat, pull-up, bicep curl, bent-over row
     - good morning, dips, overhead press, push-up
-    
+
     Returns:
     - result: object - תוצאות הניתוח (reps, scores, feedback)
     - video_url: string|null - URL לוידאו מנותח (רק אם fast=false)
     """
     t0 = time.time()
+
+    def _invalid_result_payload():
+        return {
+            "error": "invalid_result",
+            "detail": "Analyzer did not return a dict",
+            "video_path": ""
+        }
+
+    def _json_response(result_dict, status=200):
+        safe_result = result_dict if isinstance(result_dict, dict) else _invalid_result_payload()
+        safe_result = _standardize_video_path(safe_result)
+        output_path = safe_result.get("video_path") or ""
+        video_url = None
+        if output_path and os.path.exists(output_path):
+            video_url = request.host_url.rstrip('/') + '/media/' + os.path.basename(output_path)
+        return jsonify({"result": safe_result, "video_url": video_url}), status
+
     try:
         print("==== POST RECEIVED ====", file=sys.stderr, flush=True)
         ctype = (request.content_type or "").lower()
@@ -291,22 +308,22 @@ def analyze():
         # ---------- RAW upload path (video/* or application/octet-stream in body) ----------
         if ctype.startswith("video/") or ctype == "application/octet-stream":
             exercise_type = (request.args.get('exercise_type') or "").strip().lower()
-            
-            # Handle "null" string or empty value
+
             if not exercise_type or exercise_type == 'null':
-                return jsonify({
+                return _json_response({
                     "error": "Missing exercise_type",
-                    "detail": "Query parameter 'exercise_type' is required. Supported types: squat, deadlift, rdl, sldl, bulgarian, pullup, bicep_curl, bent_row, good_morning, dips, overhead_press, pushup"
-                }), 400
-            
+                    "detail": "Query parameter 'exercise_type' is required. Supported types: squat, deadlift, rdl, sldl, bulgarian, pullup, bicep_curl, bent_row, good_morning, dips, overhead_press, pushup",
+                    "video_path": ""
+                }, 400)
+
             resolved_type = EXERCISE_MAP.get(exercise_type)
             if not resolved_type:
-                return jsonify({
+                return _json_response({
                     "error": f"Unsupported exercise type: {exercise_type}",
-                    "detail": f"Supported types: {', '.join(sorted(set(EXERCISE_MAP.values())))}"
-                }), 400
+                    "detail": f"Supported types: {', '.join(sorted(set(EXERCISE_MAP.values())))}",
+                    "video_path": ""
+                }, 400)
 
-            # fast mode - default true
             fast_str = request.args.get('fast', 'true').lower()
             fast_mode = (fast_str == 'true')
             print(f"[RAW] Resolved: {resolved_type} | fast_mode={fast_mode}", file=sys.stderr, flush=True)
@@ -323,30 +340,23 @@ def analyze():
 
             result = _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_mode)
             if not isinstance(result, dict):
-                result = {"error": "invalid_result", 
-                         "detail": "Analyzer did not return a dict", 
-                         "video_path": ""}
+                result = _invalid_result_payload()
             if _is_analyzer_unavailable(result):
-                return _unavailable_response(result)
+                unavailable_resp, status = _unavailable_response(result)
+                return _json_response(unavailable_resp.get_json(silent=True) or result, status)
 
-            result = _standardize_video_path(result)
-            output_path = result.get("video_path") or ""
-            print(f"[RAW] result video_path={output_path}", file=sys.stderr, flush=True)
-            
-            full_url = None
-            if output_path and os.path.exists(output_path):
-                full_url = request.host_url.rstrip('/') + '/media/' + os.path.basename(output_path)
-
-            print(f"[RAW] OK -> {full_url}", file=sys.stderr, flush=True)
+            response, status = _json_response(result)
+            print(f"[RAW] OK -> {response.get_json(silent=True).get('video_url')}", file=sys.stderr, flush=True)
             print(f"[RAW] TOTAL TIME: {(time.time() - t0):.3f}s", file=sys.stderr, flush=True)
-            return jsonify({"result": result, "video_url": full_url})
+            return response, status
 
         # ---------- multipart/form-data path ----------
         if "multipart/form-data" not in ctype:
-            return jsonify({
-                "error": "Bad request", 
-                "detail": "Send video as multipart/form-data (field 'video') or raw video body (Content-Type: video/* or application/octet-stream) with query params"
-            }), 400
+            return _json_response({
+                "error": "Bad request",
+                "detail": "Send video as multipart/form-data (field 'video') or raw video body (Content-Type: video/* or application/octet-stream) with query params",
+                "video_path": ""
+            }, 400)
 
         try:
             form = request.form
@@ -357,35 +367,37 @@ def analyze():
             print(f"[MP] request parsing failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
             print(f"[MP] client likely disconnected while upload was in-flight (content_length={content_length})",
                   file=sys.stderr, flush=True)
-            return jsonify({
+            return _json_response({
                 "error": "client_disconnected",
                 "detail": "Upload interrupted before the multipart payload was fully received (client/proxy timeout or connection drop)",
                 "content_length": content_length,
                 "size_mb": size_mb,
-                "hint": "Client/proxy timed out during upload. Retry on better network, send smaller/compressed video, or use raw video upload (Content-Type: video/mp4 with ?exercise_type=...&fast=true)."
-            }), 408
+                "hint": "Client/proxy timed out during upload. Retry on better network, send smaller/compressed video, or use raw video upload (Content-Type: video/mp4 with ?exercise_type=...&fast=true).",
+                "video_path": ""
+            }, 408)
 
         video_file = files.get('video')
         if not video_file:
             print("NO 'video' FILE FIELD", file=sys.stderr, flush=True)
-            return jsonify({
-                "error": "No video uploaded", 
-                "detail": "form-data field name must be 'video'"
-            }), 400
+            return _json_response({
+                "error": "No video uploaded",
+                "detail": "form-data field name must be 'video'",
+                "video_path": ""
+            }, 400)
 
         print(f"FORM KEYS: {list(form.keys())}", file=sys.stderr, flush=True)
         print(f"FILES KEYS: {list(files.keys())}", file=sys.stderr, flush=True)
 
         exercise_type = form.get('exercise_type')
         print(f"[MP] exercise_type from form: '{exercise_type}'", file=sys.stderr, flush=True)
-        
-        # Handle "null" string from client
+
         if not exercise_type or exercise_type == 'null':
             print(f"[MP] ERROR: Missing or invalid exercise_type (got: '{exercise_type}')", file=sys.stderr, flush=True)
-            return jsonify({
+            return _json_response({
                 "error": "Missing exercise_type",
-                "detail": "The 'exercise_type' field is required and cannot be null. Supported types: squat, deadlift, rdl, sldl, bulgarian, pullup, bicep_curl, bent_row, good_morning, dips, overhead_press, pushup"
-            }), 400
+                "detail": "The 'exercise_type' field is required and cannot be null. Supported types: squat, deadlift, rdl, sldl, bulgarian, pullup, bicep_curl, bent_row, good_morning, dips, overhead_press, pushup",
+                "video_path": ""
+            }, 400)
 
         exercise_type = exercise_type.lower().strip()
         print(f"[MP] normalized exercise_type: '{exercise_type}'", file=sys.stderr, flush=True)
@@ -393,12 +405,12 @@ def analyze():
         print(f"[MP] resolved_type: '{resolved_type}'", file=sys.stderr, flush=True)
         if not resolved_type:
             print(f"[MP] ERROR: Unsupported exercise type: {exercise_type}", file=sys.stderr, flush=True)
-            return jsonify({
+            return _json_response({
                 "error": f"Unsupported exercise type: {exercise_type}",
-                "detail": f"Supported types: {', '.join(sorted(set(EXERCISE_MAP.values())))}"
-            }), 400
+                "detail": f"Supported types: {', '.join(sorted(set(EXERCISE_MAP.values())))}",
+                "video_path": ""
+            }, 400)
 
-        # fast mode - default true
         fast_str = form.get('fast', 'true').lower()
         fast_mode = (fast_str == 'true')
         print(f"[MP] fast_str='{fast_str}' -> fast_mode={fast_mode}", file=sys.stderr, flush=True)
@@ -408,8 +420,8 @@ def analyze():
         base_filename = f"{resolved_type}_{unique_id}"
         raw_video_path = os.path.join(MEDIA_DIR, base_filename + ".mp4")
         analyzed_path = os.path.join(MEDIA_DIR, base_filename + "_analyzed.mp4")
-        
-        print(f"[MP] raw_video_path={raw_video_path}, analyzed_path={analyzed_path}", 
+
+        print(f"[MP] raw_video_path={raw_video_path}, analyzed_path={analyzed_path}",
               file=sys.stderr, flush=True)
 
         t_save0 = time.time()
@@ -419,28 +431,24 @@ def analyze():
 
         result = _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_mode)
         if not isinstance(result, dict):
-            result = {"error": "invalid_result", 
-                     "detail": "Analyzer did not return a dict", 
-                     "video_path": ""}
+            result = _invalid_result_payload()
         if _is_analyzer_unavailable(result):
-            return _unavailable_response(result)
+            unavailable_resp, status = _unavailable_response(result)
+            return _json_response(unavailable_resp.get_json(silent=True) or result, status)
 
-        result = _standardize_video_path(result)
-        output_path = result.get("video_path") or ""
-        print(f"[MP] result video_path={output_path}", file=sys.stderr, flush=True)
-        
-        full_url = None
-        if output_path and os.path.exists(output_path):
-            full_url = request.host_url.rstrip('/') + '/media/' + os.path.basename(output_path)
-
-        print(f"[MP] OK -> {full_url}", file=sys.stderr, flush=True)
+        response, status = _json_response(result)
+        print(f"[MP] OK -> {response.get_json(silent=True).get('video_url')}", file=sys.stderr, flush=True)
         print(f"[MP] TOTAL TIME: {(time.time() - t0):.3f}s", file=sys.stderr, flush=True)
-        return jsonify({"result": result, "video_url": full_url})
+        return response, status
 
     except Exception as e:
         tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         print("\n*** analyze() EXCEPTION ***\n", tb, file=sys.stderr, flush=True)
-        return jsonify({"error": "internal_error_in_analyze", "detail": str(e)}), 500
+        return _json_response({
+            "error": "internal_error_in_analyze",
+            "detail": str(e),
+            "video_path": ""
+        }, 500)
 
 @app.route('/media/<filename>')
 def media(filename):
