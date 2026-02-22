@@ -82,8 +82,8 @@ class PressConfig:
     lean_target_max: float = 12.0         # Ideal max torso lean
     lean_ok_max: float = 22.0             # Acceptable lean
     lean_bad_max: float = 30.0            # Bad lean threshold
-    stack_target_max: float = 0.04        # Ideal wrist-shoulder horizontal offset (normalized)
-    stack_ok_max: float = 0.07            # Acceptable offset
+    stack_target_max: float = 0.05        # Ideal wrist-shoulder horizontal offset at lockout (normalized)
+    stack_ok_max: float = 0.10            # Acceptable offset at lockout
     bar_path_target: float = 0.03         # Ideal bar path deviation (normalized)
     bar_path_ok: float = 0.06             # Acceptable bar path deviation
 
@@ -106,7 +106,8 @@ class RepMetrics:
     min_elbow_angle: float = 999.0        # Lowest elbow angle (bottom)
     max_elbow_angle: float = 0.0          # Highest elbow angle (top/lockout)
     max_torso_lean: float = 0.0           # Peak torso lean during rep
-    max_wrist_offset: float = 0.0         # Peak wrist-shoulder horizontal offset
+    max_wrist_offset: float = 0.0         # Peak wrist-shoulder horizontal offset (whole rep)
+    top_wrist_offset: float = 0.0        # Wrist-shoulder horizontal offset captured at lockout (TOP)
     bar_path_deviation: float = 0.0       # Lateral deviation of wrist path
     wrist_x_samples: list = field(default_factory=list)  # For bar path tracking
     wrist_y_at_bottom: float = 0.0
@@ -520,9 +521,11 @@ class OverheadPressTracker:
             higher_is_better=False
         )
 
-        # Stacking score (wrist over shoulder)
+        # Stacking score (wrist over shoulder) — evaluated only at the lockout/TOP position.
+        # Using top_wrist_offset (captured on first lockout frame) instead of max across
+        # the entire rep; at the bottom the wrists are naturally wider than the shoulders.
         metrics.stack_score = score_interpolate(
-            metrics.max_wrist_offset,
+            metrics.top_wrist_offset,
             target=cfg.stack_target_max,
             ok=cfg.stack_ok_max,
             bad=cfg.stack_ok_max + 0.04,
@@ -725,6 +728,8 @@ class OverheadPressTracker:
             if is_top and enough_frames:
                 self._transition(PressPhase.TOP)
                 m.wrist_y_at_top = self.wrist_y_ema
+                # Capture stacking offset at the lockout position (not max across whole rep)
+                m.top_wrist_offset = wrist_offset_norm
             elif is_bottom and enough_frames:
                 # Went back down without reaching top — false start
                 self._transition(PressPhase.BOTTOM)
@@ -847,7 +852,7 @@ class OverheadPressTracker:
                 "bottom_elbow": round(r.min_elbow_angle, 1),
                 "top_elbow": round(r.max_elbow_angle, 1),
                 "max_lean": round(r.max_torso_lean, 1),
-                "max_stack_offset": round(r.max_wrist_offset, 3),
+                "top_stack_offset": round(r.top_wrist_offset, 3),
                 "issues": r.issues,
             })
 
