@@ -186,6 +186,52 @@ def score_label(s: float) -> str:
     return "Poor"
 
 
+# ============ Form Tips (non-scoring, coaching suggestions) ============
+# These do NOT affect the score — they are general coaching observations.
+
+PRESS_TIP_SLOW_DESCENT  = "Lower the bar slowly — aim for 2–3 seconds on the way down"
+PRESS_TIP_PAUSE_BOTTOM  = "Pause briefly at the shoulder before pressing for better activation"
+PRESS_TIP_BAR_PATH      = "Focus on pressing straight up — keep the bar path vertical"
+PRESS_TIP_BREATHE       = "Breathe in on the way down, breathe out as you press"
+PRESS_TIP_KEEP_GOING    = "Great consistency — keep challenging yourself!"
+
+# Priority order for tip selection
+PRESS_TIP_PRIORITY = [
+    PRESS_TIP_SLOW_DESCENT,
+    PRESS_TIP_PAUSE_BOTTOM,
+    PRESS_TIP_BAR_PATH,
+    PRESS_TIP_BREATHE,
+    PRESS_TIP_KEEP_GOING,
+]
+
+# Thresholds for tip selection
+TIP_MIN_DESC_FRAMES  = 6     # Descent shorter than this → suggest slower eccentric
+TIP_DESC_ASC_RATIO   = 0.65  # Descent/ascent ratio below this → suggest slower eccentric
+TIP_BAR_PATH_WARN    = 0.045 # Bar path deviation above this (but below score threshold) → path tip
+
+
+def choose_press_tip(avg_desc_frames: float, avg_asc_frames: float, avg_bar_path_dev: float) -> str:
+    """
+    Return a coaching form tip (non-scoring) for military press.
+
+    avg_desc_frames   – average descending-phase frames per rep
+    avg_asc_frames    – average ascending-phase frames per rep
+    avg_bar_path_dev  – average bar-path lateral deviation (normalised)
+    """
+    # Eccentric too fast → slow down tip
+    if avg_desc_frames < TIP_MIN_DESC_FRAMES:
+        return PRESS_TIP_SLOW_DESCENT
+    if avg_asc_frames > 0 and (avg_desc_frames / avg_asc_frames) < TIP_DESC_ASC_RATIO:
+        return PRESS_TIP_SLOW_DESCENT
+
+    # Moderate bar-path wobble (not bad enough to fail, but worth coaching)
+    if avg_bar_path_dev > TIP_BAR_PATH_WARN:
+        return PRESS_TIP_BAR_PATH
+
+    # Default breathing/technique cue
+    return PRESS_TIP_BREATHE
+
+
 # ============ Torso Lean Calculation ============
 
 def compute_torso_lean(lms, lsh, rsh, lh, rh, vis_thr: float = 0.3) -> Optional[float]:
@@ -805,7 +851,12 @@ class OverheadPressTracker:
                 "issues": r.issues,
             })
 
-        form_tip = session_feedback[0] if session_feedback else None
+        # Form tip — coaching note that does NOT affect the score.
+        # Chosen from descending-phase tempo and bar-path data, independent of feedback.
+        avg_desc  = float(np.mean([r.descending_frames for r in self.all_reps]))
+        avg_asc   = float(np.mean([r.ascending_frames  for r in self.all_reps]))
+        avg_bar_dev = float(np.mean([r.bar_path_deviation for r in self.all_reps]))
+        form_tip  = choose_press_tip(avg_desc, avg_asc, avg_bar_dev)
 
         return {
             "rep_count": self.rep_count,
