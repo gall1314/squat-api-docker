@@ -524,7 +524,7 @@ def run_pushup_analysis(video_path,
                 motion_detector.activate("enter_plank")
 
             if onpushup and offpushup_streak>=OFFPUSHUP_MIN_FRAMES:
-                robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow)
+                robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow, confirmed_bottom=confirmed_bottom_samples)
                 cycle_has_issues = _evaluate_cycle_form(lms, robust_bottom_elbow, robust_top_elbow,
                                    cycle_max_hip_misalign, cycle_max_flare,
                                    cycle_max_descent_vel,
@@ -621,7 +621,8 @@ def run_pushup_analysis(video_path,
                     
                     if reset_by_asc or reset_by_elb:
                         robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(
-                            cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow
+                            cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow,
+                            confirmed_bottom=confirmed_bottom_samples
                         )
                         cycle_has_issues = _evaluate_cycle_form(lms, robust_bottom_elbow, robust_top_elbow,
                                            cycle_max_hip_misalign, cycle_max_flare,
@@ -728,7 +729,7 @@ def run_pushup_analysis(video_path,
             if shoulder_y is not None: shoulder_prev=shoulder_y
 
     if onpushup and (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and (cycle_min_elbow<=ELBOW_BENT_ANGLE):
-        robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow)
+        robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow, confirmed_bottom=confirmed_bottom_samples)
         cycle_has_issues = _evaluate_cycle_form(lms, robust_bottom_elbow, robust_top_elbow,
                            cycle_max_hip_misalign, cycle_max_flare,
                            cycle_max_descent_vel,
@@ -855,12 +856,18 @@ def _robust_cycle_elbows(bottom_samples, top_samples, fallback_bottom=None, fall
     # was detected at the bottom position, so the percentile is not inflated by
     # mid-descent angles. This prevents false "go deeper" feedback when the user
     # is genuinely touching the floor.
-    if confirmed_bottom and len(confirmed_bottom) >= 2:
+    if confirmed_bottom and len(confirmed_bottom) >= 1:
         arr = np.array(confirmed_bottom, dtype=np.float32)
         robust_bottom = float(np.percentile(arr, ROBUST_CONFIRMED_PERCENTILE))
     elif bottom_samples:
         arr = np.array(bottom_samples, dtype=np.float32)
         robust_bottom = float(np.percentile(arr, ROBUST_BOTTOM_PERCENTILE))
+
+    # Cap the robust estimate with the actual observed minimum angle.
+    # The percentile of all-cycle samples can be inflated by descent/ascent frames;
+    # if the person genuinely reached a deep position, trust that observation.
+    if fallback_bottom is not None and robust_bottom is not None:
+        robust_bottom = min(robust_bottom, fallback_bottom)
 
     if top_samples:
         arr = np.array(top_samples, dtype=np.float32)
