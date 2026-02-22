@@ -347,6 +347,8 @@ DEBUG_GRADING = bool(int(os.getenv("DEBUG_GRADING", "1")))
 MIN_CYCLE_ELBOW_SAMPLES = 4
 ROBUST_BOTTOM_PERCENTILE = 25
 ROBUST_TOP_PERCENTILE = 75
+# Percentile used when we have confirmed-at-bottom samples (much more accurate)
+ROBUST_CONFIRMED_PERCENTILE = 10
 
 
 def run_pushup_analysis(video_path,
@@ -412,7 +414,7 @@ def run_pushup_analysis(video_path,
     rt_fb_msg=None; rt_fb_hold=0
 
     cycle_tip_deeper=False; cycle_tip_hips=False; cycle_tip_lockout=False; cycle_tip_elbows=False
-    cycle_bottom_samples=[]; cycle_top_samples=[]
+    cycle_bottom_samples=[]; cycle_top_samples=[]; confirmed_bottom_samples=[]
     depth_fail_count=0; hips_fail_count=0; lockout_fail_count=0; flare_fail_count=0
     depth_already_reported=False; hips_already_reported=False
     lockout_already_reported=False; flare_already_reported=False
@@ -514,7 +516,7 @@ def run_pushup_analysis(video_path,
                 desc_base_shoulder=None; allow_new_bottom=True
                 cycle_max_descent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
                 cycle_tip_deeper=False; cycle_tip_hips=False; cycle_tip_lockout=False; cycle_tip_elbows=False
-                cycle_bottom_samples=[]; cycle_top_samples=[]
+                cycle_bottom_samples=[]; cycle_top_samples=[]; confirmed_bottom_samples=[]
                 bottom_phase_min_elbow=None; top_phase_max_elbow=None
                 cycle_max_hip_misalign=None; cycle_max_flare=None
                 cycle_max_descent_vel=0.0
@@ -546,7 +548,7 @@ def run_pushup_analysis(video_path,
                 onpushup=False; offpushup_frames_since_any_rep=0
                 desc_base_shoulder=None; cycle_max_descent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
                 cycle_tip_deeper=False; cycle_tip_hips=False; cycle_tip_lockout=False; cycle_tip_elbows=False
-                cycle_bottom_samples=[]; cycle_top_samples=[]
+                cycle_bottom_samples=[]; cycle_top_samples=[]; confirmed_bottom_samples=[]
                 bottom_phase_min_elbow=None; top_phase_max_elbow=None
                 cycle_max_hip_misalign=None; cycle_max_flare=None
                 cycle_max_descent_vel=0.0
@@ -571,7 +573,7 @@ def run_pushup_analysis(video_path,
                     if shoulder_vel>abs(INFLECT_VEL_THR):
                         desc_base_shoulder=shoulder_y
                         cycle_max_descent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
-                        cycle_bottom_samples=[]; cycle_top_samples=[]
+                        cycle_bottom_samples=[]; cycle_top_samples=[]; confirmed_bottom_samples=[]
                         bottom_phase_min_elbow=None; top_phase_max_elbow=None
                         cycle_max_hip_misalign=None; cycle_max_flare=None
                         cycle_max_descent_vel=0.0
@@ -644,7 +646,7 @@ def run_pushup_analysis(video_path,
                         desc_base_shoulder=shoulder_y
                         cycle_max_descent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
                         allow_new_bottom=True
-                        cycle_bottom_samples=[]; cycle_top_samples=[]
+                        cycle_bottom_samples=[]; cycle_top_samples=[]; confirmed_bottom_samples=[]
                         bottom_phase_min_elbow=None; top_phase_max_elbow=None
                         cycle_max_hip_misalign=None; cycle_max_flare=None
                         cycle_max_descent_vel=0.0
@@ -659,10 +661,17 @@ def run_pushup_analysis(video_path,
                 at_bottom=at_bottom or raw_bottom
                 can_cnt=(frame_idx - last_bottom_frame) >= REFRACTORY_FRAMES
 
+                # Collect confirmed-bottom samples: only frames where we're actually at the bottom.
+                # These are far more reliable than the full descent window for depth checking.
+                if at_bottom:
+                    confirmed_bottom_samples.append(raw_elbow_min)
+                    if len(confirmed_bottom_samples) > 15:
+                        confirmed_bottom_samples.pop(0)
+
                 if at_bottom and allow_new_bottom and can_cnt and (not counted_this_cycle):
                     # ✅ Calculate if has issues based on current measurements
                     rep_has_issues = False
-                    robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow)
+                    robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow, confirmed_bottom=confirmed_bottom_samples)
                     if robust_bottom_elbow and robust_bottom_elbow > DEPTH_ERROR_ANGLE:
                         rep_has_issues = True
                     if robust_top_elbow and robust_top_elbow < LOCKOUT_ERROR_ANGLE:
@@ -693,7 +702,7 @@ def run_pushup_analysis(video_path,
                             allow_new_bottom=True
 
                 if at_bottom and not cycle_tip_deeper:
-                    robust_bottom_elbow, _ = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow)
+                    robust_bottom_elbow, _ = _robust_cycle_elbows(cycle_bottom_samples, cycle_top_samples, bottom_phase_min_elbow, top_phase_max_elbow, confirmed_bottom=confirmed_bottom_samples)
                     if robust_bottom_elbow and robust_bottom_elbow > DEPTH_ERROR_ANGLE:
                         cycle_tip_deeper = True
                         depth_fail_count += 1
@@ -837,13 +846,22 @@ def run_pushup_analysis(video_path,
 
 # ============ Helper Functions ============
 
-def _robust_cycle_elbows(bottom_samples, top_samples, fallback_bottom=None, fallback_top=None):
+def _robust_cycle_elbows(bottom_samples, top_samples, fallback_bottom=None, fallback_top=None,
+                         confirmed_bottom=None):
     robust_bottom = fallback_bottom
     robust_top = fallback_top
 
-    if bottom_samples:
+    # Prefer confirmed-at-bottom samples: they only contain frames where the person
+    # was detected at the bottom position, so the percentile is not inflated by
+    # mid-descent angles. This prevents false "go deeper" feedback when the user
+    # is genuinely touching the floor.
+    if confirmed_bottom and len(confirmed_bottom) >= 2:
+        arr = np.array(confirmed_bottom, dtype=np.float32)
+        robust_bottom = float(np.percentile(arr, ROBUST_CONFIRMED_PERCENTILE))
+    elif bottom_samples:
         arr = np.array(bottom_samples, dtype=np.float32)
         robust_bottom = float(np.percentile(arr, ROBUST_BOTTOM_PERCENTILE))
+
     if top_samples:
         arr = np.array(top_samples, dtype=np.float32)
         robust_top = float(np.percentile(arr, ROBUST_TOP_PERCENTILE))
