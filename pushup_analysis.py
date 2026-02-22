@@ -763,6 +763,11 @@ def run_pushup_analysis(video_path,
             penalty = 0.0
         technique_score=_half_floor10(max(0.0,10.0-penalty))
 
+    # Perfect score: override rep counts so all reps are good
+    if technique_score == 10.0 and rep_count > 0:
+        good_reps = rep_count
+        bad_reps = 0
+
     form_errors_list = [err for err in FORM_ERROR_PRIORITY if err in session_form_errors]
     perf_tips_list = [tip for tip in PERF_TIP_PRIORITY if tip in session_perf_tips]
 
@@ -820,7 +825,7 @@ def run_pushup_analysis(video_path,
         "technique_label": score_label(technique_score),
         "good_reps": int(good_reps),
         "bad_reps": int(bad_reps),
-        "feedback": form_errors_list,      # ⚠️ Form Errors בלבד
+        "feedback": form_errors_list if form_errors_list else (["Great form! Keep it up 💪"] if technique_score == 10.0 and rep_count > 0 else []),      # ⚠️ Form Errors / perfect-score message
         "tips": perf_tips_list,            # רשימה מלאה של tips
         "reps": rep_reports,
         "video_path": final_path if return_video else "",
