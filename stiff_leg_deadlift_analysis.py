@@ -38,16 +38,12 @@ mp_pose = mp.solutions.pose
 # ===================== FEEDBACK SEVERITY =====================
 FB_SEVERITY = {
     "Go deeper - lower the bar to shins": 3,
-    # ✅✅ REMOVED unreliable checks:
-    # "Knees bending too much - keep legs straighter"
-    # "Back rounding detected"
-    # "Control the lowering"
-    # "Pause at the bottom"
+    "Knees bending too much - keep legs straighter": 4,
 }
 
 FEEDBACK_CATEGORY = {
     "Go deeper - lower the bar to shins": "depth",
-    # ✅✅ REMOVED unreliable categories
+    "Knees bending too much - keep legs straighter": "knee",
 }
 
 def pick_strongest_feedback(feedback_list):
@@ -394,8 +390,10 @@ def run_stiff_leg_deadlift_analysis(video_path,
                         feedback.append("Go deeper - lower the bar to shins")
                         score -= 2.0
 
-                    # ✅✅ REMOVED: Knee angle check - not reliable with MediaPipe
-                    # MediaPipe's accuracy isn't good enough for precise knee angle detection
+                    # Knee angle check - stiff-leg requires nearly straight knees
+                    if min_knee_angle < KNEE_MIN_ANGLE:
+                        feedback.append("Knees bending too much - keep legs straighter")
+                        score -= 2.0
 
                     # ✅✅ REMOVED: Back rounding check - not reliable with MediaPipe
                     # MediaPipe can't accurately detect back rounding
@@ -464,7 +462,9 @@ def run_stiff_leg_deadlift_analysis(video_path,
 
     session_tip = None
     if session_feedback_by_cat:
-        if "depth" in session_feedback_by_cat:
+        if "knee" in session_feedback_by_cat:
+            session_tip = "Focus on keeping your legs straight - slight soft bend only, not a squat"
+        elif "depth" in session_feedback_by_cat:
             session_tip = "Focus on hip mobility to lower the bar closer to the ground"
     else:
         session_tip = "Perfect stiff-leg form! Great hamstring work 💪"
