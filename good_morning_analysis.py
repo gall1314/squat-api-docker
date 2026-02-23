@@ -175,67 +175,75 @@ def _wrap_two_lines(draw, text, font, max_width):
 
 
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Match pull-up overlay layout/sizing exactly (with DEPTH label)."""
+    """Reps בפינת שמאל-עליון; דונאט ימני-עליון; פידבק תחתון — זהה לסקוואט."""
     h, w, _ = frame.shape
+
+    # --- Reps box (top-left) ---
+    pil = Image.fromarray(frame)
+    draw = ImageDraw.Draw(pil)
+    reps_text = f"Reps: {reps}"
+    inner_pad_x, inner_pad_y = 10, 6
+    text_w = draw.textlength(reps_text, font=REPS_FONT)
+    text_h = REPS_FONT.size
+    x0, y0 = 0, 0
+    x1 = int(text_w + 2 * inner_pad_x)
+    y1 = int(text_h + 2 * inner_pad_y)
+    top = frame.copy()
+    cv2.rectangle(top, (x0, y0), (x1, y1), (0, 0, 0), -1)
+    frame = cv2.addWeighted(top, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
+    pil = Image.fromarray(frame)
+    ImageDraw.Draw(pil).text((x0 + inner_pad_x, y0 + inner_pad_y - 1),
+                             reps_text, font=REPS_FONT, fill=(255, 255, 255))
+    frame = np.array(pil)
+
+    # --- Donut (top-right) ---
     ref_h = max(int(h * 0.06), int(REPS_FONT_SIZE * 1.6))
-    r = int(ref_h * DONUT_RADIUS_SCALE)
-    th = max(3, int(r * DONUT_THICKNESS_FRAC))
-    m = 12
-    cx = w - m - r
-    cy = max(ref_h + r // 8, r + th // 2 + 2)
-    pct = float(np.clip(depth_pct, 0.0, 1.0))
-    cv2.circle(frame, (cx, cy), r, DEPTH_RING_BG, th, cv2.LINE_AA)
-    cv2.ellipse(frame, (cx, cy), (r, r), 0, -90, -90 + int(360 * pct), DEPTH_COLOR, th, cv2.LINE_AA)
+    radius = int(ref_h * DONUT_RADIUS_SCALE)
+    thick = max(3, int(radius * DONUT_THICKNESS_FRAC))
+    margin = 12
+    cx = w - margin - radius
+    cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
+    frame = draw_depth_donut(frame, (cx, cy), radius, thick, float(np.clip(depth_pct, 0, 1)))
 
-    reps_font = _load_font(FONT_PATH, REPS_FONT_SIZE)
-    feedback_font = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
-    depth_label_font = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
-    depth_pct_font = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
-
-    pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    pil = Image.fromarray(frame)
     draw = ImageDraw.Draw(pil)
+    label_txt = "DEPTH"
+    pct_txt = f"{int(float(np.clip(depth_pct, 0, 1)) * 100)}%"
+    label_w = draw.textlength(label_txt, font=DEPTH_LABEL_FONT)
+    pct_w = draw.textlength(pct_txt, font=DEPTH_PCT_FONT)
+    gap = max(2, int(radius * 0.10))
+    base_y = cy - (DEPTH_LABEL_FONT.size + gap + DEPTH_PCT_FONT.size) // 2
+    draw.text((cx - int(label_w // 2), base_y), label_txt, font=DEPTH_LABEL_FONT, fill=(255, 255, 255))
+    draw.text((cx - int(pct_w // 2), base_y + DEPTH_LABEL_FONT.size + gap),
+              pct_txt, font=DEPTH_PCT_FONT, fill=(255, 255, 255))
+    frame = np.array(pil)
 
-    txt = f"Reps: {int(reps)}"
-    pad_x, pad_y = 10, 6
-    tw = draw.textlength(txt, font=reps_font)
-    thh = reps_font.size
-    base = np.array(pil)
-    over = base.copy()
-    cv2.rectangle(over, (0, 0), (int(tw + 2 * pad_x), int(thh + 2 * pad_y)), (0, 0, 0), -1)
-    base = cv2.addWeighted(over, BAR_BG_ALPHA, base, 1 - BAR_BG_ALPHA, 0)
-    pil = Image.fromarray(base)
-    draw = ImageDraw.Draw(pil)
-    draw.text((pad_x, pad_y - 1), txt, font=reps_font, fill=(255, 255, 255))
-
-    gap = max(2, int(r * 0.10))
-    label = "DEPTH"
-    pct_txt = f"{int(pct * 100)}%"
-    by = cy - (depth_label_font.size + gap + depth_pct_font.size) // 2
-    lw = draw.textlength(label, font=depth_label_font)
-    pw = draw.textlength(pct_txt, font=depth_pct_font)
-    draw.text((cx - int(lw // 2), by), label, font=depth_label_font, fill=(255, 255, 255))
-    draw.text((cx - int(pw // 2), by + depth_label_font.size + gap), pct_txt, font=depth_pct_font, fill=(255, 255, 255))
-
+    # --- Bottom feedback ---
     if feedback:
-        max_w = int(w - 2 * 12 - 20)
-        lines = _wrap_two_lines(draw, feedback, feedback_font, max_w)
-        line_h = feedback_font.size + 6
-        block_h = 2 * 8 + len(lines) * line_h + (len(lines) - 1) * 4
-        y0 = max(0, h - max(6, int(h * 0.02)) - block_h)
-        y1 = h - max(6, int(h * 0.02))
-        base2 = np.array(pil)
-        over2 = base2.copy()
-        cv2.rectangle(over2, (0, y0), (w, y1), (0, 0, 0), -1)
-        base2 = cv2.addWeighted(over2, BAR_BG_ALPHA, base2, 1 - BAR_BG_ALPHA, 0)
-        pil = Image.fromarray(base2)
-        draw = ImageDraw.Draw(pil)
-        ty = y0 + 8
+        pil_fb = Image.fromarray(frame)
+        draw_fb = ImageDraw.Draw(pil_fb)
+        safe_margin = max(6, int(h * 0.02))
+        pad_x, pad_y, line_gap = 12, 8, 4
+        max_text_w = int(w - 2 * pad_x - 20)
+        lines = _wrap_two_lines(draw_fb, feedback, FEEDBACK_FONT, max_text_w)
+        line_h = FEEDBACK_FONT.size + 6
+        block_h = (2 * pad_y) + len(lines) * line_h + (len(lines) - 1) * line_gap
+        y0 = max(0, h - safe_margin - block_h)
+        y1 = h - safe_margin
+        over = frame.copy()
+        cv2.rectangle(over, (0, y0), (w, y1), (0, 0, 0), -1)
+        frame = cv2.addWeighted(over, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
+        pil_fb = Image.fromarray(frame)
+        draw_fb = ImageDraw.Draw(pil_fb)
+        ty = y0 + pad_y
         for ln in lines:
-            tw2 = draw.textlength(ln, font=feedback_font)
-            tx = max(12, (w - int(tw2)) // 2)
-            draw.text((tx, ty), ln, font=feedback_font, fill=(255, 255, 255))
-            ty += line_h + 4
-    return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+            tw = draw_fb.textlength(ln, font=FEEDBACK_FONT)
+            tx = max(pad_x, (w - int(tw)) // 2)
+            draw_fb.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255, 255, 255))
+            ty += line_h + line_gap
+        frame = np.array(pil_fb)
+
+    return frame
 
 # ===================== GEOMETRY =====================
 def angle_deg(a, b, c):
