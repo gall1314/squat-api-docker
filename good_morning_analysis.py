@@ -175,32 +175,22 @@ def _wrap_two_lines(draw, text, font, max_width):
 
 
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Reps בפינת שמאל-עליון; דונאט ימני-עליון; פידבק תחתון"""
+    """Match pull-up overlay layout/sizing exactly (with DEPTH label)."""
     h, w, _ = frame.shape
-
-    # Match pull-up visual scale across mixed aspect ratios:
-    # portrait clips otherwise look oversized compared to typical pull-up landscape clips.
-    overlay_scale = min(1.0, max(0.78, w / float(max(1, h))))
-    reps_size = max(16, int(round(REPS_FONT_SIZE * overlay_scale)))
-    feedback_size = max(14, int(round(FEEDBACK_FONT_SIZE * overlay_scale)))
-    depth_label_size = max(11, int(round(DEPTH_LABEL_FONT_SIZE * overlay_scale)))
-    depth_pct_size = max(13, int(round(DEPTH_PCT_FONT_SIZE * overlay_scale)))
-
-    ref_axis = min(h, w)
-    ref_h = max(int(ref_axis * 0.06), int(reps_size * 1.6))
+    ref_h = max(int(h * 0.06), int(REPS_FONT_SIZE * 1.6))
     r = int(ref_h * DONUT_RADIUS_SCALE)
     th = max(3, int(r * DONUT_THICKNESS_FRAC))
     m = 12
     cx = w - m - r
     cy = max(ref_h + r // 8, r + th // 2 + 2)
     pct = float(np.clip(depth_pct, 0.0, 1.0))
+    cv2.circle(frame, (cx, cy), r, DEPTH_RING_BG, th, cv2.LINE_AA)
+    cv2.ellipse(frame, (cx, cy), (r, r), 0, -90, -90 + int(360 * pct), DEPTH_COLOR, th, cv2.LINE_AA)
 
-    frame = draw_depth_donut(frame, (cx, cy), r, th, pct)
-
-    reps_font = _load_font(FONT_PATH, reps_size)
-    feedback_font = _load_font(FONT_PATH, feedback_size)
-    depth_label_font = _load_font(FONT_PATH, depth_label_size)
-    depth_pct_font = _load_font(FONT_PATH, depth_pct_size)
+    reps_font = _load_font(FONT_PATH, REPS_FONT_SIZE)
+    feedback_font = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
+    depth_label_font = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
+    depth_pct_font = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 
     pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil)
@@ -245,7 +235,6 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
             tx = max(12, (w - int(tw2)) // 2)
             draw.text((tx, ty), ln, font=feedback_font, fill=(255, 255, 255))
             ty += line_h + 4
-
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
 # ===================== GEOMETRY =====================
