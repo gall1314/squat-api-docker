@@ -29,14 +29,16 @@ except Exception as e:
 # ================== THEME (MATCH SQUAT) ==================
 # Keep these values identical to the Squat overlay to ensure visual parity.
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"  # must exist in working dir (same as squat)
-TOP_BAR_FRAC    = 0.095
-BOTTOM_BAR_FRAC = 0.08
-BAR_BG_OPACITY  = 0.58
+BAR_BG_ALPHA         = 0.55
+DONUT_RADIUS_SCALE   = 0.72
+DONUT_THICKNESS_FRAC = 0.28
+DEPTH_COLOR          = (40, 200, 80)
+DEPTH_RING_BG        = (70, 70, 70)
 
-REPS_FONT_PX    = 30
-DEPTH_LABEL_PX  = 16
-DEPTH_PCT_PX    = 22
-FEEDBACK_BASE_PX= 20
+REPS_FONT_SIZE        = 28
+FEEDBACK_FONT_SIZE    = 22
+DEPTH_LABEL_FONT_SIZE = 14
+DEPTH_PCT_FONT_SIZE   = 18
 
 SKELETON_THICK  = 2
 SKELETON_OPAC   = 0.85
@@ -132,30 +134,31 @@ def technique_label(score):
     if score >= 6.5: return "Fair"
     return "Needs work"
 
-# ================== OVERLAY (identical sizing/placement) ==================
+# ================== OVERLAY (identical sizing/placement to squat) ==================
 from PIL import ImageFont, ImageDraw, Image
 
-def draw_text(draw, xy, text, px, fill=(255,255,255), anchor=None):
-    if ensure_font():
-        font = ImageFont.truetype(FONT_PATH, px)
-        draw.text(xy, text, font=font, fill=fill, anchor=anchor)
-    else:
-        # PIL fallback: approximate size with default bitmap font
-        draw.text(xy, text, fill=fill, anchor=anchor)
+def _load_font(path, size):
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception:
+        return ImageFont.load_default()
 
-def draw_rect_alpha(img_pil, xyxy, opacity, fill=(0,0,0)):
-    x1,y1,x2,y2 = xyxy
-    overlay = Image.new('RGBA', (x2-x1, y2-y1), fill + (int(255*opacity),))
-    img_pil.paste(overlay, (x1,y1), overlay)
+REPS_FONT        = _load_font(FONT_PATH, REPS_FONT_SIZE)
+FEEDBACK_FONT    = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
+DEPTH_LABEL_FONT = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
+DEPTH_PCT_FONT   = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 
-def draw_donut(draw, center, radius, pct):
-    # Draw a donut representing 0..100%; identical width as squat
-    start_angle = -90  # start at top
-    end_angle = start_angle + 360 * (clamp(pct, 0, 100) / 100.0)
-    # outer
-    draw.ellipse([center[0]-radius, center[1]-radius, center[0]+radius, center[1]+radius], outline=(255,255,255), width=8)
-    # filled arc (progress)
-    draw.arc([center[0]-radius, center[1]-radius, center[0]+radius, center[1]+radius], start=start_angle, end=end_angle, fill=(255,255,255), width=8)
+def draw_depth_donut(frame, center, radius, thickness, pct):
+    pct = float(np.clip(pct, 0.0, 1.0))
+    cx, cy = int(center[0]), int(center[1])
+    radius = int(radius)
+    thickness = int(thickness)
+    cv2.circle(frame, (cx, cy), radius, DEPTH_RING_BG, thickness, lineType=cv2.LINE_AA)
+    start_ang = -90
+    end_ang = start_ang + int(360 * pct)
+    cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang,
+                DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
+    return frame
 
 def draw_skeleton(frame, lm):
     # Only body (no face) — similar to squat
@@ -167,38 +170,103 @@ def draw_skeleton(frame, lm):
     ]
     h, w = frame.shape[:2]
     for a,b in pairs:
-        if lm[a] is None or lm[b] is None: 
+        if lm[a] is None or lm[b] is None:
             continue
         x1,y1 = int(lm[a][0]), int(lm[a][1])
         x2,y2 = int(lm[b][0]), int(lm[b][1])
         cv2.line(frame, (x1,y1), (x2,y2), (255,255,255), SKELETON_THICK)
 
-def render_overlay(frame_bgr, reps_count, live_depth_pct, feedback_text):
-    # Make bars + donut + text with identical proportions to squat
-    h, w = frame_bgr.shape[:2]
-    img_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-    draw = ImageDraw.Draw(img_pil)
+def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
+    """Reps בפינת שמאל-עליון; דונאט ימני-עליון; פידבק תחתון — זהה לסקוואט."""
+    h, w, _ = frame.shape
 
-    # Top bar
-    top_h = int(h * TOP_BAR_FRAC)
-    draw_rect_alpha(img_pil, (0,0,w,top_h), BAR_BG_OPACITY)
-    # Reps text (left)
-    draw_text(draw, (12, int(top_h*0.6)), f"Reps: {reps_count}", REPS_FONT_PX, fill=(255,255,255), anchor=None)
-    # Donut (right-top)
-    donut_center = (w - int(top_h*0.9), int(top_h*0.55))
-    donut_radius = int(top_h*0.42)
-    draw_donut(draw, donut_center, donut_radius, live_depth_pct)
-    # Label + pct
-    draw_text(draw, (donut_center[0], donut_center[1]-int(top_h*0.35)), "DEPTH", DEPTH_LABEL_PX, fill=(255,255,255), anchor="mm")
-    draw_text(draw, (donut_center[0], donut_center[1]+int(top_h*0.35)), f"{int(clamp(live_depth_pct,0,100))}%", DEPTH_PCT_PX, fill=(255,255,255), anchor="mm")
+    # --- Reps box (top-left) ---
+    pil = Image.fromarray(frame)
+    draw = ImageDraw.Draw(pil)
+    reps_text = f"Reps: {reps}"
+    inner_pad_x, inner_pad_y = 10, 6
+    text_w = draw.textlength(reps_text, font=REPS_FONT)
+    text_h = REPS_FONT.size
+    x0, y0 = 0, 0
+    x1 = int(text_w + 2 * inner_pad_x)
+    y1 = int(text_h + 2 * inner_pad_y)
+    top = frame.copy()
+    cv2.rectangle(top, (x0, y0), (x1, y1), (0, 0, 0), -1)
+    frame = cv2.addWeighted(top, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
+    pil = Image.fromarray(frame)
+    ImageDraw.Draw(pil).text((x0 + inner_pad_x, y0 + inner_pad_y - 1),
+                             reps_text, font=REPS_FONT, fill=(255, 255, 255))
+    frame = np.array(pil)
 
-    # Bottom bar (feedback)
-    bot_h = int(h * BOTTOM_BAR_FRAC)
-    draw_rect_alpha(img_pil, (0,h-bot_h,w,h), BAR_BG_OPACITY)
-    if feedback_text:
-        draw_text(draw, (12, h - int(bot_h*0.5)), feedback_text, FEEDBACK_BASE_PX, fill=(255,255,255), anchor=None)
+    # --- Donut (top-right) ---
+    ref_h = max(int(h * 0.06), int(REPS_FONT_SIZE * 1.6))
+    radius = int(ref_h * DONUT_RADIUS_SCALE)
+    thick = max(3, int(radius * DONUT_THICKNESS_FRAC))
+    margin = 12
+    cx = w - margin - radius
+    cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
+    frame = draw_depth_donut(frame, (cx, cy), radius, thick, float(np.clip(depth_pct, 0, 1)))
 
-    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+    pil = Image.fromarray(frame)
+    draw = ImageDraw.Draw(pil)
+    label_txt = "DEPTH"
+    pct_txt = f"{int(float(np.clip(depth_pct, 0, 1)) * 100)}%"
+    label_w = draw.textlength(label_txt, font=DEPTH_LABEL_FONT)
+    pct_w = draw.textlength(pct_txt, font=DEPTH_PCT_FONT)
+    gap = max(2, int(radius * 0.10))
+    base_y = cy - (DEPTH_LABEL_FONT.size + gap + DEPTH_PCT_FONT.size) // 2
+    draw.text((cx - int(label_w // 2), base_y), label_txt, font=DEPTH_LABEL_FONT, fill=(255, 255, 255))
+    draw.text((cx - int(pct_w // 2), base_y + DEPTH_LABEL_FONT.size + gap),
+              pct_txt, font=DEPTH_PCT_FONT, fill=(255, 255, 255))
+    frame = np.array(pil)
+
+    # --- Bottom feedback ---
+    if feedback:
+        def wrap_to_two_lines(draw, text, font, max_width):
+            words = text.split()
+            if not words: return [""]
+            lines, cur = [], ""
+            for w in words:
+                trial = (cur + " " + w).strip()
+                if draw.textlength(trial, font=font) <= max_width:
+                    cur = trial
+                else:
+                    if cur: lines.append(cur)
+                    cur = w
+                if len(lines) == 2: break
+            if cur and len(lines) < 2: lines.append(cur)
+            leftover = len(words) - sum(len(l.split()) for l in lines)
+            if leftover > 0 and len(lines) >= 2:
+                last = lines[-1] + "…"
+                while draw.textlength(last, font=font) > max_width and len(last) > 1:
+                    last = last[:-2] + "…"
+                lines[-1] = last
+            return lines
+
+        pil_fb = Image.fromarray(frame)
+        draw_fb = ImageDraw.Draw(pil_fb)
+        safe_margin = max(6, int(h * 0.02))
+        pad_x, pad_y, line_gap = 12, 8, 4
+        max_text_w = int(w - 2 * pad_x - 20)
+        lines = wrap_to_two_lines(draw_fb, feedback, FEEDBACK_FONT, max_text_w)
+        line_h = FEEDBACK_FONT.size + 6
+        block_h = (2 * pad_y) + len(lines) * line_h + (len(lines) - 1) * line_gap
+        y0 = max(0, h - safe_margin - block_h)
+        y1 = h - safe_margin
+        over = frame.copy()
+        cv2.rectangle(over, (0, y0), (w, y1), (0, 0, 0), -1)
+        frame = cv2.addWeighted(over, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
+        pil_fb = Image.fromarray(frame)
+        draw_fb = ImageDraw.Draw(pil_fb)
+        ty = y0 + pad_y
+        for ln in lines:
+            tw = draw_fb.textlength(ln, font=FEEDBACK_FONT)
+            tx = max(pad_x, (w - int(tw)) // 2)
+            draw_fb.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255, 255, 255))
+            ty += line_h + line_gap
+        frame = np.array(pil_fb)
+
+    return frame
 
 # ================== CORE ANALYSIS ==================
 def get_landmarks_xy(results, frame_shape):
@@ -568,7 +636,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
             if return_video and writer is not None:
                 if lm:
                     draw_skeleton(frame, lm)
-                frame = render_overlay(frame, reps, live_depth_pct, overlay_msg)
+                frame = draw_overlay(frame, reps, overlay_msg, live_depth_pct / 100.0)
                 writer.write(frame)
 
         # Finalize
