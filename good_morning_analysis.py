@@ -39,6 +39,44 @@ DEPTH_PCT_FONT   = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 
 mp_pose = mp.solutions.pose
 
+# ===================== SKELETON =====================
+_FACE_LMS = set()
+_BODY_CONNECTIONS = tuple()
+_BODY_POINTS = tuple()
+
+
+def _init_skeleton_data():
+    global _FACE_LMS, _BODY_CONNECTIONS, _BODY_POINTS
+    if not _BODY_CONNECTIONS:
+        _FACE_LMS = {
+            mp_pose.PoseLandmark.NOSE.value,
+            mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
+            mp_pose.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose.PoseLandmark.RIGHT_EYE.value, mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
+            mp_pose.PoseLandmark.LEFT_EAR.value, mp_pose.PoseLandmark.RIGHT_EAR.value,
+            mp_pose.PoseLandmark.MOUTH_LEFT.value, mp_pose.PoseLandmark.MOUTH_RIGHT.value,
+        }
+        _BODY_CONNECTIONS = tuple((a, b) for (a, b) in mp_pose.POSE_CONNECTIONS if a not in _FACE_LMS and b not in _FACE_LMS)
+        _BODY_POINTS = tuple(sorted({i for conn in _BODY_CONNECTIONS for i in conn}))
+
+
+def _dyn_thickness(h):
+    return max(2, int(round(h * 0.002))), max(3, int(round(h * 0.004)))
+
+
+def draw_body_only(frame, lms, color=(255, 255, 255)):
+    h, w = frame.shape[:2]
+    line, dot = _dyn_thickness(h)
+    for a, b in _BODY_CONNECTIONS:
+        pa, pb = lms[a], lms[b]
+        ax, ay = int(pa.x * w), int(pa.y * h)
+        bx, by = int(pb.x * w), int(pb.y * h)
+        cv2.line(frame, (ax, ay), (bx, by), color, line, cv2.LINE_AA)
+    for i in _BODY_POINTS:
+        p = lms[i]
+        x, y = int(p.x * w), int(p.y * h)
+        cv2.circle(frame, (x, y), dot, color, -1, cv2.LINE_AA)
+    return frame
+
 # ===================== FEEDBACK SEVERITY =====================
 FB_SEVERITY = {
     "Hinge a bit deeper": 3,
@@ -107,46 +145,96 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
                 DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
     return frame
 
+def _wrap_two_lines(draw, text, font, max_width):
+    words = (text or "").split()
+    if not words:
+        return [""]
+
+    lines = []
+    cur = ""
+    for w in words:
+        t = (cur + " " + w).strip()
+        if draw.textlength(t, font=font) <= max_width:
+            cur = t
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+        if len(lines) == 2:
+            break
+
+    if cur and len(lines) < 2:
+        lines.append(cur)
+
+    if len(lines) >= 2 and draw.textlength(lines[-1], font=font) > max_width:
+        last = lines[-1] + "…"
+        while draw.textlength(last, font=font) > max_width and len(last) > 1:
+            last = last[:-2] + "…"
+        lines[-1] = last
+    return lines
+
+
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Reps בפינת שמאל-עליון; דונאט ימני-עליון; פידבק תחתון"""
+    """Match pull-up overlay layout/sizing exactly (with DEPTH label)."""
     h, w, _ = frame.shape
+    ref_h = max(int(h * 0.06), int(REPS_FONT_SIZE * 1.6))
+    r = int(ref_h * DONUT_RADIUS_SCALE)
+    th = max(3, int(r * DONUT_THICKNESS_FRAC))
+    m = 12
+    cx = w - m - r
+    cy = max(ref_h + r // 8, r + th // 2 + 2)
+    pct = float(np.clip(depth_pct, 0.0, 1.0))
+    cv2.circle(frame, (cx, cy), r, DEPTH_RING_BG, th, cv2.LINE_AA)
+    cv2.ellipse(frame, (cx, cy), (r, r), 0, -90, -90 + int(360 * pct), DEPTH_COLOR, th, cv2.LINE_AA)
 
-    pil = Image.fromarray(frame)
-    draw = ImageDraw.Draw(pil)
-    reps_text = f"Reps: {reps}"
-    inner_pad_x, inner_pad_y = 10, 6
-    text_w = draw.textlength(reps_text, font=REPS_FONT)
-    text_h = REPS_FONT.size
-    x0, y0 = 0, 0
-    x1 = int(text_w + 2*inner_pad_x)
-    y1 = int(text_h + 2*inner_pad_y)
-    overlay = Image.new('RGBA', (x1, y1), (0, 0, 0, int(255 * BAR_BG_ALPHA)))
-    pil.paste(overlay, (x0, y0), overlay)
-    draw.text((x0 + inner_pad_x, y0 + inner_pad_y), reps_text, font=REPS_FONT, fill=(255,255,255))
+    reps_font = _load_font(FONT_PATH, REPS_FONT_SIZE)
+    feedback_font = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
+    depth_label_font = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
+    depth_pct_font = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
 
-    donut_r = int(h * DONUT_RADIUS_SCALE * 0.09)
-    thickness = max(6, int(donut_r * DONUT_THICKNESS_FRAC))
-    cx = w - donut_r - 15
-    cy = donut_r + 15
-    frame = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-    frame = draw_depth_donut(frame, (cx, cy), donut_r, thickness, depth_pct)
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(frame)
+    pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil)
 
-    draw.text((cx, cy - 10 - DEPTH_LABEL_FONT_SIZE), "DEPTH", font=DEPTH_LABEL_FONT, fill=(255,255,255), anchor="mm")
-    draw.text((cx, cy + 10), f"{int(depth_pct*100)}%", font=DEPTH_PCT_FONT, fill=(255,255,255), anchor="mm")
+    txt = f"Reps: {int(reps)}"
+    pad_x, pad_y = 10, 6
+    tw = draw.textlength(txt, font=reps_font)
+    thh = reps_font.size
+    base = np.array(pil)
+    over = base.copy()
+    cv2.rectangle(over, (0, 0), (int(tw + 2 * pad_x), int(thh + 2 * pad_y)), (0, 0, 0), -1)
+    base = cv2.addWeighted(over, BAR_BG_ALPHA, base, 1 - BAR_BG_ALPHA, 0)
+    pil = Image.fromarray(base)
+    draw = ImageDraw.Draw(pil)
+    draw.text((pad_x, pad_y - 1), txt, font=reps_font, fill=(255, 255, 255))
+
+    gap = max(2, int(r * 0.10))
+    label = "DEPTH"
+    pct_txt = f"{int(pct * 100)}%"
+    by = cy - (depth_label_font.size + gap + depth_pct_font.size) // 2
+    lw = draw.textlength(label, font=depth_label_font)
+    pw = draw.textlength(pct_txt, font=depth_pct_font)
+    draw.text((cx - int(lw // 2), by), label, font=depth_label_font, fill=(255, 255, 255))
+    draw.text((cx - int(pw // 2), by + depth_label_font.size + gap), pct_txt, font=depth_pct_font, fill=(255, 255, 255))
 
     if feedback:
-        fb_text = feedback
-        text_w = draw.textlength(fb_text, font=FEEDBACK_FONT)
-        text_h = FEEDBACK_FONT.size
-        fb_pad_x, fb_pad_y = 10, 6
-        fb_h = int(text_h + 2*fb_pad_y)
-        overlay = Image.new('RGBA', (w, fb_h), (0, 0, 0, int(255 * BAR_BG_ALPHA)))
-        pil.paste(overlay, (0, h - fb_h), overlay)
-        draw.text((fb_pad_x, h - fb_h + fb_pad_y), fb_text, font=FEEDBACK_FONT, fill=(255,255,255))
-
+        max_w = int(w - 2 * 12 - 20)
+        lines = _wrap_two_lines(draw, feedback, feedback_font, max_w)
+        line_h = feedback_font.size + 6
+        block_h = 2 * 8 + len(lines) * line_h + (len(lines) - 1) * 4
+        y0 = max(0, h - max(6, int(h * 0.02)) - block_h)
+        y1 = h - max(6, int(h * 0.02))
+        base2 = np.array(pil)
+        over2 = base2.copy()
+        cv2.rectangle(over2, (0, y0), (w, y1), (0, 0, 0), -1)
+        base2 = cv2.addWeighted(over2, BAR_BG_ALPHA, base2, 1 - BAR_BG_ALPHA, 0)
+        pil = Image.fromarray(base2)
+        draw = ImageDraw.Draw(pil)
+        ty = y0 + 8
+        for ln in lines:
+            tw2 = draw.textlength(ln, font=feedback_font)
+            tx = max(12, (w - int(tw2)) // 2)
+            draw.text((tx, ty), ln, font=feedback_font, fill=(255, 255, 255))
+            ty += line_h + 4
     return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
 # ===================== GEOMETRY =====================
@@ -259,6 +347,7 @@ def run_good_morning_analysis(video_path,
     with mp_pose.Pose(model_complexity=1,
                       min_detection_confidence=0.5,
                       min_tracking_confidence=0.5) as pose:
+        _init_skeleton_data()
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -383,7 +472,8 @@ def run_good_morning_analysis(video_path,
                 rt_fb_hold -= 1
 
             if return_video and out is not None:
-                frame_drawn = draw_overlay(work.copy(), reps=counter, feedback=(rt_fb_msg if rt_fb_hold > 0 else None), depth_pct=prog)
+                frame_with_skeleton = draw_body_only(work.copy(), lm)
+                frame_drawn = draw_overlay(frame_with_skeleton, reps=counter, feedback=(rt_fb_msg if rt_fb_hold > 0 else None), depth_pct=prog)
                 out.write(frame_drawn)
 
     cap.release()
