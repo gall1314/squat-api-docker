@@ -178,7 +178,16 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     """Reps בפינת שמאל-עליון; דונאט ימני-עליון; פידבק תחתון"""
     h, w, _ = frame.shape
 
-    ref_h = max(int(h * 0.06), int(REPS_FONT_SIZE * 1.6))
+    # Match pull-up visual scale across mixed aspect ratios:
+    # portrait clips otherwise look oversized compared to typical pull-up landscape clips.
+    overlay_scale = min(1.0, max(0.78, w / float(max(1, h))))
+    reps_size = max(16, int(round(REPS_FONT_SIZE * overlay_scale)))
+    feedback_size = max(14, int(round(FEEDBACK_FONT_SIZE * overlay_scale)))
+    depth_label_size = max(11, int(round(DEPTH_LABEL_FONT_SIZE * overlay_scale)))
+    depth_pct_size = max(13, int(round(DEPTH_PCT_FONT_SIZE * overlay_scale)))
+
+    ref_axis = min(h, w)
+    ref_h = max(int(ref_axis * 0.06), int(reps_size * 1.6))
     r = int(ref_h * DONUT_RADIUS_SCALE)
     th = max(3, int(r * DONUT_THICKNESS_FRAC))
     m = 12
@@ -188,10 +197,10 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
     frame = draw_depth_donut(frame, (cx, cy), r, th, pct)
 
-    reps_font = _load_font(FONT_PATH, REPS_FONT_SIZE)
-    feedback_font = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
-    depth_label_font = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
-    depth_pct_font = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
+    reps_font = _load_font(FONT_PATH, reps_size)
+    feedback_font = _load_font(FONT_PATH, feedback_size)
+    depth_label_font = _load_font(FONT_PATH, depth_label_size)
+    depth_pct_font = _load_font(FONT_PATH, depth_pct_size)
 
     pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil)
