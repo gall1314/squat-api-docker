@@ -61,7 +61,7 @@ def _wrap_two_lines(draw, text, font, max_width):
         lines[-1] = last
     return lines
 
-def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
+def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
     """Reps שמאל-עליון; דונאט ימין-עליון; פידבק תחתון — בדיוק כמו בסקוואט."""
     h, w, _ = frame.shape
     HD_H = 1080
@@ -78,7 +78,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     _DEPTH_LABEL_FONT = _load_font(FONT_PATH, depth_label_font_size)
     _DEPTH_PCT_FONT = _load_font(FONT_PATH, depth_pct_font_size)
 
-    pct = float(np.clip(depth_pct, 0, 1))
+    pct = float(np.clip(height_pct, 0, 1))
     bg_alpha_val = int(round(255 * BAR_BG_ALPHA))
 
     ref_h = max(int(HD_H * 0.06), int(reps_font_size * 1.6))
@@ -128,7 +128,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
     gap = max(2, int(radius * 0.10))
     by = cy - (_DEPTH_LABEL_FONT.size + gap + _DEPTH_PCT_FONT.size) // 2
-    label = "DEPTH"
+    label = "HEIGHT"
     pct_txt = f"{int(pct * 100)}%"
     lw = draw.textlength(label, font=_DEPTH_LABEL_FONT)
     pw = draw.textlength(pct_txt, font=_DEPTH_PCT_FONT)
@@ -316,7 +316,7 @@ def run_barbell_bicep_curl_analysis(video_path,
                 depth_live = 0.0
                 if rt_fb_hold > 0: rt_fb_hold -= 1
                 if return_video:
-                    frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
+                    frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=depth_live)
                     if out is not None:
                         out.write(frame)
                 continue
@@ -363,7 +363,7 @@ def run_barbell_bicep_curl_analysis(video_path,
                 if rt_fb_hold > 0: rt_fb_hold -= 1
                 depth_live = 0.0
                 if return_video:
-                    frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
+                    frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=depth_live)
                     if out is not None:
                         out.write(frame)
                 continue
@@ -521,7 +521,7 @@ def run_barbell_bicep_curl_analysis(video_path,
             # ציור שלד גוף בלבד + Overlay זהה
             if return_video:
                 frame = draw_body_only(frame, lm)
-                frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
+                frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=depth_live)
                 if out is not None:
                     out.write(frame)
 
