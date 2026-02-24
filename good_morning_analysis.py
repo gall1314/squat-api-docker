@@ -21,10 +21,13 @@ DEPTH_COLOR          = (40, 200, 80)
 DEPTH_RING_BG        = (70, 70, 70)
 
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
-REPS_FONT_SIZE = 28
-FEEDBACK_FONT_SIZE = 22
-DEPTH_LABEL_FONT_SIZE = 14
-DEPTH_PCT_FONT_SIZE   = 18
+
+# Reference height at which the original fixed font sizes looked correct (pullup typical)
+_REF_H = 480.0
+_REF_REPS_FONT_SIZE = 28
+_REF_FEEDBACK_FONT_SIZE = 22
+_REF_DEPTH_LABEL_FONT_SIZE = 14
+_REF_DEPTH_PCT_FONT_SIZE = 18
 
 def _load_font(path, size):
     try:
@@ -32,10 +35,10 @@ def _load_font(path, size):
     except Exception:
         return ImageFont.load_default()
 
-REPS_FONT        = _load_font(FONT_PATH, REPS_FONT_SIZE)
-FEEDBACK_FONT    = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
-DEPTH_LABEL_FONT = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
-DEPTH_PCT_FONT   = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
+def _scaled_font_size(ref_size, frame_h):
+    """Scale font size proportionally to frame height, so overlay looks
+    the same relative size regardless of frame resolution."""
+    return max(10, int(round(ref_size * (frame_h / _REF_H))))
 
 mp_pose = mp.solutions.pose
 
@@ -175,9 +178,9 @@ def _wrap_two_lines(draw, text, font, max_width):
 
 
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Reps בפינת שמאל-עליון; דונאט ימני-עליון; פידבק תחתון — זהה לסקוואט."""
+    """Reps top-left; donut top-right; feedback bottom — matches pullup overlay sizing."""
     h, w, _ = frame.shape
-    ref_h = max(int(h * 0.06), int(REPS_FONT_SIZE * 1.6))
+    ref_h = max(int(h * 0.06), int(_scaled_font_size(_REF_REPS_FONT_SIZE, h) * 1.6))
     r = int(ref_h * DONUT_RADIUS_SCALE)
     th = max(3, int(r * DONUT_THICKNESS_FRAC))
     m = 12
@@ -187,10 +190,16 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     cv2.circle(frame, (cx, cy), r, DEPTH_RING_BG, th, cv2.LINE_AA)
     cv2.ellipse(frame, (cx, cy), (r, r), 0, -90, -90 + int(360 * pct), DEPTH_COLOR, th, cv2.LINE_AA)
 
-    _REPS_FONT = _load_font(FONT_PATH, REPS_FONT_SIZE)
-    _FEEDBACK_FONT = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
-    _DEPTH_LABEL_FONT = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
-    _DEPTH_PCT_FONT = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
+    # Scale all font sizes proportionally to frame height
+    reps_font_size = _scaled_font_size(_REF_REPS_FONT_SIZE, h)
+    feedback_font_size = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, h)
+    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, h)
+    depth_pct_font_size = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, h)
+
+    _REPS_FONT = _load_font(FONT_PATH, reps_font_size)
+    _FEEDBACK_FONT = _load_font(FONT_PATH, feedback_font_size)
+    _DEPTH_LABEL_FONT = _load_font(FONT_PATH, depth_label_font_size)
+    _DEPTH_PCT_FONT = _load_font(FONT_PATH, depth_pct_font_size)
 
     pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil)
