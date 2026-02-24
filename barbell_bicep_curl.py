@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # barbell_bicep_curl.py — תואם סקוואט: Overlay/פונטים/גדלים/פריימים/קידוד/סינון הליכה.
 # דונאט הפוך: 100% בטופ (כיווץ), 0% בתחתית (יישור).
+# FIXED: Video output at original resolution (not scale=0.4) for sharp overlay on phone.
 
 import os
 import cv2
@@ -180,17 +181,22 @@ _BODY_CONNECTIONS = tuple(
 )
 _BODY_POINTS = tuple(sorted({i for conn in _BODY_CONNECTIONS for i in conn}))
 
+def _dyn_thickness(h):
+    """Scale skeleton line/dot thickness to frame height."""
+    return max(2, int(round(h * 0.003))), max(3, int(round(h * 0.005)))
+
 def draw_body_only(frame, landmarks, color=(255,255,255)):
     h, w = frame.shape[:2]
+    line_th, dot_th = _dyn_thickness(h)
     for a, b in _BODY_CONNECTIONS:
         pa = landmarks[a]; pb = landmarks[b]
         ax, ay = int(pa.x * w), int(pa.y * h)
         bx, by = int(pb.x * w), int(pb.y * h)
-        cv2.line(frame, (ax, ay), (bx, by), color, 2, cv2.LINE_AA)
+        cv2.line(frame, (ax, ay), (bx, by), color, line_th, cv2.LINE_AA)
     for i in _BODY_POINTS:
         p = landmarks[i]
         x, y = int(p.x * w), int(p.y * h)
-        cv2.circle(frame, (x, y), 3, color, -1, cv2.LINE_AA)
+        cv2.circle(frame, (x, y), dot_th, color, -1, cv2.LINE_AA)
     return frame
 
 # ===================== עזר גיאומטרי =====================
@@ -248,7 +254,7 @@ def display_half_str(x):
 # ===================== MAIN =====================
 def run_barbell_bicep_curl_analysis(video_path,
                                     frame_skip=3,     # זהה לסקוואט
-                                    scale=0.4,        # זהה לסקוואט
+                                    scale=0.4,        # used for MediaPipe only
                                     output_path="barbell_curl_analyzed.mp4",
                                     feedback_path="barbell_curl_feedback.txt",
                                     return_video=True,
@@ -313,17 +319,21 @@ def run_barbell_bicep_curl_analysis(video_path,
 
     with mp_pose.Pose(model_complexity=1, min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
         while cap.isOpened():
-            ret, frame = cap.read()
+            ret, frame_orig = cap.read()
             if not ret: break
             frame_idx += 1
             if frame_idx % frame_skip != 0: continue
-            if scale != 1.0: frame = cv2.resize(frame, (0,0), fx=scale, fy=scale)
 
-            h, w = frame.shape[:2]
+            # ✅ Small frame for MediaPipe (fast), keep original for output (sharp)
+            frame_small = cv2.resize(frame_orig, (0,0), fx=scale, fy=scale) if scale != 1.0 else frame_orig
+            h_sm, w_sm = frame_small.shape[:2]
+            h_orig, w_orig = frame_orig.shape[:2]
+
+            # ✅ VideoWriter at ORIGINAL resolution
             if return_video and out is None:
-                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
+                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w_orig, h_orig))
 
-            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = cv2.cvtColor(frame_small, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
 
             # ללא לנדמארקס — עדיין overlay זהה
@@ -331,9 +341,10 @@ def run_barbell_bicep_curl_analysis(video_path,
                 depth_live = 0.0
                 if rt_fb_hold > 0: rt_fb_hold -= 1
                 if return_video:
-                    frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=depth_live)
+                    # ✅ Draw overlay on full-res frame
+                    out_frame = draw_overlay(frame_orig, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=depth_live)
                     if out is not None:
-                        out.write(frame)
+                        out.write(out_frame)
                 continue
 
             lm = results.pose_landmarks.landmark
@@ -341,18 +352,18 @@ def run_barbell_bicep_curl_analysis(video_path,
 
             def _pt(p): return np.array([p.x, p.y])
 
-            # תנועה גלובלית (סינון הליכה) — זהה
+            # תנועה גלובלית (סינון הליכה) — uses small frame dims for consistent thresholds
             hip     = _pt(lm[R.RIGHT_HIP.value])
             l_ankle = _pt(lm[R.LEFT_ANKLE.value])
             r_ankle = _pt(lm[R.RIGHT_ANKLE.value])
 
-            hip_px = (hip[0]*w, hip[1]*h)
-            la_px  = (l_ankle[0]*w, l_ankle[1]*h)
-            ra_px  = (r_ankle[0]*w, r_ankle[1]*h)
+            hip_px = (hip[0]*w_sm, hip[1]*h_sm)
+            la_px  = (l_ankle[0]*w_sm, l_ankle[1]*h_sm)
+            ra_px  = (r_ankle[0]*w_sm, r_ankle[1]*h_sm)
             if prev_hip is None:
                 prev_hip, prev_la, prev_ra = hip_px, la_px, ra_px
 
-            def _d(a,b): return math.hypot(a[0]-b[0], a[1]-b[1]) / max(w, h)
+            def _d(a,b): return math.hypot(a[0]-b[0], a[1]-b[1]) / max(w_sm, h_sm)
             hip_vel = _d(hip_px, prev_hip)
             an_vel  = max(_d(la_px, prev_la), _d(ra_px, prev_ra))
             hip_vel_ema   = EMA_ALPHA*hip_vel + (1-EMA_ALPHA)*hip_vel_ema
@@ -363,7 +374,7 @@ def run_barbell_bicep_curl_analysis(video_path,
             if movement_block: movement_free_streak = 0
             else:              movement_free_streak = min(MOVEMENT_CLEAR_FRAMES, movement_free_streak + 1)
 
-            # זווית מרפק ממוצעת (שמאל/ימין אם קיימים)
+            # זווית מרפק ממוצעת (שמאל/ימין אם קיימים) — landmarks are 0-1 normalized
             l_sh, l_el, l_wr = lm[R.LEFT_SHOULDER.value], lm[R.LEFT_ELBOW.value], lm[R.LEFT_WRIST.value]
             r_sh, r_el, r_wr = lm[R.RIGHT_SHOULDER.value], lm[R.RIGHT_ELBOW.value], lm[R.RIGHT_WRIST.value]
 
@@ -378,9 +389,9 @@ def run_barbell_bicep_curl_analysis(video_path,
                 if rt_fb_hold > 0: rt_fb_hold -= 1
                 depth_live = 0.0
                 if return_video:
-                    frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=depth_live)
+                    out_frame = draw_overlay(frame_orig, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=depth_live)
                     if out is not None:
-                        out.write(frame)
+                        out.write(out_frame)
                 continue
             elbow_angle_raw = float(np.mean(angles))
             elbow_angle_ema = elbow_angle_raw if elbow_angle_ema is None else (
@@ -393,17 +404,16 @@ def run_barbell_bicep_curl_analysis(video_path,
                 ext_elbow_ema = elbow_angle if ext_elbow_ema is None else (0.30*elbow_angle + 0.70*ext_elbow_ema)
 
             # ===== דונאט הפוך: 100% בטופ =====
-            # מיפוי כיווץ: 0 בתחתית (angle ~ 170), 1 בטופ (angle ~ 60)
             bottom_ref = ext_elbow_ema if ext_elbow_ema is not None else ELBOW_BOTTOM_EXT_REF
             top_flex_thr = _top_flexion_threshold(bottom_ref)
             top_flex_feedback_thr = top_flex_thr + TOP_FLEXION_MARGIN_DEG
-            denom_live = max(10.0, (bottom_ref - ELBOW_TOP_FLEX_REF))  # ~110°
+            denom_live = max(10.0, (bottom_ref - ELBOW_TOP_FLEX_REF))
             depth_live = float(np.clip((bottom_ref - elbow_angle) / denom_live, 0.0, 1.0))
 
             # נגזרת זווית (שלב)
             deriv = None
             if last_angle is not None:
-                deriv = elbow_angle - last_angle  # >0 ירידה (אקצנטרי), <0 עלייה (קונצנטרי)
+                deriv = elbow_angle - last_angle
             last_angle = elbow_angle
 
             if deriv is not None:
@@ -533,12 +543,12 @@ def run_barbell_bicep_curl_analysis(video_path,
                     rt_fb_msg = None
                     rt_fb_hold = 0
 
-            # ציור שלד גוף בלבד + Overlay זהה
+            # ✅ ציור שלד גוף בלבד + Overlay על פריים מקורי בגודל מלא
             if return_video:
-                frame = draw_body_only(frame, lm)
-                frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=depth_live)
+                frame_orig = draw_body_only(frame_orig, lm)
+                frame_orig = draw_overlay(frame_orig, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=depth_live)
                 if out is not None:
-                    out.write(frame)
+                    out.write(frame_orig)
 
     cap.release()
     if out: out.release()
