@@ -77,7 +77,7 @@ def _init_skeleton_data():
 
 
 def _dyn_thickness(h):
-    return max(2, int(round(h * 0.002))), max(3, int(round(h * 0.004)))
+    return max(2, int(round(h * 0.003))), max(3, int(round(h * 0.005)))
 
 
 def draw_body_only(frame, lms, color=(255, 255, 255)):
@@ -346,6 +346,8 @@ def run_good_morning_analysis(video_path,
     Notes:
     1. Back-rounding detection was removed (not reliable enough with MediaPipe landmarks)
     2. Feedback is deduplicated so each message appears only once
+    3. Video content stays at scale resolution for speed; overlay drawn at original
+       resolution for sharpness (upscale-then-overlay approach).
     """
     if fast_mode is True:
         return_video = False
@@ -365,6 +367,10 @@ def run_good_morning_analysis(video_path,
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
     dt = 1.0 / float(effective_fps)
+
+    # ✅ Read original dimensions for output
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
     counter = good_reps = bad_reps = 0
     all_scores = []
@@ -401,16 +407,19 @@ def run_good_morning_analysis(video_path,
                 continue
 
             work = cv2.resize(frame, (0,0), fx=scale, fy=scale) if scale != 1.0 else frame
+
+            # ✅ VideoWriter at ORIGINAL resolution (overlay will be sharp)
             if return_video and out is None:
-                h0, w0 = work.shape[:2]
-                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w0, h0))
+                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (orig_w, orig_h))
 
             rgb = cv2.cvtColor(work, cv2.COLOR_BGR2RGB)
             res = pose.process(rgb)
 
             if not res.pose_landmarks:
                 if return_video and out is not None:
-                    frame_drawn = draw_overlay(work.copy(), reps=counter, feedback=(rt_fb_msg if rt_fb_hold > 0 else None), depth_pct=prog)
+                    # ✅ Upscale small frame → draw overlay at full res
+                    frame_out = cv2.resize(work, (orig_w, orig_h))
+                    frame_drawn = draw_overlay(frame_out, reps=counter, feedback=(rt_fb_msg if rt_fb_hold > 0 else None), depth_pct=prog)
                     out.write(frame_drawn)
                 continue
 
@@ -516,8 +525,10 @@ def run_good_morning_analysis(video_path,
                 rt_fb_hold -= 1
 
             if return_video and out is not None:
-                frame_with_skeleton = draw_body_only(work.copy(), lm)
-                frame_drawn = draw_overlay(frame_with_skeleton, reps=counter, feedback=(rt_fb_msg if rt_fb_hold > 0 else None), depth_pct=prog)
+                # ✅ Upscale small frame → draw skeleton + overlay at full resolution
+                frame_out = cv2.resize(work, (orig_w, orig_h))
+                frame_out = draw_body_only(frame_out, lm)
+                frame_drawn = draw_overlay(frame_out, reps=counter, feedback=(rt_fb_msg if rt_fb_hold > 0 else None), depth_pct=prog)
                 out.write(frame_drawn)
 
     cap.release()
