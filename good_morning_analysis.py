@@ -30,9 +30,23 @@ _REF_DEPTH_LABEL_FONT_SIZE = 14
 _REF_DEPTH_PCT_FONT_SIZE = 18
 
 def _load_font(path, size):
+    """Load font with robust fallback — works even without Roboto."""
     try:
         return ImageFont.truetype(path, size)
     except Exception:
+        pass
+    for fallback in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]:
+        try:
+            return ImageFont.truetype(fallback, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
         return ImageFont.load_default()
 
 def _scaled_font_size(ref_size, frame_h):
