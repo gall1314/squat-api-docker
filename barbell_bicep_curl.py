@@ -209,15 +209,15 @@ MOVEMENT_CLEAR_FRAMES = 2
 RT_FB_HOLD_SEC        = 0.8
 
 # ===================== ספי קרל =====================
-ELBOW_BOTTOM_EXT_REF = 170.0
-ELBOW_TOP_FLEX_REF   = 60.0
-ELBOW_EXT_END_THR    = 160.0
+ELBOW_BOTTOM_EXT_REF = 170.0  # תחתית (יישור)
+ELBOW_TOP_FLEX_REF   = 60.0   # טופ (כיווץ יעד)
+ELBOW_EXT_END_THR    = 160.0  # סף סיום רפ (חזרה ליישור)
 MIN_BOTTOM_EXTENSION_ANGLE = 155.0
-TOP_FLEXION_RATIO          = 0.50
-TOP_FLEXION_MIN_ANGLE      = 60.0
-TOP_FLEXION_MAX_ANGLE      = 130.0
-TOP_FLEXION_MARGIN_DEG     = 12.0
-TOP_FLEXION_TRIGGER_FRAMES = 6
+TOP_FLEXION_RATIO          = 0.50  # יעד טופ יחסי לטווח (מרכך את "curl higher")
+TOP_FLEXION_MIN_ANGLE      = 60.0  # רצפה כדי לא להיות קשוח מדי
+TOP_FLEXION_MAX_ANGLE      = 130.0 # תקרה כדי לא להיות רך מדי
+TOP_FLEXION_MARGIN_DEG     = 12.0  # מרווח נוסף לפני שמתריעים
+TOP_FLEXION_TRIGGER_FRAMES = 6     # כמה פריימים רצופים לפני RT alert
 ECC_SLOW_MIN_SEC           = 0.25
 ANGLE_EMA_ALPHA            = 0.45
 UP_START_DERIV_THR         = -0.9
@@ -247,8 +247,8 @@ def display_half_str(x):
 
 # ===================== MAIN =====================
 def run_barbell_bicep_curl_analysis(video_path,
-                                    frame_skip=3,
-                                    scale=0.4,
+                                    frame_skip=3,     # זהה לסקוואט
+                                    scale=0.4,        # זהה לסקוואט
                                     output_path="barbell_curl_analyzed.mp4",
                                     feedback_path="barbell_curl_feedback.txt",
                                     return_video=True,
@@ -281,14 +281,17 @@ def run_barbell_bicep_curl_analysis(video_path,
     all_scores = []
     session_best_feedback = ""
 
+    # גלובל-מושן (סינון הליכה)
     prev_hip = prev_la = prev_ra = None
     hip_vel_ema = ankle_vel_ema = 0.0
     movement_free_streak = 0
 
-    stage = None
+    # מצב רפ
+    stage = None  # None / "up" (עלייה) / "down" (ירידה)
     frame_idx = 0
     last_rep_frame = -999
 
+    # עקיבות זווית/"עומק" (כאן "כיווץ")
     ext_elbow_ema = None
     EXT_ALPHA = 0.30
     depth_live = 0.0
@@ -304,6 +307,7 @@ def run_barbell_bicep_curl_analysis(video_path,
     down_motion_streak = 0
     saw_descent_after_top = False
 
+    # RT feedback
     rt_fb_msg = None
     rt_fb_hold = 0
 
@@ -322,6 +326,7 @@ def run_barbell_bicep_curl_analysis(video_path,
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
 
+            # ללא לנדמארקס — עדיין overlay זהה
             if not results.pose_landmarks:
                 depth_live = 0.0
                 if rt_fb_hold > 0: rt_fb_hold -= 1
@@ -336,6 +341,7 @@ def run_barbell_bicep_curl_analysis(video_path,
 
             def _pt(p): return np.array([p.x, p.y])
 
+            # תנועה גלובלית (סינון הליכה) — זהה
             hip     = _pt(lm[R.RIGHT_HIP.value])
             l_ankle = _pt(lm[R.LEFT_ANKLE.value])
             r_ankle = _pt(lm[R.RIGHT_ANKLE.value])
@@ -357,6 +363,7 @@ def run_barbell_bicep_curl_analysis(video_path,
             if movement_block: movement_free_streak = 0
             else:              movement_free_streak = min(MOVEMENT_CLEAR_FRAMES, movement_free_streak + 1)
 
+            # זווית מרפק ממוצעת (שמאל/ימין אם קיימים)
             l_sh, l_el, l_wr = lm[R.LEFT_SHOULDER.value], lm[R.LEFT_ELBOW.value], lm[R.LEFT_WRIST.value]
             r_sh, r_el, r_wr = lm[R.RIGHT_SHOULDER.value], lm[R.RIGHT_ELBOW.value], lm[R.RIGHT_WRIST.value]
 
@@ -381,18 +388,22 @@ def run_barbell_bicep_curl_analysis(video_path,
             )
             elbow_angle = float(elbow_angle_ema)
 
+            # EMA ליישור תחתית (כמו סקוואט — מתעדכן רק כשהיד כמעט ישרה ושקט תנועתי)
             if (elbow_angle > ELBOW_EXT_END_THR) and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
                 ext_elbow_ema = elbow_angle if ext_elbow_ema is None else (0.30*elbow_angle + 0.70*ext_elbow_ema)
 
+            # ===== דונאט הפוך: 100% בטופ =====
+            # מיפוי כיווץ: 0 בתחתית (angle ~ 170), 1 בטופ (angle ~ 60)
             bottom_ref = ext_elbow_ema if ext_elbow_ema is not None else ELBOW_BOTTOM_EXT_REF
             top_flex_thr = _top_flexion_threshold(bottom_ref)
             top_flex_feedback_thr = top_flex_thr + TOP_FLEXION_MARGIN_DEG
-            denom_live = max(10.0, (bottom_ref - ELBOW_TOP_FLEX_REF))
+            denom_live = max(10.0, (bottom_ref - ELBOW_TOP_FLEX_REF))  # ~110°
             depth_live = float(np.clip((bottom_ref - elbow_angle) / denom_live, 0.0, 1.0))
 
+            # נגזרת זווית (שלב)
             deriv = None
             if last_angle is not None:
-                deriv = elbow_angle - last_angle
+                deriv = elbow_angle - last_angle  # >0 ירידה (אקצנטרי), <0 עלייה (קונצנטרי)
             last_angle = elbow_angle
 
             if deriv is not None:
@@ -406,6 +417,7 @@ def run_barbell_bicep_curl_analysis(video_path,
                 else:
                     down_motion_streak = 0
 
+            # התחלת רפ — מלמטה מתחילים לעלות (קונצנטרי)
             if (stage is None or stage == "down") and (deriv is not None) and (up_motion_streak >= DIRECTION_STREAK_FRAMES) \
                and (elbow_angle <= ELBOW_EXT_END_THR) and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES):
                 stage = "up"
@@ -419,14 +431,17 @@ def run_barbell_bicep_curl_analysis(video_path,
                 rt_fb_msg = None
                 rt_fb_hold = 0
 
+            # תוך כדי רפ
             if stage in ("up", "down"):
                 rep_min_elbow_angle = min(rep_min_elbow_angle, elbow_angle)
                 rep_max_elbow_angle = max(rep_max_elbow_angle, elbow_angle)
+                # מעבר לטופ → מתחילה ירידה
                 if stage == "up" and (deriv is not None) and (down_motion_streak >= DIRECTION_STREAK_FRAMES):
                     stage = "down"
                     top_index = frame_idx
                     saw_descent_after_top = True
 
+                # RT-feedback: לא מספיק גבוה למעלה
                 if stage == "up":
                     if rep_min_elbow_angle > top_flex_feedback_thr:
                         top_flex_bad_frames += 1
@@ -443,31 +458,38 @@ def run_barbell_bicep_curl_analysis(video_path,
                 else:
                     if rt_fb_hold > 0: rt_fb_hold -= 1
 
+            # סיום רפ — חזרה ליישור + שקט תנועתי
             if (stage in ("up","down")) and (elbow_angle >= REP_END_ANGLE_THR) and (movement_free_streak >= MOVEMENT_CLEAR_FRAMES) and saw_descent_after_top:
                 if frame_idx - (rep_start_frame or frame_idx) > 3:
                     feedbacks = []
                     penalty = 0.0
 
+                    # יישור מלא בתחתית
                     if rep_max_elbow_angle < MIN_BOTTOM_EXTENSION_ANGLE:
                         feedbacks.append("Straighten your arms fully at the bottom for a full range of motion")
                         penalty += 3
 
+                    # טופ מספיק גבוה
                     if rep_min_elbow_angle > top_flex_feedback_thr:
                         feedbacks.append("Try to curl higher — aim to squeeze at the top")
                         penalty += 2
 
+                    # טיפ: אקסצנטרי איטי מספיק (top_index → סוף)
                     tip_msg = None
                     if top_index is not None:
                         ecc_frames = frame_idx - top_index
                         if ecc_frames < ECC_SLOW_MIN_FRAMES:
                             tip_msg = "Slow down the lowering phase to maximize hypertrophy"
 
+                    # ציון (חצי נק׳)
                     score = 10.0 if not feedbacks else round(max(4, 10 - min(penalty, 6)) * 2) / 2
 
+                    # עומק סופי (כיווץ%) לפי דונאט ההפוך
                     bottom_ref_final = ext_elbow_ema if ext_elbow_ema is not None else ELBOW_BOTTOM_EXT_REF
                     denom = max(10.0, (bottom_ref_final - ELBOW_TOP_FLEX_REF))
                     depth_pct_final = float(np.clip((bottom_ref_final - rep_min_elbow_angle) / denom, 0.0, 1.0))
 
+                    # דוח רפ
                     rep_reports.append({
                         "rep_index": counter + 1,
                         "score": round(float(score), 1),
@@ -482,12 +504,14 @@ def run_barbell_bicep_curl_analysis(video_path,
                         "depth_pct": depth_pct_final
                     })
 
+                    # הצטברות פידבק-סשן (החמור גובר)
                     def _sev(m): return {"Straighten your arms fully at the bottom for a full range of motion":3,
                                          "Try to curl higher — aim to squeeze at the top":2}.get(m,1)
                     if feedbacks:
                         best = max(feedbacks, key=_sev)
                         session_best_feedback = best if (not session_best_feedback or _sev(best) >= _sev(session_best_feedback)) else session_best_feedback
 
+                    # ספירה/סטטיסטיקות
                     if frame_idx - last_rep_frame > MIN_FRAMES_BETWEEN_REPS:
                         counter += 1
                         last_rep_frame = frame_idx
@@ -495,6 +519,7 @@ def run_barbell_bicep_curl_analysis(video_path,
                         else: bad_reps += 1
                         all_scores.append(score)
 
+                    # איפוס מצב
                     stage = None
                     rep_start_frame = None
                     rep_start_elbow_angle = None
@@ -508,6 +533,7 @@ def run_barbell_bicep_curl_analysis(video_path,
                     rt_fb_msg = None
                     rt_fb_hold = 0
 
+            # ציור שלד גוף בלבד + Overlay זהה
             if return_video:
                 frame = draw_body_only(frame, lm)
                 frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), height_pct=depth_live)
@@ -518,10 +544,12 @@ def run_barbell_bicep_curl_analysis(video_path,
     if out: out.release()
     cv2.destroyAllWindows()
 
+    # ציון סופי והחזרה
     avg = np.mean(all_scores) if all_scores else 0.0
     technique_score = round(round(avg * 2) / 2, 2)
     feedback_list = [session_best_feedback] if session_best_feedback else ["Great form! Keep it up 💪"]
 
+    # קובץ טקסט
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
             f.write(f"Total Reps: {counter}\n")
@@ -532,6 +560,7 @@ def run_barbell_bicep_curl_analysis(video_path,
     except Exception:
         pass
 
+    # קידוד faststart (כמו בסקוואט)
     final_video_path = ""
     if return_video and output_path:
         encoded_path = output_path.replace(".mp4", "_encoded.mp4")
@@ -548,7 +577,7 @@ def run_barbell_bicep_curl_analysis(video_path,
         final_video_path = encoded_path if os.path.exists(encoded_path) else (output_path if os.path.exists(output_path) else "")
 
     return {
-        "squat_count": counter,
+        "squat_count": counter,  # נשמר לשמירה על תאימות UI קיימת
         "technique_score": technique_score,
         "technique_score_display": display_half_str(technique_score),
         "technique_label": score_label(technique_score),
