@@ -9,7 +9,7 @@ from PIL import ImageFont, ImageDraw, Image
 BAR_BG_ALPHA=0.55; DONUT_RADIUS_SCALE=0.72; DONUT_THICKNESS_FRAC=0.28
 DEPTH_COLOR=(40,200,80); DEPTH_RING_BG=(70,70,70)
 FONT_PATH="Roboto-VariableFont_wdth,wght.ttf"
-REPS_FONT_SIZE=28; FEEDBACK_FONT_SIZE=22; DEPTH_LABEL_FONT_SIZE=14; DEPTH_PCT_FONT_SIZE=18
+REPS_FONT_SIZE=16; FEEDBACK_FONT_SIZE=13; DEPTH_LABEL_FONT_SIZE=8; DEPTH_PCT_FONT_SIZE=11
 
 def _load_font(p,s):
     try: return ImageFont.truetype(p,s)
@@ -90,7 +90,7 @@ def draw_body_only(frame, lms, color=(255,255,255)):
 
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     h,w,_=frame.shape
-    ref_h=max(int(h*0.06),int(REPS_FONT_SIZE*1.6))
+    ref_h=max(int(h*0.035),int(REPS_FONT_SIZE*1.6))
     r=int(ref_h*DONUT_RADIUS_SCALE); th=max(3,int(r*DONUT_THICKNESS_FRAC))
     m=12; cx=w-m-r; cy=max(ref_h+r//8, r+th//2+2)
     pct=float(np.clip(depth_pct,0,1))
