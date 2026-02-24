@@ -8,6 +8,8 @@ Bent-Over Barbell Row — analysis pipeline matching the Squat standard:
 - Faststart-encoded analyzed video output
 - FIXED: proper_reps now counts correctly (not overly strict)
 - FIXED: form_tip now returns best tip instead of null
+- FIXED: Overlay sizes now scale proportionally with frame height (matches pullup)
+- FIXED: Skeleton drawing uses MediaPipe body-only approach (matches pullup/good morning)
 """
 import os
 import cv2
@@ -35,13 +37,12 @@ DONUT_THICKNESS_FRAC = 0.28
 DEPTH_COLOR          = (40, 200, 80)
 DEPTH_RING_BG        = (70, 70, 70)
 
-REPS_FONT_SIZE        = 28
-FEEDBACK_FONT_SIZE    = 22
-DEPTH_LABEL_FONT_SIZE = 14
-DEPTH_PCT_FONT_SIZE   = 18
-
-SKELETON_THICK  = 2
-SKELETON_OPAC   = 0.85
+# Reference height at which the original fixed font sizes looked correct (pullup typical)
+_REF_H = 480.0
+_REF_REPS_FONT_SIZE = 28
+_REF_FEEDBACK_FONT_SIZE = 22
+_REF_DEPTH_LABEL_FONT_SIZE = 14
+_REF_DEPTH_PCT_FONT_SIZE = 18
 
 # ================== ANALYSIS PARAMS ==================
 SCALE = 0.4          # identical to squat
@@ -134,7 +135,7 @@ def technique_label(score):
     if score >= 6.5: return "Fair"
     return "Needs work"
 
-# ================== OVERLAY (identical sizing/placement to squat) ==================
+# ================== OVERLAY (proportional sizing — matches pullup/good morning) ==================
 from PIL import ImageFont, ImageDraw, Image
 
 def _load_font(path, size):
@@ -143,10 +144,48 @@ def _load_font(path, size):
     except Exception:
         return ImageFont.load_default()
 
-REPS_FONT        = _load_font(FONT_PATH, REPS_FONT_SIZE)
-FEEDBACK_FONT    = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
-DEPTH_LABEL_FONT = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
-DEPTH_PCT_FONT   = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
+def _scaled_font_size(ref_size, frame_h):
+    """Scale font size proportionally to frame height, so overlay looks
+    the same relative size regardless of frame resolution."""
+    return max(10, int(round(ref_size * (frame_h / _REF_H))))
+
+# ================== SKELETON (body-only, matches pullup/good morning) ==================
+mp_pose_module = mp.solutions.pose if mp is not None else None
+
+_FACE_LMS = set()
+_BODY_CONNECTIONS = tuple()
+_BODY_POINTS = tuple()
+
+def _init_skeleton_data():
+    global _FACE_LMS, _BODY_CONNECTIONS, _BODY_POINTS
+    if mp_pose_module and not _BODY_CONNECTIONS:
+        _FACE_LMS = {
+            mp_pose_module.PoseLandmark.NOSE.value,
+            mp_pose_module.PoseLandmark.LEFT_EYE_INNER.value, mp_pose_module.PoseLandmark.LEFT_EYE.value, mp_pose_module.PoseLandmark.LEFT_EYE_OUTER.value,
+            mp_pose_module.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose_module.PoseLandmark.RIGHT_EYE.value, mp_pose_module.PoseLandmark.RIGHT_EYE_OUTER.value,
+            mp_pose_module.PoseLandmark.LEFT_EAR.value, mp_pose_module.PoseLandmark.RIGHT_EAR.value,
+            mp_pose_module.PoseLandmark.MOUTH_LEFT.value, mp_pose_module.PoseLandmark.MOUTH_RIGHT.value,
+        }
+        _BODY_CONNECTIONS = tuple((a, b) for (a, b) in mp_pose_module.POSE_CONNECTIONS if a not in _FACE_LMS and b not in _FACE_LMS)
+        _BODY_POINTS = tuple(sorted({i for conn in _BODY_CONNECTIONS for i in conn}))
+
+def _dyn_thickness(h):
+    return max(2, int(round(h * 0.002))), max(3, int(round(h * 0.004)))
+
+def draw_body_only(frame, lms, color=(255, 255, 255)):
+    """Draw body-only skeleton from MediaPipe landmarks — matches pullup/good morning exactly."""
+    h, w = frame.shape[:2]
+    line, dot = _dyn_thickness(h)
+    for a, b in _BODY_CONNECTIONS:
+        pa, pb = lms[a], lms[b]
+        ax, ay = int(pa.x * w), int(pa.y * h)
+        bx, by = int(pb.x * w), int(pb.y * h)
+        cv2.line(frame, (ax, ay), (bx, by), color, line, cv2.LINE_AA)
+    for i in _BODY_POINTS:
+        p = lms[i]
+        x, y = int(p.x * w), int(p.y * h)
+        cv2.circle(frame, (x, y), dot, color, -1, cv2.LINE_AA)
+    return frame
 
 def draw_depth_donut(frame, center, radius, thickness, pct):
     pct = float(np.clip(pct, 0.0, 1.0))
@@ -160,113 +199,101 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
                 DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
     return frame
 
-def draw_skeleton(frame, lm):
-    # Only body (no face) — similar to squat
-    pairs = [
-        (11,13),(13,15), # left arm
-        (12,14),(14,16), # right arm
-        (11,23),(12,24), # shoulders to hips
-        (23,25),(25,27),(24,26),(26,28) # legs
-    ]
-    h, w = frame.shape[:2]
-    for a,b in pairs:
-        if lm[a] is None or lm[b] is None:
-            continue
-        x1,y1 = int(lm[a][0]), int(lm[a][1])
-        x2,y2 = int(lm[b][0]), int(lm[b][1])
-        cv2.line(frame, (x1,y1), (x2,y2), (255,255,255), SKELETON_THICK)
+def _wrap_two_lines(draw, text, font, max_width):
+    words = (text or "").split()
+    if not words:
+        return [""]
+    lines = []
+    cur = ""
+    for w in words:
+        t = (cur + " " + w).strip()
+        if draw.textlength(t, font=font) <= max_width:
+            cur = t
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+        if len(lines) == 2:
+            break
+    if cur and len(lines) < 2:
+        lines.append(cur)
+    if len(lines) >= 2 and draw.textlength(lines[-1], font=font) > max_width:
+        last = lines[-1] + "…"
+        while draw.textlength(last, font=font) > max_width and len(last) > 1:
+            last = last[:-2] + "…"
+        lines[-1] = last
+    return lines
 
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Reps בפינת שמאל-עליון; דונאט ימני-עליון; פידבק תחתון — זהה לסקוואט."""
+    """Reps top-left; donut top-right; feedback bottom — matches pullup/good morning exactly."""
     h, w, _ = frame.shape
 
-    # --- Reps box (top-left) ---
-    pil = Image.fromarray(frame)
+    # Scale all font sizes proportionally to frame height
+    reps_font_size = _scaled_font_size(_REF_REPS_FONT_SIZE, h)
+    feedback_font_size = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, h)
+    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, h)
+    depth_pct_font_size = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, h)
+
+    _REPS_FONT = _load_font(FONT_PATH, reps_font_size)
+    _FEEDBACK_FONT = _load_font(FONT_PATH, feedback_font_size)
+    _DEPTH_LABEL_FONT = _load_font(FONT_PATH, depth_label_font_size)
+    _DEPTH_PCT_FONT = _load_font(FONT_PATH, depth_pct_font_size)
+
+    ref_h = max(int(h * 0.06), int(reps_font_size * 1.6))
+    r = int(ref_h * DONUT_RADIUS_SCALE)
+    th = max(3, int(r * DONUT_THICKNESS_FRAC))
+    m = 12
+    cx = w - m - r
+    cy = max(ref_h + r // 8, r + th // 2 + 2)
+    pct = float(np.clip(depth_pct, 0, 1))
+    cv2.circle(frame, (cx, cy), r, DEPTH_RING_BG, th, cv2.LINE_AA)
+    cv2.ellipse(frame, (cx, cy), (r, r), 0, -90, -90 + int(360 * pct), DEPTH_COLOR, th, cv2.LINE_AA)
+
+    pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil)
-    reps_text = f"Reps: {reps}"
-    inner_pad_x, inner_pad_y = 10, 6
-    text_w = draw.textlength(reps_text, font=REPS_FONT)
-    text_h = REPS_FONT.size
-    x0, y0 = 0, 0
-    x1 = int(text_w + 2 * inner_pad_x)
-    y1 = int(text_h + 2 * inner_pad_y)
-    top = frame.copy()
-    cv2.rectangle(top, (x0, y0), (x1, y1), (0, 0, 0), -1)
-    frame = cv2.addWeighted(top, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
-    pil = Image.fromarray(frame)
-    ImageDraw.Draw(pil).text((x0 + inner_pad_x, y0 + inner_pad_y - 1),
-                             reps_text, font=REPS_FONT, fill=(255, 255, 255))
-    frame = np.array(pil)
 
-    # --- Donut (top-right) ---
-    ref_h = max(int(h * 0.06), int(REPS_FONT_SIZE * 1.6))
-    radius = int(ref_h * DONUT_RADIUS_SCALE)
-    thick = max(3, int(radius * DONUT_THICKNESS_FRAC))
-    margin = 12
-    cx = w - margin - radius
-    cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
-    frame = draw_depth_donut(frame, (cx, cy), radius, thick, float(np.clip(depth_pct, 0, 1)))
-
-    pil = Image.fromarray(frame)
+    txt = f"Reps: {int(reps)}"
+    pad_x, pad_y = 10, 6
+    tw = draw.textlength(txt, font=_REPS_FONT)
+    thh = _REPS_FONT.size
+    base = np.array(pil)
+    over = base.copy()
+    cv2.rectangle(over, (0, 0), (int(tw + 2 * pad_x), int(thh + 2 * pad_y)), (0, 0, 0), -1)
+    base = cv2.addWeighted(over, BAR_BG_ALPHA, base, 1 - BAR_BG_ALPHA, 0)
+    pil = Image.fromarray(base)
     draw = ImageDraw.Draw(pil)
-    label_txt = "DEPTH"
-    pct_txt = f"{int(float(np.clip(depth_pct, 0, 1)) * 100)}%"
-    label_w = draw.textlength(label_txt, font=DEPTH_LABEL_FONT)
-    pct_w = draw.textlength(pct_txt, font=DEPTH_PCT_FONT)
-    gap = max(2, int(radius * 0.10))
-    base_y = cy - (DEPTH_LABEL_FONT.size + gap + DEPTH_PCT_FONT.size) // 2
-    draw.text((cx - int(label_w // 2), base_y), label_txt, font=DEPTH_LABEL_FONT, fill=(255, 255, 255))
-    draw.text((cx - int(pct_w // 2), base_y + DEPTH_LABEL_FONT.size + gap),
-              pct_txt, font=DEPTH_PCT_FONT, fill=(255, 255, 255))
-    frame = np.array(pil)
+    draw.text((pad_x, pad_y - 1), txt, font=_REPS_FONT, fill=(255, 255, 255))
 
-    # --- Bottom feedback ---
+    gap = max(2, int(r * 0.10))
+    by = cy - (_DEPTH_LABEL_FONT.size + gap + _DEPTH_PCT_FONT.size) // 2
+    label = "DEPTH"
+    pct_txt = f"{int(pct * 100)}%"
+    lw = draw.textlength(label, font=_DEPTH_LABEL_FONT)
+    pw = draw.textlength(pct_txt, font=_DEPTH_PCT_FONT)
+    draw.text((cx - int(lw // 2), by), label, font=_DEPTH_LABEL_FONT, fill=(255, 255, 255))
+    draw.text((cx - int(pw // 2), by + _DEPTH_LABEL_FONT.size + gap), pct_txt, font=_DEPTH_PCT_FONT, fill=(255, 255, 255))
+
     if feedback:
-        def wrap_to_two_lines(draw, text, font, max_width):
-            words = text.split()
-            if not words: return [""]
-            lines, cur = [], ""
-            for w in words:
-                trial = (cur + " " + w).strip()
-                if draw.textlength(trial, font=font) <= max_width:
-                    cur = trial
-                else:
-                    if cur: lines.append(cur)
-                    cur = w
-                if len(lines) == 2: break
-            if cur and len(lines) < 2: lines.append(cur)
-            leftover = len(words) - sum(len(l.split()) for l in lines)
-            if leftover > 0 and len(lines) >= 2:
-                last = lines[-1] + "…"
-                while draw.textlength(last, font=font) > max_width and len(last) > 1:
-                    last = last[:-2] + "…"
-                lines[-1] = last
-            return lines
-
-        pil_fb = Image.fromarray(frame)
-        draw_fb = ImageDraw.Draw(pil_fb)
-        safe_margin = max(6, int(h * 0.02))
-        pad_x, pad_y, line_gap = 12, 8, 4
-        max_text_w = int(w - 2 * pad_x - 20)
-        lines = wrap_to_two_lines(draw_fb, feedback, FEEDBACK_FONT, max_text_w)
-        line_h = FEEDBACK_FONT.size + 6
-        block_h = (2 * pad_y) + len(lines) * line_h + (len(lines) - 1) * line_gap
-        y0 = max(0, h - safe_margin - block_h)
-        y1 = h - safe_margin
-        over = frame.copy()
-        cv2.rectangle(over, (0, y0), (w, y1), (0, 0, 0), -1)
-        frame = cv2.addWeighted(over, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
-        pil_fb = Image.fromarray(frame)
-        draw_fb = ImageDraw.Draw(pil_fb)
-        ty = y0 + pad_y
+        max_w = int(w - 2 * 12 - 20)
+        lines = _wrap_two_lines(draw, feedback, _FEEDBACK_FONT, max_w)
+        line_h = _FEEDBACK_FONT.size + 6
+        block_h = 2 * 8 + len(lines) * line_h + (len(lines) - 1) * 4
+        y0 = max(0, h - max(6, int(h * 0.02)) - block_h)
+        y1 = h - max(6, int(h * 0.02))
+        base2 = np.array(pil)
+        over2 = base2.copy()
+        cv2.rectangle(over2, (0, y0), (w, y1), (0, 0, 0), -1)
+        base2 = cv2.addWeighted(over2, BAR_BG_ALPHA, base2, 1 - BAR_BG_ALPHA, 0)
+        pil = Image.fromarray(base2)
+        draw = ImageDraw.Draw(pil)
+        ty = y0 + 8
         for ln in lines:
-            tw = draw_fb.textlength(ln, font=FEEDBACK_FONT)
-            tx = max(pad_x, (w - int(tw)) // 2)
-            draw_fb.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255, 255, 255))
-            ty += line_h + line_gap
-        frame = np.array(pil_fb)
+            tw2 = draw.textlength(ln, font=_FEEDBACK_FONT)
+            tx = max(12, (w - int(tw2)) // 2)
+            draw.text((tx, ty), ln, font=_FEEDBACK_FONT, fill=(255, 255, 255))
+            ty += line_h + 4
 
-    return frame
+    return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
 # ================== CORE ANALYSIS ==================
 def get_landmarks_xy(results, frame_shape):
@@ -445,6 +472,9 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                         enable_segmentation=False,
                         min_detection_confidence=CONF_DET, min_tracking_confidence=CONF_TRK)
 
+    # Initialize skeleton data for body-only drawing
+    _init_skeleton_data()
+
     # State
     reps = 0
     good_reps = 0  # Track good reps (like squat)
@@ -495,12 +525,9 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(rgb)
 
-            # Landmarks
+            # Landmarks (xy tuple format for angle calculations)
             lm = get_landmarks_xy(results, frame.shape)
             # Needed joints
-            # Left side (11-12 shoulders, 13-14 elbows, 15-16 wrists, 23-24 hips, 25-26 knees, 27-28 ankles)
-            # Use the more confident side when both available; here prefer right if both None choose other.
-            # Simple choose right side if present else left.
             def pick(idx_r, idx_l):
                 return lm[idx_r] if lm[idx_r] is not None else lm[idx_l]
 
@@ -514,12 +541,9 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
             elbow_ang = angle(shoulder, elbow, wrist)
             
             # Calculate ACTUAL torso angle relative to horizontal (ground)
-            # Vector from hip to shoulder
-            torso_vector = (shoulder[0] - hip[0], shoulder[1] - hip[1])
-            # Horizontal reference vector (right direction in image coords)
+            torso_vector = (shoulder[0] - hip[0], shoulder[1] - hip[1]) if shoulder is not None and hip is not None else None
             horizontal = (1.0, 0.0)
-            # Calculate angle between torso and horizontal
-            torso_ang = angle_between_vectors(torso_vector, horizontal) if shoulder is not None and hip is not None else None
+            torso_ang = angle_between_vectors(torso_vector, horizontal) if torso_vector is not None else None
             
             knee_ang  = angle(hip, knee, ankle)
 
@@ -577,16 +601,14 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                     knee_mean   = _safe_mean(knee_vals)
                     
                     # Detect ACTUAL leg drive: knee extension (angle increasing during pull)
-                    # Compare knee angle at start vs during pull
                     knee_extension = None
                     if knee_vals and len(knee_vals) >= MIN_REP_SAMPLES:
-                        # Find if knees straightened significantly during the pull
-                        knee_start = knee_vals[:len(knee_vals)//3]  # first third
-                        knee_mid = knee_vals[len(knee_vals)//3:]     # rest of rep
+                        knee_start = knee_vals[:len(knee_vals)//3]
+                        knee_mid = knee_vals[len(knee_vals)//3:]
                         if knee_start and knee_mid:
                             start_avg = sum(knee_start) / len(knee_start)
                             mid_avg = sum(knee_mid) / len(knee_mid)
-                            knee_extension = mid_avg - start_avg  # positive = straightening = leg drive
+                            knee_extension = mid_avg - start_avg
 
                     rep_m = {
                         "start_frame": rep_start,
@@ -595,13 +617,12 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                         "max_elbow_angle": elbow_max,
                         "torso_drift": torso_drift,
                         "knee_drift": knee_drift,
-                        "knee_extension": knee_extension,  # NEW: actual leg drive metric
+                        "knee_extension": knee_extension,
                         "torso_mean": torso_mean,
                         "depth_pct": row_depth_from_elbow(elbow_min, ext_ref, top_ref)
                     }
                     pen, ov_msg, sess_msgs, tips, is_proper = analyze_rep(rep_m)
                     
-                    # Count good/bad reps like squat (9.5+ = good)
                     # Calculate score for this rep
                     rep_score = MAX_SCORE - pen
                     rep_score = clamp(rep_score, MIN_SCORE, MAX_SCORE)
@@ -632,10 +653,11 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                     torso_vals = []
                     knee_vals  = []
 
-            # Draw overlay (with current skeleton) before writing
+            # Draw overlay (with body-only skeleton) before writing
             if return_video and writer is not None:
-                if lm:
-                    draw_skeleton(frame, lm)
+                # Use body-only skeleton from MediaPipe landmarks (matches pullup/good morning)
+                if results and results.pose_landmarks:
+                    draw_body_only(frame, results.pose_landmarks.landmark)
                 frame = draw_overlay(frame, reps, overlay_msg, live_depth_pct / 100.0)
                 writer.write(frame)
 
@@ -663,9 +685,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     # Select best form tip (coaching advice - SEPARATE from feedback)
     form_tip = None
     
-    # Generate coaching tip based on patterns, not just feedback
     if session_feedback:
-        # If there's feedback, give actionable coaching
         if any("torso" in fb.lower() or "horizontal" in fb.lower() for fb in session_feedback):
             form_tip = "Focus on hip hinge — push your hips back to get more horizontal"
         elif any("pull" in fb.lower() or "higher" in fb.lower() for fb in session_feedback):
@@ -673,11 +693,10 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
         elif any("momentum" in fb.lower() for fb in session_feedback):
             form_tip = "Control the descent — lower the bar slowly over 2-3 seconds"
         else:
-            form_tip = session_feedback[0]  # Fallback to first feedback
+            form_tip = session_feedback[0]
     elif session_tips:
         form_tip = "Squeeze your shoulder blades together at the top"
     else:
-        # No issues - give encouraging + progressive advice
         if good_reps == reps and reps > 0:
             form_tip = "Great form! Keep it up 💪"
         elif reps > 0:
@@ -692,25 +711,24 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     duration_s = (time.time() - start_time)
     result = {
         "success": True,
-        "squat_count": reps,                # keep same key name for UI compatibility
+        "squat_count": reps,
         "row_count": reps,
-        "good_reps": int(good_reps),        # FIXED: Now matches squat exactly
-        "bad_reps": int(bad_reps),          # FIXED: Added like squat
+        "good_reps": int(good_reps),
+        "bad_reps": int(bad_reps),
         "technique_score": float(score),
         "technique_score_display": f"{score:.1f}",
         "technique_label": label,
-        "feedback": session_feedback,       # unique, severe-first
-        "tips": session_tips,               # do not reduce score
-        "form_tip": form_tip,               # FIXED: Now returns best single tip
-        "rep_details": rep_details,         # per-rep metrics
-        "analyzed_video_path": out_fast if return_video else "",    # file path; caller can build URL
+        "feedback": session_feedback,
+        "tips": session_tips,
+        "form_tip": form_tip,
+        "rep_details": rep_details,
+        "analyzed_video_path": out_fast if return_video else "",
         "fps": src_fps/max(1,FRAME_SKIP),
         "duration_s": duration_s,
     }
     return result
 
 if __name__ == "__main__":
-    # Quick manual test (adjust paths)
     test_in = "sample_row.mp4"
     if not os.path.exists(test_in):
         print(json.dumps({"success": False, "error": f"Missing {test_in} for test"}, ensure_ascii=False))
