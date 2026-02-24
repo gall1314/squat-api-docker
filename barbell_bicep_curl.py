@@ -17,132 +17,139 @@ DONUT_THICKNESS_FRAC = 0.28
 DEPTH_COLOR          = (40, 200, 80)
 DEPTH_RING_BG        = (70, 70, 70)
 
-# פונטים — אותם גדלים כמו בסקוואט
-REPS_FONT_SIZE        = 28
-FEEDBACK_FONT_SIZE    = 22
-DEPTH_LABEL_FONT_SIZE = 14
-DEPTH_PCT_FONT_SIZE   = 18
+FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
+_REF_H = 480.0
+_REF_REPS_FONT_SIZE = 28
+_REF_FEEDBACK_FONT_SIZE = 22
+_REF_DEPTH_LABEL_FONT_SIZE = 14
+_REF_DEPTH_PCT_FONT_SIZE = 18
 
-def _load_font(size):
-    # מנסה קודם את אותו קובץ פונט, אחרת fallback קבוע כדי למנוע שינוי מטריקה
-    candidates = [
-        "Roboto-VariableFont_wdth,wght.ttf",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "Roboto-VariableFont_wdth,wght.ttf"),
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    ]
-    for path in candidates:
-        try:
-            if os.path.exists(path):
-                return ImageFont.truetype(path, size)
-        except Exception:
-            pass
-    return ImageFont.load_default()
+def _load_font(path, size):
+    try:
+        return ImageFont.truetype(path, size)
+    except Exception:
+        return ImageFont.load_default()
 
-REPS_FONT        = _load_font(REPS_FONT_SIZE)
-FEEDBACK_FONT    = _load_font(FEEDBACK_FONT_SIZE)
-DEPTH_LABEL_FONT = _load_font(DEPTH_LABEL_FONT_SIZE)
-DEPTH_PCT_FONT   = _load_font(DEPTH_PCT_FONT_SIZE)
+def _scaled_font_size(ref_size, canvas_h):
+    return max(10, int(round(ref_size * (canvas_h / _REF_H))))
 
 mp_pose = mp.solutions.pose
 
-# ===================== OVERLAY (מועתק 1:1 מהסקוואט) =====================
-def _draw_depth_donut(frame, center, radius, thickness, pct):
-    pct = float(np.clip(pct, 0.0, 1.0))
-    cx, cy = int(center[0]), int(center[1])
-    radius   = int(radius)
-    thickness = int(thickness)
-    cv2.circle(frame, (cx, cy), radius, DEPTH_RING_BG, thickness, lineType=cv2.LINE_AA)
-    start_ang = -90
-    end_ang   = start_ang + int(360 * pct)
-    cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang,
-                DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
-    return frame
+# ===================== OVERLAY =====================
+def _wrap_two_lines(draw, text, font, max_width):
+    words = (text or "").split()
+    if not words:
+        return [""]
+    lines = []
+    cur = ""
+    for w in words:
+        t = (cur + " " + w).strip()
+        if draw.textlength(t, font=font) <= max_width:
+            cur = t
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+        if len(lines) == 2:
+            break
+    if cur and len(lines) < 2:
+        lines.append(cur)
+    if len(lines) >= 2 and draw.textlength(lines[-1], font=font) > max_width:
+        last = lines[-1] + "…"
+        while draw.textlength(last, font=font) > max_width and len(last) > 1:
+            last = last[:-2] + "…"
+        lines[-1] = last
+    return lines
 
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     """Reps שמאל-עליון; דונאט ימין-עליון; פידבק תחתון — בדיוק כמו בסקוואט."""
     h, w, _ = frame.shape
+    HD_H = 1080
+    hd_scale = HD_H / float(h)
+    HD_W = max(1, int(round(w * hd_scale)))
 
-    # Reps box — שמאל עליון
-    pil = Image.fromarray(frame); draw = ImageDraw.Draw(pil)
-    reps_text = f"Reps: {reps}"
-    inner_pad_x, inner_pad_y = 10, 6
-    text_w = draw.textlength(reps_text, font=REPS_FONT)
-    text_h = REPS_FONT.size
-    x0, y0 = 0, 0
-    x1 = int(text_w + 2*inner_pad_x); y1 = int(text_h + 2*inner_pad_y)
-    top = frame.copy()
-    cv2.rectangle(top, (x0, y0), (x1, y1), (0, 0, 0), -1)
-    frame = cv2.addWeighted(top, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
-    pil = Image.fromarray(frame)
-    ImageDraw.Draw(pil).text((x0 + inner_pad_x, y0 + inner_pad_y - 1),
-                             reps_text, font=REPS_FONT, fill=(255, 255, 255))
-    frame = np.array(pil)
+    reps_font_size = _scaled_font_size(_REF_REPS_FONT_SIZE, HD_H)
+    feedback_font_size = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, HD_H)
+    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, HD_H)
+    depth_pct_font_size = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, HD_H)
 
-    # Donut — ימין עליון (אותו חישוב גודל/מיקום)
-    ref_h  = max(int(h * 0.06), int(REPS_FONT_SIZE * 1.6))
+    _REPS_FONT = _load_font(FONT_PATH, reps_font_size)
+    _FEEDBACK_FONT = _load_font(FONT_PATH, feedback_font_size)
+    _DEPTH_LABEL_FONT = _load_font(FONT_PATH, depth_label_font_size)
+    _DEPTH_PCT_FONT = _load_font(FONT_PATH, depth_pct_font_size)
+
+    pct = float(np.clip(depth_pct, 0, 1))
+    bg_alpha_val = int(round(255 * BAR_BG_ALPHA))
+
+    ref_h = max(int(HD_H * 0.06), int(reps_font_size * 1.6))
     radius = int(ref_h * DONUT_RADIUS_SCALE)
-    thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
-    margin = 12
-    cx = w - margin - radius
+    thick = max(3, int(radius * DONUT_THICKNESS_FRAC))
+    margin = int(12 * hd_scale)
+    cx = HD_W - margin - radius
     cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
-    frame = _draw_depth_donut(frame, (cx, cy), radius, thick, float(np.clip(depth_pct, 0, 1)))
 
-    pil  = Image.fromarray(frame); draw = ImageDraw.Draw(pil)
-    label_txt = "DEPTH"
-    pct_txt   = f"{int(float(np.clip(depth_pct, 0, 1)) * 100)}%"
-    label_w = draw.textlength(label_txt, font=DEPTH_LABEL_FONT)
-    pct_w   = draw.textlength(pct_txt,   font=DEPTH_PCT_FONT)
-    gap     = max(2, int(radius * 0.10))
-    base_y  = cy - (DEPTH_LABEL_FONT.size + gap + DEPTH_PCT_FONT.size) // 2
-    draw.text((cx - int(label_w // 2), base_y),                      label_txt, font=DEPTH_LABEL_FONT, fill=(255,255,255))
-    draw.text((cx - int(pct_w // 2),   base_y + DEPTH_LABEL_FONT.size + gap),
-              pct_txt, font=DEPTH_PCT_FONT, fill=(255,255,255))
-    frame = np.array(pil)
+    overlay_np = np.zeros((HD_H, HD_W, 4), dtype=np.uint8)
 
-    # Feedback — תחתון (שתי שורות + …)
+    pad_x, pad_y = int(10 * hd_scale), int(6 * hd_scale)
+    tmp_pil = Image.new("RGBA", (1, 1))
+    tmp_draw = ImageDraw.Draw(tmp_pil)
+    txt = f"Reps: {int(reps)}"
+    tw = tmp_draw.textlength(txt, font=_REPS_FONT)
+    thh = _REPS_FONT.size
+    box_w = int(tw + 2 * pad_x)
+    box_h = int(thh + 2 * pad_y)
+    cv2.rectangle(overlay_np, (0, 0), (box_w, box_h), (0, 0, 0, bg_alpha_val), -1)
+
+    cv2.circle(overlay_np, (cx, cy), radius, (*DEPTH_RING_BG, 255), thick, cv2.LINE_AA)
+    start_ang = -90
+    end_ang = start_ang + int(360 * pct)
+    if end_ang != start_ang:
+        cv2.ellipse(overlay_np, (cx, cy), (radius, radius), 0, start_ang, end_ang,
+                    (*DEPTH_COLOR, 255), thick, cv2.LINE_AA)
+
+    fb_y0 = 0
+    fb_lines = []
+    fb_pad_x = fb_pad_y = line_gap = line_h = 0
     if feedback:
-        def wrap_to_two_lines(draw, text, font, max_width):
-            words = text.split()
-            if not words: return [""]
-            lines, cur = [], ""
-            for w_ in words:
-                trial = (cur + " " + w_).strip()
-                if draw.textlength(trial, font=font) <= max_width:
-                    cur = trial
-                else:
-                    if cur: lines.append(cur)
-                    cur = w_
-                if len(lines) == 2: break
-            if cur and len(lines) < 2: lines.append(cur)
-            leftover = len(words) - sum(len(l.split()) for l in lines)
-            if leftover > 0 and len(lines) >= 2:
-                last = lines[-1] + "…"
-                while draw.textlength(last, font=font) > max_width and len(last) > 1:
-                    last = last[:-2] + "…"
-                lines[-1] = last
-            return lines
+        safe_margin = max(int(6 * hd_scale), int(HD_H * 0.02))
+        fb_pad_x, fb_pad_y, line_gap = int(12 * hd_scale), int(8 * hd_scale), int(4 * hd_scale)
+        max_text_w = int(HD_W - 2 * fb_pad_x - int(20 * hd_scale))
+        fb_lines = _wrap_two_lines(tmp_draw, feedback, _FEEDBACK_FONT, max_text_w)
+        line_h = _FEEDBACK_FONT.size + int(6 * hd_scale)
+        block_h = 2 * fb_pad_y + len(fb_lines) * line_h + (len(fb_lines) - 1) * line_gap
+        fb_y0 = max(0, HD_H - safe_margin - block_h)
+        y1 = HD_H - safe_margin
+        cv2.rectangle(overlay_np, (0, fb_y0), (HD_W, y1), (0, 0, 0, bg_alpha_val), -1)
 
-        pil_fb = Image.fromarray(frame); draw_fb = ImageDraw.Draw(pil_fb)
-        safe_margin = max(6, int(h * 0.02))
-        pad_x, pad_y, line_gap = 12, 8, 4
-        max_text_w = int(w - 2*pad_x - 20)
-        lines = wrap_to_two_lines(draw_fb, feedback, FEEDBACK_FONT, max_text_w)
-        line_h = FEEDBACK_FONT.size + 6
-        block_h = (2*pad_y) + len(lines)*line_h + (len(lines)-1)*line_gap
-        y0 = max(0, h - safe_margin - block_h); y1 = h - safe_margin
-        over = frame.copy()
-        cv2.rectangle(over, (0, y0), (w, y1), (0,0,0), -1)
-        frame = cv2.addWeighted(over, BAR_BG_ALPHA, frame, 1.0 - BAR_BG_ALPHA, 0)
-        pil_fb = Image.fromarray(frame); draw_fb = ImageDraw.Draw(pil_fb)
-        ty = y0 + pad_y
-        for ln in lines:
-            tw = draw_fb.textlength(ln, font=FEEDBACK_FONT)
-            tx = max(pad_x, (w - int(tw)) // 2)
-            draw_fb.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255,255,255))
+    overlay_pil = Image.fromarray(overlay_np, mode="RGBA")
+    draw = ImageDraw.Draw(overlay_pil)
+
+    draw.text((pad_x, pad_y - 1), txt, font=_REPS_FONT, fill=(255, 255, 255, 255))
+
+    gap = max(2, int(radius * 0.10))
+    by = cy - (_DEPTH_LABEL_FONT.size + gap + _DEPTH_PCT_FONT.size) // 2
+    label = "DEPTH"
+    pct_txt = f"{int(pct * 100)}%"
+    lw = draw.textlength(label, font=_DEPTH_LABEL_FONT)
+    pw = draw.textlength(pct_txt, font=_DEPTH_PCT_FONT)
+    draw.text((cx - int(lw // 2), by), label, font=_DEPTH_LABEL_FONT, fill=(255, 255, 255, 255))
+    draw.text((cx - int(pw // 2), by + _DEPTH_LABEL_FONT.size + gap), pct_txt, font=_DEPTH_PCT_FONT, fill=(255, 255, 255, 255))
+
+    if feedback and fb_lines:
+        ty = fb_y0 + fb_pad_y
+        for ln in fb_lines:
+            tw2 = draw.textlength(ln, font=_FEEDBACK_FONT)
+            tx = max(fb_pad_x, (HD_W - int(tw2)) // 2)
+            draw.text((tx, ty), ln, font=_FEEDBACK_FONT, fill=(255, 255, 255, 255))
             ty += line_h + line_gap
-        frame = np.array(pil_fb)
 
-    return frame
+    overlay_rgba = np.array(overlay_pil)
+    overlay_small = cv2.resize(overlay_rgba, (w, h), interpolation=cv2.INTER_AREA)
+    alpha = overlay_small[:, :, 3:4].astype(np.float32) / 255.0
+    overlay_bgr_ch = overlay_small[:, :, [2, 1, 0]].astype(np.float32)
+    frame_f = frame.astype(np.float32)
+    result = frame_f * (1.0 - alpha) + overlay_bgr_ch * alpha
+    return result.astype(np.uint8)
 
 # ===================== BODY-ONLY SKELETON (ללא פנים) =====================
 _FACE_LMS = {
