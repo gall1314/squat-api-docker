@@ -355,49 +355,79 @@ def _donut(frame, c, r, t, p):
 
 def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
     h, w, _ = frame.shape
-    # Reps box
-    pil = Image.fromarray(frame); d = ImageDraw.Draw(pil)
-    txt = f"Reps: {reps}"; padx, pady = 10, 6
-    tw = d.textlength(txt, font=REPS_FONT); th = REPS_FONT.size
-    x0, y0 = 0, 0; x1 = int(tw + 2*padx); y1 = int(th + 2*pady)
-    top = frame.copy(); cv2.rectangle(top, (x0,y0), (x1,y1), (0,0,0), -1)
-    frame = cv2.addWeighted(top, BAR_BG_ALPHA, frame, 1-BAR_BG_ALPHA, 0)
-    pil = Image.fromarray(frame)
-    ImageDraw.Draw(pil).text((x0+padx, y0+pady-1), txt, font=REPS_FONT, fill=(255,255,255))
-    frame = np.array(pil)
+    HD_H = 1080
+    hd_scale = HD_H / float(h)
+    HD_W = max(1, int(round(w * hd_scale)))
 
-    # Donut (top-right)
-    ref_h = max(int(h*0.06), int(REPS_FONT_SIZE*1.6))
+    pct = float(np.clip(progress_pct, 0, 1))
+    ref_h = max(int(HD_H * 0.06), int(REPS_FONT_SIZE * 1.6))
     r = int(ref_h * DONUT_RADIUS_SCALE)
     thick = max(3, int(r * DONUT_THICKNESS_FRAC))
-    m = 12; cx = w - m - r; cy = max(ref_h + r//8, r + thick//2 + 2)
-    frame = _donut(frame, (cx,cy), r, thick, float(np.clip(progress_pct,0,1)))
+    m = 12
+    cx = HD_W - m - r
+    cy = max(ref_h + r // 8, r + thick // 2 + 2)
 
-    pil = Image.fromarray(frame); d = ImageDraw.Draw(pil)
-    label = "DEPTH"; pct = f"{int(float(np.clip(progress_pct,0,1))*100)}%"
-    lw = d.textlength(label, font=DEPTH_LABEL_FONT); pw = d.textlength(pct, font=DEPTH_PCT_FONT)
-    gap = max(2, int(r*0.10)); base = cy - (DEPTH_LABEL_FONT.size + gap + DEPTH_PCT_FONT.size)//2
-    d.text((cx-int(lw//2), base), label, font=DEPTH_LABEL_FONT, fill=(255,255,255))
-    d.text((cx-int(pw//2), base+DEPTH_LABEL_FONT.size+gap), pct, font=DEPTH_PCT_FONT, fill=(255,255,255))
-    frame = np.array(pil)
+    overlay_bgr = np.zeros((HD_H, HD_W, 3), dtype=np.uint8)
+    overlay_a = np.zeros((HD_H, HD_W), dtype=np.uint8)
+    bg_alpha = int(round(255 * BAR_BG_ALPHA))
 
-    # Feedback (bottom)
+    txt = f"Reps: {reps}"
+    padx, pady = 10, 6
+    tmp = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    tw = tmp.textlength(txt, font=REPS_FONT)
+    th = REPS_FONT.size
+    cv2.rectangle(overlay_bgr, (0, 0), (int(tw + 2 * padx), int(th + 2 * pady)), (0, 0, 0), -1)
+    cv2.rectangle(overlay_a, (0, 0), (int(tw + 2 * padx), int(th + 2 * pady)), bg_alpha, -1)
+
+    cv2.circle(overlay_bgr, (cx, cy), r, DEPTH_RING_BG, thick, cv2.LINE_AA)
+    cv2.circle(overlay_a, (cx, cy), r, 255, thick, cv2.LINE_AA)
+    cv2.ellipse(overlay_bgr, (cx, cy), (r, r), 0, -90, -90 + int(360 * pct), DEPTH_COLOR, thick, cv2.LINE_AA)
+    cv2.ellipse(overlay_a, (cx, cy), (r, r), 0, -90, -90 + int(360 * pct), 255, thick, cv2.LINE_AA)
+
+    pil_rgba = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGBA)
+    pil_rgba[:, :, 3] = np.maximum(pil_rgba[:, :, 3], overlay_a)
+    pil = Image.fromarray(pil_rgba)
+    d = ImageDraw.Draw(pil)
+    d.text((padx, pady - 1), txt, font=REPS_FONT, fill=(255, 255, 255, 255))
+
+    label = "DEPTH"
+    pct_txt = f"{int(pct * 100)}%"
+    lw = d.textlength(label, font=DEPTH_LABEL_FONT)
+    pw = d.textlength(pct_txt, font=DEPTH_PCT_FONT)
+    gap = max(2, int(r * 0.10))
+    base = cy - (DEPTH_LABEL_FONT.size + gap + DEPTH_PCT_FONT.size) // 2
+    d.text((cx - int(lw // 2), base), label, font=DEPTH_LABEL_FONT, fill=(255, 255, 255, 255))
+    d.text((cx - int(pw // 2), base + DEPTH_LABEL_FONT.size + gap), pct_txt, font=DEPTH_PCT_FONT, fill=(255, 255, 255, 255))
+
     if feedback:
-        pil_fb = Image.fromarray(frame); dfb = ImageDraw.Draw(pil_fb)
-        safe = max(6, int(h*0.02)); pad_x, pad_y, lg = 12, 8, 4
-        maxw = int(w - 2*pad_x - 20)
-        lines = _wrap2(dfb, feedback, FEEDBACK_FONT, maxw)
+        safe = max(6, int(HD_H * 0.02))
+        pad_x, pad_y, lg = 12, 8, 4
+        maxw = int(HD_W - 2 * pad_x - 20)
+        lines = _wrap2(d, feedback, FEEDBACK_FONT, maxw)
         lh = FEEDBACK_FONT.size + 6
-        block = (2*pad_y) + len(lines)*lh + (len(lines)-1)*lg
-        y0 = max(0, h - safe - block); y1 = h - safe
-        over = frame.copy(); cv2.rectangle(over, (0,y0), (w,y1), (0,0,0), -1)
-        frame = cv2.addWeighted(over, BAR_BG_ALPHA, frame, 1-BAR_BG_ALPHA, 0)
-        pil_fb = Image.fromarray(frame); dfb = ImageDraw.Draw(pil_fb); ty = y0 + pad_y
+        block = (2 * pad_y) + len(lines) * lh + (len(lines) - 1) * lg
+        y0 = max(0, HD_H - safe - block)
+        y1 = HD_H - safe
+        cv2.rectangle(overlay_bgr, (0, y0), (HD_W, y1), (0, 0, 0), -1)
+        cv2.rectangle(overlay_a, (0, y0), (HD_W, y1), bg_alpha, -1)
+
+        pil_rgba = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGBA)
+        pil_rgba[:, :, 3] = np.maximum(pil_rgba[:, :, 3], overlay_a)
+        pil = Image.fromarray(pil_rgba)
+        dfb = ImageDraw.Draw(pil)
+        ty = y0 + pad_y
         for ln in lines:
-            t_w = dfb.textlength(ln, font=FEEDBACK_FONT); tx = max(pad_x, (w - int(t_w)) // 2)
-            dfb.text((tx,ty), ln, font=FEEDBACK_FONT, fill=(255,255,255)); ty += lh + lg
-        frame = np.array(pil_fb)
-    return frame
+            t_w = dfb.textlength(ln, font=FEEDBACK_FONT)
+            tx = max(pad_x, (HD_W - int(t_w)) // 2)
+            dfb.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255, 255, 255, 255))
+            ty += lh + lg
+
+    overlay_rgba = np.array(pil)
+    overlay_small = cv2.resize(overlay_rgba, (w, h), interpolation=cv2.INTER_AREA)
+    alpha = overlay_small[:, :, 3:4].astype(np.float32) / 255.0
+    rgb = cv2.cvtColor(overlay_small[:, :, :3], cv2.COLOR_RGB2BGR).astype(np.float32)
+    out = frame.astype(np.float32) * (1.0 - alpha) + rgb * alpha
+    return out.astype(np.uint8)
 
 # ===================== MAIN =====================
 def run_deadlift_analysis(video_path,
