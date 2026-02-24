@@ -62,7 +62,6 @@ def _wrap_two_lines(draw, text, font, max_width):
     return lines
 
 def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
-    """Reps שמאל-עליון; דונאט ימין-עליון; פידבק תחתון — בדיוק כמו בסקוואט."""
     h, w, _ = frame.shape
     HD_H = 1080
     hd_scale = HD_H / float(h)
@@ -112,7 +111,9 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
     fb_pad_x = fb_pad_y = line_gap = line_h = 0
     if feedback:
         safe_margin = max(int(6 * hd_scale), int(HD_H * 0.02))
-        fb_pad_x, fb_pad_y, line_gap = int(12 * hd_scale), int(8 * hd_scale), int(4 * hd_scale)
+        fb_pad_x = int(12 * hd_scale)
+        fb_pad_y = int(8 * hd_scale)
+        line_gap = int(4 * hd_scale)
         max_text_w = int(HD_W - 2 * fb_pad_x - int(20 * hd_scale))
         fb_lines = _wrap_two_lines(tmp_draw, feedback, _FEEDBACK_FONT, max_text_w)
         line_h = _FEEDBACK_FONT.size + int(6 * hd_scale)
@@ -146,9 +147,9 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
     overlay_rgba = np.array(overlay_pil)
     overlay_small = cv2.resize(overlay_rgba, (w, h), interpolation=cv2.INTER_AREA)
     alpha = overlay_small[:, :, 3:4].astype(np.float32) / 255.0
-    overlay_bgr_ch = overlay_small[:, :, [2, 1, 0]].astype(np.float32)
+    overlay_bgr = overlay_small[:, :, [2, 1, 0]].astype(np.float32)
     frame_f = frame.astype(np.float32)
-    result = frame_f * (1.0 - alpha) + overlay_bgr_ch * alpha
+    result = frame_f * (1.0 - alpha) + overlay_bgr * alpha
     return result.astype(np.uint8)
 
 # ===================== BODY-ONLY SKELETON (ללא פנים) =====================
