@@ -280,7 +280,11 @@ def _get_fast_pose():
     return _FAST_POSE
 
 def _read_source_rotation_degrees(video_path):
-    """Read source rotation metadata without rotating pixels (0/90/180/270)."""
+    """
+    Read rotation metadata from video (0/90/180/270).
+    Returns the degrees the video stream needs to be rotated to display upright.
+    OpenCV ignores rotation metadata, so we must apply it manually to pixels.
+    """
     try:
         proc = subprocess.run(
             [
@@ -292,16 +296,15 @@ def _read_source_rotation_degrees(video_path):
             ],
             check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
-        if proc.returncode != 0 or not proc.stdout:
-            return 0
-        for line in proc.stdout.splitlines():
-            m = re.search(r"-?\d+(?:\.\d+)?", line.strip())
-            if not m: continue
-            try:
-                rot = int(round(float(m.group(0)))) % 360
-            except Exception:
-                continue
-            return min((0, 90, 180, 270), key=lambda x: abs(x - rot))
+        if proc.returncode == 0 and proc.stdout:
+            for line in proc.stdout.splitlines():
+                m = re.search(r"-?\d+(?:\.\d+)?", line.strip())
+                if not m: continue
+                try:
+                    rot = int(round(float(m.group(0)))) % 360
+                    return min((0, 90, 180, 270), key=lambda x: abs(x - rot))
+                except Exception:
+                    continue
     except Exception:
         pass
     try:
@@ -317,6 +320,27 @@ def _read_source_rotation_degrees(video_path):
     except Exception:
         pass
     return 0
+
+
+def _rotate_frame(frame, rotation_degrees):
+    """
+    Rotate frame pixels to compensate for video metadata rotation.
+    OpenCV reads raw pixels without applying rotation metadata,
+    so we must rotate manually to get the upright image.
+
+    rotation_degrees: value from _read_source_rotation_degrees()
+      90  → phone held portrait, video stored rotated 90° CW  → rotate CCW 90°
+      180 → upside-down                                        → rotate 180°
+      270 → phone held portrait other way                      → rotate CW 90°
+      0   → no rotation needed
+    """
+    if rotation_degrees == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif rotation_degrees == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    elif rotation_degrees == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    return frame
 
 # ============ Helpers ============
 def _ang(a, b, c):
@@ -476,6 +500,10 @@ def run_pullup_analysis(video_path,
     cap=cv2.VideoCapture(video_path)
     if not cap.isOpened(): return _ret_err("Could not open video", feedback_path)
 
+    # Read rotation ONCE — OpenCV ignores metadata rotation, so we apply it
+    # manually to every frame so the video is always displayed upright.
+    source_rotation = _read_source_rotation_degrees(video_path)
+
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps=max(1.0, fps_in/max(1,effective_frame_skip))
     sec_to_frames=lambda s: max(1,int(s*effective_fps))
@@ -563,6 +591,10 @@ def run_pullup_analysis(video_path,
             ret, frame = cap.read()
             if not ret: break
             frame_idx += 1
+
+            # Fix orientation — apply before any processing or writing
+            if source_rotation != 0:
+                frame = _rotate_frame(frame, source_rotation)
 
             process_now = (burst_cntr > 0) or (frame_idx % max(1, effective_frame_skip) == 0)
             if not process_now:
@@ -962,13 +994,14 @@ def run_pullup_analysis(video_path,
     if slow_path and os.path.exists(output_path):
         encoded_path=output_path.replace(".mp4","_encoded.mp4")
         try:
-            source_rotation = _read_source_rotation_degrees(video_path)
             ffmpeg_cmd = [
                 "ffmpeg", "-y", "-i", output_path,
                 "-c:v", "libx264", "-preset", "fast",
                 "-crf", str(int(encode_crf if encode_crf is not None else 23)),
                 "-movflags", "+faststart", "-pix_fmt", "yuv420p",
-                "-metadata:s:v:0", f"rotate={int(source_rotation)}",
+                # Pixels are already rotated correctly — explicitly clear any
+                # stale rotation metadata so players don't rotate a second time.
+                "-metadata:s:v:0", "rotate=0",
                 encoded_path,
             ]
             subprocess.run(ffmpeg_cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
