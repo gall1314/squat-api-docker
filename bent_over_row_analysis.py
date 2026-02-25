@@ -399,25 +399,23 @@ def technique_label(score):
 
 def row_depth_pct(elbow_angle, ext_ref, top_ref):
     """
-    Returns 0.0..1.0 where:
-      1.0 = max pull — elbow most bent, bar touching torso (deepest pull)
-      0.0 = arms extended — resting position
+    DEPTH of pull: 1.0 when bar is fully pulled to torso (elbow most bent),
+    0.0 when arms are fully extended (rest).
 
-    Donut fills as user PULLS UP (bar comes to torso).
-    ext_ref = largest elbow angle seen (arms straight)
-    top_ref = smallest elbow angle seen (max pull)
+    ext_ref = max elbow angle (arms straight, ~170°)
+    top_ref = min elbow angle (bar at torso, ~60°)
+
+    Formula: as elbow_angle drops from ext_ref → top_ref, pct rises 0 → 1.
     """
     if elbow_angle is None or ext_ref is None or top_ref is None:
         return 0.0
     span = max(10.0, ext_ref - top_ref)
-    # elbow small (max pull, bar at torso) → pct=1.0 — donut full
-    # elbow large (arms extended, rest)     → pct=0.0 — donut empty
     pct = (ext_ref - elbow_angle) / span
-    return float(clamp(pct, 0.0, 1.0))
+    return float(clamp(1.0 - pct, 0.0, 1.0))  # 1-pct: full when arms extended (bar down)
 
 
 def row_depth_pct_from_min(elbow_min, ext_ref, top_ref):
-    """Depth at the deepest point of a rep (smallest elbow = bar highest = min depth)."""
+    """Peak pull depth for a completed rep (elbow_min = most bent point)."""
     return row_depth_pct(elbow_min, ext_ref, top_ref)
 
 # ================== CORE ANALYSIS ==================
