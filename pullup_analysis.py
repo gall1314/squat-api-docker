@@ -2,7 +2,7 @@
 # pullup_analysis.py — SMART FORM_TIP edition with FAST/SLOW path optimization
 # form_tip = optimization advice (doesn't affect score, only helps improve)
 
-import os, cv2, math, numpy as np, subprocess, json
+import os, cv2, math, numpy as np, subprocess, re
 from collections import deque
 from PIL import ImageFont, ImageDraw, Image
 
@@ -95,16 +95,15 @@ else:
 def _get_fast_pose():
     return _FAST_POSE
 
-# ============ Video orientation helpers ============
-def _read_video_rotation(video_path):
-    """Return normalized clockwise rotation in degrees (0/90/180/270)."""
+def _read_source_rotation_degrees(video_path):
+    """Read source rotation metadata without rotating pixels (0/90/180/270)."""
     try:
         proc = subprocess.run(
             [
                 "ffprobe", "-v", "error",
                 "-select_streams", "v:0",
                 "-show_entries", "stream_tags=rotate:stream_side_data=rotation",
-                "-of", "json",
+                "-of", "default=noprint_wrappers=1:nokey=1",
                 video_path,
             ],
             check=False,
@@ -115,50 +114,36 @@ def _read_video_rotation(video_path):
         if proc.returncode != 0 or not proc.stdout:
             return 0
 
-        data = json.loads(proc.stdout)
-        streams = data.get("streams") or []
-        if not streams:
-            return 0
-
-        st = streams[0] if isinstance(streams[0], dict) else {}
-        rot = None
-
-        tags = st.get("tags") if isinstance(st.get("tags"), dict) else {}
-        if "rotate" in tags:
+        for line in proc.stdout.splitlines():
+            m = re.search(r"-?\d+(?:\.\d+)?", line.strip())
+            if not m:
+                continue
             try:
-                rot = int(float(tags["rotate"]))
+                rot = int(round(float(m.group(0)))) % 360
             except Exception:
-                rot = None
-
-        if rot is None:
-            for sd in (st.get("side_data_list") or []):
-                if not isinstance(sd, dict):
-                    continue
-                if "rotation" in sd:
-                    try:
-                        rot = int(float(sd["rotation"]))
-                        break
-                    except Exception:
-                        pass
-
-        if rot is None:
-            return 0
-
-        # ffprobe rotation may be negative; convert to clockwise canonical [0, 360).
-        rot = rot % 360
-        closest = min((0, 90, 180, 270), key=lambda x: abs(x - rot))
-        return int(closest)
+                continue
+            return min((0, 90, 180, 270), key=lambda x: abs(x - rot))
     except Exception:
-        return 0
+        pass
 
-def _rotate_frame_clockwise(frame, degrees):
-    if degrees == 90:
-        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    if degrees == 180:
-        return cv2.rotate(frame, cv2.ROTATE_180)
-    if degrees == 270:
-        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    return frame
+    # Fallback for environments that ship ffmpeg without ffprobe.
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-i", video_path],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        txt = proc.stderr or ""
+        m = re.search(r"rotate\s*:\s*(-?\d+)", txt)
+        if m:
+            rot = int(m.group(1)) % 360
+            return min((0, 90, 180, 270), key=lambda x: abs(x - rot))
+    except Exception:
+        pass
+
+    return 0
 
 # ============ Helpers ============
 def _ang(a,b,c):
@@ -924,9 +909,18 @@ def run_pullup_analysis(video_path,
     if slow_path and os.path.exists(output_path):
         encoded_path=output_path.replace(".mp4","_encoded.mp4")
         try:
-            subprocess.run(["ffmpeg","-y","-i",output_path,"-c:v","libx264","-preset","fast",
-                            "-crf",str(int(encode_crf if encode_crf is not None else 23)),"-movflags","+faststart","-pix_fmt","yuv420p",
-                            encoded_path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            source_rotation = _read_source_rotation_degrees(video_path)
+            ffmpeg_cmd = [
+                "ffmpeg", "-y", "-i", output_path,
+                "-c:v", "libx264", "-preset", "fast",
+                "-crf", str(int(encode_crf if encode_crf is not None else 23)),
+                "-movflags", "+faststart", "-pix_fmt", "yuv420p",
+            ]
+            # Preserve source orientation metadata exactly as captured/displayed by clients.
+            ffmpeg_cmd += ["-metadata:s:v:0", f"rotate={int(source_rotation)}"]
+            ffmpeg_cmd += [encoded_path]
+
+            subprocess.run(ffmpeg_cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             final_path=encoded_path if os.path.exists(encoded_path) else output_path
             if os.path.exists(output_path) and os.path.exists(encoded_path):
                 try: os.remove(output_path)
