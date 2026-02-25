@@ -6,9 +6,16 @@
 # DESIGNED TO WORK WITH: frame_skip=3, scale=0.4 (from app.py)
 # This means: ~8-10 effective FPS, small image → noisy landmarks.
 # Thresholds are tuned for these real-world conditions.
+#
+# FIXES vs original:
+# 1. draw_overlay: fixed NameError (wrap_to_two_lines → _wrap_two_lines)
+# 2. draw_overlay: works at frame resolution (no 1080p upscale/downscale)
+#    with a per-resolution cache for static layers — same approach as pullup.
+# 3. Rotation: reads video metadata once and rotates pixels before processing,
+#    so portrait/landscape videos always display upright.
 # ============================================================================
 
-import os, math, subprocess, collections
+import os, math, subprocess, re, collections
 from typing import List, Optional, Tuple
 
 import cv2
@@ -19,58 +26,305 @@ import mediapipe as mp
 mp_pose = mp.solutions.pose
 
 # ========================== CONSTANTS ==========================
-# --- These are tuned for frame_skip=3, scale=0.4 ---
+ANGLE_DOWN_THRESH    = 105
+ANGLE_UP_THRESH      = 150
+MIN_RANGE_DELTA_DEG  = 10
+MIN_DOWN_FRAMES      = 2
+FAST_REP_MIN_DEPTH_DELTA = 18
 
-# Rep detection thresholds
-ANGLE_DOWN_THRESH   = 105     # knee angle below this = "down" (wider than 95 for noisy data)
-ANGLE_UP_THRESH     = 150     # knee angle above this = "up" (lower than 160 for noisy data)
-MIN_RANGE_DELTA_DEG = 10      # min ROM to count (lower than 12 for skip=3)
-MIN_DOWN_FRAMES     = 2       # with skip=3 at 30fps → only ~3-5 frames in descent
-FAST_REP_MIN_DEPTH_DELTA = 18 # allow faster reps if there is clear ROM
+GOOD_REP_MIN_SCORE   = 8.0
+PERFECT_MIN_KNEE     = 70
+TORSO_LEAN_MIN       = 112
+TORSO_MARGIN_DEG     = 3
+TORSO_BAD_MIN_FRAMES = 8
+VALGUS_X_TOL         = 0.03
+VALGUS_BAD_MIN_FRAMES = 2
 
-# Form scoring
-GOOD_REP_MIN_SCORE  = 8.0
-PERFECT_MIN_KNEE    = 70
-TORSO_LEAN_MIN      = 112
-TORSO_MARGIN_DEG    = 3
-TORSO_BAD_MIN_FRAMES = 8       # much stricter persistence to avoid natural-lean false positives
-VALGUS_X_TOL        = 0.03
-VALGUS_BAD_MIN_FRAMES = 2      # lower for skip=3
+EMA_ALPHA            = 0.7
+REP_DEBOUNCE_FRAMES  = 3
 
-# Smoothing
-EMA_ALPHA           = 0.7     # higher = more responsive (less lag with few frames)
-
-# Debounce
-REP_DEBOUNCE_FRAMES = 3       # lower for skip=3 (each frame = 3 real frames)
-
-# Walking filter
-HIP_VEL_THRESH_PCT   = 0.018  # more lenient (noisy at low res)
+HIP_VEL_THRESH_PCT   = 0.018
 ANKLE_VEL_THRESH_PCT  = 0.022
-MOTION_EMA_ALPHA      = 0.55
-MOVEMENT_CLEAR_FRAMES = 1     # just 1 clean frame needed at low fps
+MOTION_EMA_ALPHA     = 0.55
+MOVEMENT_CLEAR_FRAMES = 1
 
-# Early exit
-NOPOSE_STOP_SEC       = 1.5
-NO_MOVEMENT_STOP_SEC  = 1.5
+NOPOSE_STOP_SEC      = 1.5
+NO_MOVEMENT_STOP_SEC = 1.5
 
 # Overlay style
-BAR_BG_ALPHA         = 0.55
-REPS_FONT_SIZE       = 28
-FEEDBACK_FONT_SIZE   = 22
-DEPTH_LABEL_FONT_SIZE = 14
-DEPTH_PCT_FONT_SIZE  = 18
-FONT_PATH            = "Roboto-VariableFont_wdth,wght.ttf"
-RT_FB_HOLD_SEC       = 0.8
-DONUT_RADIUS_SCALE   = 0.72
-DONUT_THICKNESS_FRAC = 0.28
-DEPTH_COLOR          = (40, 200, 80)
-DEPTH_RING_BG        = (70, 70, 70)
+BAR_BG_ALPHA          = 0.55
+FONT_PATH             = "Roboto-VariableFont_wdth,wght.ttf"
+RT_FB_HOLD_SEC        = 0.8
+DONUT_RADIUS_SCALE    = 0.72
+DONUT_THICKNESS_FRAC  = 0.28
+DEPTH_COLOR           = (40, 200, 80)
+DEPTH_RING_BG         = (70, 70, 70)
+
+# Reference sizes (same as pullup so overlay looks identical)
+_REF_H                = 480.0
+_REF_REPS_FONT_SIZE   = 28
+_REF_FEEDBACK_FONT_SIZE = 22
+_REF_DEPTH_LABEL_FONT_SIZE = 14
+_REF_DEPTH_PCT_FONT_SIZE   = 18
+
+
+# ========================== ROTATION ==========================
+
+def _read_source_rotation_degrees(video_path):
+    """Read rotation metadata (0/90/180/270). OpenCV ignores this metadata."""
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream_tags=rotate:stream_side_data=rotation",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            for line in proc.stdout.splitlines():
+                m = re.search(r"-?\d+(?:\.\d+)?", line.strip())
+                if not m: continue
+                try:
+                    rot = int(round(float(m.group(0)))) % 360
+                    return min((0, 90, 180, 270), key=lambda x: abs(x - rot))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-i", video_path],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+        )
+        m = re.search(r"rotate\s*:\s*(-?\d+)", proc.stderr or "")
+        if m:
+            rot = int(m.group(1)) % 360
+            return min((0, 90, 180, 270), key=lambda x: abs(x - rot))
+    except Exception:
+        pass
+    return 0
+
+
+def _rotate_frame(frame, rotation_degrees):
+    """
+    Rotate pixels to compensate for video metadata rotation.
+      90  → rotate CCW 90°
+      180 → rotate 180°
+      270 → rotate CW 90°
+      0   → no-op
+    """
+    if rotation_degrees == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif rotation_degrees == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    elif rotation_degrees == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    return frame
+
+
+# ========================== OVERLAY CACHE ==========================
+# Pre-build static background layers once per (frame_w, frame_h).
+# Only dynamic elements (text, arc) are drawn each frame.
+
+_OVERLAY_CACHE = {}
+
+def _load_font(p, s):
+    try:
+        return ImageFont.truetype(p, s)
+    except Exception:
+        pass
+    for fallback in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]:
+        try:
+            return ImageFont.truetype(fallback, s)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size=s)
+    except TypeError:
+        return ImageFont.load_default()
+
+def _scaled_font_size(ref_size, canvas_h):
+    return max(10, int(round(ref_size * (canvas_h / _REF_H))))
+
+def _get_overlay_cache(w, h):
+    key = (int(w), int(h))
+    cached = _OVERLAY_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    fw, fh = int(w), int(h)
+
+    reps_font_size        = _scaled_font_size(_REF_REPS_FONT_SIZE,        fh)
+    feedback_font_size    = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE,    fh)
+    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, fh)
+    depth_pct_font_size   = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE,   fh)
+
+    reps_font        = _load_font(FONT_PATH, reps_font_size)
+    feedback_font    = _load_font(FONT_PATH, feedback_font_size)
+    depth_label_font = _load_font(FONT_PATH, depth_label_font_size)
+    depth_pct_font   = _load_font(FONT_PATH, depth_pct_font_size)
+
+    _tmp  = Image.new("RGBA", (1, 1))
+    _tdraw = ImageDraw.Draw(_tmp)
+    sample_txt = "Reps: 00"
+    pad_x = max(6, int(fw * 0.013))
+    pad_y = max(4, int(fh * 0.010))
+    tw = _tdraw.textlength(sample_txt, font=reps_font)
+    rep_box_w = int(tw + 2 * pad_x)
+    rep_box_h = int(reps_font.size + 2 * pad_y)
+
+    ref_h_donut = max(int(fh * 0.06), int(reps_font_size * 1.6))
+    radius  = int(ref_h_donut * DONUT_RADIUS_SCALE)
+    thick   = max(3, int(radius * DONUT_THICKNESS_FRAC))
+    margin  = max(8, int(fw * 0.016))
+    cx      = fw - margin - radius
+    cy      = max(ref_h_donut + radius // 8, radius + thick // 2 + 2)
+
+    safe_margin = max(4, int(fh * 0.012))
+    fb_pad_x    = max(8, int(fw * 0.016))
+    fb_pad_y    = max(4, int(fh * 0.010))
+    line_gap    = max(2, int(fh * 0.006))
+    max_text_w  = fw - 2 * fb_pad_x - max(8, int(fw * 0.015))
+    line_h      = feedback_font.size + max(4, int(fh * 0.008))
+    block_h     = 2 * fb_pad_y + 2 * line_h + line_gap
+    fb_y0       = max(0, fh - safe_margin - block_h)
+    fb_y1       = fh - safe_margin
+
+    bg_alpha_val = int(round(255 * BAR_BG_ALPHA))
+
+    # Static rep-count background
+    rep_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
+    cv2.rectangle(rep_bg, (0, 0), (rep_box_w, rep_box_h), (0, 0, 0, bg_alpha_val), -1)
+
+    # Static feedback background
+    fb_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
+    cv2.rectangle(fb_bg, (0, fb_y0), (fw, fb_y1), (0, 0, 0, bg_alpha_val), -1)
+
+    # Static donut ring background (grey circle)
+    donut_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
+    cv2.circle(donut_bg, (cx, cy), radius, (*DEPTH_RING_BG, 255), thick, cv2.LINE_AA)
+
+    label_gap     = max(2, int(radius * 0.10))
+    label_block_h = depth_label_font.size + label_gap + depth_pct_font.size
+    label_by      = cy - label_block_h // 2
+
+    cache = {
+        "fw": fw, "fh": fh,
+        "reps_font": reps_font,
+        "feedback_font": feedback_font,
+        "depth_label_font": depth_label_font,
+        "depth_pct_font": depth_pct_font,
+        "radius": radius, "thick": thick, "cx": cx, "cy": cy,
+        "rep_box_h": rep_box_h,
+        "rep_txt_x": pad_x, "rep_txt_y": pad_y - 1,
+        "pad_x": pad_x, "pad_y": pad_y,
+        "fb_pad_x": fb_pad_x, "fb_pad_y": fb_pad_y,
+        "fb_y0": fb_y0, "fb_y1": fb_y1,
+        "line_h": line_h, "line_gap": line_gap,
+        "max_text_w": max_text_w,
+        "label_by": label_by, "label_gap": label_gap,
+        "rep_bg_pil":   Image.fromarray(rep_bg,   mode="RGBA"),
+        "fb_bg_pil":    Image.fromarray(fb_bg,    mode="RGBA"),
+        "donut_bg_pil": Image.fromarray(donut_bg, mode="RGBA"),
+    }
+    _OVERLAY_CACHE[key] = cache
+    return cache
+
+
+def _wrap_two_lines(draw, text, font, max_width):
+    """Wrap text to at most 2 lines, truncating with … if needed."""
+    words = text.split()
+    if not words:
+        return [""]
+    lines, cur = [], ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if draw.textlength(trial, font=font) <= max_width:
+            cur = trial
+        else:
+            if cur: lines.append(cur)
+            cur = w
+        if len(lines) == 2:
+            break
+    if cur and len(lines) < 2:
+        lines.append(cur)
+    if len(lines) >= 2 and draw.textlength(lines[-1], font=font) > max_width:
+        last = lines[-1] + "…"
+        while draw.textlength(last, font=font) > max_width and len(last) > 1:
+            last = last[:-2] + "…"
+        lines[-1] = last
+    return lines if lines else [""]
+
+
+def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
+    """
+    Fast overlay — works at frame resolution, uses cached static layers.
+    No 1080p upscale/downscale per frame.
+    """
+    h, w, _ = frame.shape
+    c = _get_overlay_cache(w, h)
+
+    pct = float(np.clip(depth_pct, 0, 1))
+    fw, fh = c["fw"], c["fh"]
+    cx, cy, radius, thick = c["cx"], c["cy"], c["radius"], c["thick"]
+
+    canvas = Image.new("RGBA", (fw, fh), (0, 0, 0, 0))
+
+    # Static layers
+    canvas.alpha_composite(c["rep_bg_pil"])
+    if feedback:
+        canvas.alpha_composite(c["fb_bg_pil"])
+    canvas.alpha_composite(c["donut_bg_pil"])
+
+    # Dynamic arc
+    if pct > 0:
+        arc_np = np.zeros((fh, fw, 4), dtype=np.uint8)
+        start_ang = -90
+        end_ang   = start_ang + int(360 * pct)
+        cv2.ellipse(arc_np, (cx, cy), (radius, radius),
+                    0, start_ang, end_ang, (*DEPTH_COLOR, 255), thick, cv2.LINE_AA)
+        canvas.alpha_composite(Image.fromarray(arc_np, mode="RGBA"))
+
+    draw = ImageDraw.Draw(canvas)
+
+    # Reps text
+    txt = f"Reps: {int(reps)}"
+    draw.text((c["rep_txt_x"], c["rep_txt_y"]), txt,
+              font=c["reps_font"], fill=(255, 255, 255, 255))
+
+    # Donut labels (DEPTH + %)
+    label   = "DEPTH"
+    pct_txt = f"{int(pct * 100)}%"
+    lw = draw.textlength(label,   font=c["depth_label_font"])
+    pw = draw.textlength(pct_txt, font=c["depth_pct_font"])
+    draw.text((cx - int(lw // 2), c["label_by"]),
+              label, font=c["depth_label_font"], fill=(255, 255, 255, 255))
+    draw.text((cx - int(pw // 2), c["label_by"] + c["depth_label_font"].size + c["label_gap"]),
+              pct_txt, font=c["depth_pct_font"], fill=(255, 255, 255, 255))
+
+    # Feedback text
+    if feedback:
+        fb_lines = _wrap_two_lines(draw, feedback, c["feedback_font"], c["max_text_w"])
+        ty = c["fb_y0"] + c["fb_pad_y"]
+        for ln in fb_lines:
+            tw2 = draw.textlength(ln, font=c["feedback_font"])
+            tx  = max(c["fb_pad_x"], (fw - int(tw2)) // 2)
+            draw.text((tx, ty), ln, font=c["feedback_font"], fill=(255, 255, 255, 255))
+            ty += c["line_h"] + c["line_gap"]
+
+    canvas_np   = np.array(canvas)
+    alpha       = canvas_np[:, :, 3:4].astype(np.float32) / 255.0
+    overlay_bgr = canvas_np[:, :, [2, 1, 0]].astype(np.float32)
+    result      = frame.astype(np.float32) * (1.0 - alpha) + overlay_bgr * alpha
+    return result.astype(np.uint8)
 
 
 # ========================== GEOMETRY ==========================
 
 def angle_3pt(a, b, c):
-    """Angle at point b formed by segments ba and bc. Returns degrees [0, 360)."""
     a, b, c = np.array(a), np.array(b), np.array(c)
     radians = np.arctan2(c[1]-b[1], c[0]-b[0]) - np.arctan2(a[1]-b[1], a[0]-b[0])
     angle = np.abs(radians * 180.0 / np.pi)
@@ -80,13 +334,12 @@ def lm_xy(landmarks, idx, w, h):
     return (landmarks[idx].x * w, landmarks[idx].y * h)
 
 def detect_active_leg(landmarks):
-    """Front (working) leg has LOWER ankle in frame (higher y)."""
-    left_y = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y
+    left_y  = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y
     right_y = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y
     return 'right' if left_y < right_y else 'left'
 
 def check_valgus(landmarks, side, tol):
-    knee_x = landmarks[getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value].x
+    knee_x  = landmarks[getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value].x
     ankle_x = landmarks[getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value].x
     return not (knee_x < ankle_x - tol)
 
@@ -96,8 +349,7 @@ def check_valgus(landmarks, side, tol):
 class AngleEMA:
     def __init__(self, alpha=EMA_ALPHA):
         self.alpha = float(alpha)
-        self.knee = None
-        self.torso = None
+        self.knee = self.torso = None
 
     def update(self, knee_angle, torso_angle):
         ka, ta = float(knee_angle), float(torso_angle)
@@ -118,7 +370,7 @@ _FACE_LMS = {
     mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
     mp_pose.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose.PoseLandmark.RIGHT_EYE.value,
     mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
-    mp_pose.PoseLandmark.LEFT_EAR.value, mp_pose.PoseLandmark.RIGHT_EAR.value,
+    mp_pose.PoseLandmark.LEFT_EAR.value,  mp_pose.PoseLandmark.RIGHT_EAR.value,
     mp_pose.PoseLandmark.MOUTH_LEFT.value, mp_pose.PoseLandmark.MOUTH_RIGHT.value,
 }
 _BODY_CONNECTIONS = tuple(
@@ -130,13 +382,13 @@ _BODY_POINTS = tuple(sorted({i for conn in _BODY_CONNECTIONS for i in conn}))
 
 class LandmarkStabilizer:
     def __init__(self, quality_thr=0.55, min_fraction=0.6, jump_thr=0.12, max_hold=6):
-        self.body_points = _BODY_POINTS
-        self.quality_thr = quality_thr
-        self.min_fraction = min_fraction
-        self.jump_thr = jump_thr
-        self.max_hold = max_hold
-        self.last_good = None
-        self.hold = 0
+        self.body_points   = _BODY_POINTS
+        self.quality_thr   = quality_thr
+        self.min_fraction  = min_fraction
+        self.jump_thr      = jump_thr
+        self.max_hold      = max_hold
+        self.last_good     = None
+        self.hold          = 0
 
     def stabilize(self, lms):
         if lms is None:
@@ -195,17 +447,7 @@ def draw_body_only(frame, landmarks, color=(255, 255, 255)):
     return frame
 
 
-# ========================== OVERLAY ==========================
-
-def _load_font(path, size):
-    try: return ImageFont.truetype(path, size)
-    except: return ImageFont.load_default()
-
-REPS_FONT = _load_font(FONT_PATH, REPS_FONT_SIZE)
-FEEDBACK_FONT = _load_font(FONT_PATH, FEEDBACK_FONT_SIZE)
-DEPTH_LABEL_FONT = _load_font(FONT_PATH, DEPTH_LABEL_FONT_SIZE)
-DEPTH_PCT_FONT = _load_font(FONT_PATH, DEPTH_PCT_FONT_SIZE)
-
+# ========================== SCORE HELPERS ==========================
 
 def _display_half(x):
     q = round(float(x) * 2) / 2.0
@@ -219,237 +461,98 @@ def _score_label(s):
     if s >= 5.5: return "Fair"
     return "Needs work"
 
-def _wrap_two_lines(draw, text, font, max_width):
-    words = text.split()
-    if not words: return [""]
-    lines, cur = [], ""
-    for w in words:
-        trial = (cur + " " + w).strip()
-        if draw.textlength(trial, font=font) <= max_width: cur = trial
-        else:
-            if cur: lines.append(cur)
-            cur = w
-        if len(lines) == 2: break
-    if cur and len(lines) < 2: lines.append(cur)
-    leftover = len(words) - sum(len(l.split()) for l in lines)
-    if leftover > 0 and len(lines) >= 2:
-        last = lines[-1] + "…"
-        while draw.textlength(last, font=font) > max_width and len(last) > 1:
-            last = last[:-2] + "…"
-        lines[-1] = last
-    return lines if lines else [""]
-
-
-def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Reps בפינת שמאל-עליון; דונאט ימני-עליון; פידבק תחתון"""
-    h, w, _ = frame.shape
-    HD_H = 1080
-    hd_scale = HD_H / float(h)
-    HD_W = max(1, int(round(w * hd_scale)))
-
-    pct = float(np.clip(depth_pct, 0, 1))
-    ref_h = max(int(HD_H * 0.06), int(REPS_FONT_SIZE * 1.6))
-    radius = int(ref_h * DONUT_RADIUS_SCALE)
-    thick = max(3, int(radius * DONUT_THICKNESS_FRAC))
-    margin = 12
-    cx = HD_W - margin - radius
-    cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
-
-    overlay_bgr = np.zeros((HD_H, HD_W, 3), dtype=np.uint8)
-    overlay_a = np.zeros((HD_H, HD_W), dtype=np.uint8)
-    bg_alpha = int(round(255 * BAR_BG_ALPHA))
-
-    reps_text = f"Reps: {reps}"
-    inner_pad_x, inner_pad_y = 10, 6
-    tmp = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-    text_w = tmp.textlength(reps_text, font=REPS_FONT)
-    text_h = REPS_FONT.size
-    cv2.rectangle(overlay_bgr, (0, 0), (int(text_w + 2 * inner_pad_x), int(text_h + 2 * inner_pad_y)), (0, 0, 0), -1)
-    cv2.rectangle(overlay_a, (0, 0), (int(text_w + 2 * inner_pad_x), int(text_h + 2 * inner_pad_y)), bg_alpha, -1)
-
-    cv2.circle(overlay_bgr, (cx, cy), radius, DEPTH_RING_BG, thick, cv2.LINE_AA)
-    cv2.circle(overlay_a, (cx, cy), radius, 255, thick, cv2.LINE_AA)
-    start_ang = -90
-    end_ang = start_ang + int(360 * pct)
-    cv2.ellipse(overlay_bgr, (cx, cy), (radius, radius), 0, start_ang, end_ang, DEPTH_COLOR, thick, lineType=cv2.LINE_AA)
-    cv2.ellipse(overlay_a, (cx, cy), (radius, radius), 0, start_ang, end_ang, 255, thick, lineType=cv2.LINE_AA)
-
-    pil_rgba = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGBA)
-    pil_rgba[:, :, 3] = np.maximum(pil_rgba[:, :, 3], overlay_a)
-    pil = Image.fromarray(pil_rgba)
-    draw = ImageDraw.Draw(pil)
-    draw.text((inner_pad_x, inner_pad_y - 1), reps_text, font=REPS_FONT, fill=(255, 255, 255, 255))
-
-    label_txt = "DEPTH"
-    pct_txt = f"{int(pct * 100)}%"
-    label_w = draw.textlength(label_txt, font=DEPTH_LABEL_FONT)
-    pct_w = draw.textlength(pct_txt, font=DEPTH_PCT_FONT)
-    gap = max(2, int(radius * 0.10))
-    base_y = cy - (DEPTH_LABEL_FONT.size + gap + DEPTH_PCT_FONT.size) // 2
-    draw.text((cx - int(label_w // 2), base_y), label_txt, font=DEPTH_LABEL_FONT, fill=(255, 255, 255, 255))
-    draw.text((cx - int(pct_w // 2), base_y + DEPTH_LABEL_FONT.size + gap), pct_txt, font=DEPTH_PCT_FONT, fill=(255, 255, 255, 255))
-
-    if feedback:
-        def _wrap_two_lines(draw_obj, text, font, max_width):
-            words = text.split()
-            if not words:
-                return [""]
-            lines, cur = [], ""
-            for word in words:
-                trial = (cur + " " + word).strip()
-                if draw_obj.textlength(trial, font=font) <= max_width:
-                    cur = trial
-                else:
-                    if cur:
-                        lines.append(cur)
-                    cur = word
-                if len(lines) == 2:
-                    break
-            if cur and len(lines) < 2:
-                lines.append(cur)
-            leftover = len(words) - sum(len(line.split()) for line in lines)
-            if leftover > 0 and len(lines) >= 2:
-                last = lines[-1] + "…"
-                while draw_obj.textlength(last, font=font) > max_width and len(last) > 1:
-                    last = last[:-2] + "…"
-                lines[-1] = last
-            return lines
-
-        safe_margin = max(6, int(HD_H * 0.02))
-        pad_x, pad_y, line_gap = 12, 8, 4
-        max_text_w = int(HD_W - 2 * pad_x - 20)
-        lines = wrap_to_two_lines(draw, feedback, FEEDBACK_FONT, max_text_w)
-        line_h = FEEDBACK_FONT.size + 6
-        block_h = (2 * pad_y) + len(lines) * line_h + (len(lines) - 1) * line_gap
-        y0 = max(0, HD_H - safe_margin - block_h)
-        y1 = HD_H - safe_margin
-        cv2.rectangle(overlay_bgr, (0, y0), (HD_W, y1), (0, 0, 0), -1)
-        cv2.rectangle(overlay_a, (0, y0), (HD_W, y1), bg_alpha, -1)
-
-        pil_rgba = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGBA)
-        pil_rgba[:, :, 3] = np.maximum(pil_rgba[:, :, 3], overlay_a)
-        pil = Image.fromarray(pil_rgba)
-        draw = ImageDraw.Draw(pil)
-        ty = y0 + pad_y
-        for ln in lines:
-            tw = draw.textlength(ln, font=FEEDBACK_FONT)
-            tx = max(pad_x, (HD_W - int(tw)) // 2)
-            draw.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255, 255, 255, 255))
-            ty += line_h + line_gap
-
-    overlay_rgba = np.array(pil)
-    overlay_small = cv2.resize(overlay_rgba, (w, h), interpolation=cv2.INTER_AREA)
-    alpha = overlay_small[:, :, 3:4].astype(np.float32) / 255.0
-    rgb = cv2.cvtColor(overlay_small[:, :, :3], cv2.COLOR_RGB2BGR).astype(np.float32)
-    out = frame.astype(np.float32) * (1.0 - alpha) + rgb * alpha
-    return out.astype(np.uint8)
 
 # ========================== REP COUNTER ==========================
 
 class BulgarianRepCounter:
-    """
-    Proven 2-state (up/down) rep counter.
-    Tuned for frame_skip=3, scale=0.4 conditions.
-    """
-
     def __init__(self):
         self.count = 0
-        self.stage = None          # None, 'down', or 'up'
+        self.stage = None
         self.rep_reports = []
         self.rep_index = 1
         self.rep_start_frame = None
         self.good_reps = 0
-        self.bad_reps = 0
+        self.bad_reps  = 0
         self.all_feedback = collections.Counter()
 
-        # Per-rep tracking
-        self._start_knee_angle = None
-        self._curr_min_knee = 999.0
-        self._curr_max_knee = -999.0
-        self._curr_min_torso = 999.0
-        self._curr_valgus_bad = 0
-        self._torso_bad_frames = 0
+        self._start_knee_angle  = None
+        self._curr_min_knee     = 999.0
+        self._curr_max_knee     = -999.0
+        self._curr_min_torso    = 999.0
+        self._curr_valgus_bad   = 0
+        self._torso_bad_frames  = 0
         self._valgus_bad_frames = 0
-        self._down_frames = 0
+        self._down_frames       = 0
         self._last_depth_for_ui = 0.0
         self._last_rep_end_frame = -100
         self._last_standing_knee = 170.0
 
-        # Adaptive thresholds (start with defaults, may be calibrated)
         self._down_thresh = ANGLE_DOWN_THRESH
-        self._up_thresh = ANGLE_UP_THRESH
+        self._up_thresh   = ANGLE_UP_THRESH
 
-        # Calibration
-        self._cal_samples = []
-        self._cal_done = False
+        self._cal_samples  = []
+        self._cal_done     = False
         self._standing_angle = None
 
     def calibrate_standing(self, knee_angle, is_good_frame):
-        """Collect standing angle samples for first ~10 good frames."""
-        if self._cal_done:
-            return
+        if self._cal_done: return
         if is_good_frame and knee_angle > 130:
             self._cal_samples.append(knee_angle)
         if len(self._cal_samples) >= 10:
             self._standing_angle = float(np.median(self._cal_samples))
-            # Adjust thresholds based on actual standing angle
-            new_down = self._standing_angle - 65   # e.g. 170-65=105
-            new_up = self._standing_angle - 15     # e.g. 170-15=155
-            # Clamp to sane range
+            new_down = self._standing_angle - 65
+            new_up   = self._standing_angle - 15
             self._down_thresh = float(np.clip(new_down, 75, 120))
-            self._up_thresh = float(np.clip(new_up, 140, 170))
+            self._up_thresh   = float(np.clip(new_up,  140, 170))
             self._cal_done = True
 
     def _start_rep(self, frame_no, start_knee_angle):
         if frame_no - self._last_rep_end_frame < REP_DEBOUNCE_FRAMES:
             return False
-        self.rep_start_frame = frame_no
-        self._start_knee_angle = float(start_knee_angle)
-        self._curr_min_knee = 999.0
-        self._curr_max_knee = -999.0
-        self._curr_min_torso = 999.0
-        self._curr_valgus_bad = 0
-        self._torso_bad_frames = 0
-        self._valgus_bad_frames = 0
-        self._down_frames = 0
+        self.rep_start_frame     = frame_no
+        self._start_knee_angle   = float(start_knee_angle)
+        self._curr_min_knee      = 999.0
+        self._curr_max_knee      = -999.0
+        self._curr_min_torso     = 999.0
+        self._curr_valgus_bad    = 0
+        self._torso_bad_frames   = 0
+        self._valgus_bad_frames  = 0
+        self._down_frames        = 0
         return True
 
     def _finish_rep(self, frame_no, score, feedback, extra=None):
         score_q = round(float(score) * 2) / 2.0
-        if score_q >= GOOD_REP_MIN_SCORE:
-            self.good_reps += 1
-        else:
-            self.bad_reps += 1
+        if score_q >= GOOD_REP_MIN_SCORE: self.good_reps += 1
+        else:                              self.bad_reps  += 1
         for fb in (feedback or []):
             self.all_feedback[fb] += 1
 
         report = {
-            "rep_index": self.rep_index,
-            "score": float(score_q),
-            "score_display": _display_half(score_q),
-            "feedback": feedback or [],
-            "start_frame": self.rep_start_frame or 0,
-            "end_frame": frame_no,
+            "rep_index":        self.rep_index,
+            "score":            float(score_q),
+            "score_display":    _display_half(score_q),
+            "feedback":         feedback or [],
+            "start_frame":      self.rep_start_frame or 0,
+            "end_frame":        frame_no,
             "start_knee_angle": round(float(self._start_knee_angle or 0), 2),
-            "min_knee_angle": round(self._curr_min_knee, 2),
-            "max_knee_angle": round(self._curr_max_knee, 2),
-            "torso_min_angle": round(self._curr_min_torso, 2),
+            "min_knee_angle":   round(self._curr_min_knee, 2),
+            "max_knee_angle":   round(self._curr_max_knee, 2),
+            "torso_min_angle":  round(self._curr_min_torso, 2),
         }
-        if extra:
-            report.update(extra)
+        if extra: report.update(extra)
         self.rep_reports.append(report)
-        self.rep_index += 1
-        self.rep_start_frame = None
-        self._start_knee_angle = None
-        self._last_depth_for_ui = 0.0
+        self.rep_index          += 1
+        self.rep_start_frame     = None
+        self._start_knee_angle   = None
+        self._last_depth_for_ui  = 0.0
         self._last_rep_end_frame = frame_no
 
     def evaluate_form(self):
         feedback = []
-        score = 10.0
-        start = self._start_knee_angle or 170
-        min_k = self._curr_min_knee if self._curr_min_knee < 900 else start
-        denom = max(10.0, start - PERFECT_MIN_KNEE)
+        score    = 10.0
+        start    = self._start_knee_angle or 170
+        min_k    = self._curr_min_knee if self._curr_min_knee < 900 else start
+        denom    = max(10.0, start - PERFECT_MIN_KNEE)
         depth_pct = float(np.clip((start - min_k) / denom, 0, 1))
 
         if depth_pct < 0.6:
@@ -471,15 +574,10 @@ class BulgarianRepCounter:
         return score, feedback, depth_pct
 
     def update(self, knee_angle, torso_angle, valgus_ok_flag, frame_no):
-        """
-        Core 2-state rep counting.
-        knee_angle < down_thresh → entering descent
-        knee_angle > up_thresh AND was down → rep complete (if valid)
-        """
         if knee_angle > self._up_thresh:
             self._last_standing_knee = max(self._last_standing_knee, float(knee_angle))
 
-        # === ENTER DOWN ===
+        # ENTER DOWN
         if knee_angle < self._down_thresh:
             if self.stage != 'down':
                 self.stage = 'down'
@@ -488,33 +586,31 @@ class BulgarianRepCounter:
                     return
             self._down_frames += 1
 
-        # === ENTER UP (potential rep complete) ===
+        # ENTER UP (potential rep complete)
         elif knee_angle > (self._up_thresh - 5) and self.stage == 'down':
-            start_angle = self._start_knee_angle or 0
-            min_knee = self._curr_min_knee if self._curr_min_knee < 900 else 0
-            depth_delta = start_angle - min_knee
+            start_angle  = self._start_knee_angle or 0
+            min_knee     = self._curr_min_knee if self._curr_min_knee < 900 else 0
+            depth_delta  = start_angle - min_knee
             moved_enough = depth_delta >= MIN_RANGE_DELTA_DEG
             enough_frames = (
                 self._down_frames >= MIN_DOWN_FRAMES
                 or (self._down_frames >= 1 and depth_delta >= FAST_REP_MIN_DEPTH_DELTA)
             )
-
             if enough_frames and moved_enough:
                 score, fb, depth = self.evaluate_form()
                 self.count += 1
                 self._finish_rep(frame_no, score, fb, extra={"depth_pct": float(depth)})
                 self._last_standing_knee = float(knee_angle)
             else:
-                # Reset without counting
                 self._last_depth_for_ui = 0.0
-                self.rep_start_frame = None
-                self._start_knee_angle = None
+                self.rep_start_frame    = None
+                self._start_knee_angle  = None
             self.stage = 'up'
 
-        # === TRACK FORM DURING DOWN ===
+        # TRACK FORM DURING DOWN
         if self.stage == 'down' and self.rep_start_frame:
-            self._curr_min_knee = min(self._curr_min_knee, knee_angle)
-            self._curr_max_knee = max(self._curr_max_knee, knee_angle)
+            self._curr_min_knee  = min(self._curr_min_knee,  knee_angle)
+            self._curr_max_knee  = max(self._curr_max_knee,  knee_angle)
             self._curr_min_torso = min(self._curr_min_torso, torso_angle)
 
             if torso_angle < (TORSO_LEAN_MIN - TORSO_MARGIN_DEG):
@@ -524,7 +620,7 @@ class BulgarianRepCounter:
 
             if not valgus_ok_flag:
                 self._valgus_bad_frames += 1
-                self._curr_valgus_bad += 1
+                self._curr_valgus_bad   += 1
             else:
                 self._valgus_bad_frames = 0
 
@@ -537,17 +633,17 @@ class BulgarianRepCounter:
 
     def result(self):
         avg = np.mean([float(r["score"]) for r in self.rep_reports]) if self.rep_reports else 0.0
-        ts = round(float(avg) * 2) / 2.0
+        ts  = round(float(avg) * 2) / 2.0
         aggregated_feedback = list(self.all_feedback.keys())
         return {
-            "squat_count": self.count,
-            "technique_score": float(ts),
+            "squat_count":             self.count,
+            "technique_score":         float(ts),
             "technique_score_display": _display_half(ts),
-            "technique_label": _score_label(ts),
-            "good_reps": self.good_reps,
-            "bad_reps": self.bad_reps,
-            "feedback": aggregated_feedback if aggregated_feedback else ["Great form! Keep it up 💪"],
-            "reps": self.rep_reports,
+            "technique_label":         _score_label(ts),
+            "good_reps":               self.good_reps,
+            "bad_reps":                self.bad_reps,
+            "feedback":                aggregated_feedback if aggregated_feedback else ["Great form! Keep it up 💪"],
+            "reps":                    self.rep_reports,
         }
 
 
@@ -587,6 +683,9 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
                 "technique_score": 0.0, "technique_score_display": "0",
                 "technique_label": "N/A", "reps": []}
 
+    # Read rotation ONCE — OpenCV ignores metadata, so we rotate pixels manually.
+    source_rotation = _read_source_rotation_degrees(video_path)
+
     counter = BulgarianRepCounter()
     frame_no = 0
     active_leg = None
@@ -594,29 +693,25 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     pose = mp_pose.Pose(model_complexity=1, min_detection_confidence=0.5,
                         min_tracking_confidence=0.5)
-    ema = AngleEMA(alpha=EMA_ALPHA)
+    ema     = AngleEMA(alpha=EMA_ALPHA)
     lm_stab = LandmarkStabilizer()
 
-    fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
+    fps_in       = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
-    dt = 1.0 / float(effective_fps)
+    dt           = 1.0 / float(effective_fps)
 
-    # Early exit
-    NOPOSE_STOP_FRAMES = int(NOPOSE_STOP_SEC * effective_fps)
+    NOPOSE_STOP_FRAMES      = int(NOPOSE_STOP_SEC * effective_fps)
     NO_MOVEMENT_STOP_FRAMES = int(NO_MOVEMENT_STOP_SEC * effective_fps)
-    nopose_since_rep = 0
+    nopose_since_rep  = 0
     no_movement_frames = 0
 
-    # Live depth
-    stand_knee_ema = None
-    STAND_KNEE_ALPHA = 0.30
+    stand_knee_ema    = None
+    STAND_KNEE_ALPHA  = 0.30
 
-    # RT feedback
     RT_FB_HOLD_FRAMES = max(2, int(RT_FB_HOLD_SEC / dt))
     rt_fb_msg = None
     rt_fb_hold = 0
 
-    # Walking filter
     prev_hip = prev_la = prev_ra = None
     hip_vel_ema = ankle_vel_ema = 0.0
     movement_free_streak = 0
@@ -631,6 +726,11 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
         frame_no += 1
         if frame_skip > 1 and (frame_no % frame_skip) != 0:
             continue
+
+        # Fix orientation before any processing or writing
+        if source_rotation != 0:
+            frame = _rotate_frame(frame, source_rotation)
+
         if scale != 1.0:
             frame = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
 
@@ -639,7 +739,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
 
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = pose.process(image_rgb)
+        results   = pose.process(image_rgb)
         depth_live = 0.0
 
         if not results.pose_landmarks:
@@ -661,54 +761,50 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
                 active_leg = detect_active_leg(lms)
             side = "RIGHT" if active_leg == "right" else "LEFT"
 
-            # --- Walking filter ---
-            hip_px = (lms[getattr(mp_pose.PoseLandmark, f"{side}_HIP").value].x * w,
-                      lms[getattr(mp_pose.PoseLandmark, f"{side}_HIP").value].y * h)
+            # Walking filter
+            hip_px   = (lms[getattr(mp_pose.PoseLandmark, f"{side}_HIP").value].x * w,
+                        lms[getattr(mp_pose.PoseLandmark, f"{side}_HIP").value].y * h)
             l_ankle_px = (lms[mp_pose.PoseLandmark.LEFT_ANKLE.value].x * w,
                           lms[mp_pose.PoseLandmark.LEFT_ANKLE.value].y * h)
             r_ankle_px = (lms[mp_pose.PoseLandmark.RIGHT_ANKLE.value].x * w,
                           lms[mp_pose.PoseLandmark.RIGHT_ANKLE.value].y * h)
             if prev_hip is None:
                 prev_hip, prev_la, prev_ra = hip_px, l_ankle_px, r_ankle_px
-            norm = max(h, w)
-            hip_vel = _euclid(hip_px, prev_hip, norm)
-            an_vel = max(_euclid(l_ankle_px, prev_la, norm), _euclid(r_ankle_px, prev_ra, norm))
-            hip_vel_ema = MOTION_EMA_ALPHA * hip_vel + (1 - MOTION_EMA_ALPHA) * hip_vel_ema
-            ankle_vel_ema = MOTION_EMA_ALPHA * an_vel + (1 - MOTION_EMA_ALPHA) * ankle_vel_ema
+            norm     = max(h, w)
+            hip_vel  = _euclid(hip_px, prev_hip, norm)
+            an_vel   = max(_euclid(l_ankle_px, prev_la, norm), _euclid(r_ankle_px, prev_ra, norm))
+            hip_vel_ema   = MOTION_EMA_ALPHA * hip_vel  + (1 - MOTION_EMA_ALPHA) * hip_vel_ema
+            ankle_vel_ema = MOTION_EMA_ALPHA * an_vel   + (1 - MOTION_EMA_ALPHA) * ankle_vel_ema
             prev_hip, prev_la, prev_ra = hip_px, l_ankle_px, r_ankle_px
 
             movement_block = (hip_vel_ema > HIP_VEL_THRESH_PCT) or (ankle_vel_ema > ANKLE_VEL_THRESH_PCT)
             if movement_block:
                 movement_free_streak = 0
-                no_movement_frames = 0
+                no_movement_frames   = 0
             else:
                 movement_free_streak = min(MOVEMENT_CLEAR_FRAMES, movement_free_streak + 1)
-                no_movement_frames += 1
+                no_movement_frames  += 1
 
             if counter.count > 0 and no_movement_frames >= NO_MOVEMENT_STOP_FRAMES:
                 break
 
-            # --- Angles ---
-            hip = lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_HIP").value, w, h)
-            knee = lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value, w, h)
-            ankle = lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value, w, h)
+            # Angles
+            hip      = lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_HIP").value, w, h)
+            knee     = lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value, w, h)
+            ankle    = lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_ANKLE").value, w, h)
             shoulder = lm_xy(lms, getattr(mp_pose.PoseLandmark, f"{side}_SHOULDER").value, w, h)
-            knee_angle_raw = angle_3pt(hip, knee, ankle)
+            knee_angle_raw  = angle_3pt(hip, knee, ankle)
             torso_angle_raw = angle_3pt(shoulder, hip, knee)
             knee_angle, torso_angle = ema.update(knee_angle_raw, torso_angle_raw)
             v_ok = check_valgus(lms, side, VALGUS_X_TOL)
 
-            # --- Calibration (first ~10 stable frames) ---
+            # Calibration
             vis = getattr(lms[getattr(mp_pose.PoseLandmark, f"{side}_KNEE").value], 'visibility', 0) or 0
             counter.calibrate_standing(knee_angle, vis > 0.5)
 
-            # --- Update counter ---
-            # IMPORTANT: do not block rep counting by the walking filter.
-            # In real videos, hip/ankle velocity can stay above threshold even during valid reps,
-            # which previously led to never calling `counter.update(...)` and reporting 0 reps.
             counter.update(knee_angle, torso_angle, v_ok, frame_no)
 
-            # --- Live depth ---
+            # Live depth
             if knee_angle > counter._up_thresh - 5 and movement_free_streak >= 1:
                 stand_knee_ema = knee_angle if stand_knee_ema is None else (
                     STAND_KNEE_ALPHA * knee_angle + (1 - STAND_KNEE_ALPHA) * stand_knee_ema)
@@ -718,7 +814,7 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
             else:
                 depth_live = counter.depth_for_overlay()
 
-            # --- RT feedback ---
+            # RT feedback
             live_msgs = []
             if counter.stage == 'down':
                 if counter._torso_bad_frames >= TORSO_BAD_MIN_FRAMES:
@@ -737,9 +833,9 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
             stab_lms = lm_stab.stabilize(lms)
 
-        # === Draw ===
+        # Draw
         if return_video:
-            if 'stab_lms' in locals() and stab_lms:
+            if stab_lms:
                 frame = draw_body_only(frame, stab_lms)
             frame = draw_overlay(frame, reps=counter.count,
                                  feedback=(rt_fb_msg if rt_fb_hold > 0 else None),
@@ -749,18 +845,14 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
 
     pose.close()
     cap.release()
-    if out:
-        out.release()
+    if out: out.release()
     cv2.destroyAllWindows()
 
     result = counter.result()
-
-    # Session tip
-    session_tip = choose_session_tip(counter)
-    result["tips"] = [session_tip]
+    session_tip       = choose_session_tip(counter)
+    result["tips"]     = [session_tip]
     result["form_tip"] = session_tip
 
-    # Feedback file
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
             f.write(f"Total Reps: {result['squat_count']}\n")
@@ -770,10 +862,10 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
                 f.write("Feedback:\n")
                 for fb in result["feedback"]:
                     f.write(f"- {fb}\n")
-    except:
+    except Exception:
         pass
 
-    # ffmpeg encode
+    # ffmpeg encode — pixels already rotated, clear stale metadata
     final_path = ""
     if return_video and output_path:
         encoded_path = output_path.replace('.mp4', '_encoded.mp4')
@@ -782,15 +874,16 @@ def run_bulgarian_analysis(video_path, frame_skip=1, scale=1.0,
                 'ffmpeg', '-y', '-i', output_path,
                 '-c:v', 'libx264', '-preset', 'fast',
                 '-movflags', '+faststart', '-pix_fmt', 'yuv420p',
+                '-metadata:s:v:0', 'rotate=0',
                 encoded_path
             ], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             final_path = encoded_path if os.path.isfile(encoded_path) else output_path
-        except:
+        except Exception:
             final_path = output_path if os.path.isfile(output_path) else ""
         if not os.path.isfile(final_path) and os.path.isfile(output_path):
             final_path = output_path
 
-    result["video_path"] = final_path if return_video else ""
+    result["video_path"]    = final_path if return_video else ""
     result["feedback_path"] = feedback_path
     return result
 
