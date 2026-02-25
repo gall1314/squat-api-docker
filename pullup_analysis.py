@@ -2,7 +2,7 @@
 # pullup_analysis.py — SMART FORM_TIP edition with FAST/SLOW path optimization
 # form_tip = optimization advice (doesn't affect score, only helps improve)
 
-import os, cv2, math, numpy as np, subprocess
+import os, cv2, math, numpy as np, subprocess, json
 from collections import deque
 from PIL import ImageFont, ImageDraw, Image
 
@@ -94,6 +94,71 @@ else:
 
 def _get_fast_pose():
     return _FAST_POSE
+
+# ============ Video orientation helpers ============
+def _read_video_rotation(video_path):
+    """Return normalized clockwise rotation in degrees (0/90/180/270)."""
+    try:
+        proc = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream_tags=rotate:stream_side_data=rotation",
+                "-of", "json",
+                video_path,
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if proc.returncode != 0 or not proc.stdout:
+            return 0
+
+        data = json.loads(proc.stdout)
+        streams = data.get("streams") or []
+        if not streams:
+            return 0
+
+        st = streams[0] if isinstance(streams[0], dict) else {}
+        rot = None
+
+        tags = st.get("tags") if isinstance(st.get("tags"), dict) else {}
+        if "rotate" in tags:
+            try:
+                rot = int(float(tags["rotate"]))
+            except Exception:
+                rot = None
+
+        if rot is None:
+            for sd in (st.get("side_data_list") or []):
+                if not isinstance(sd, dict):
+                    continue
+                if "rotation" in sd:
+                    try:
+                        rot = int(float(sd["rotation"]))
+                        break
+                    except Exception:
+                        pass
+
+        if rot is None:
+            return 0
+
+        # ffprobe rotation may be negative; convert to clockwise canonical [0, 360).
+        rot = rot % 360
+        closest = min((0, 90, 180, 270), key=lambda x: abs(x - rot))
+        return int(closest)
+    except Exception:
+        return 0
+
+def _rotate_frame_clockwise(frame, degrees):
+    if degrees == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if degrees == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if degrees == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
 
 # ============ Helpers ============
 def _ang(a,b,c):
