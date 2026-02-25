@@ -423,7 +423,7 @@ def run_pullup_analysis(video_path,
     if not cap.isOpened(): return _ret_err("Could not open video", feedback_path)
 
     source_rotation = _read_video_rotation(video_path)
-    apply_rotation = (source_rotation == 180)
+    apply_rotation = False
     rotation_checked = False
 
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
@@ -523,6 +523,8 @@ def run_pullup_analysis(video_path,
 
             if not rotation_checked:
                 # Apply 90/270 only when source is likely stored sideways (landscape buffers).
+                # We intentionally avoid forced 180 rotation: some decoders already apply
+                # 180 orientation and rotating again flips the analyzed output upside-down.
                 if source_rotation in (90, 270):
                     h0, w0 = frame.shape[:2]
                     apply_rotation = (w0 > h0)
