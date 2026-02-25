@@ -434,7 +434,7 @@ def analyze_rep(rep_metrics):
     penalty = 0.0
     is_proper = True
     depth_pct = rep_metrics.get("depth_pct") or 0.0
-    allow_stability_cues = depth_pct >= MIN_DEPTH_PCT_FOR_STABILITY / 100.0  # depth_pct now 0..1
+    allow_stability_cues = depth_pct >= 0.3  # depth_pct is 0..1; was incorrectly using 60/100
 
     torso_mean = rep_metrics.get("torso_mean")
     torso_is_upright = torso_mean is not None and torso_mean > TORSO_IDEAL_MAX
@@ -591,6 +591,7 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     session_tips     = []
     rep_details      = []
     overlay_msg      = ""
+    overlay_msg_hold = 0   # frames remaining to show overlay_msg
 
     start_time = time.time()
 
@@ -707,7 +708,10 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                     if rep_score >= 9.5: good_reps += 1
                     else:                bad_reps  += 1
 
-                    overlay_msg = ov_msg or overlay_msg
+                    if ov_msg:
+                        overlay_msg = ov_msg
+                        overlay_msg_hold = max(1, int(src_fps / max(1, FRAME_SKIP) * 2.5))
+                    # else keep previous message until hold expires
 
                     for m in sess_msgs:
                         if m not in session_feedback: session_feedback.append(m)
@@ -722,10 +726,16 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                     torso_vals = []
                     knee_vals  = []
 
+            # Decay overlay message hold counter
+            if overlay_msg_hold > 0:
+                overlay_msg_hold -= 1
+            else:
+                overlay_msg = ""
+
             if return_video and writer is not None:
                 if results and results.pose_landmarks:
                     draw_body_only(frame, results.pose_landmarks.landmark)
-                frame = draw_overlay(frame, reps, overlay_msg, live_depth_pct)
+                frame = draw_overlay(frame, reps, overlay_msg if overlay_msg_hold > 0 else None, live_depth_pct)
                 writer.write(frame)
 
     finally:
@@ -756,9 +766,9 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     elif session_tips:
         form_tip = "Squeeze your shoulder blades together at the top"
     else:
-        form_tip = "Great form! Keep it up 💪" if (good_reps == reps and reps > 0) else (
-                   "Try slowing down the lowering phase for better control" if reps > 0 else
-                   "Complete a full rep to get feedback")
+        form_tip = ("Great form! Keep it up 💪" if (good_reps == reps and reps > 0)
+                   else "Try slowing down the lowering phase for better control" if reps > 0
+                   else "Complete a full rep to get feedback")
 
     out_fast = faststart_remux(out_path) if return_video else ""
 
