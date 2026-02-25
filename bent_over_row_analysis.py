@@ -10,10 +10,12 @@ Bent-Over Barbell Row — analysis pipeline matching the Squat standard:
 - FIXED: form_tip now returns best tip instead of null
 - FIXED: Overlay sizes now scale proportionally with frame height (matches pullup)
 - FIXED: Skeleton drawing uses MediaPipe body-only approach (matches pullup/good morning)
-- FIXED: Donut now fills when bar is at BOTTOM (max pull depth), not when lifting
+- FIXED: Donut fills when bar is at BOTTOM (arms extended = max depth), not when pulling
 - FIXED: Overlay uses frame-resolution cache (no 1080p upscale per frame)
 - FIXED: Rotation metadata applied to pixels before processing/writing
+- FIXED: Depth logic inverted — straight arms (bar down) = full donut
 """
+
 import os
 import cv2
 import math
@@ -24,7 +26,6 @@ import re
 import shutil
 import subprocess
 from collections import deque
-
 import numpy as np
 
 try:
@@ -34,12 +35,11 @@ except Exception as e:
 
 # ================== THEME (MATCH SQUAT) ==================
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
-BAR_BG_ALPHA         = 0.55
-DONUT_RADIUS_SCALE   = 0.72
+BAR_BG_ALPHA = 0.55
+DONUT_RADIUS_SCALE = 0.72
 DONUT_THICKNESS_FRAC = 0.28
-DEPTH_COLOR          = (40, 200, 80)
-DEPTH_RING_BG        = (70, 70, 70)
-
+DEPTH_COLOR = (40, 200, 80)
+DEPTH_RING_BG = (70, 70, 70)
 _REF_H = 480.0
 _REF_REPS_FONT_SIZE = 28
 _REF_FEEDBACK_FONT_SIZE = 22
@@ -52,51 +52,48 @@ FRAME_SKIP = 2
 CONF_DET = 0.5
 CONF_TRK = 0.5
 MODEL_COMPLEXITY = 1
-
 EMA_ALPHA = 0.2
 HIP_VEL_THRESH = 2.0
 GLOBAL_MOTION_LOCK_FRAMES = 4
-
 ELBOW_EXTENDED_MIN = 160.0
-ELBOW_PULL_START   = 150.0
-ELBOW_TOP_MAX      = 80.0
+ELBOW_PULL_START = 150.0
+ELBOW_TOP_MAX = 80.0
 MIN_FRAMES_BETWEEN_REPS = 6
-
 DONUT_FLOOR = 0.0
-DONUT_CEIL  = 100.0
-
+DONUT_CEIL = 100.0
 TORSO_IDEAL_MIN = 15.0
 TORSO_IDEAL_MAX = 35.0
 TORSO_HIGH_WARNING = 50.0
-TORSO_DRIFT_MAX  = 25.0
+TORSO_DRIFT_MAX = 25.0
 KNEE_EXTENSION_THRESHOLD = 12.0
 KNEE_EXTENSION_TIP_THRESHOLD = 9.0
-MIN_REP_SAMPLES  = 5
+MIN_REP_SAMPLES = 5
 MIN_DEPTH_PCT_FOR_STABILITY = 60.0
-
 MIN_SCORE = 4.0
 MAX_SCORE = 10.0
 ROM_PENALTY_STRONG = 3.0
-ROM_PENALTY_LIGHT  = 1.5
-MOMENTUM_PENALTY   = 2.0
-TORSO_PENALTY      = 1.0
-LEGDRIVE_PENALTY   = 0.8
+ROM_PENALTY_LIGHT = 1.5
+MOMENTUM_PENALTY = 2.0
+TORSO_PENALTY = 1.0
+LEGDRIVE_PENALTY = 0.8
 
 # ================== ROTATION ==================
-
 def _read_source_rotation_degrees(video_path):
     """Read rotation metadata (0/90/180/270). OpenCV ignores this metadata."""
     try:
         proc = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+            ["ffprobe", "-v", "error",
+             "-select_streams", "v:0",
              "-show_entries", "stream_tags=rotate:stream_side_data=rotation",
-             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             video_path],
             check=False, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
         if proc.returncode == 0 and proc.stdout:
             for line in proc.stdout.splitlines():
                 m = re.search(r"-?\d+(?:\.\d+)?", line.strip())
-                if not m: continue
+                if not m:
+                    continue
                 try:
                     rot = int(round(float(m.group(0)))) % 360
                     return min((0, 90, 180, 270), key=lambda x: abs(x - rot))
@@ -116,7 +113,6 @@ def _read_source_rotation_degrees(video_path):
     except Exception:
         pass
     return 0
-
 
 def _rotate_frame(frame, rotation_degrees):
     if rotation_degrees == 90:
@@ -161,11 +157,10 @@ def _get_overlay_cache(w, h):
         return cached
 
     fw, fh = int(w), int(h)
-
-    reps_font_size        = _scaled_font_size(_REF_REPS_FONT_SIZE,        fh)
-    feedback_font_size    = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE,    fh)
+    reps_font_size        = _scaled_font_size(_REF_REPS_FONT_SIZE, fh)
+    feedback_font_size    = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, fh)
     depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, fh)
-    depth_pct_font_size   = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE,   fh)
+    depth_pct_font_size   = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, fh)
 
     reps_font        = _load_font(FONT_PATH, reps_font_size)
     feedback_font    = _load_font(FONT_PATH, feedback_font_size)
@@ -174,19 +169,20 @@ def _get_overlay_cache(w, h):
 
     _tmp   = Image.new("RGBA", (1, 1))
     _tdraw = ImageDraw.Draw(_tmp)
+
     sample_txt = "Reps: 00"
     pad_x = max(6, int(fw * 0.013))
     pad_y = max(4, int(fh * 0.010))
-    tw = _tdraw.textlength(sample_txt, font=reps_font)
+    tw    = _tdraw.textlength(sample_txt, font=reps_font)
     rep_box_w = int(tw + 2 * pad_x)
     rep_box_h = int(reps_font.size + 2 * pad_y)
 
     ref_h_donut = max(int(fh * 0.06), int(reps_font_size * 1.6))
-    radius  = int(ref_h_donut * DONUT_RADIUS_SCALE)
-    thick   = max(3, int(radius * DONUT_THICKNESS_FRAC))
-    margin  = max(8, int(fw * 0.016))
-    cx      = fw - margin - radius
-    cy      = max(ref_h_donut + radius // 8, radius + thick // 2 + 2)
+    radius = int(ref_h_donut * DONUT_RADIUS_SCALE)
+    thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
+    margin = max(8, int(fw * 0.016))
+    cx = fw - margin - radius
+    cy = max(ref_h_donut + radius // 8, radius + thick // 2 + 2)
 
     safe_margin = max(4, int(fh * 0.012))
     fb_pad_x    = max(8, int(fw * 0.016))
@@ -215,10 +211,8 @@ def _get_overlay_cache(w, h):
 
     cache = {
         "fw": fw, "fh": fh,
-        "reps_font": reps_font,
-        "feedback_font": feedback_font,
-        "depth_label_font": depth_label_font,
-        "depth_pct_font": depth_pct_font,
+        "reps_font": reps_font, "feedback_font": feedback_font,
+        "depth_label_font": depth_label_font, "depth_pct_font": depth_pct_font,
         "radius": radius, "thick": thick, "cx": cx, "cy": cy,
         "rep_box_h": rep_box_h,
         "rep_txt_x": pad_x, "rep_txt_y": pad_y - 1,
@@ -235,7 +229,6 @@ def _get_overlay_cache(w, h):
     _OVERLAY_CACHE[key] = cache
     return cache
 
-
 def _wrap_two_lines(draw, text, font, max_width):
     words = (text or "").split()
     if not words:
@@ -246,10 +239,13 @@ def _wrap_two_lines(draw, text, font, max_width):
         if draw.textlength(t, font=font) <= max_width:
             cur = t
         else:
-            if cur: lines.append(cur)
+            if cur:
+                lines.append(cur)
             cur = w
-        if len(lines) == 2: break
-    if cur and len(lines) < 2: lines.append(cur)
+            if len(lines) == 2:
+                break
+    if cur and len(lines) < 2:
+        lines.append(cur)
     if len(lines) >= 2 and draw.textlength(lines[-1], font=font) > max_width:
         last = lines[-1] + "…"
         while draw.textlength(last, font=font) > max_width and len(last) > 1:
@@ -257,16 +253,15 @@ def _wrap_two_lines(draw, text, font, max_width):
         lines[-1] = last
     return lines
 
-
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     """
     Fast overlay at frame resolution with cached static layers.
-    depth_pct: 0.0 = bar at top (arms extended), 1.0 = bar at bottom (max pull).
-    Donut fills as bar goes DOWN — max fill = maximum depth reached.
+    depth_pct: 0.0 = bar at top (max pull / arms bent),
+               1.0 = bar at bottom (arms fully extended = maximum depth).
+    Donut fills clockwise as bar goes DOWN toward full extension.
     """
     h, w, _ = frame.shape
     c = _get_overlay_cache(w, h)
-
     pct = float(np.clip(depth_pct, 0, 1))
     fw, fh = c["fw"], c["fh"]
     cx, cy, radius, thick = c["cx"], c["cy"], c["radius"], c["thick"]
@@ -278,11 +273,12 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     canvas.alpha_composite(c["donut_bg_pil"])
 
     if pct > 0:
-        arc_np    = np.zeros((fh, fw, 4), dtype=np.uint8)
+        arc_np = np.zeros((fh, fw, 4), dtype=np.uint8)
         start_ang = -90
-        end_ang   = start_ang + int(360 * pct)
-        cv2.ellipse(arc_np, (cx, cy), (radius, radius),
-                    0, start_ang, end_ang, (*DEPTH_COLOR, 255), thick, cv2.LINE_AA)
+        end_ang = start_ang + int(360 * pct)  # clockwise fill
+        cv2.ellipse(arc_np, (cx, cy), (radius, radius), 0,
+                    start_ang, end_ang,
+                    (*DEPTH_COLOR, 255), thick, cv2.LINE_AA)
         canvas.alpha_composite(Image.fromarray(arc_np, mode="RGBA"))
 
     draw = ImageDraw.Draw(canvas)
@@ -312,27 +308,35 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     canvas_np   = np.array(canvas)
     alpha       = canvas_np[:, :, 3:4].astype(np.float32) / 255.0
     overlay_bgr = canvas_np[:, :, [2, 1, 0]].astype(np.float32)
-    result      = frame.astype(np.float32) * (1.0 - alpha) + overlay_bgr * alpha
+    result = frame.astype(np.float32) * (1.0 - alpha) + overlay_bgr * alpha
     return result.astype(np.uint8)
 
 # ================== SKELETON ==================
-mp_pose_module = mp.solutions.pose if mp is not None else None
-
-_FACE_LMS = set()
+mp_pose_module   = mp.solutions.pose if mp is not None else None
+_FACE_LMS        = set()
 _BODY_CONNECTIONS = tuple()
-_BODY_POINTS = tuple()
+_BODY_POINTS     = tuple()
 
 def _init_skeleton_data():
     global _FACE_LMS, _BODY_CONNECTIONS, _BODY_POINTS
     if mp_pose_module and not _BODY_CONNECTIONS:
         _FACE_LMS = {
             mp_pose_module.PoseLandmark.NOSE.value,
-            mp_pose_module.PoseLandmark.LEFT_EYE_INNER.value, mp_pose_module.PoseLandmark.LEFT_EYE.value, mp_pose_module.PoseLandmark.LEFT_EYE_OUTER.value,
-            mp_pose_module.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose_module.PoseLandmark.RIGHT_EYE.value, mp_pose_module.PoseLandmark.RIGHT_EYE_OUTER.value,
-            mp_pose_module.PoseLandmark.LEFT_EAR.value, mp_pose_module.PoseLandmark.RIGHT_EAR.value,
-            mp_pose_module.PoseLandmark.MOUTH_LEFT.value, mp_pose_module.PoseLandmark.MOUTH_RIGHT.value,
+            mp_pose_module.PoseLandmark.LEFT_EYE_INNER.value,
+            mp_pose_module.PoseLandmark.LEFT_EYE.value,
+            mp_pose_module.PoseLandmark.LEFT_EYE_OUTER.value,
+            mp_pose_module.PoseLandmark.RIGHT_EYE_INNER.value,
+            mp_pose_module.PoseLandmark.RIGHT_EYE.value,
+            mp_pose_module.PoseLandmark.RIGHT_EYE_OUTER.value,
+            mp_pose_module.PoseLandmark.LEFT_EAR.value,
+            mp_pose_module.PoseLandmark.RIGHT_EAR.value,
+            mp_pose_module.PoseLandmark.MOUTH_LEFT.value,
+            mp_pose_module.PoseLandmark.MOUTH_RIGHT.value,
         }
-        _BODY_CONNECTIONS = tuple((a, b) for (a, b) in mp_pose_module.POSE_CONNECTIONS if a not in _FACE_LMS and b not in _FACE_LMS)
+        _BODY_CONNECTIONS = tuple(
+            (a, b) for (a, b) in mp_pose_module.POSE_CONNECTIONS
+            if a not in _FACE_LMS and b not in _FACE_LMS
+        )
         _BODY_POINTS = tuple(sorted({i for conn in _BODY_CONNECTIONS for i in conn}))
 
 def _dyn_thickness(h):
@@ -396,26 +400,32 @@ def technique_label(score):
     return "Needs work"
 
 # ================== DEPTH CALCULATION ==================
-
 def row_depth_pct(elbow_angle, ext_ref, top_ref):
     """
-    DEPTH of pull: 1.0 when bar is fully pulled to torso (elbow most bent),
-    0.0 when arms are fully extended (rest).
+    Returns 0.0..1.0 where:
+      0.0 = arms fully bent / max pull (bar at top, touching torso)
+      1.0 = arms fully extended (bar hanging down = maximum DEPTH)
 
-    ext_ref = max elbow angle (arms straight, ~170°)
-    top_ref = min elbow angle (bar at torso, ~60°)
+    Logic: LARGER elbow angle = more extended = deeper = more depth.
+      ext_ref = largest elbow angle seen (arms straight, bar at bottom)
+      top_ref = smallest elbow angle seen (max pull, bar at torso)
 
-    Formula: as elbow_angle drops from ext_ref → top_ref, pct rises 0 → 1.
+    This means the donut fills as the bar DESCENDS (arms extend),
+    and empties as the athlete pulls up — correct for a DEPTH metric.
     """
     if elbow_angle is None or ext_ref is None or top_ref is None:
         return 0.0
     span = max(10.0, ext_ref - top_ref)
-    pct = (ext_ref - elbow_angle) / span
-    return float(clamp(1.0 - pct, 0.0, 1.0))  # 1-pct: full when arms extended (bar down)
-
+    # Larger elbow_angle (toward ext_ref) → pct closer to 1.0
+    pct = (elbow_angle - top_ref) / span
+    return float(clamp(pct, 0.0, 1.0))
 
 def row_depth_pct_from_min(elbow_min, ext_ref, top_ref):
-    """Peak pull depth for a completed rep (elbow_min = most bent point)."""
+    """
+    For rep summary: use the MAXIMUM elbow angle of the rep
+    (the most extended point = deepest descent) to score depth.
+    Note: pass elbow_MAX here, not elbow_min.
+    """
     return row_depth_pct(elbow_min, ext_ref, top_ref)
 
 # ================== CORE ANALYSIS ==================
@@ -430,13 +440,14 @@ def get_landmarks_xy(results, frame_shape):
     return lm
 
 def analyze_rep(rep_metrics):
-    feedback = []
-    penalty = 0.0
+    feedback  = []
+    penalty   = 0.0
     is_proper = True
-    depth_pct = rep_metrics.get("depth_pct") or 0.0
-    allow_stability_cues = depth_pct >= 0.3  # depth_pct is 0..1; was incorrectly using 60/100
 
-    torso_mean = rep_metrics.get("torso_mean")
+    depth_pct = rep_metrics.get("depth_pct") or 0.0
+    allow_stability_cues = depth_pct >= MIN_DEPTH_PCT_FOR_STABILITY / 100.0
+
+    torso_mean       = rep_metrics.get("torso_mean")
     torso_is_upright = torso_mean is not None and torso_mean > TORSO_IDEAL_MAX
 
     # ROM check
@@ -472,7 +483,7 @@ def analyze_rep(rep_metrics):
         elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > TORSO_DRIFT_MAX:
             penalty += TORSO_PENALTY * 0.6
             feedback.append(("medium", "Keep your torso angle more consistent"))
-        elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > 0.7*TORSO_DRIFT_MAX:
+        elif rep_metrics["torso_drift"] is not None and rep_metrics["torso_drift"] > 0.7 * TORSO_DRIFT_MAX:
             feedback.append(("tip", "Try to minimize torso movement"))
 
     # Leg drive
@@ -521,8 +532,8 @@ def faststart_remux(in_path):
         cmd = [
             "ffmpeg", "-y", "-i", in_path,
             "-c:v", "libx264", "-preset", "fast",
-            "-movflags", "+faststart", "-pix_fmt", "yuv420p",
-            # Pixels already rotated correctly — clear stale metadata
+            "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p",
             "-metadata:s:v:0", "rotate=0",
             out_path
         ]
@@ -531,10 +542,10 @@ def faststart_remux(in_path):
     except Exception:
         return in_path
 
-def run_row_analysis(input_video_path, output_dir="./media", user_session_id=None, return_video=True, fast_mode=None):
+def run_row_analysis(input_video_path, output_dir="./media",
+                     user_session_id=None, return_video=True, fast_mode=None):
     if mp is None:
         return {"success": False, "error": "mediapipe not installed"}
-
     if fast_mode is True:
         return_video = False
 
@@ -543,36 +554,37 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     if not cap.isOpened():
         return {"success": False, "error": "cannot open video"}
 
-    # Read rotation ONCE — OpenCV ignores metadata, rotate pixels manually.
     source_rotation = _read_source_rotation_degrees(input_video_path)
+    src_fps  = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    width    = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out_w    = int(width  * SCALE)
+    out_h    = int(height * SCALE)
 
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    width   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out_w   = int(width  * SCALE)
-    out_h   = int(height * SCALE)
-
-    uid = uuid.uuid4().hex[:8]
+    uid          = uuid.uuid4().hex[:8]
     out_basename = f"barbell_row_{uid}_analyzed.mp4"
-    out_path = os.path.join(output_dir, out_basename)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(out_path, fourcc, src_fps/max(1,FRAME_SKIP), (out_w, out_h)) if return_video else None
+    out_path     = os.path.join(output_dir, out_basename)
+    fourcc       = cv2.VideoWriter_fourcc(*"mp4v")
+    writer       = cv2.VideoWriter(out_path, fourcc, src_fps / max(1, FRAME_SKIP),
+                                   (out_w, out_h)) if return_video else None
 
     mp_pose = mp.solutions.pose
-    pose = mp_pose.Pose(static_image_mode=False, model_complexity=MODEL_COMPLEXITY,
-                        enable_segmentation=False,
-                        min_detection_confidence=CONF_DET, min_tracking_confidence=CONF_TRK)
-
+    pose    = mp_pose.Pose(
+        static_image_mode=False,
+        model_complexity=MODEL_COMPLEXITY,
+        enable_segmentation=False,
+        min_detection_confidence=CONF_DET,
+        min_tracking_confidence=CONF_TRK,
+    )
     _init_skeleton_data()
 
-    reps = 0
+    reps      = 0
     good_reps = 0
     bad_reps  = 0
-    last_rep_frame = -9999
-    frame_idx = -1
-
-    hip_y_prev   = None
-    hip_vel_ema  = None
+    last_rep_frame      = -9999
+    frame_idx           = -1
+    hip_y_prev          = None
+    hip_vel_ema         = None
     global_motion_cooldown = 0
 
     in_pull    = False
@@ -582,18 +594,15 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     torso_vals = []
     knee_vals  = []
 
-    ext_ref = None  # largest elbow angle (arms extended)
-    top_ref = None  # smallest elbow angle (max pull)
+    ext_ref = None   # largest elbow angle seen  (arms extended, bar down)
+    top_ref = None   # smallest elbow angle seen (max pull, bar at torso)
 
-    live_depth_pct = 0.0
-
+    live_depth_pct  = 0.0
     session_feedback = []
     session_tips     = []
     rep_details      = []
     overlay_msg      = ""
-    overlay_msg_hold = 0   # frames remaining to show overlay_msg
-
-    start_time = time.time()
+    start_time       = time.time()
 
     try:
         while True:
@@ -604,64 +613,61 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
             if FRAME_SKIP > 1 and (frame_idx % FRAME_SKIP != 0):
                 continue
 
-            # Fix orientation before any processing or writing
             if source_rotation != 0:
                 frame = _rotate_frame(frame, source_rotation)
-
             frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
 
             rgb     = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(rgb)
-
-            lm = get_landmarks_xy(results, frame.shape)
+            lm      = get_landmarks_xy(results, frame.shape)
 
             def pick(idx_r, idx_l):
                 return lm[idx_r] if lm[idx_r] is not None else lm[idx_l]
 
-            shoulder = pick(12, 11)
-            elbow_pt = pick(14, 13)
-            wrist    = pick(16, 15)
-            hip      = pick(24, 23)
-            knee     = pick(26, 25)
-            ankle    = pick(28, 27)
+            shoulder  = pick(12, 11)
+            elbow_pt  = pick(14, 13)
+            wrist     = pick(16, 15)
+            hip       = pick(24, 23)
+            knee      = pick(26, 25)
+            ankle     = pick(28, 27)
 
-            elbow_ang = angle(shoulder, elbow_pt, wrist)
-
-            torso_vector = (shoulder[0] - hip[0], shoulder[1] - hip[1]) if shoulder and hip else None
+            elbow_ang    = angle(shoulder, elbow_pt, wrist)
+            torso_vector = (shoulder[0]-hip[0], shoulder[1]-hip[1]) if shoulder and hip else None
             torso_ang    = angle_between_vectors(torso_vector, (1.0, 0.0)) if torso_vector else None
+            knee_ang     = angle(hip, knee, ankle)
 
-            knee_ang = angle(hip, knee, ankle)
-
-            # Update references: ext_ref = max elbow angle, top_ref = min elbow angle
+            # Update references
             if elbow_ang is not None:
                 if ext_ref is None or elbow_ang > ext_ref:
-                    ext_ref = elbow_ang
+                    ext_ref = elbow_ang   # largest = arms straight
                 if top_ref is None or elbow_ang < top_ref:
-                    top_ref = elbow_ang
+                    top_ref = elbow_ang   # smallest = max pull
 
             # Global motion gating
             hip_y = hip[1] if hip is not None else None
             if hip_y is not None:
-                hip_vel = 0.0 if hip_y_prev is None else abs(hip_y - hip_y_prev)
-                hip_y_prev   = hip_y
-                hip_vel_ema  = ema(hip_vel_ema, hip_vel, EMA_ALPHA)
-            if hip_vel_ema is not None and hip_vel_ema > HIP_VEL_THRESH:
-                global_motion_cooldown = GLOBAL_MOTION_LOCK_FRAMES
-            else:
-                global_motion_cooldown = max(0, global_motion_cooldown - 1)
+                hip_vel     = 0.0 if hip_y_prev is None else abs(hip_y - hip_y_prev)
+                hip_y_prev  = hip_y
+                hip_vel_ema = ema(hip_vel_ema, hip_vel, EMA_ALPHA)
+                if hip_vel_ema is not None and hip_vel_ema > HIP_VEL_THRESH:
+                    global_motion_cooldown = GLOBAL_MOTION_LOCK_FRAMES
+                else:
+                    global_motion_cooldown = max(0, global_motion_cooldown - 1)
 
-            # ----------------------------------------------------------------
-            # Live depth donut:
-            #   0% = arms extended (bar at top)
-            #   100% = maximum pull depth (bar at bottom / touching torso)
-            # ----------------------------------------------------------------
+            # ------------------------------------------------------------------
+            # Live depth donut — CORRECTED LOGIC:
+            #   large elbow angle (arms extended, bar DOWN) = high depth = full donut
+            #   small elbow angle (arms bent, bar UP at torso) = low depth = empty donut
+            # ------------------------------------------------------------------
             live_depth_pct = row_depth_pct(elbow_ang, ext_ref, top_ref)
 
             # Rep state machine
             if not in_pull:
-                if (elbow_ang is not None and elbow_ang < ELBOW_PULL_START and
-                    hip is not None and global_motion_cooldown == 0 and
-                    (frame_idx - last_rep_frame) > MIN_FRAMES_BETWEEN_REPS):
+                if (elbow_ang is not None
+                        and elbow_ang < ELBOW_PULL_START
+                        and hip is not None
+                        and global_motion_cooldown == 0
+                        and (frame_idx - last_rep_frame) > MIN_FRAMES_BETWEEN_REPS):
                     in_pull    = True
                     rep_start  = frame_idx
                     elbow_min  = elbow_ang
@@ -672,25 +678,30 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                 if elbow_ang is not None:
                     elbow_min = min(elbow_min, elbow_ang) if elbow_min is not None else elbow_ang
                     elbow_max = max(elbow_max, elbow_ang) if elbow_max is not None else elbow_ang
-                if torso_ang is not None: torso_vals.append(torso_ang)
-                if knee_ang  is not None: knee_vals.append(knee_ang)
+                if torso_ang is not None:
+                    torso_vals.append(torso_ang)
+                if knee_ang is not None:
+                    knee_vals.append(knee_ang)
 
-                if (elbow_ang is not None and elbow_ang >= ELBOW_EXTENDED_MIN and global_motion_cooldown == 0):
-                    reps += 1
+                if (elbow_ang is not None
+                        and elbow_ang >= ELBOW_EXTENDED_MIN
+                        and global_motion_cooldown == 0):
+                    reps          += 1
                     last_rep_frame = frame_idx
 
                     torso_drift    = _robust_range(torso_vals)
                     torso_mean     = _safe_mean(torso_vals)
                     knee_extension = None
                     if knee_vals and len(knee_vals) >= MIN_REP_SAMPLES:
-                        n3 = len(knee_vals) // 3
+                        n3         = len(knee_vals) // 3
                         knee_start = knee_vals[:n3]
                         knee_mid   = knee_vals[n3:]
                         if knee_start and knee_mid:
-                            knee_extension = sum(knee_mid)/len(knee_mid) - sum(knee_start)/len(knee_start)
+                            knee_extension = (sum(knee_mid) / len(knee_mid)
+                                              - sum(knee_start) / len(knee_start))
 
-                    # depth_pct 0..1 for this rep
-                    rep_depth_pct = row_depth_pct_from_min(elbow_min, ext_ref, top_ref)
+                    # Use elbow_MAX for depth (deepest descent = most extended)
+                    rep_depth_pct = row_depth_pct_from_min(elbow_max, ext_ref, top_ref)
 
                     rep_m = {
                         "start_frame":     rep_start,
@@ -703,46 +714,42 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
                         "depth_pct":       rep_depth_pct,
                     }
                     pen, ov_msg, sess_msgs, tips, is_proper = analyze_rep(rep_m)
-
                     rep_score = clamp(round_to_half(MAX_SCORE - pen), MIN_SCORE, MAX_SCORE)
-                    if rep_score >= 9.5: good_reps += 1
-                    else:                bad_reps  += 1
 
-                    if ov_msg:
-                        overlay_msg = ov_msg
-                        overlay_msg_hold = max(1, int(src_fps / max(1, FRAME_SKIP) * 2.5))
-                    # else keep previous message until hold expires
+                    if rep_score >= 9.5:
+                        good_reps += 1
+                    else:
+                        bad_reps += 1
 
+                    overlay_msg = ov_msg or overlay_msg
                     for m in sess_msgs:
-                        if m not in session_feedback: session_feedback.append(m)
+                        if m not in session_feedback:
+                            session_feedback.append(m)
                     for t in tips:
-                        if t not in session_tips: session_tips.append(t)
-
+                        if t not in session_tips:
+                            session_tips.append(t)
                     rep_details.append(rep_m)
 
-                    in_pull    = False
-                    rep_start  = None
-                    elbow_min  = elbow_max = None
+                    in_pull   = False
+                    rep_start = None
+                    elbow_min = elbow_max = None
                     torso_vals = []
                     knee_vals  = []
-
-            # Decay overlay message hold counter
-            if overlay_msg_hold > 0:
-                overlay_msg_hold -= 1
-            else:
-                overlay_msg = ""
 
             if return_video and writer is not None:
                 if results and results.pose_landmarks:
                     draw_body_only(frame, results.pose_landmarks.landmark)
-                frame = draw_overlay(frame, reps, overlay_msg if overlay_msg_hold > 0 else None, live_depth_pct)
+                frame = draw_overlay(frame, reps, overlay_msg, live_depth_pct)
                 writer.write(frame)
 
     finally:
-        try: pose.close()
-        except Exception: pass
+        try:
+            pose.close()
+        except Exception:
+            pass
         cap.release()
-        if writer is not None: writer.release()
+        if writer is not None:
+            writer.release()
 
     # Session score
     score = MAX_SCORE
@@ -766,13 +773,19 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     elif session_tips:
         form_tip = "Squeeze your shoulder blades together at the top"
     else:
-        form_tip = ("Great form! Keep it up 💪" if (good_reps == reps and reps > 0)
-                   else "Try slowing down the lowering phase for better control" if reps > 0
-                   else "Complete a full rep to get feedback")
+        form_tip = (
+            "Great form! Keep it up 💪"
+            if (good_reps == reps and reps > 0)
+            else (
+                "Try slowing down the lowering phase for better control"
+                if reps > 0
+                else "Complete a full rep to get feedback"
+            )
+        )
 
-    out_fast = faststart_remux(out_path) if return_video else ""
+    out_fast      = faststart_remux(out_path) if return_video else ""
+    duration_s    = time.time() - start_time
 
-    duration_s = time.time() - start_time
     result = {
         "success":                  True,
         "squat_count":              reps,
@@ -792,10 +805,12 @@ def run_row_analysis(input_video_path, output_dir="./media", user_session_id=Non
     }
     return result
 
+
 if __name__ == "__main__":
     test_in = "sample_row.mp4"
     if not os.path.exists(test_in):
-        print(json.dumps({"success": False, "error": f"Missing {test_in} for test"}, ensure_ascii=False))
+        print(json.dumps({"success": False, "error": f"Missing {test_in} for test"},
+                         ensure_ascii=False))
     else:
         res = run_row_analysis(test_in)
         print(json.dumps(res, indent=2, ensure_ascii=False))
