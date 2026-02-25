@@ -16,12 +16,62 @@ _REF_FEEDBACK_FONT_SIZE = 22
 _REF_DEPTH_LABEL_FONT_SIZE = 14
 _REF_DEPTH_PCT_FONT_SIZE = 18
 
+# Cache overlay resources per output frame size to avoid expensive per-frame
+# font loading and constant geometry recalculation.
+_OVERLAY_CACHE = {}
+
 def _load_font(p,s):
     try: return ImageFont.truetype(p,s)
     except: return ImageFont.load_default()
 
 def _scaled_font_size(ref_size, canvas_h):
     return max(10, int(round(ref_size * (canvas_h / _REF_H))))
+
+def _get_overlay_cache(w, h):
+    key = (int(w), int(h))
+    cached = _OVERLAY_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    HD_H = 1080
+    hd_scale = HD_H / float(h)
+    HD_W = max(1, int(round(w * hd_scale)))
+
+    reps_font_size = _scaled_font_size(_REF_REPS_FONT_SIZE, HD_H)
+    feedback_font_size = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, HD_H)
+    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, HD_H)
+    depth_pct_font_size = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, HD_H)
+
+    reps_font = _load_font(FONT_PATH, reps_font_size)
+    feedback_font = _load_font(FONT_PATH, feedback_font_size)
+    depth_label_font = _load_font(FONT_PATH, depth_label_font_size)
+    depth_pct_font = _load_font(FONT_PATH, depth_pct_font_size)
+
+    ref_h = max(int(HD_H * 0.06), int(reps_font_size * 1.6))
+    radius = int(ref_h * DONUT_RADIUS_SCALE)
+    thick = max(3, int(radius * DONUT_THICKNESS_FRAC))
+    margin = int(12 * hd_scale)
+    cx = HD_W - margin - radius
+    cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
+    pad_x, pad_y = int(10 * hd_scale), int(6 * hd_scale)
+
+    cache = {
+        "HD_H": HD_H,
+        "HD_W": HD_W,
+        "hd_scale": hd_scale,
+        "reps_font": reps_font,
+        "feedback_font": feedback_font,
+        "depth_label_font": depth_label_font,
+        "depth_pct_font": depth_pct_font,
+        "radius": radius,
+        "thick": thick,
+        "cx": cx,
+        "cy": cy,
+        "pad_x": pad_x,
+        "pad_y": pad_y,
+    }
+    _OVERLAY_CACHE[key] = cache
+    return cache
 
 # ============ MediaPipe ============
 try:
@@ -115,33 +165,27 @@ def draw_body_only(frame, lms, color=(255,255,255)):
 
 def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
     h, w, _ = frame.shape
-    HD_H = 1080
-    hd_scale = HD_H / float(h)
-    HD_W = max(1, int(round(w * hd_scale)))
-
-    reps_font_size = _scaled_font_size(_REF_REPS_FONT_SIZE, HD_H)
-    feedback_font_size = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, HD_H)
-    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, HD_H)
-    depth_pct_font_size = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, HD_H)
-
-    _REPS_FONT = _load_font(FONT_PATH, reps_font_size)
-    _FEEDBACK_FONT = _load_font(FONT_PATH, feedback_font_size)
-    _DEPTH_LABEL_FONT = _load_font(FONT_PATH, depth_label_font_size)
-    _DEPTH_PCT_FONT = _load_font(FONT_PATH, depth_pct_font_size)
+    cache = _get_overlay_cache(w, h)
+    HD_H = cache["HD_H"]
+    HD_W = cache["HD_W"]
+    hd_scale = cache["hd_scale"]
+    _REPS_FONT = cache["reps_font"]
+    _FEEDBACK_FONT = cache["feedback_font"]
+    _DEPTH_LABEL_FONT = cache["depth_label_font"]
+    _DEPTH_PCT_FONT = cache["depth_pct_font"]
 
     pct = float(np.clip(height_pct, 0, 1))
     bg_alpha_val = int(round(255 * BAR_BG_ALPHA))
 
-    ref_h = max(int(HD_H * 0.06), int(reps_font_size * 1.6))
-    radius = int(ref_h * DONUT_RADIUS_SCALE)
-    thick = max(3, int(radius * DONUT_THICKNESS_FRAC))
-    margin = int(12 * hd_scale)
-    cx = HD_W - margin - radius
-    cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
+    radius = cache["radius"]
+    thick = cache["thick"]
+    cx = cache["cx"]
+    cy = cache["cy"]
 
     overlay_np = np.zeros((HD_H, HD_W, 4), dtype=np.uint8)
 
-    pad_x, pad_y = int(10 * hd_scale), int(6 * hd_scale)
+    pad_x = cache["pad_x"]
+    pad_y = cache["pad_y"]
     tmp_pil = Image.new("RGBA", (1, 1))
     tmp_draw = ImageDraw.Draw(tmp_pil)
     txt = f"Reps: {int(reps)}"
@@ -313,6 +357,7 @@ def run_pullup_analysis(video_path,
     cap=cv2.VideoCapture(video_path)
     if not cap.isOpened(): return _ret_err("Could not open video", feedback_path)
 
+
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps=max(1.0, fps_in/max(1,effective_frame_skip))
     sec_to_frames=lambda s: max(1,int(s*effective_fps))
@@ -407,7 +452,8 @@ def run_pullup_analysis(video_path,
             
             if burst_cntr > 0:
                 burst_cntr -= 1
-            
+
+
             processed_frame_count += 1
 
             # Resize frame (for both paths, affects pose detection)
@@ -813,7 +859,7 @@ def run_pullup_analysis(video_path,
     if slow_path and os.path.exists(output_path):
         encoded_path=output_path.replace(".mp4","_encoded.mp4")
         try:
-            subprocess.run(["ffmpeg","-y","-i",output_path,"-c:v","libx264","-preset","medium",
+            subprocess.run(["ffmpeg","-y","-i",output_path,"-c:v","libx264","-preset","fast",
                             "-crf",str(int(encode_crf if encode_crf is not None else 23)),"-movflags","+faststart","-pix_fmt","yuv420p",
                             encoded_path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             final_path=encoded_path if os.path.exists(encoded_path) else output_path
