@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# pushup_analysis.py — IMPROVED: Better fast detection + FIXED separation + FIXED overlay cache
+# pushup_analysis.py — IMPROVED: Better fast detection + FIXED separation + HD overlay (upscale-then-overlay)
 
 import os, cv2, math, numpy as np, subprocess
 from collections import deque
@@ -100,120 +100,110 @@ def draw_body_only(frame, lms, color=(255,255,255)):
         cv2.circle(frame,(x,y),dot,color,-1,cv2.LINE_AA)
     return frame
 
-# ============ OVERLAY — HD 1080p render → downscale to frame ============
-HD_H = 1080
-
+# ============ OVERLAY — HD rendering (matches good_morning approach) ============
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Render overlay at 1080p then downscale to frame resolution for sharp text."""
-    h, w = frame.shape[:2]
-    fh = HD_H
-    fw = max(1, int(round(w * fh / h)))
+    """
+    HD overlay: renders text/donut at 1080p then composites onto the frame.
+    This matches the good_morning_analysis approach for sharp text at any frame size.
+    """
+    h, w, _ = frame.shape
+    HD_H = 1080
+    hd_scale = HD_H / float(h)
+    HD_W = max(1, int(round(w * hd_scale)))
+
+    reps_font_size        = _scaled_font_size(_REF_REPS_FONT_SIZE, HD_H)
+    feedback_font_size    = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, HD_H)
+    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, HD_H)
+    depth_pct_font_size   = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, HD_H)
+
+    _REPS_FONT        = _load_font(FONT_PATH, reps_font_size)
+    _FEEDBACK_FONT    = _load_font(FONT_PATH, feedback_font_size)
+    _DEPTH_LABEL_FONT = _load_font(FONT_PATH, depth_label_font_size)
+    _DEPTH_PCT_FONT   = _load_font(FONT_PATH, depth_pct_font_size)
+
     pct = float(np.clip(depth_pct, 0, 1))
-
-    reps_font_size        = _scaled_font_size(_REF_REPS_FONT_SIZE, fh)
-    feedback_font_size    = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, fh)
-    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, fh)
-    depth_pct_font_size   = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, fh)
-
-    reps_font        = _load_font(FONT_PATH, reps_font_size)
-    feedback_font    = _load_font(FONT_PATH, feedback_font_size)
-    depth_label_font = _load_font(FONT_PATH, depth_label_font_size)
-    depth_pct_font   = _load_font(FONT_PATH, depth_pct_font_size)
-
-    _tmp   = Image.new("RGBA", (1, 1))
-    _tdraw = ImageDraw.Draw(_tmp)
-
-    sample_txt = "Reps: 00"
-    pad_x = max(6, int(fw * 0.013))
-    pad_y = max(4, int(fh * 0.010))
-    tw    = _tdraw.textlength(sample_txt, font=reps_font)
-    rep_box_w = int(tw + 2 * pad_x)
-    rep_box_h = int(reps_font.size + 2 * pad_y)
-
-    ref_h_donut = max(int(fh * 0.06), int(reps_font_size * 1.6))
-    radius = int(ref_h_donut * DONUT_RADIUS_SCALE)
-    thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
-    margin = max(8, int(fw * 0.016))
-    cx = fw - margin - radius
-    cy = max(ref_h_donut + radius // 8, radius + thick // 2 + 2)
-
-    safe_margin = max(4, int(fh * 0.012))
-    fb_pad_x    = max(8, int(fw * 0.016))
-    fb_pad_y    = max(4, int(fh * 0.010))
-    line_gap    = max(2, int(fh * 0.006))
-    max_text_w  = fw - 2 * fb_pad_x - max(8, int(fw * 0.015))
-    line_h      = feedback_font.size + max(4, int(fh * 0.008))
-    block_h     = 2 * fb_pad_y + 2 * line_h + line_gap
-    fb_y0       = max(0, fh - safe_margin - block_h)
-    fb_y1       = fh - safe_margin
-
     bg_alpha_val = int(round(255 * BAR_BG_ALPHA))
 
-    rep_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
-    cv2.rectangle(rep_bg, (0, 0), (rep_box_w, rep_box_h), (0, 0, 0, bg_alpha_val), -1)
+    ref_h = max(int(HD_H * 0.06), int(reps_font_size * 1.6))
+    radius = int(ref_h * DONUT_RADIUS_SCALE)
+    thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
+    margin = int(12 * hd_scale)
+    cx = HD_W - margin - radius
+    cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
 
-    fb_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
-    cv2.rectangle(fb_bg, (0, fb_y0), (fw, fb_y1), (0, 0, 0, bg_alpha_val), -1)
+    overlay_np = np.zeros((HD_H, HD_W, 4), dtype=np.uint8)
 
-    donut_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
-    cv2.circle(donut_bg, (cx, cy), radius, (*DEPTH_RING_BG, 255), thick, cv2.LINE_AA)
-
-    label_gap     = max(2, int(radius * 0.10))
-    label_block_h = depth_label_font.size + label_gap + depth_pct_font.size
-    label_by      = cy - label_block_h // 2
-
-    rep_txt_x = pad_x
-    rep_txt_y = pad_y - 1
-
-    # Composite static layers
-    canvas = Image.new("RGBA", (fw, fh), (0, 0, 0, 0))
-    canvas.alpha_composite(Image.fromarray(rep_bg, mode="RGBA"))
-    if feedback:
-        canvas.alpha_composite(Image.fromarray(fb_bg, mode="RGBA"))
-    canvas.alpha_composite(Image.fromarray(donut_bg, mode="RGBA"))
-
-    # Dynamic arc
-    if pct > 0:
-        arc_np = np.zeros((fh, fw, 4), dtype=np.uint8)
-        start_ang = -90
-        end_ang = start_ang + int(360 * pct)
-        cv2.ellipse(arc_np, (cx, cy), (radius, radius), 0,
-                    start_ang, end_ang, (*DEPTH_COLOR, 255), thick, cv2.LINE_AA)
-        canvas.alpha_composite(Image.fromarray(arc_np, mode="RGBA"))
-
-    draw = ImageDraw.Draw(canvas)
-
-    # Reps counter
+    # Reps box
+    pad_x, pad_y = int(10 * hd_scale), int(6 * hd_scale)
+    tmp_pil  = Image.new("RGBA", (1, 1))
+    tmp_draw = ImageDraw.Draw(tmp_pil)
     txt = f"Reps: {int(reps)}"
-    draw.text((rep_txt_x, rep_txt_y), txt,
-              font=reps_font, fill=(255, 255, 255, 255))
+    tw  = tmp_draw.textlength(txt, font=_REPS_FONT)
+    box_w = int(tw + 2 * pad_x)
+    box_h = int(_REPS_FONT.size + 2 * pad_y)
+    cv2.rectangle(overlay_np, (0, 0), (box_w, box_h), (0, 0, 0, bg_alpha_val), -1)
+
+    # Donut background ring
+    cv2.circle(overlay_np, (cx, cy), radius, (*DEPTH_RING_BG, 255), thick, cv2.LINE_AA)
+    start_ang = -90
+    end_ang   = start_ang + int(360 * pct)
+    if end_ang != start_ang:
+        cv2.ellipse(overlay_np, (cx, cy), (radius, radius), 0,
+                    start_ang, end_ang, (*DEPTH_COLOR, 255), thick, cv2.LINE_AA)
+
+    # Feedback bar
+    fb_y0 = 0
+    fb_lines = []
+    fb_pad_x = fb_pad_y = line_gap = line_h = 0
+    if feedback:
+        safe_margin = max(int(6 * hd_scale), int(HD_H * 0.02))
+        fb_pad_x = int(12 * hd_scale)
+        fb_pad_y = int(8 * hd_scale)
+        line_gap = int(4 * hd_scale)
+        max_text_w = int(HD_W - 2 * fb_pad_x - int(20 * hd_scale))
+        fb_lines = _wrap_two_lines(tmp_draw, feedback, _FEEDBACK_FONT, max_text_w)
+        line_h   = _FEEDBACK_FONT.size + int(6 * hd_scale)
+        block_h  = 2 * fb_pad_y + len(fb_lines) * line_h + (len(fb_lines) - 1) * line_gap
+        fb_y0    = max(0, HD_H - safe_margin - block_h)
+        y1       = HD_H - safe_margin
+        cv2.rectangle(overlay_np, (0, fb_y0), (HD_W, y1), (0, 0, 0, bg_alpha_val), -1)
+
+    # Draw text with Pillow
+    overlay_pil = Image.fromarray(overlay_np, mode="RGBA")
+    draw = ImageDraw.Draw(overlay_pil)
+
+    draw.text((pad_x, pad_y - 1), txt, font=_REPS_FONT, fill=(255, 255, 255, 255))
 
     # Donut labels
+    gap = max(2, int(radius * 0.10))
+    label_block_h = _DEPTH_LABEL_FONT.size + gap + _DEPTH_PCT_FONT.size
+    by = cy - label_block_h // 2
     label   = "DEPTH"
     pct_txt = f"{int(pct * 100)}%"
-    lw = draw.textlength(label,   font=depth_label_font)
-    pw = draw.textlength(pct_txt, font=depth_pct_font)
-    draw.text((cx - int(lw // 2), label_by),
-              label, font=depth_label_font, fill=(255, 255, 255, 255))
-    draw.text((cx - int(pw // 2), label_by + depth_label_font.size + label_gap),
-              pct_txt, font=depth_pct_font, fill=(255, 255, 255, 255))
+    lw = draw.textlength(label,   font=_DEPTH_LABEL_FONT)
+    pw = draw.textlength(pct_txt, font=_DEPTH_PCT_FONT)
+    draw.text((cx - int(lw // 2), by), label,
+              font=_DEPTH_LABEL_FONT, fill=(255, 255, 255, 255))
+    draw.text((cx - int(pw // 2), by + _DEPTH_LABEL_FONT.size + gap), pct_txt,
+              font=_DEPTH_PCT_FONT, fill=(255, 255, 255, 255))
 
     # Feedback text
-    if feedback:
-        fb_lines = _wrap_two_lines(draw, feedback, feedback_font, max_text_w)
+    if feedback and fb_lines:
         ty = fb_y0 + fb_pad_y
         for ln in fb_lines:
-            tw2 = draw.textlength(ln, font=feedback_font)
-            tx  = max(fb_pad_x, (fw - int(tw2)) // 2)
-            draw.text((tx, ty), ln, font=feedback_font, fill=(255, 255, 255, 255))
+            tw2 = draw.textlength(ln, font=_FEEDBACK_FONT)
+            tx  = max(fb_pad_x, (HD_W - int(tw2)) // 2)
+            draw.text((tx, ty), ln, font=_FEEDBACK_FONT, fill=(255, 255, 255, 255))
             ty += line_h + line_gap
 
-    # Downscale to frame size and alpha blend
-    canvas_small = cv2.resize(np.array(canvas), (w, h), interpolation=cv2.INTER_AREA)
-    alpha       = canvas_small[:, :, 3:4].astype(np.float32) / 255.0
-    overlay_bgr = canvas_small[:, :, [2, 1, 0]].astype(np.float32)
+    # Composite onto frame: downscale overlay to frame size, then alpha-blend
+    overlay_rgba = np.array(overlay_pil)
+    overlay_small = cv2.resize(overlay_rgba, (w, h), interpolation=cv2.INTER_AREA)
+    alpha       = overlay_small[:, :, 3:4].astype(np.float32) / 255.0
+    overlay_bgr = overlay_small[:, :, [2, 1, 0]].astype(np.float32)
     result = frame.astype(np.float32) * (1.0 - alpha) + overlay_bgr * alpha
     return result.astype(np.uint8)
+
 
 # ============ IMPROVED Motion Detection ============
 BASE_FRAME_SKIP = 2
@@ -389,13 +379,13 @@ def run_pushup_analysis(video_path,
     cap=cv2.VideoCapture(video_path)
     if not cap.isOpened(): return _ret_err("Could not open video", feedback_path)
 
+    fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
+    effective_fps=max(1.0, fps_in/max(1, BASE_FRAME_SKIP))
+    sec_to_frames=lambda s: max(1,int(s*effective_fps))
+
+    # ✅ Read original dimensions for HD output
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
-    # effective_fps used for timing calculations only; output video uses fps_in for correct playback speed
-    effective_fps = max(1.0, fps_in / max(1, BASE_FRAME_SKIP))
-    sec_to_frames = lambda s: max(1, int(s * effective_fps))
 
     fourcc=cv2.VideoWriter_fourcc(*'mp4v')
     out=None; frame_idx=0
@@ -469,25 +459,30 @@ def run_pushup_analysis(video_path,
             
             frames_processed += 1
 
+            # Scale down for pose detection (fast)
             if scale != 1.0:
-                frame=cv2.resize(frame,(0,0),fx=scale,fy=scale)
-            h,w=frame.shape[:2]
+                work=cv2.resize(frame,(0,0),fx=scale,fy=scale)
+            else:
+                work = frame
+            h,w=work.shape[:2]
 
+            # ✅ VideoWriter at ORIGINAL resolution (overlay will be sharp)
             if return_video and out is None:
-                out=cv2.VideoWriter(output_path, fourcc, fps_in, (orig_w, orig_h))
+                out=cv2.VideoWriter(output_path, fourcc, effective_fps, (orig_w, orig_h))
 
-            res=pose.process(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
+            res=pose.process(cv2.cvtColor(work,cv2.COLOR_BGR2RGB))
             depth_live=0.0
 
             if not res.pose_landmarks:
                 nopose_frames_since_any_rep = (nopose_frames_since_any_rep+1) if rep_count>0 else 0
                 if rep_count>0 and nopose_frames_since_any_rep>=NOPOSE_STOP_FRAMES: break
                 if return_video and out is not None:
-                    _fo = cv2.resize(frame, (orig_w, orig_h))
-                    _fo = draw_overlay(_fo, reps=rep_count,
-                                       feedback=(rt_fb_msg if rt_fb_hold>0 else None),
-                                       depth_pct=0.0)
-                    out.write(_fo)
+                    # ✅ Upscale to original res, then draw overlay at full resolution
+                    frame_out = cv2.resize(work, (orig_w, orig_h))
+                    frame_out = draw_overlay(frame_out, reps=rep_count,
+                                             feedback=(rt_fb_msg if rt_fb_hold>0 else None),
+                                             depth_pct=0.0)
+                    out.write(frame_out)
                 if rt_fb_hold>0: rt_fb_hold-=1
                 continue
 
@@ -634,7 +629,7 @@ def run_pushup_analysis(video_path,
                                            session_form_errors, session_perf_tips, rep_count, locals())
 
                         if (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and (cycle_min_elbow<=ELBOW_BENT_ANGLE):
-                            _count_rep(rep_reports,rep_count,cycle_min_elbow, desc_base_shoulder,
+                            _count_rep(rep_reports,rep_count,elbow_angle, desc_base_shoulder,
                                        baseline_shoulder_y+cycle_max_descent if baseline_shoulder_y is not None else shoulder_y,
                                        all_scores, cycle_has_issues,
                                        robust_bottom_elbow, robust_top_elbow, cycle_max_hip_misalign, cycle_max_flare)
@@ -711,13 +706,14 @@ def run_pushup_analysis(video_path,
             else:
                 if rt_fb_hold>0: rt_fb_hold-=1
 
+            # ✅ Upscale to original res → draw skeleton + overlay at full resolution (HD sharp)
             if return_video and out is not None:
-                _fo = cv2.resize(frame, (orig_w, orig_h))
-                draw_body_only(_fo, lms)
-                _fo = draw_overlay(_fo, reps=rep_count,
-                                   feedback=(rt_fb_msg if rt_fb_hold>0 else None),
-                                   depth_pct=depth_live)
-                out.write(_fo)
+                frame_out = cv2.resize(work, (orig_w, orig_h))
+                draw_body_only(frame_out, lms)
+                frame_out = draw_overlay(frame_out, reps=rep_count,
+                                         feedback=(rt_fb_msg if rt_fb_hold>0 else None),
+                                         depth_pct=depth_live)
+                out.write(frame_out)
 
             if shoulder_y is not None: shoulder_prev=shoulder_y
 
