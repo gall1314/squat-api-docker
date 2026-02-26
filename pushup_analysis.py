@@ -102,13 +102,12 @@ def draw_body_only(frame, lms, color=(255,255,255)):
 
 # ============ OVERLAY — HD 1080p render → downscale to frame ============
 HD_H = 1080
+_OVERLAY_CACHE = {}
 
-def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Render overlay at 1080p then downscale to frame resolution for sharp text."""
-    h, w = frame.shape[:2]
+def _build_overlay_cache(w, h):
+    """Build and cache fonts + static 1080p layers keyed on frame resolution."""
     fh = HD_H
     fw = max(1, int(round(w * fh / h)))
-    pct = float(np.clip(depth_pct, 0, 1))
 
     reps_font_size        = _scaled_font_size(_REF_REPS_FONT_SIZE, fh)
     feedback_font_size    = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, fh)
@@ -149,6 +148,10 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
     bg_alpha_val = int(round(255 * BAR_BG_ALPHA))
 
+    label_gap     = max(2, int(radius * 0.10))
+    label_block_h = depth_label_font.size + label_gap + depth_pct_font.size
+    label_by      = cy - label_block_h // 2
+
     rep_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
     cv2.rectangle(rep_bg, (0, 0), (rep_box_w, rep_box_h), (0, 0, 0, bg_alpha_val), -1)
 
@@ -158,19 +161,40 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     donut_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
     cv2.circle(donut_bg, (cx, cy), radius, (*DEPTH_RING_BG, 255), thick, cv2.LINE_AA)
 
-    label_gap     = max(2, int(radius * 0.10))
-    label_block_h = depth_label_font.size + label_gap + depth_pct_font.size
-    label_by      = cy - label_block_h // 2
+    return {
+        "fw": fw, "fh": fh,
+        "reps_font": reps_font, "feedback_font": feedback_font,
+        "depth_label_font": depth_label_font, "depth_pct_font": depth_pct_font,
+        "radius": radius, "thick": thick, "cx": cx, "cy": cy,
+        "rep_txt_x": pad_x, "rep_txt_y": pad_y - 1,
+        "fb_pad_x": fb_pad_x, "fb_pad_y": fb_pad_y,
+        "fb_y0": fb_y0, "fb_y1": fb_y1,
+        "line_h": line_h, "line_gap": line_gap,
+        "max_text_w": max_text_w,
+        "label_by": label_by, "label_gap": label_gap,
+        "rep_bg_pil":   Image.fromarray(rep_bg,   mode="RGBA"),
+        "fb_bg_pil":    Image.fromarray(fb_bg,    mode="RGBA"),
+        "donut_bg_pil": Image.fromarray(donut_bg, mode="RGBA"),
+    }
 
-    rep_txt_x = pad_x
-    rep_txt_y = pad_y - 1
+def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
+    """Render overlay at 1080p (cached) then downscale to frame resolution for sharp text."""
+    h, w = frame.shape[:2]
+    key = (w, h)
+    if key not in _OVERLAY_CACHE:
+        _OVERLAY_CACHE[key] = _build_overlay_cache(w, h)
+    c = _OVERLAY_CACHE[key]
 
-    # Composite static layers
+    pct = float(np.clip(depth_pct, 0, 1))
+    fw, fh = c["fw"], c["fh"]
+    cx, cy, radius, thick = c["cx"], c["cy"], c["radius"], c["thick"]
+
+    # Composite static layers (all pre-built at 1080p)
     canvas = Image.new("RGBA", (fw, fh), (0, 0, 0, 0))
-    canvas.alpha_composite(Image.fromarray(rep_bg, mode="RGBA"))
+    canvas.alpha_composite(c["rep_bg_pil"])
     if feedback:
-        canvas.alpha_composite(Image.fromarray(fb_bg, mode="RGBA"))
-    canvas.alpha_composite(Image.fromarray(donut_bg, mode="RGBA"))
+        canvas.alpha_composite(c["fb_bg_pil"])
+    canvas.alpha_composite(c["donut_bg_pil"])
 
     # Dynamic arc
     if pct > 0:
@@ -185,28 +209,28 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
     # Reps counter
     txt = f"Reps: {int(reps)}"
-    draw.text((rep_txt_x, rep_txt_y), txt,
-              font=reps_font, fill=(255, 255, 255, 255))
+    draw.text((c["rep_txt_x"], c["rep_txt_y"]), txt,
+              font=c["reps_font"], fill=(255, 255, 255, 255))
 
     # Donut labels
     label   = "DEPTH"
     pct_txt = f"{int(pct * 100)}%"
-    lw = draw.textlength(label,   font=depth_label_font)
-    pw = draw.textlength(pct_txt, font=depth_pct_font)
-    draw.text((cx - int(lw // 2), label_by),
-              label, font=depth_label_font, fill=(255, 255, 255, 255))
-    draw.text((cx - int(pw // 2), label_by + depth_label_font.size + label_gap),
-              pct_txt, font=depth_pct_font, fill=(255, 255, 255, 255))
+    lw = draw.textlength(label,   font=c["depth_label_font"])
+    pw = draw.textlength(pct_txt, font=c["depth_pct_font"])
+    draw.text((cx - int(lw // 2), c["label_by"]),
+              label, font=c["depth_label_font"], fill=(255, 255, 255, 255))
+    draw.text((cx - int(pw // 2), c["label_by"] + c["depth_label_font"].size + c["label_gap"]),
+              pct_txt, font=c["depth_pct_font"], fill=(255, 255, 255, 255))
 
     # Feedback text
     if feedback:
-        fb_lines = _wrap_two_lines(draw, feedback, feedback_font, max_text_w)
-        ty = fb_y0 + fb_pad_y
+        fb_lines = _wrap_two_lines(draw, feedback, c["feedback_font"], c["max_text_w"])
+        ty = c["fb_y0"] + c["fb_pad_y"]
         for ln in fb_lines:
-            tw2 = draw.textlength(ln, font=feedback_font)
-            tx  = max(fb_pad_x, (fw - int(tw2)) // 2)
-            draw.text((tx, ty), ln, font=feedback_font, fill=(255, 255, 255, 255))
-            ty += line_h + line_gap
+            tw2 = draw.textlength(ln, font=c["feedback_font"])
+            tx  = max(c["fb_pad_x"], (fw - int(tw2)) // 2)
+            draw.text((tx, ty), ln, font=c["feedback_font"], fill=(255, 255, 255, 255))
+            ty += c["line_h"] + c["line_gap"]
 
     # Downscale to frame size and alpha blend
     canvas_small = cv2.resize(np.array(canvas), (w, h), interpolation=cv2.INTER_AREA)
