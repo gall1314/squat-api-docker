@@ -100,30 +100,55 @@ def draw_body_only(frame, lms, color=(255,255,255)):
         cv2.circle(frame,(x,y),dot,color,-1,cv2.LINE_AA)
     return frame
 
-# ============ OVERLAY — HD rendering (matches good_morning approach) ============
+# ============ OVERLAY — HD rendering with font cache ============
+_FONT_CACHE = {}
+
+def _get_cached_fonts(frame_h):
+    """Cache fonts per frame height so we don't reload every frame."""
+    key = int(frame_h)
+    if key in _FONT_CACHE:
+        return _FONT_CACHE[key]
+    
+    HD_H = 1080
+    reps_font_size        = _scaled_font_size(_REF_REPS_FONT_SIZE, HD_H)
+    feedback_font_size    = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, HD_H)
+    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, HD_H)
+    depth_pct_font_size   = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, HD_H)
+
+    fonts = {
+        "reps": _load_font(FONT_PATH, reps_font_size),
+        "feedback": _load_font(FONT_PATH, feedback_font_size),
+        "depth_label": _load_font(FONT_PATH, depth_label_font_size),
+        "depth_pct": _load_font(FONT_PATH, depth_pct_font_size),
+    }
+    _FONT_CACHE[key] = fonts
+    return fonts
+
+
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     """
-    HD overlay: renders text/donut at 1080p then composites onto the frame.
-    This matches the good_morning_analysis approach for sharp text at any frame size.
+    HD overlay — identical approach to good_morning_analysis:
+    1. Render overlay RGBA at 1080p (sharp fonts/shapes)
+    2. Downscale overlay to match frame size
+    3. Alpha-composite onto frame
+    
+    Fonts are cached per frame height for speed.
     """
     h, w, _ = frame.shape
     HD_H = 1080
     hd_scale = HD_H / float(h)
     HD_W = max(1, int(round(w * hd_scale)))
 
-    reps_font_size        = _scaled_font_size(_REF_REPS_FONT_SIZE, HD_H)
-    feedback_font_size    = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, HD_H)
-    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, HD_H)
-    depth_pct_font_size   = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, HD_H)
-
-    _REPS_FONT        = _load_font(FONT_PATH, reps_font_size)
-    _FEEDBACK_FONT    = _load_font(FONT_PATH, feedback_font_size)
-    _DEPTH_LABEL_FONT = _load_font(FONT_PATH, depth_label_font_size)
-    _DEPTH_PCT_FONT   = _load_font(FONT_PATH, depth_pct_font_size)
+    fonts = _get_cached_fonts(h)
+    _REPS_FONT        = fonts["reps"]
+    _FEEDBACK_FONT    = fonts["feedback"]
+    _DEPTH_LABEL_FONT = fonts["depth_label"]
+    _DEPTH_PCT_FONT   = fonts["depth_pct"]
 
     pct = float(np.clip(depth_pct, 0, 1))
     bg_alpha_val = int(round(255 * BAR_BG_ALPHA))
 
+    reps_font_size = _REPS_FONT.size
     ref_h = max(int(HD_H * 0.06), int(reps_font_size * 1.6))
     radius = int(ref_h * DONUT_RADIUS_SCALE)
     thick  = max(3, int(radius * DONUT_THICKNESS_FRAC))
@@ -196,7 +221,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
             draw.text((tx, ty), ln, font=_FEEDBACK_FONT, fill=(255, 255, 255, 255))
             ty += line_h + line_gap
 
-    # Composite onto frame: downscale overlay to frame size, then alpha-blend
+    # Composite: downscale 1080p overlay to frame size, then alpha-blend
     overlay_rgba = np.array(overlay_pil)
     overlay_small = cv2.resize(overlay_rgba, (w, h), interpolation=cv2.INTER_AREA)
     alpha       = overlay_small[:, :, 3:4].astype(np.float32) / 255.0
@@ -459,6 +484,9 @@ def run_pushup_analysis(video_path,
             
             frames_processed += 1
 
+            # Keep original frame for HD video output
+            orig_frame = frame
+
             # Scale down for pose detection (fast)
             if scale != 1.0:
                 work=cv2.resize(frame,(0,0),fx=scale,fy=scale)
@@ -477,9 +505,8 @@ def run_pushup_analysis(video_path,
                 nopose_frames_since_any_rep = (nopose_frames_since_any_rep+1) if rep_count>0 else 0
                 if rep_count>0 and nopose_frames_since_any_rep>=NOPOSE_STOP_FRAMES: break
                 if return_video and out is not None:
-                    # ✅ Upscale to original res, then draw overlay at full resolution
-                    frame_out = cv2.resize(work, (orig_w, orig_h))
-                    frame_out = draw_overlay(frame_out, reps=rep_count,
+                    # ✅ Use original full-res frame for sharp output
+                    frame_out = draw_overlay(orig_frame, reps=rep_count,
                                              feedback=(rt_fb_msg if rt_fb_hold>0 else None),
                                              depth_pct=0.0)
                     out.write(frame_out)
@@ -706,11 +733,10 @@ def run_pushup_analysis(video_path,
             else:
                 if rt_fb_hold>0: rt_fb_hold-=1
 
-            # ✅ Upscale to original res → draw skeleton + overlay at full resolution (HD sharp)
+            # ✅ Draw skeleton + overlay on original full-res frame (HD sharp)
             if return_video and out is not None:
-                frame_out = cv2.resize(work, (orig_w, orig_h))
-                draw_body_only(frame_out, lms)
-                frame_out = draw_overlay(frame_out, reps=rep_count,
+                draw_body_only(orig_frame, lms)
+                frame_out = draw_overlay(orig_frame, reps=rep_count,
                                          feedback=(rt_fb_msg if rt_fb_hold>0 else None),
                                          depth_pct=depth_live)
                 out.write(frame_out)
