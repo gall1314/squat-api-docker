@@ -392,9 +392,10 @@ def run_pushup_analysis(video_path,
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
-    effective_fps=max(1.0, fps_in/max(1, BASE_FRAME_SKIP))
-    sec_to_frames=lambda s: max(1,int(s*effective_fps))
+    fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
+    # effective_fps used for timing calculations only; output video uses fps_in for correct playback speed
+    effective_fps = max(1.0, fps_in / max(1, BASE_FRAME_SKIP))
+    sec_to_frames = lambda s: max(1, int(s * effective_fps))
 
     fourcc=cv2.VideoWriter_fourcc(*'mp4v')
     out=None; frame_idx=0
@@ -473,7 +474,7 @@ def run_pushup_analysis(video_path,
             h,w=frame.shape[:2]
 
             if return_video and out is None:
-                out=cv2.VideoWriter(output_path, fourcc, effective_fps, (orig_w, orig_h))
+                out=cv2.VideoWriter(output_path, fourcc, fps_in, (orig_w, orig_h))
 
             res=pose.process(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
             depth_live=0.0
