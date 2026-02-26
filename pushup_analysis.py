@@ -802,8 +802,8 @@ def run_pushup_analysis(video_path,
     if return_video and os.path.exists(output_path):
         encoded_path=output_path.replace(".mp4","_encoded.mp4")
         try:
-            subprocess.run(["ffmpeg","-y","-i",output_path,"-c:v","libx264","-preset","medium",
-                            "-crf",str(int(encode_crf)),"-movflags","+faststart","-pix_fmt","yuv420p",
+            subprocess.run(["ffmpeg","-y","-i",output_path,"-c:v","libx264","-preset","fast",
+                            "-movflags","+faststart","-pix_fmt","yuv420p",
                             encoded_path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             final_path=encoded_path if os.path.exists(encoded_path) else output_path
             if os.path.exists(output_path) and os.path.exists(encoded_path):
