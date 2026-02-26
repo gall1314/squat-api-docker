@@ -347,6 +347,65 @@ def _wrap_two_lines(draw, text, font, max_width):
     return lines[:2]
 
 
+_OVERLAY_CACHE = {}
+
+
+def _build_overlay_cache(w, h):
+    """Build and cache static 1080p layers keyed on frame resolution."""
+    fh = 1080
+    fw = max(1, int(round(w * fh / h)))
+
+    _tmp   = Image.new("RGBA", (1, 1))
+    _tdraw = ImageDraw.Draw(_tmp)
+
+    sample_txt = "Reps: 00"
+    pad_x, pad_y = 10, 6
+    tw       = _tdraw.textlength(sample_txt, font=REPS_FONT)
+    rep_box_w = int(tw + 2 * pad_x)
+    rep_box_h = int(REPS_FONT.size + 2 * pad_y)
+
+    ref_h_donut = max(int(fh * 0.06), int(REPS_FONT_SIZE * 1.6))
+    r  = int(ref_h_donut * DONUT_RADIUS_SCALE)
+    th = max(3, int(r * DONUT_THICKNESS_FRAC))
+    m  = 12
+    cx = fw - m - r
+    cy = max(ref_h_donut + r // 8, r + th // 2 + 2)
+
+    safe   = max(6, int(fh * 0.02))
+    fb_pad_x, fb_pad_y, lg = 12, 8, 4
+    max_w  = int(fw - 2 * fb_pad_x - 20)
+    line_h = FEEDBACK_FONT.size + 6
+    block_h = 2 * fb_pad_y + 2 * line_h + lg
+    fb_y0  = max(0, fh - safe - block_h)
+    fb_y1  = fh - safe
+
+    bg_alpha = int(round(255 * BAR_BG_ALPHA))
+
+    gap      = max(2, int(r * 0.10))
+    label_by = cy - (DEPTH_LABEL_FONT.size + gap + DEPTH_PCT_FONT.size) // 2
+
+    rep_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
+    cv2.rectangle(rep_bg, (0, 0), (rep_box_w, rep_box_h), (0, 0, 0, bg_alpha), -1)
+
+    fb_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
+    cv2.rectangle(fb_bg, (0, fb_y0), (fw, fb_y1), (0, 0, 0, bg_alpha), -1)
+
+    donut_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
+    cv2.circle(donut_bg, (cx, cy), r, (*DEPTH_RING_BG, 255), th, cv2.LINE_AA)
+
+    return {
+        "fw": fw, "fh": fh,
+        "r": r, "th": th, "cx": cx, "cy": cy,
+        "rep_txt_x": pad_x, "rep_txt_y": pad_y - 1,
+        "fb_pad_x": fb_pad_x, "fb_pad_y": fb_pad_y, "lg": lg, "line_h": line_h,
+        "fb_y0": fb_y0, "fb_y1": fb_y1, "max_w": max_w,
+        "label_by": label_by, "gap": gap,
+        "rep_bg_pil":   Image.fromarray(rep_bg,   mode="RGBA"),
+        "fb_bg_pil":    Image.fromarray(fb_bg,    mode="RGBA"),
+        "donut_bg_pil": Image.fromarray(donut_bg, mode="RGBA"),
+    }
+
+
 def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0, phase_name=""):
     if not HAS_PIL:
         # Fallback: simple OpenCV text
@@ -357,78 +416,55 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0, phase_name=""):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         return frame
 
-    h, w, _ = frame.shape
-    HD_H = 1080
-    hd_scale = HD_H / float(h)
-    HD_W = max(1, int(round(w * hd_scale)))
+    h, w = frame.shape[:2]
+    key = (w, h)
+    if key not in _OVERLAY_CACHE:
+        _OVERLAY_CACHE[key] = _build_overlay_cache(w, h)
+    c = _OVERLAY_CACHE[key]
 
     pct = float(np.clip(height_pct, 0, 1))
-    ref_h = max(int(HD_H * 0.06), int(REPS_FONT_SIZE * 1.6))
-    r = int(ref_h * DONUT_RADIUS_SCALE)
-    th = max(3, int(r * DONUT_THICKNESS_FRAC))
-    m = 12
-    cx = HD_W - m - r
-    cy = max(ref_h + r // 8, r + th // 2 + 2)
+    fw, fh = c["fw"], c["fh"]
+    cx, cy, r, th = c["cx"], c["cy"], c["r"], c["th"]
 
-    overlay_bgr = np.zeros((HD_H, HD_W, 3), dtype=np.uint8)
-    overlay_a = np.zeros((HD_H, HD_W), dtype=np.uint8)
-    bg_alpha = int(round(255 * BAR_BG_ALPHA))
+    canvas = Image.new("RGBA", (fw, fh), (0, 0, 0, 0))
+    canvas.alpha_composite(c["rep_bg_pil"])
+    if feedback:
+        canvas.alpha_composite(c["fb_bg_pil"])
+    canvas.alpha_composite(c["donut_bg_pil"])
+
+    if pct > 0:
+        arc_np = np.zeros((fh, fw, 4), dtype=np.uint8)
+        cv2.ellipse(arc_np, (cx, cy), (r, r), 0, -90, -90 + int(360 * pct),
+                    (*DEPTH_COLOR, 255), th, cv2.LINE_AA)
+        canvas.alpha_composite(Image.fromarray(arc_np, mode="RGBA"))
+
+    draw = ImageDraw.Draw(canvas)
 
     txt = f"Reps: {int(reps)}"
-    pad_x, pad_y = 10, 6
-    tmp = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
-    tw = tmp.textlength(txt, font=REPS_FONT)
-    thh = REPS_FONT.size
-    cv2.rectangle(overlay_bgr, (0, 0), (int(tw + 2 * pad_x), int(thh + 2 * pad_y)), (0, 0, 0), -1)
-    cv2.rectangle(overlay_a, (0, 0), (int(tw + 2 * pad_x), int(thh + 2 * pad_y)), bg_alpha, -1)
+    draw.text((c["rep_txt_x"], c["rep_txt_y"]), txt, font=REPS_FONT, fill=(255, 255, 255, 255))
 
-    cv2.circle(overlay_bgr, (cx, cy), r, DEPTH_RING_BG, th, cv2.LINE_AA)
-    cv2.circle(overlay_a, (cx, cy), r, 255, th, cv2.LINE_AA)
-    cv2.ellipse(overlay_bgr, (cx, cy), (r, r), 0, -90, -90 + int(360 * pct), DEPTH_COLOR, th, cv2.LINE_AA)
-    cv2.ellipse(overlay_a, (cx, cy), (r, r), 0, -90, -90 + int(360 * pct), 255, th, cv2.LINE_AA)
-
-    pil_rgba = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGBA)
-    pil_rgba[:, :, 3] = np.maximum(pil_rgba[:, :, 3], overlay_a)
-    pil = Image.fromarray(pil_rgba)
-    draw = ImageDraw.Draw(pil)
-    draw.text((pad_x, pad_y - 1), txt, font=REPS_FONT, fill=(255, 255, 255, 255))
-
-    gap = max(2, int(r * 0.10))
-    by = cy - (DEPTH_LABEL_FONT.size + gap + DEPTH_PCT_FONT.size) // 2
-    label = "HEIGHT"
+    label   = "HEIGHT"
     pct_txt = f"{int(pct * 100)}%"
-    lw = draw.textlength(label, font=DEPTH_LABEL_FONT)
+    lw = draw.textlength(label,   font=DEPTH_LABEL_FONT)
     pw = draw.textlength(pct_txt, font=DEPTH_PCT_FONT)
-    draw.text((cx - int(lw // 2), by), label, font=DEPTH_LABEL_FONT, fill=(255, 255, 255, 255))
-    draw.text((cx - int(pw // 2), by + DEPTH_LABEL_FONT.size + gap), pct_txt,
-              font=DEPTH_PCT_FONT, fill=(255, 255, 255, 255))
+    draw.text((cx - int(lw // 2), c["label_by"]),
+              label, font=DEPTH_LABEL_FONT, fill=(255, 255, 255, 255))
+    draw.text((cx - int(pw // 2), c["label_by"] + DEPTH_LABEL_FONT.size + c["gap"]),
+              pct_txt, font=DEPTH_PCT_FONT, fill=(255, 255, 255, 255))
 
     if feedback:
-        max_w = int(HD_W - 2 * 12 - 20)
-        lines = _wrap_two_lines(draw, feedback, FEEDBACK_FONT, max_w)
-        line_h = FEEDBACK_FONT.size + 6
-        block_h = 2 * 8 + len(lines) * line_h + (len(lines) - 1) * 4
-        y0 = max(0, HD_H - max(6, int(HD_H * 0.02)) - block_h)
-        y1 = HD_H - max(6, int(HD_H * 0.02))
-        cv2.rectangle(overlay_bgr, (0, y0), (HD_W, y1), (0, 0, 0), -1)
-        cv2.rectangle(overlay_a, (0, y0), (HD_W, y1), bg_alpha, -1)
-
-        pil_rgba = cv2.cvtColor(overlay_bgr, cv2.COLOR_BGR2RGBA)
-        pil_rgba[:, :, 3] = np.maximum(pil_rgba[:, :, 3], overlay_a)
-        pil = Image.fromarray(pil_rgba)
-        draw = ImageDraw.Draw(pil)
-        ty = y0 + 8
+        lines = _wrap_two_lines(draw, feedback, FEEDBACK_FONT, c["max_w"])
+        ty = c["fb_y0"] + c["fb_pad_y"]
         for ln in lines:
             tw2 = draw.textlength(ln, font=FEEDBACK_FONT)
-            tx = max(12, (HD_W - int(tw2)) // 2)
+            tx  = max(c["fb_pad_x"], (fw - int(tw2)) // 2)
             draw.text((tx, ty), ln, font=FEEDBACK_FONT, fill=(255, 255, 255, 255))
-            ty += line_h + 4
+            ty += c["line_h"] + c["lg"]
 
-    overlay_rgba = np.array(pil)
-    overlay_small = cv2.resize(overlay_rgba, (w, h), interpolation=cv2.INTER_AREA)
-    alpha = overlay_small[:, :, 3:4].astype(np.float32) / 255.0
-    rgb = cv2.cvtColor(overlay_small[:, :, :3], cv2.COLOR_RGB2BGR).astype(np.float32)
-    out = frame.astype(np.float32) * (1.0 - alpha) + rgb * alpha
+    canvas_small = cv2.resize(np.array(canvas), (w, h), interpolation=cv2.INTER_AREA)
+    alpha = canvas_small[:, :, 3:4].astype(np.float32) / 255.0
+    rgb   = cv2.cvtColor(canvas_small[:, :, :3], cv2.COLOR_RGB2BGR).astype(np.float32)
+    out   = frame.astype(np.float32) * (1.0 - alpha) + rgb * alpha
     return out.astype(np.uint8)
 
 # ============ State Machine Rep Counter ============
