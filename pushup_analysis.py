@@ -404,6 +404,8 @@ def run_pushup_analysis(video_path,
     cap=cv2.VideoCapture(video_path)
     if not cap.isOpened(): return _ret_err("Could not open video", feedback_path)
 
+    print(f"[PUSHUP] ===== HD OVERLAY VERSION 2026-02-27 =====")
+
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps=max(1.0, fps_in/max(1, BASE_FRAME_SKIP))
     sec_to_frames=lambda s: max(1,int(s*effective_fps))
@@ -485,7 +487,7 @@ def run_pushup_analysis(video_path,
             frames_processed += 1
 
             # Keep original frame for HD video output
-            orig_frame = frame
+            orig_frame = frame.copy()  # IMPORTANT: .copy() so resize doesn't affect it
 
             # Scale down for pose detection (fast)
             if scale != 1.0:
@@ -497,6 +499,7 @@ def run_pushup_analysis(video_path,
             # ✅ VideoWriter at ORIGINAL resolution (overlay will be sharp)
             if return_video and out is None:
                 out=cv2.VideoWriter(output_path, fourcc, effective_fps, (orig_w, orig_h))
+                print(f"[PUSHUP DEBUG] orig={orig_w}x{orig_h}, work={w}x{h}, orig_frame={orig_frame.shape}, scale={scale}")
 
             res=pose.process(cv2.cvtColor(work,cv2.COLOR_BGR2RGB))
             depth_live=0.0
