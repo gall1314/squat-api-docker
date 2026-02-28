@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 # pullup_analysis.py — SMART FORM_TIP edition with FAST/SLOW path optimization
 # form_tip = optimization advice (doesn't affect score, only helps improve)
+#
+# FIX APPLIED: Fast and slow paths now use the same model_complexity=1
+# to ensure consistent rep counts between fast (count-only) and slow (video) modes.
 
 import os, cv2, math, numpy as np, subprocess, re
 from collections import deque
@@ -266,10 +269,20 @@ try:
 except Exception:
     mp_pose=None
 
-# Reused fast-mode Pose (avoids per-request graph/delegate creation)
+# ============================================================
+# FIX: Use model_complexity=1 for the reusable singleton too,
+# so fast path gets the same landmark quality as slow path.
+# This adds ~20-40ms/frame latency but ensures rep count parity.
+# ============================================================
+_FAST_POSE_COMPLEXITY = 1  # <-- CHANGED from 0 to 1
+
 if mp_pose is not None:
     try:
-        _FAST_POSE = mp_pose.Pose(model_complexity=0, min_detection_confidence=0.5, min_tracking_confidence=0.5)
+        _FAST_POSE = mp_pose.Pose(
+            model_complexity=_FAST_POSE_COMPLEXITY,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
         _FAST_POSE.process(np.zeros((64, 64, 3), dtype=np.uint8))
     except Exception:
         _FAST_POSE = None
@@ -488,9 +501,16 @@ def run_pullup_analysis(video_path,
 
     effective_frame_skip = frame_skip
     effective_scale = scale
-    model_complexity = 0 if fast_path else 1
+
+    # ============================================================
+    # FIX: Use the SAME model_complexity for both paths.
+    # This is the root cause of the rep count mismatch — complexity=0
+    # (lite) produces lower-quality landmarks, causing missed reps.
+    # ============================================================
+    model_complexity = 1  # <-- FIXED: was "0 if fast_path else 1"
+
     if fast_path:
-        print(f"[FAST MODE][pullup] stable-count profile: frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=lite", flush=True)
+        print(f"[FAST MODE][pullup] stable-count profile: frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=full(matched)", flush=True)
 
     if preserve_quality:
         effective_scale=1.0; effective_frame_skip=1; encode_crf=18 if encode_crf is None else encode_crf
@@ -578,11 +598,20 @@ def run_pullup_analysis(video_path,
     burst_cntr=0
     processed_frame_count = 0
 
-    pose = _get_fast_pose() if fast_path else mp_pose.Pose(
-        model_complexity=model_complexity,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+    # ============================================================
+    # FIX: Always create a fresh Pose with the SAME model_complexity.
+    # Don't use the singleton _FAST_POSE if its complexity differs.
+    # Since we now set _FAST_POSE_COMPLEXITY=1 above, the singleton
+    # matches — but we add a safety check just in case.
+    # ============================================================
+    if fast_path and _FAST_POSE is not None and _FAST_POSE_COMPLEXITY == model_complexity:
+        pose = _FAST_POSE
+    else:
+        pose = mp_pose.Pose(
+            model_complexity=model_complexity,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
     if pose is None:
         return _ret_err("Mediapipe not available", feedback_path)
 
@@ -913,7 +942,9 @@ def run_pullup_analysis(video_path,
             else: good_reps+=1
 
     finally:
-        if not fast_path:
+        # FIX: Always close pose (was skipping close in fast path)
+        # Only close if it's NOT the shared singleton (to avoid breaking future calls)
+        if pose is not _FAST_POSE:
             pose.close()
 
     cap.release()
