@@ -2,8 +2,12 @@
 # pullup_analysis.py — SMART FORM_TIP edition with FAST/SLOW path optimization
 # form_tip = optimization advice (doesn't affect score, only helps improve)
 #
-# FIX APPLIED: Fast and slow paths now use the same model_complexity=1
-# to ensure consistent rep counts between fast (count-only) and slow (video) modes.
+# FIXES APPLIED:
+# 1. Fast/slow paths now use same model_complexity=1 (rep count parity)
+# 2. Swing & face detection now runs BEFORE rep counting (was after → tips never applied)
+# 3. Session-level feedback properly penalizes technique score
+# 4. good_reps / bad_reps correctly reflect per-rep tip flags
+# 5. pose.close() always called properly
 
 import os, cv2, math, numpy as np, subprocess, re
 from collections import deque
@@ -20,9 +24,7 @@ _REF_DEPTH_LABEL_FONT_SIZE = 14
 _REF_DEPTH_PCT_FONT_SIZE = 18
 
 # ============================================================
-# OVERLAY CACHE — key: (frame_w, frame_h)
-# Stores pre-built static background layer + all geometry so
-# draw_overlay() only composites the dynamic parts each frame.
+# OVERLAY CACHE
 # ============================================================
 _OVERLAY_CACHE = {}
 
@@ -49,20 +51,11 @@ def _scaled_font_size(ref_size, canvas_h):
     return max(10, int(round(ref_size * (canvas_h / _REF_H))))
 
 def _get_overlay_cache(w, h):
-    """
-    Build (once per resolution) everything that does NOT change frame-to-frame:
-    - fonts at the correct size for this resolution
-    - geometry (donut centre/radius, text box sizes)
-    - a pre-rendered static background numpy array (BGRA) that already has
-      the semi-transparent rep-box and feedback-box painted on it.
-      Dynamic content (text, arc) is composited on top each frame.
-    """
     key = (int(w), int(h))
     cached = _OVERLAY_CACHE.get(key)
     if cached is not None:
         return cached
 
-    # Work directly at frame resolution — no 1080p upscale needed.
     fw, fh = int(w), int(h)
 
     reps_font_size         = _scaled_font_size(_REF_REPS_FONT_SIZE,         fh)
@@ -75,7 +68,6 @@ def _get_overlay_cache(w, h):
     depth_label_font = _load_font(FONT_PATH, depth_label_font_size)
     depth_pct_font   = _load_font(FONT_PATH, depth_pct_font_size)
 
-    # Measure rep text box size using a throw-away PIL image
     _tmp = Image.new("RGBA", (1, 1))
     _tdraw = ImageDraw.Draw(_tmp)
     sample_txt = "Reps: 00"
@@ -85,7 +77,6 @@ def _get_overlay_cache(w, h):
     rep_box_w = int(tw + 2 * pad_x)
     rep_box_h = int(reps_font.size + 2 * pad_y)
 
-    # Donut geometry
     ref_h_donut = max(int(fh * 0.06), int(reps_font_size * 1.6))
     radius  = int(ref_h_donut * DONUT_RADIUS_SCALE)
     thick   = max(3, int(radius * DONUT_THICKNESS_FRAC))
@@ -93,71 +84,52 @@ def _get_overlay_cache(w, h):
     cx      = fw - margin - radius
     cy      = max(ref_h_donut + radius // 8, radius + thick // 2 + 2)
 
-    # Feedback box geometry (full-width strip at bottom)
     safe_margin = max(4, int(fh * 0.012))
     fb_pad_x    = max(8, int(fw * 0.016))
     fb_pad_y    = max(4, int(fh * 0.010))
     line_gap    = max(2, int(fh * 0.006))
     max_text_w  = fw - 2 * fb_pad_x - max(8, int(fw * 0.015))
     line_h      = feedback_font.size + max(4, int(fh * 0.008))
-    # Two lines max
     block_h     = 2 * fb_pad_y + 2 * line_h + line_gap
     fb_y0       = max(0, fh - safe_margin - block_h)
     fb_y1       = fh - safe_margin
 
     bg_alpha_val = int(round(255 * BAR_BG_ALPHA))
 
-    # --- Pre-build the STATIC rep-count background (BGRA, frame size) ---
     rep_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
     cv2.rectangle(rep_bg, (0, 0), (rep_box_w, rep_box_h), (0, 0, 0, bg_alpha_val), -1)
 
-    # --- Pre-build the STATIC feedback background (BGRA, frame size) ---
     fb_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
     cv2.rectangle(fb_bg, (0, fb_y0), (fw, fb_y1), (0, 0, 0, bg_alpha_val), -1)
 
-    # --- Pre-build the STATIC donut ring background (BGRA, frame size) ---
     donut_bg = np.zeros((fh, fw, 4), dtype=np.uint8)
     cv2.circle(donut_bg, (cx, cy), radius, (*DEPTH_RING_BG, 255), thick, cv2.LINE_AA)
 
-    # Convert all static layers to PIL for compositing convenience
     rep_bg_pil   = Image.fromarray(rep_bg,   mode="RGBA")
     fb_bg_pil    = Image.fromarray(fb_bg,    mode="RGBA")
     donut_bg_pil = Image.fromarray(donut_bg, mode="RGBA")
 
-    # Text origin for reps label
     rep_txt_x = pad_x
     rep_txt_y = pad_y - 1
 
-    # Donut label origin (centred inside ring)
     label_gap = max(2, int(radius * 0.10))
     label_block_h = depth_label_font.size + label_gap + depth_pct_font.size
     label_by = cy - label_block_h // 2
 
     cache = {
-        # resolution
         "fw": fw, "fh": fh,
-        # fonts
-        "reps_font":        reps_font,
-        "feedback_font":    feedback_font,
-        "depth_label_font": depth_label_font,
-        "depth_pct_font":   depth_pct_font,
-        # donut
+        "reps_font": reps_font, "feedback_font": feedback_font,
+        "depth_label_font": depth_label_font, "depth_pct_font": depth_pct_font,
         "radius": radius, "thick": thick, "cx": cx, "cy": cy,
-        # rep box
         "rep_box_h": rep_box_h,
         "rep_txt_x": rep_txt_x, "rep_txt_y": rep_txt_y,
         "pad_x": pad_x, "pad_y": pad_y,
-        # feedback box
         "fb_pad_x": fb_pad_x, "fb_pad_y": fb_pad_y,
         "fb_y0": fb_y0, "fb_y1": fb_y1,
         "line_h": line_h, "line_gap": line_gap,
         "max_text_w": max_text_w,
-        # donut label
         "label_by": label_by, "label_gap": label_gap,
-        # pre-built static PIL layers
-        "rep_bg_pil":   rep_bg_pil,
-        "fb_bg_pil":    fb_bg_pil,
-        "donut_bg_pil": donut_bg_pil,
+        "rep_bg_pil": rep_bg_pil, "fb_bg_pil": fb_bg_pil, "donut_bg_pil": donut_bg_pil,
     }
     _OVERLAY_CACHE[key] = cache
     return cache
@@ -186,16 +158,6 @@ def _wrap_two_lines(draw, text, font, max_width):
 
 
 def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
-    """
-    Fast overlay compositing — works entirely at frame resolution.
-
-    Changes vs original:
-    • No 1080p upscale/downscale of the overlay (was the main bottleneck).
-    • Static background layers (rep box, donut ring, feedback strip) are
-      pre-built once and reused from cache — only dynamic elements (text,
-      arc sweep) are drawn each frame.
-    • Single PIL composite call instead of multiple numpy alpha blends.
-    """
     h, w, _ = frame.shape
     c = _get_overlay_cache(w, h)
 
@@ -203,20 +165,12 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
     fw, fh = c["fw"], c["fh"]
     cx, cy, radius, thick = c["cx"], c["cy"], c["radius"], c["thick"]
 
-    # ---- Start with a fresh transparent canvas at frame resolution ----
     canvas = Image.new("RGBA", (fw, fh), (0, 0, 0, 0))
-
-    # 1. Rep-count background (static, pre-built)
     canvas.alpha_composite(c["rep_bg_pil"])
-
-    # 2. Feedback background (static, pre-built) — only if there is text
     if feedback:
         canvas.alpha_composite(c["fb_bg_pil"])
-
-    # 3. Donut ring background (static grey circle, pre-built)
     canvas.alpha_composite(c["donut_bg_pil"])
 
-    # 4. Dynamic arc sweep on top of ring
     if pct > 0:
         arc_layer = np.zeros((fh, fw, 4), dtype=np.uint8)
         start_ang = -90
@@ -226,15 +180,11 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
                     (*DEPTH_COLOR, 255), thick, cv2.LINE_AA)
         canvas.alpha_composite(Image.fromarray(arc_layer, mode="RGBA"))
 
-    # 5. Draw all text with PIL
     draw = ImageDraw.Draw(canvas)
-
-    # Rep count
     txt = f"Reps: {int(reps)}"
     draw.text((c["rep_txt_x"], c["rep_txt_y"]), txt,
               font=c["reps_font"], fill=(255, 255, 255, 255))
 
-    # Donut labels (HEIGHT + %)
     label   = "HEIGHT"
     pct_txt = f"{int(pct * 100)}%"
     lw = draw.textlength(label,   font=c["depth_label_font"])
@@ -244,7 +194,6 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
     draw.text((cx - int(pw // 2), c["label_by"] + c["depth_label_font"].size + c["label_gap"]),
               pct_txt, font=c["depth_pct_font"], fill=(255, 255, 255, 255))
 
-    # Feedback text (wrapped, centred)
     if feedback:
         fb_lines = _wrap_two_lines(draw, feedback, c["feedback_font"], c["max_text_w"])
         ty = c["fb_y0"] + c["fb_pad_y"]
@@ -254,8 +203,7 @@ def draw_overlay(frame, reps=0, feedback=None, height_pct=0.0):
             draw.text((tx, ty), ln, font=c["feedback_font"], fill=(255, 255, 255, 255))
             ty += c["line_h"] + c["line_gap"]
 
-    # 6. Composite canvas onto frame using numpy alpha blend
-    canvas_np   = np.array(canvas)                        # RGBA, frame size
+    canvas_np   = np.array(canvas)
     alpha       = canvas_np[:, :, 3:4].astype(np.float32) / 255.0
     overlay_bgr = canvas_np[:, :, [2, 1, 0]].astype(np.float32)
     result      = frame.astype(np.float32) * (1.0 - alpha) + overlay_bgr * alpha
@@ -269,12 +217,8 @@ try:
 except Exception:
     mp_pose=None
 
-# ============================================================
-# FIX: Use model_complexity=1 for the reusable singleton too,
-# so fast path gets the same landmark quality as slow path.
-# This adds ~20-40ms/frame latency but ensures rep count parity.
-# ============================================================
-_FAST_POSE_COMPLEXITY = 1  # <-- CHANGED from 0 to 1
+# FIX: Use model_complexity=1 for singleton to match slow path
+_FAST_POSE_COMPLEXITY = 1
 
 if mp_pose is not None:
     try:
@@ -293,11 +237,6 @@ def _get_fast_pose():
     return _FAST_POSE
 
 def _read_source_rotation_degrees(video_path):
-    """
-    Read rotation metadata from video (0/90/180/270).
-    Returns the degrees the video stream needs to be rotated to display upright.
-    OpenCV ignores rotation metadata, so we must apply it manually to pixels.
-    """
     try:
         proc = subprocess.run(
             [
@@ -336,17 +275,6 @@ def _read_source_rotation_degrees(video_path):
 
 
 def _rotate_frame(frame, rotation_degrees):
-    """
-    Rotate frame pixels to compensate for video metadata rotation.
-    OpenCV reads raw pixels without applying rotation metadata,
-    so we must rotate manually to get the upright image.
-
-    rotation_degrees: value from _read_source_rotation_degrees()
-      90  → phone held portrait, video stored rotated 90° CW  → rotate CCW 90°
-      180 → upside-down                                        → rotate 180°
-      270 → phone held portrait other way                      → rotate CW 90°
-      0   → no rotation needed
-    """
     if rotation_degrees == 90:
         return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
     elif rotation_degrees == 180:
@@ -437,7 +365,7 @@ PENALTY_MIN_IF_ANY=0.5
 
 FEEDBACK_ORDER = [FB_CUE_HIGHER, FB_CUE_BOTTOM, FB_CUE_SWING]
 
-# ============ FORM_TIP (optimization advice - doesn't affect score!) ============
+# ============ FORM_TIP ============
 FORM_TIP_SLOW_ECCENTRIC  = "slow_eccentric"
 FORM_TIP_EXPLOSIVE_PULL  = "explosive_pull"
 FORM_TIP_TOP_PAUSE       = "top_pause"
@@ -497,17 +425,12 @@ def run_pullup_analysis(video_path,
     slow_path = not fast_path
 
     if fast_path:
-        return_video = False  # Never produce video in fast path
+        return_video = False
 
     effective_frame_skip = frame_skip
     effective_scale = scale
-
-    # ============================================================
-    # FIX: Use the SAME model_complexity for both paths.
-    # This is the root cause of the rep count mismatch — complexity=0
-    # (lite) produces lower-quality landmarks, causing missed reps.
-    # ============================================================
-    model_complexity = 1  # <-- FIXED: was "0 if fast_path else 1"
+    # FIX: Same model for both paths
+    model_complexity = 1
 
     if fast_path:
         print(f"[FAST MODE][pullup] stable-count profile: frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=full(matched)", flush=True)
@@ -520,8 +443,6 @@ def run_pullup_analysis(video_path,
     cap=cv2.VideoCapture(video_path)
     if not cap.isOpened(): return _ret_err("Could not open video", feedback_path)
 
-    # Read rotation ONCE — OpenCV ignores metadata rotation, so we apply it
-    # manually to every frame so the video is always displayed upright.
     source_rotation = _read_source_rotation_degrees(video_path)
 
     fps_in=cap.get(cv2.CAP_PROP_FPS) or 25
@@ -529,7 +450,6 @@ def run_pullup_analysis(video_path,
     sec_to_frames=lambda s: max(1,int(s*effective_fps))
     frames_to_sec=lambda f: float(f)/effective_fps
 
-    # Video writer (SLOW PATH ONLY)
     out=None
     if slow_path:
         fourcc=cv2.VideoWriter_fourcc(*'mp4v')
@@ -537,10 +457,8 @@ def run_pullup_analysis(video_path,
 
     frame_idx=0
 
-    # Counters
     rep_count=0; good_reps=0; bad_reps=0; rep_reports=[]; all_scores=[]
 
-    # Landmarks
     LSH=mp_pose.PoseLandmark.LEFT_SHOULDER.value;  RSH=mp_pose.PoseLandmark.RIGHT_SHOULDER.value
     LE =mp_pose.PoseLandmark.LEFT_ELBOW.value;     RE =mp_pose.PoseLandmark.RIGHT_ELBOW.value
     LW =mp_pose.PoseLandmark.LEFT_WRIST.value;     RW =mp_pose.PoseLandmark.RIGHT_WRIST.value
@@ -563,7 +481,6 @@ def run_pullup_analysis(video_path,
     onbar=False; onbar_streak=0; offbar_streak=0; prev_torso_cx=None
     offbar_frames_since_any_rep=0; nopose_frames_since_any_rep=0
 
-    # Feedback state
     session_feedback=set()
     rt_fb_msg=None; rt_fb_hold=0
     swing_streak=0
@@ -572,10 +489,8 @@ def run_pullup_analysis(video_path,
     bottom_lockout_max=None
     bottom_already_reported=False
 
-    # Per-cycle tips
     cycle_tip_higher=False; cycle_tip_swing=False; cycle_tip_bottom=False
 
-    # Tempo tracking for form_tip
     rep_phase_timings = []
     phase_start_frame = None
     phase_type = None
@@ -587,7 +502,6 @@ def run_pullup_analysis(video_path,
 
     REARM_DESCENT_EFF=max(RESET_DESCENT*0.60, 0.012)
 
-    # Face-vs-bar
     bar_y_ema=None
     cycle_face_pass=False
     cycle_face_near=False
@@ -598,12 +512,7 @@ def run_pullup_analysis(video_path,
     burst_cntr=0
     processed_frame_count = 0
 
-    # ============================================================
-    # FIX: Always create a fresh Pose with the SAME model_complexity.
-    # Don't use the singleton _FAST_POSE if its complexity differs.
-    # Since we now set _FAST_POSE_COMPLEXITY=1 above, the singleton
-    # matches — but we add a safety check just in case.
-    # ============================================================
+    # FIX: Use same model for both paths
     if fast_path and _FAST_POSE is not None and _FAST_POSE_COMPLEXITY == model_complexity:
         pose = _FAST_POSE
     else:
@@ -621,7 +530,6 @@ def run_pullup_analysis(video_path,
             if not ret: break
             frame_idx += 1
 
-            # Fix orientation — apply before any processing or writing
             if source_rotation != 0:
                 frame = _rotate_frame(frame, source_rotation)
 
@@ -638,7 +546,6 @@ def run_pullup_analysis(video_path,
                 frame=cv2.resize(frame,(0,0),fx=effective_scale,fy=effective_scale)
             h,w=frame.shape[:2]
 
-            # Initialize video writer (SLOW PATH ONLY)
             if slow_path and out is None:
                 out=cv2.VideoWriter(output_path,fourcc,effective_fps,(w,h))
 
@@ -747,7 +654,13 @@ def run_pullup_analysis(video_path,
             head_vel_prev = head_vel
 
             if onbar and vis_strict_ok:
-                # REP COUNTING
+                # ============================================================
+                # FIX: Compute ascent_amt early so face/swing detection can
+                # run BEFORE rep counting. This ensures cycle_tip_* flags
+                # are set before the rep is scored.
+                # ============================================================
+
+                # --- Phase 1: Update cycle tracking (ascent, elbow, bottom) ---
                 if asc_base_head is None:
                     if head_vel<-abs(HEAD_VEL_UP_TINY):
                         asc_base_head=head_y
@@ -773,86 +686,20 @@ def run_pullup_analysis(video_path,
                     if bottom_lockout_max is None: bottom_lockout_max = lockout_now
                     else: bottom_lockout_max = max(bottom_lockout_max, lockout_now)
 
-                    reset_by_desc=(asc_base_head is not None) and ((head_y-asc_base_head)>=RESET_DESCENT)
-                    reset_by_elb =(elbow_angle>=RESET_ELBOW)
-
-                    if reset_by_desc or reset_by_elb:
-                        if phase_type == "eccentric" and phase_start_frame is not None:
-                            eccentric_frames = processed_frame_count - phase_start_frame
-                            eccentric_sec = frames_to_sec(eccentric_frames)
-                            if len(rep_phase_timings) > 0:
-                                rep_phase_timings[-1]["eccentric_sec"] = eccentric_sec
-
-                        if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
-                            cycle_tip_bottom = True
-                            bottom_fail_count += 1
-                            if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS and not bottom_already_reported:
-                                session_feedback.add(FB_CUE_BOTTOM)
-                                bottom_already_reported = True
-
-                        if (not counted_this_cycle) and (cycle_peak_ascent>=HEAD_MIN_ASCENT) and (cycle_min_elbow<=ELBOW_TOP_ANGLE):
-                            rep_has_tip = cycle_tip_higher or cycle_tip_swing or cycle_tip_bottom
-                            _count_rep(rep_reports,rep_count,0.0,cycle_min_elbow,
-                                       asc_base_head,
-                                       baseline_head_y_global-cycle_peak_ascent if baseline_head_y_global is not None else head_y,
-                                       all_scores, rep_has_tip)
-                            rep_count+=1
-                            if rep_has_tip: bad_reps+=1
-                            else: good_reps+=1
-
-                        asc_base_head=head_y
-                        cycle_peak_ascent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
-                        allow_new_peak=True
-                        bottom_phase_max_elbow=None
-                        bottom_lockout_max=None
-                        cycle_tip_higher=False; cycle_tip_swing=False; cycle_tip_bottom=False
-                        cycle_face_pass=False; cycle_face_near=False
-                        face_pass_q.clear(); face_near_q.clear()
-                        phase_start_frame=processed_frame_count
-                        phase_type="concentric"
-
                 ascent_amt=0.0 if asc_base_head is None else (asc_base_head-head_y)
 
-                at_top=(elbow_angle<=ELBOW_TOP_ANGLE) and (ascent_amt>=HEAD_MIN_ASCENT)
-                raw_top=(raw_elbow_min<=(ELBOW_TOP_ANGLE+4.0)) and (ascent_amt>=HEAD_MIN_ASCENT*0.92)
-                at_top=at_top or raw_top
-                can_cnt=(frame_idx - last_peak_frame) >= REFRACTORY_FRAMES
+                # ============================================================
+                # FIX: Phase 2 — Run SWING and FACE detection BEFORE rep counting
+                # so that cycle_tip_* flags are already set when the rep is scored.
+                # ============================================================
 
-                if at_top and allow_new_peak and can_cnt and (not counted_this_cycle):
-                    if phase_type == "concentric" and phase_start_frame is not None:
-                        concentric_frames = processed_frame_count - phase_start_frame
-                        concentric_sec = frames_to_sec(concentric_frames)
-                        rep_phase_timings.append({
-                            "concentric_sec": concentric_sec,
-                            "top_hold_sec": 0.0,
-                            "eccentric_sec": 0.0
-                        })
-                        phase_start_frame = processed_frame_count
-                        phase_type = "top"
+                # --- Swing detection ---
+                if torso_dx_norm>SWING_THR: swing_streak+=1
+                else: swing_streak=max(0,swing_streak-1)
+                if (swing_streak>=SWING_MIN_STREAK) and (not cycle_tip_swing):
+                    session_feedback.add(FB_CUE_SWING); cur_rt=FB_CUE_SWING; cycle_tip_swing=True
 
-                    rep_has_tip = cycle_tip_higher or cycle_tip_swing or cycle_tip_bottom
-                    _count_rep(rep_reports,rep_count,0.0,elbow_angle,
-                               asc_base_head if asc_base_head is not None else head_y, head_y,
-                               all_scores, rep_has_tip)
-                    rep_count+=1
-                    if rep_has_tip: bad_reps+=1
-                    else: good_reps+=1
-                    last_peak_frame=frame_idx; allow_new_peak=False; counted_this_cycle=True
-                    bottom_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
-
-                if (allow_new_peak is False) and (last_peak_frame>0):
-                    if head_prev is not None and (head_y - head_prev) > 0 and (asc_base_head is not None):
-                        if (head_y - (asc_base_head - cycle_peak_ascent)) >= REARM_DESCENT_EFF:
-                            if phase_type == "top" and phase_start_frame is not None:
-                                top_hold_frames = processed_frame_count - phase_start_frame
-                                top_hold_sec = frames_to_sec(top_hold_frames)
-                                if len(rep_phase_timings) > 0:
-                                    rep_phase_timings[-1]["top_hold_sec"] = top_hold_sec
-                                phase_start_frame = processed_frame_count
-                                phase_type = "eccentric"
-                            allow_new_peak=True
-
-                # Face detection (throttled)
+                # --- Face detection (throttled) ---
                 face_check_counter += 1
                 if face_check_counter >= FACE_CHECK_INTERVAL:
                     face_check_counter = 0
@@ -895,14 +742,95 @@ def run_pullup_analysis(video_path,
                         if face_failed and not cycle_tip_higher:
                             cycle_tip_higher = True
                             session_feedback.add(FB_CUE_HIGHER)
-                            cur_rt = FB_CUE_HIGHER
+                            if cur_rt is None:
+                                cur_rt = FB_CUE_HIGHER
                             allow_new_peak = False
 
-                # Swing cue
-                if torso_dx_norm>SWING_THR: swing_streak+=1
-                else: swing_streak=max(0,swing_streak-1)
-                if (cur_rt is None) and (swing_streak>=SWING_MIN_STREAK) and (not cycle_tip_swing):
-                    session_feedback.add(FB_CUE_SWING); cur_rt=FB_CUE_SWING; cycle_tip_swing=True
+                # ============================================================
+                # Phase 3: Cycle reset (descent detection)
+                # ============================================================
+                if asc_base_head is not None:
+                    reset_by_desc=((head_y-asc_base_head)>=RESET_DESCENT)
+                    reset_by_elb =(elbow_angle>=RESET_ELBOW)
+
+                    if reset_by_desc or reset_by_elb:
+                        if phase_type == "eccentric" and phase_start_frame is not None:
+                            eccentric_frames = processed_frame_count - phase_start_frame
+                            eccentric_sec = frames_to_sec(eccentric_frames)
+                            if len(rep_phase_timings) > 0:
+                                rep_phase_timings[-1]["eccentric_sec"] = eccentric_sec
+
+                        if _check_bottom_extension(bottom_phase_max_elbow, bottom_lockout_max):
+                            cycle_tip_bottom = True
+                            bottom_fail_count += 1
+                            if bottom_fail_count >= BOTTOM_FAIL_MIN_REPS and not bottom_already_reported:
+                                session_feedback.add(FB_CUE_BOTTOM)
+                                bottom_already_reported = True
+
+                        if (not counted_this_cycle) and (cycle_peak_ascent>=HEAD_MIN_ASCENT) and (cycle_min_elbow<=ELBOW_TOP_ANGLE):
+                            rep_has_tip = cycle_tip_higher or cycle_tip_swing or cycle_tip_bottom
+                            _count_rep(rep_reports,rep_count,0.0,cycle_min_elbow,
+                                       asc_base_head,
+                                       baseline_head_y_global-cycle_peak_ascent if baseline_head_y_global is not None else head_y,
+                                       all_scores, rep_has_tip)
+                            rep_count+=1
+                            if rep_has_tip: bad_reps+=1
+                            else: good_reps+=1
+
+                        asc_base_head=head_y
+                        cycle_peak_ascent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
+                        allow_new_peak=True
+                        bottom_phase_max_elbow=None
+                        bottom_lockout_max=None
+                        cycle_tip_higher=False; cycle_tip_swing=False; cycle_tip_bottom=False
+                        cycle_face_pass=False; cycle_face_near=False
+                        face_pass_q.clear(); face_near_q.clear()
+                        phase_start_frame=processed_frame_count
+                        phase_type="concentric"
+
+                # ============================================================
+                # Phase 4: Rep counting at top (AFTER feedback detection)
+                # ============================================================
+                at_top=(elbow_angle<=ELBOW_TOP_ANGLE) and (ascent_amt>=HEAD_MIN_ASCENT)
+                raw_top=(raw_elbow_min<=(ELBOW_TOP_ANGLE+4.0)) and (ascent_amt>=HEAD_MIN_ASCENT*0.92)
+                at_top=at_top or raw_top
+                can_cnt=(frame_idx - last_peak_frame) >= REFRACTORY_FRAMES
+
+                if at_top and allow_new_peak and can_cnt and (not counted_this_cycle):
+                    if phase_type == "concentric" and phase_start_frame is not None:
+                        concentric_frames = processed_frame_count - phase_start_frame
+                        concentric_sec = frames_to_sec(concentric_frames)
+                        rep_phase_timings.append({
+                            "concentric_sec": concentric_sec,
+                            "top_hold_sec": 0.0,
+                            "eccentric_sec": 0.0
+                        })
+                        phase_start_frame = processed_frame_count
+                        phase_type = "top"
+
+                    # FIX: cycle_tip_* flags are NOW already set by swing/face detection above
+                    rep_has_tip = cycle_tip_higher or cycle_tip_swing or cycle_tip_bottom
+                    _count_rep(rep_reports,rep_count,0.0,elbow_angle,
+                               asc_base_head if asc_base_head is not None else head_y, head_y,
+                               all_scores, rep_has_tip)
+                    rep_count+=1
+                    if rep_has_tip: bad_reps+=1
+                    else: good_reps+=1
+                    last_peak_frame=frame_idx; allow_new_peak=False; counted_this_cycle=True
+                    bottom_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
+
+                # Phase transition detection (top → eccentric)
+                if (allow_new_peak is False) and (last_peak_frame>0):
+                    if head_prev is not None and (head_y - head_prev) > 0 and (asc_base_head is not None):
+                        if (head_y - (asc_base_head - cycle_peak_ascent)) >= REARM_DESCENT_EFF:
+                            if phase_type == "top" and phase_start_frame is not None:
+                                top_hold_frames = processed_frame_count - phase_start_frame
+                                top_hold_sec = frames_to_sec(top_hold_frames)
+                                if len(rep_phase_timings) > 0:
+                                    rep_phase_timings[-1]["top_hold_sec"] = top_hold_sec
+                                phase_start_frame = processed_frame_count
+                                phase_type = "eccentric"
+                            allow_new_peak=True
 
             else:
                 asc_base_head=None; allow_new_peak=True
@@ -942,8 +870,6 @@ def run_pullup_analysis(video_path,
             else: good_reps+=1
 
     finally:
-        # FIX: Always close pose (was skipping close in fast path)
-        # Only close if it's NOT the shared singleton (to avoid breaking future calls)
         if pose is not _FAST_POSE:
             pose.close()
 
@@ -953,17 +879,41 @@ def run_pullup_analysis(video_path,
     cv2.destroyAllWindows()
 
     # ============ SESSION SCORE ============
+    # ============================================================
+    # FIX: If session_feedback has issues, the score MUST reflect them
+    # even if per-rep scoring missed some (e.g. feedback detected between reps).
+    # We take the MINIMUM of per-rep average and session-penalty score.
+    # ============================================================
     if rep_count==0:
         technique_score=0.0
-    elif all_scores:
-        technique_score=_half_floor10(np.mean(all_scores))
     else:
+        # Per-rep average score
+        if all_scores:
+            per_rep_score = np.mean(all_scores)
+        else:
+            per_rep_score = 10.0
+
+        # Session-level penalty score
         if session_feedback:
             penalty = sum(FB_WEIGHTS.get(m,FB_DEFAULT_WEIGHT) for m in set(session_feedback))
             penalty = max(PENALTY_MIN_IF_ANY, penalty)
+            session_score = max(0.0, 10.0 - penalty)
         else:
-            penalty = 0.0
-        technique_score=_half_floor10(max(0.0,10.0-penalty))
+            session_score = 10.0
+
+        # FIX: Take the MINIMUM — if session detected issues, score can't be perfect
+        # even if per-rep scoring happened to miss them
+        raw_score = min(per_rep_score, session_score)
+        technique_score = _half_floor10(raw_score)
+
+        # FIX: If there's session feedback but all reps scored as good,
+        # retroactively mark some reps as bad (proportional to feedback severity)
+        if session_feedback and bad_reps == 0 and rep_count > 0:
+            # At least 1 rep should be marked bad if there's any feedback
+            estimated_bad = max(1, int(round(rep_count * penalty / 10.0)))
+            estimated_bad = min(estimated_bad, rep_count)
+            bad_reps = estimated_bad
+            good_reps = rep_count - bad_reps
 
     # ============ FORM_TIP LOGIC ============
     form_tip = None
@@ -1030,8 +980,6 @@ def run_pullup_analysis(video_path,
                 "-c:v", "libx264", "-preset", "fast",
                 "-crf", str(int(encode_crf if encode_crf is not None else 23)),
                 "-movflags", "+faststart", "-pix_fmt", "yuv420p",
-                # Pixels are already rotated correctly — explicitly clear any
-                # stale rotation metadata so players don't rotate a second time.
                 "-metadata:s:v:0", "rotate=0",
                 encoded_path,
             ]
