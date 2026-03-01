@@ -285,17 +285,21 @@ class DeadliftRepDetector:
         self.hip_ema        = EMA(0.45)
         self.ydrop_ema      = EMA(0.40)
         self.foreshort_ema  = EMA(0.40)
+        self.compress_ema   = EMA(0.40)
         self.composite_ema  = EMA(0.30)
 
-        # ── Standing calibration ──
-        # We collect torso_len and shoulder_y in the first frames / between reps
-        # to know what "standing" looks like, so we can measure relative change.
-        self._calib_torso_lens = []   # euclidean dist shoulder↔hip while standing
-        self._calib_shoulder_ys = []  # shoulder.y while standing
-        self._calib_hip_ys = []       # hip.y while standing (reference)
-        self.standing_torso_len = None   # calibrated
-        self.standing_shoulder_y = None  # calibrated
-        self.standing_hip_y = None       # calibrated
+        # ── Adaptive standing calibration ──
+        # Instead of calibrating from first N frames (which may be bent),
+        # we continuously track the MOST UPRIGHT position ever observed:
+        #   - Maximum torso_len (tallest torso = most upright)
+        #   - Minimum shoulder_y (highest shoulder = most upright)
+        # This way even if video starts at bottom, once the person stands
+        # up after first rep, calibration auto-corrects.
+        self.standing_torso_len = None    # max torso_len seen
+        self.standing_shoulder_y = None   # min shoulder_y seen (highest)
+        self.standing_hip_y = None
+        self._torso_len_history = []      # rolling buffer for percentile
+        self._shoulder_y_history = []
         self._frames_seen = 0
 
         # Per-rep quality tracking
@@ -318,71 +322,81 @@ class DeadliftRepDetector:
         self.all_scores = []
         self.reps_report = []
 
-    # ── Calibration ──
+    # ── Adaptive calibration ──
     def _update_calibration(self, shoulder, hip):
-        """Collect standing-posture measurements."""
+        """
+        Adaptively learn standing posture by tracking the MOST UPRIGHT
+        position observed so far.
+        
+        Key insight: "most upright" = longest torso in 2D + highest shoulder.
+        We use the 95th percentile of torso_len and 5th percentile of shoulder_y
+        (not raw max/min to avoid outliers).
+        
+        This works even if the video starts with the person already bent over,
+        because as soon as they stand up between reps, calibration improves.
+        """
         torso_len = float(np.linalg.norm(shoulder - hip))
-        self._calib_torso_lens.append(torso_len)
-        self._calib_shoulder_ys.append(float(shoulder[1]))
-        self._calib_hip_ys.append(float(hip[1]))
-        # Keep a rolling window
-        max_buf = 30
-        if len(self._calib_torso_lens) > max_buf:
-            self._calib_torso_lens = self._calib_torso_lens[-max_buf:]
-            self._calib_shoulder_ys = self._calib_shoulder_ys[-max_buf:]
-            self._calib_hip_ys = self._calib_hip_ys[-max_buf:]
-        # Use median for robustness
-        self.standing_torso_len = float(np.median(self._calib_torso_lens))
-        self.standing_shoulder_y = float(np.median(self._calib_shoulder_ys))
-        self.standing_hip_y = float(np.median(self._calib_hip_ys))
+        shoulder_y = float(shoulder[1])
+        hip_y = float(hip[1])
+        
+        self._torso_len_history.append(torso_len)
+        self._shoulder_y_history.append(shoulder_y)
+        
+        # Keep rolling buffer (enough to capture a few reps)
+        max_buf = 120
+        if len(self._torso_len_history) > max_buf:
+            self._torso_len_history = self._torso_len_history[-max_buf:]
+            self._shoulder_y_history = self._shoulder_y_history[-max_buf:]
+        
+        # Use high percentile for torso_len (longest = most upright)
+        # Use low percentile for shoulder_y (highest = most upright, y=0 is top)
+        arr_tl = np.array(self._torso_len_history)
+        arr_sy = np.array(self._shoulder_y_history)
+        
+        self.standing_torso_len = float(np.percentile(arr_tl, 92))
+        self.standing_shoulder_y = float(np.percentile(arr_sy, 8))
+        self.standing_hip_y = hip_y  # hip doesn't move much, just track current
 
     def _compute_composite(self, torso_angle, hip_angle, x_delta,
-                           shoulder_y_drop, foreshortening, side_ratio):
+                           shoulder_y_drop, foreshortening, compression, side_ratio):
         """
-        Fuse 5 signals into composite hinge-depth [0, 1].
-        Weights adapt to camera angle.
+        Fuse 6 signals into composite hinge-depth [0, 1].
+        
+        Signal 6 (compression) is the KEY front-view signal — it needs NO
+        calibration and works from frame 1.  Signals 4 & 5 (ydrop, foreshortening)
+        amplify it once calibration converges.
         """
-        # ── Normalize each signal to [0, 1] ──
-        # (0 = standing, 1 = deep hinge)
-
-        # Signal 1: torso angle vs vertical (0°=upright → ~70°=deep hinge)
-        torso_norm = float(np.clip((torso_angle - 10) / 60.0, 0.0, 1.0))
-
-        # Signal 2: hip angle (170°=standing → ~100°=deep hinge)
-        hip_norm = float(np.clip((170 - hip_angle) / 70.0, 0.0, 1.0))
-
-        # Signal 3: x-delta (side view only)
-        xdelta_norm = float(np.clip((x_delta - 0.02) / 0.12, 0.0, 1.0))
-
-        # Signal 4: shoulder Y-drop ratio
-        # How far shoulder has dropped from standing position, normalized by torso length
-        # In standing: ~0.  In deep hinge from front: shoulder drops ~0.5-1.0× torso length
-        ydrop_norm = float(np.clip(shoulder_y_drop / 0.55, 0.0, 1.0))
-
-        # Signal 5: torso foreshortening
-        # Ratio of (standing_torso_len - current_torso_len) / standing_torso_len
-        # In standing: ~0.  In deep hinge from front: torso appears ~40-70% shorter
+        torso_norm    = float(np.clip((torso_angle - 10) / 60.0, 0.0, 1.0))
+        hip_norm      = float(np.clip((170 - hip_angle) / 70.0, 0.0, 1.0))
+        xdelta_norm   = float(np.clip((x_delta - 0.02) / 0.12, 0.0, 1.0))
+        ydrop_norm    = float(np.clip(shoulder_y_drop / 0.55, 0.0, 1.0))
         foreshort_norm = float(np.clip(foreshortening / 0.50, 0.0, 1.0))
+        compress_norm = float(np.clip(compression, 0.0, 1.0))
 
-        # ── Adaptive weights by view angle ──
         if side_ratio > 0.65:
-            # Mostly SIDE view → torso angle & x_delta are king
-            w = {'torso': 0.38, 'hip': 0.22, 'xdelta': 0.28, 'ydrop': 0.07, 'fore': 0.05}
+            # SIDE view
+            w = {'torso': 0.35, 'hip': 0.20, 'xdelta': 0.25,
+                 'ydrop': 0.05, 'fore': 0.05, 'comp': 0.10}
         elif side_ratio < 0.25:
-            # Mostly FRONT/BACK view → Y-drop & foreshortening are primary
-            w = {'torso': 0.08, 'hip': 0.15, 'xdelta': 0.02, 'ydrop': 0.45, 'fore': 0.30}
+            # FRONT/BACK view — compression is calibration-free anchor,
+            # ydrop & foreshort boost once calibrated
+            w = {'torso': 0.05, 'hip': 0.10, 'xdelta': 0.00,
+                 'ydrop': 0.25, 'fore': 0.20, 'comp': 0.40}
         elif side_ratio < 0.45:
-            # Diagonal leaning front
-            w = {'torso': 0.18, 'hip': 0.25, 'xdelta': 0.07, 'ydrop': 0.30, 'fore': 0.20}
+            # Diagonal (leaning front)
+            w = {'torso': 0.15, 'hip': 0.18, 'xdelta': 0.05,
+                 'ydrop': 0.17, 'fore': 0.15, 'comp': 0.30}
         else:
-            # Diagonal leaning side
-            w = {'torso': 0.30, 'hip': 0.28, 'xdelta': 0.17, 'ydrop': 0.15, 'fore': 0.10}
+            # Diagonal (leaning side)
+            w = {'torso': 0.28, 'hip': 0.20, 'xdelta': 0.15,
+                 'ydrop': 0.10, 'fore': 0.07, 'comp': 0.20}
 
         composite = (w['torso'] * torso_norm +
                      w['hip']   * hip_norm +
                      w['xdelta'] * xdelta_norm +
                      w['ydrop'] * ydrop_norm +
-                     w['fore']  * foreshort_norm)
+                     w['fore']  * foreshort_norm +
+                     w['comp']  * compress_norm)
 
         return self.composite_ema.update(composite)
 
@@ -429,15 +443,11 @@ class DeadliftRepDetector:
         # View angle
         side_ratio = self.view_estimator.estimate(smoothed_pts)
 
-        # ── Calibrate standing posture ──
-        # During first N frames, or while in STANDING state between reps
-        is_calibrating = (self._frames_seen <= self.CALIBRATION_FRAMES or
-                          (self.state == self.STANDING and
-                           frame_idx - self.last_rep_frame > 3))
-        if is_calibrating:
-            self._update_calibration(shoulder, hip)
+        # ── Update adaptive calibration EVERY frame ──
+        # (it finds the most upright position ever seen, so it's safe to call always)
+        self._update_calibration(shoulder, hip)
 
-        # ── Compute all 5 signals ──
+        # ── Compute all 6 signals ──
 
         # Signal 1: Torso angle vs vertical
         torso_angle = _angle_to_vertical(hip, shoulder)
@@ -470,10 +480,33 @@ class DeadliftRepDetector:
             foreshortening = max(0.0, foreshortening)  # only count shortening
         foreshort_smooth = self.foreshort_ema.update(foreshortening)
 
+        # Signal 6: Torso-to-legs Y ratio (NO calibration needed!)
+        # Uses the ratio (hip.y - shoulder.y) / (ankle.y - hip.y).
+        # - "hip-to-ankle" Y distance is STABLE (legs don't change length)
+        # - "shoulder-to-hip" Y distance SHRINKS when bending forward (front view)
+        # Standing: ratio ≈ 0.50-0.55;  Bottom of deadlift: ratio ≈ 0.15-0.25
+        # This is a 60%+ change — very strong signal from front view.
+        torso_leg_ratio = 0.0
+        if a_ok:
+            s2h_y = hip[1] - shoulder[1]   # shoulder-to-hip vertical (positive = upright)
+            h2a_y = ankle[1] - hip[1]       # hip-to-ankle vertical (stable reference)
+            if h2a_y > 0.03:
+                torso_leg_ratio = s2h_y / h2a_y
+        elif k_ok:
+            # Fallback: use knee if ankle not visible
+            s2h_y = hip[1] - shoulder[1]
+            h2k_y = knee[1] - hip[1]
+            if h2k_y > 0.03:
+                torso_leg_ratio = s2h_y / h2k_y
+        # Normalize: ratio ~0.52 at standing → 0, ratio ~0.15 at deep hinge → 1
+        # compression = (0.52 - ratio) / 0.40, clipped to [0, 1]
+        compression = float(np.clip((0.52 - torso_leg_ratio) / 0.40, 0.0, 1.0))
+        compression_smooth = self.compress_ema.update(compression)
+
         # ── Composite ──
         composite = self._compute_composite(
             torso_smooth, hip_smooth, x_delta,
-            shoulder_y_drop_smooth, foreshort_smooth,
+            shoulder_y_drop_smooth, foreshort_smooth, compression_smooth,
             side_ratio
         )
 
