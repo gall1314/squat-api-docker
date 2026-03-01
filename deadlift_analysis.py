@@ -305,27 +305,31 @@ class DeadliftRepDetector:
         composite = self._compute_composite(torso_angle_smooth, hip_angle_smooth, side_ratio)
 
         # ── NEW: Front-view signal B (when camera shows front/back view) ──
-        # More relaxed threshold: side_ratio < 0.45 (was 0.35)
-        # Also compute signal B more robustly
-        if side_ratio < 0.45:
+        # Even more relaxed threshold + stronger signal B
+        if side_ratio < 0.6:  # Was 0.45, now 0.6 - catch more front views
             sig_b = 0.0
             
             # Try ankle first, then knee as fallback
             ref_point = None
-            if a_ok and ankle[1] > hip[1]:  # ankle below hip
+            if a_ok and ankle[1] > shoulder[1]:  # ankle clearly below shoulder
                 ref_point = ankle
-            elif k_ok and knee[1] > hip[1]:  # knee below hip  
+            elif k_ok and knee[1] > shoulder[1]:  # knee clearly below shoulder
                 ref_point = knee
                 
             if ref_point is not None:
-                s2h_y = hip[1] - shoulder[1]      # shoulder-to-hip Y (positive = shoulder above hip)
-                h2ref_y = ref_point[1] - hip[1]   # hip-to-ref Y (positive = ref below hip)
+                s2h_y = hip[1] - shoulder[1]      # shoulder-to-hip Y
+                h2ref_y = ref_point[1] - hip[1]   # hip-to-ref Y
                 
-                # Only proceed if measurements make sense
-                if h2ref_y > 0.05 and s2h_y > 0:  # hip clearly above ref, shoulder above hip
-                    ratio = s2h_y / h2ref_y
-                    # Standing: ratio ≈ 0.5-0.6, Bottom: ratio ≈ 0.1-0.2
-                    sig_b = float(np.clip((0.55 - ratio) / 0.45, 0.0, 1.0))
+                # More lenient validation
+                if h2ref_y > 0.03 and s2h_y >= 0:  # just need positive values
+                    if h2ref_y > 0:
+                        ratio = s2h_y / h2ref_y
+                        # More generous normalization: standing ≈ 0.6, bottom ≈ 0.1
+                        sig_b = float(np.clip((0.6 - ratio) / 0.5, 0.0, 1.0))
+                        
+                        # Debug boost for testing
+                        if sig_b > 0.1:
+                            sig_b = min(1.0, sig_b * 1.2)  # 20% boost
                     
             # Use signal B as boost (only if stronger than composite)
             if sig_b > composite:
@@ -774,6 +778,31 @@ class PoseEstimator:
             self._impl.__exit__(None, None, None)
 
 # ===================== MAIN =====================
+def get_video_rotation(video_path):
+    """Get video rotation angle from metadata to fix mobile videos."""
+    try:
+        import subprocess
+        result = subprocess.run([
+            'ffprobe', '-v', 'quiet', '-select_streams', 'v:0', 
+            '-show_entries', 'stream_tags=rotate', '-of', 'csv=p=0', video_path
+        ], capture_output=True, text=True, timeout=10)
+        
+        if result.returncode == 0 and result.stdout.strip():
+            return int(result.stdout.strip())
+    except:
+        pass
+    return 0
+
+def rotate_frame(frame, angle):
+    """Rotate frame by angle (90, 180, 270 degrees)."""
+    if angle == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    elif angle == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    elif angle == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
+
 def run_deadlift_analysis(video_path,
                           frame_skip=3,
                           scale=0.4,
@@ -799,6 +828,9 @@ def run_deadlift_analysis(video_path,
             "good_reps": 0, "bad_reps": 0, "feedback": ["Could not open video"],
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
+
+    # Check for video rotation (mobile videos)
+    rotation_angle = get_video_rotation(video_path)
 
     # Optional YOLO detector
     detector = None
@@ -854,6 +886,11 @@ def run_deadlift_analysis(video_path,
             ret, frame = cap.read()
             if not ret:
                 break
+            
+            # Apply rotation if needed (mobile videos)
+            if rotation_angle != 0:
+                frame = rotate_frame(frame, rotation_angle)
+                
             frame_idx += 1
             if frame_idx % frame_skip != 0:
                 continue
