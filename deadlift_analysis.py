@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — V2 restored + front-view fix
+# deadlift_analysis.py — V3: robust front-view rep detection
 #
 # BASE: exact V2 code that counted reps correctly from side view
-# ADDED: dual MediaPipe API support + front-view signal B (gated by side_ratio)
+# IMPROVED: front-view detection using shoulder-drop + body-compression signals
+# with adaptive calibration (first ~1 second calibrates standing pose)
 
 import os, cv2, math, numpy as np, subprocess
 from collections import deque
@@ -188,21 +189,196 @@ class ViewAngleEstimator:
         side_score = float(np.clip(1.0 - (ratio - 0.15) / 0.85, 0.0, 1.0))
         return self.ema.update(side_score)
 
-# ===================== REP DETECTOR (V2 proven logic + front-view signal) =====================
+
+# ===================== FRONT-VIEW SIGNAL (NEW V3) =====================
+class FrontViewSignal:
+    """
+    Detects deadlift reps from front/back camera angles using signals
+    that are visible even when the depth axis is compressed.
+    
+    Key signals from front view:
+    1. Shoulder Y drop — shoulders move DOWN in frame as person hinges
+    2. Body compression — shoulder-to-hip Y distance shrinks relative to 
+       hip-to-ankle distance as torso bends forward toward camera
+    3. Mid-shoulder Y relative to standing calibration
+    
+    Uses adaptive calibration: collects the first N frames to establish
+    the "standing" baseline, then measures deviation from it.
+    """
+    
+    def __init__(self, calibration_frames=8):
+        self.calibration_frames = calibration_frames
+        self.calibration_samples = []
+        self.standing_shoulder_y = None      # average shoulder Y when standing
+        self.standing_hip_y = None           # average hip Y when standing  
+        self.standing_ankle_y = None         # average ankle Y when standing
+        self.standing_torso_ratio = None     # shoulder-hip / hip-ankle ratio when standing
+        self.standing_shoulder_hip_dist = None  # absolute Y distance shoulder-hip when standing
+        
+        self.signal_ema = EMA(0.40)
+        self.frame_count = 0
+        self.calibrated = False
+    
+    def _get_key_points(self, smoothed_pts):
+        """Extract averaged shoulder, hip, ankle Y positions."""
+        ls = smoothed_pts.get(11)
+        rs = smoothed_pts.get(12)
+        lh = smoothed_pts.get(23)
+        rh = smoothed_pts.get(24)
+        la = smoothed_pts.get(27)
+        ra = smoothed_pts.get(28)
+        lk = smoothed_pts.get(25)
+        rk = smoothed_pts.get(26)
+        
+        # Need at least shoulders and hips
+        if not ls or not rs or not lh or not rh:
+            return None
+            
+        shoulder_y = (ls[1] + rs[1]) / 2.0
+        hip_y = (lh[1] + rh[1]) / 2.0
+        
+        # Ankle — use if available, else use knee, else None
+        ankle_y = None
+        if la and ra:
+            ankle_y = (la[1] + ra[1]) / 2.0
+        elif la:
+            ankle_y = la[1]
+        elif ra:
+            ankle_y = ra[1]
+        elif lk and rk:
+            ankle_y = (lk[1] + rk[1]) / 2.0
+        elif lk:
+            ankle_y = lk[1]
+        elif rk:
+            ankle_y = rk[1]
+            
+        return {
+            'shoulder_y': shoulder_y,
+            'hip_y': hip_y,
+            'ankle_y': ankle_y,
+            'shoulder_x_mid': (ls[0] + rs[0]) / 2.0,
+            'hip_x_mid': (lh[0] + rh[0]) / 2.0,
+        }
+    
+    def update(self, smoothed_pts):
+        """
+        Returns a front-view hinge signal in [0, 1].
+        0 = standing upright, 1 = fully hinged.
+        Returns None if not enough data.
+        """
+        self.frame_count += 1
+        pts = self._get_key_points(smoothed_pts)
+        if pts is None:
+            return self.signal_ema.value if self.signal_ema.value is not None else 0.0
+        
+        shoulder_y = pts['shoulder_y']
+        hip_y = pts['hip_y']
+        ankle_y = pts['ankle_y']
+        
+        # --- Calibration phase: collect standing baseline ---
+        if not self.calibrated:
+            self.calibration_samples.append(pts)
+            if len(self.calibration_samples) >= self.calibration_frames:
+                self._calibrate()
+            # During calibration, return 0 (standing)
+            self.signal_ema.update(0.0)
+            return 0.0
+        
+        # --- Signal computation ---
+        # Signal 1: Shoulder drop (how far shoulder Y has moved down from standing)
+        # In normalized coords, Y increases downward
+        # When hinging forward from front view, shoulders drop in the frame
+        shoulder_drop = shoulder_y - self.standing_shoulder_y
+        
+        # Normalize: at full deadlift from front, shoulders can drop by ~20-40% 
+        # of the standing shoulder-to-hip distance
+        if self.standing_shoulder_hip_dist > 0.01:
+            sig_shoulder_drop = float(np.clip(
+                shoulder_drop / (self.standing_shoulder_hip_dist * 0.6),
+                0.0, 1.0
+            ))
+        else:
+            sig_shoulder_drop = 0.0
+        
+        # Signal 2: Torso compression — shoulder-hip Y distance shrinks
+        # as torso rotates toward/away from camera
+        current_sh_dist = hip_y - shoulder_y  # positive when hip below shoulder
+        if self.standing_shoulder_hip_dist > 0.01:
+            # Ratio: 1.0 when same as standing, <1.0 when compressed
+            compression_ratio = current_sh_dist / self.standing_shoulder_hip_dist
+            # Convert: more compression = higher signal
+            sig_compression = float(np.clip(
+                (1.0 - compression_ratio) / 0.5,  # 50% compression = signal 1.0
+                0.0, 1.0
+            ))
+        else:
+            sig_compression = 0.0
+        
+        # Signal 3: Hip Y stability check — hips shouldn't move much in deadlift
+        # This validates that we're seeing a hinge, not just the person walking away
+        hip_shift = abs(hip_y - self.standing_hip_y)
+        hip_stable = hip_shift < (self.standing_shoulder_hip_dist * 0.3)
+        
+        # Combine signals
+        # Shoulder drop is the PRIMARY signal for front view
+        # Compression is the SECONDARY signal (confirms hinging vs just bending knees)
+        if hip_stable:
+            combined = 0.65 * sig_shoulder_drop + 0.35 * sig_compression
+        else:
+            # Hip moved a lot — might be walking, reduce confidence
+            combined = 0.4 * sig_shoulder_drop + 0.2 * sig_compression
+        
+        # Additional boost: if ankle is visible and torso ratio changed significantly
+        if ankle_y is not None and self.standing_torso_ratio is not None:
+            hip_ankle_dist = ankle_y - hip_y
+            if hip_ankle_dist > 0.03:
+                current_ratio = current_sh_dist / hip_ankle_dist
+                ratio_change = self.standing_torso_ratio - current_ratio
+                if ratio_change > 0.05:  # torso got shorter relative to legs
+                    ratio_boost = float(np.clip(ratio_change / 0.4, 0.0, 0.3))
+                    combined = min(1.0, combined + ratio_boost)
+        
+        smoothed = self.signal_ema.update(combined)
+        return smoothed
+    
+    def _calibrate(self):
+        """Establish standing baseline from collected samples."""
+        sy = np.mean([s['shoulder_y'] for s in self.calibration_samples])
+        hy = np.mean([s['hip_y'] for s in self.calibration_samples])
+        
+        ankle_samples = [s['ankle_y'] for s in self.calibration_samples if s['ankle_y'] is not None]
+        ay = np.mean(ankle_samples) if ankle_samples else None
+        
+        self.standing_shoulder_y = sy
+        self.standing_hip_y = hy
+        self.standing_ankle_y = ay
+        self.standing_shoulder_hip_dist = hy - sy  # positive (hip below shoulder)
+        
+        if ay is not None and (ay - hy) > 0.01:
+            self.standing_torso_ratio = (hy - sy) / (ay - hy)
+        else:
+            self.standing_torso_ratio = None
+        
+        self.calibrated = True
+
+
+# ===================== REP DETECTOR V3 =====================
 class DeadliftRepDetector:
     """
-    V2 proven rep detection with 2-signal composite (torso angle + hip angle).
+    V2 proven rep detection with side-view composite (torso angle + hip angle).
+    V3 adds: FrontViewSignal that blends in when side_ratio indicates front/back view.
     
-    ADDED for front view: when side_ratio < 0.35, we also compute a 
-    torso-to-legs Y ratio signal and take max(composite, sig_b_front).
-    This is ONLY active for front/back camera angles.
+    The blending is smooth: 
+    - side_ratio > 0.6 → 100% side-view signals (V2 behavior, untouched)
+    - side_ratio < 0.3 → 100% front-view signal
+    - between → linear blend
     """
 
     STANDING = 0
     HINGING  = 1
     RISING   = 2
 
-    # V2 original thresholds (PROVEN)
+    # V2 original thresholds (PROVEN — unchanged)
     COMPOSITE_HINGE_START = 0.25
     COMPOSITE_HINGE_DEEP  = 0.50
     COMPOSITE_STANDING    = 0.15
@@ -221,6 +397,9 @@ class DeadliftRepDetector:
         self.torso_angle_ema = EMA(0.45)
         self.hip_angle_ema = EMA(0.45)
         self.composite_ema = EMA(0.40)
+
+        # V3: Front-view signal
+        self.front_signal = FrontViewSignal(calibration_frames=8)
 
         # Per-rep tracking
         self.rep_max_composite = 0.0
@@ -242,7 +421,7 @@ class DeadliftRepDetector:
         self.all_scores = []
         self.reps_report = []
 
-    def _compute_composite(self, torso_angle, hip_angle, side_ratio):
+    def _compute_side_composite(self, torso_angle, hip_angle, side_ratio):
         """V2 ORIGINAL: 2-signal composite weighted by view angle."""
         torso_norm = float(np.clip((torso_angle - 12) / 55.0, 0.0, 1.0))
         hip_norm = float(np.clip((170 - hip_angle) / 70.0, 0.0, 1.0))
@@ -270,7 +449,7 @@ class DeadliftRepDetector:
             return 0.5 if attr == 'visibility' else 0.0
 
     def process_frame(self, smoothed_pts, raw_landmarks, frame_idx):
-        """V2 ORIGINAL state machine + front-view signal B."""
+        """V2 state machine with V3 front-view blending."""
         self.frame_count = frame_idx
         lm = raw_landmarks
 
@@ -283,17 +462,17 @@ class DeadliftRepDetector:
                 return np.array(smoothed_pts[fallback_idx], dtype=float), True
             return None, False
 
-        shoulder, s_ok = _get_pt(12, 11)  # RIGHT_SHOULDER, LEFT_SHOULDER
-        hip, h_ok = _get_pt(24, 23)       # RIGHT_HIP, LEFT_HIP
-        knee, k_ok = _get_pt(26, 25)      # RIGHT_KNEE, LEFT_KNEE
-        ankle, a_ok = _get_pt(28, 27)     # RIGHT_ANKLE, LEFT_ANKLE
+        shoulder, s_ok = _get_pt(12, 11)
+        hip, h_ok = _get_pt(24, 23)
+        knee, k_ok = _get_pt(26, 25)
+        ankle, a_ok = _get_pt(28, 27)
 
         if not (s_ok and h_ok):
             return self.prev_composite, None, None
 
         side_ratio = self.view_estimator.estimate(smoothed_pts)
 
-        # ── V2 ORIGINAL: torso angle + hip angle ──
+        # ── V2: Side-view composite (always computed) ──
         torso_angle = _angle_to_vertical(hip, shoulder)
         torso_angle_smooth = self.torso_angle_ema.update(torso_angle)
 
@@ -302,42 +481,35 @@ class DeadliftRepDetector:
             hip_angle = _angle_3pt(shoulder, hip, knee)
         hip_angle_smooth = self.hip_angle_ema.update(hip_angle)
 
-        composite = self._compute_composite(torso_angle_smooth, hip_angle_smooth, side_ratio)
+        side_composite = self._compute_side_composite(torso_angle_smooth, hip_angle_smooth, side_ratio)
 
-        # ── NEW: Front-view signal B (when camera shows front/back view) ──
-        # Even more relaxed threshold + stronger signal B
-        if side_ratio < 0.6:  # Was 0.45, now 0.6 - catch more front views
-            sig_b = 0.0
-            
-            # Try ankle first, then knee as fallback
-            ref_point = None
-            if a_ok and ankle[1] > shoulder[1]:  # ankle clearly below shoulder
-                ref_point = ankle
-            elif k_ok and knee[1] > shoulder[1]:  # knee clearly below shoulder
-                ref_point = knee
-                
-            if ref_point is not None:
-                s2h_y = hip[1] - shoulder[1]      # shoulder-to-hip Y
-                h2ref_y = ref_point[1] - hip[1]   # hip-to-ref Y
-                
-                # More lenient validation
-                if h2ref_y > 0.03 and s2h_y >= 0:  # just need positive values
-                    if h2ref_y > 0:
-                        ratio = s2h_y / h2ref_y
-                        # More generous normalization: standing ≈ 0.6, bottom ≈ 0.1
-                        sig_b = float(np.clip((0.6 - ratio) / 0.5, 0.0, 1.0))
-                        
-                        # Debug boost for testing
-                        if sig_b > 0.1:
-                            sig_b = min(1.0, sig_b * 1.2)  # 20% boost
-                    
-            # Use signal B as boost (only if stronger than composite)
-            if sig_b > composite:
-                composite = sig_b
+        # ── V3: Front-view signal ──
+        front_signal = self.front_signal.update(smoothed_pts)
+
+        # ── V3: Blend based on view angle ──
+        # side_ratio: 1.0 = pure side view, 0.0 = pure front view
+        # Blend zone: 0.3 to 0.6
+        if side_ratio >= 0.6:
+            # Pure side view → use V2 composite unchanged
+            composite = side_composite
+        elif side_ratio <= 0.3:
+            # Pure front view → use front signal entirely
+            composite = front_signal
+        else:
+            # Transition zone: linear blend
+            blend = (side_ratio - 0.3) / 0.3  # 0 at 0.3, 1 at 0.6
+            composite = blend * side_composite + (1.0 - blend) * front_signal
+
+        # Debug logging (every 10 frames)
+        if frame_idx % 10 == 0:
+            view_str = "SIDE" if side_ratio >= 0.6 else ("FRONT" if side_ratio <= 0.3 else "BLEND")
+            print(f"F{frame_idx}: {view_str} sr={side_ratio:.2f} "
+                  f"side_c={side_composite:.3f} front_s={front_signal:.3f} "
+                  f"final={composite:.3f} state={self.state} reps={self.reps}")
 
         # ── V2 ORIGINAL: back rounding check ──
         head_pt = None
-        for idx in (8, 7, 0):  # RIGHT_EAR, LEFT_EAR, NOSE
+        for idx in (8, 7, 0):
             vis = self._get_lm_val(lm, idx, 'visibility')
             if idx in smoothed_pts and vis > 0.45:
                 head_pt = np.array(smoothed_pts[idx], dtype=float)
@@ -351,7 +523,7 @@ class DeadliftRepDetector:
         if k_ok and a_ok:
             knee_angle = _angle_3pt(hip, knee, ankle)
 
-        # ── V2 ORIGINAL state machine ──
+        # ── V2 ORIGINAL state machine (unchanged logic) ──
         rt_feedback = None
         rep_info = None
 
@@ -369,7 +541,6 @@ class DeadliftRepDetector:
             if back_rounded:
                 rt_feedback = "Try to keep your back a bit straighter"
 
-            # V2 ORIGINAL transition: composite drops 0.03 from previous
             if composite < self.prev_composite - 0.03 and self.hinge_frames >= self.MIN_HINGE_FRAMES:
                 if self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.7:
                     self.state = self.RISING
@@ -783,10 +954,10 @@ def get_video_rotation(video_path):
     try:
         import subprocess
         result = subprocess.run([
-            'ffprobe', '-v', 'quiet', '-select_streams', 'v:0', 
+            'ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
             '-show_entries', 'stream_tags=rotate', '-of', 'csv=p=0', video_path
         ], capture_output=True, text=True, timeout=10)
-        
+
         if result.returncode == 0 and result.stdout.strip():
             return int(result.stdout.strip())
     except:
@@ -829,10 +1000,8 @@ def run_deadlift_analysis(video_path,
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
 
-    # Check for video rotation (mobile videos)
     rotation_angle = get_video_rotation(video_path)
 
-    # Optional YOLO detector
     detector = None
     if detector_onnx_path and _ORT_AVAILABLE and os.path.exists(detector_onnx_path):
         try:
@@ -855,7 +1024,6 @@ def run_deadlift_analysis(video_path,
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Core components
     rep_detector = DeadliftRepDetector(fps=effective_fps)
     landmark_smoother = LandmarkSmoother(alpha=0.5, vis_threshold=0.35)
     progress_ema = EMA(0.35)
@@ -864,7 +1032,6 @@ def run_deadlift_analysis(video_path,
     frame_idx = 0
     current_feedback = None
 
-    # Initialize pose estimator
     try:
         pose_est = PoseEstimator(model_path=pose_model_path)
     except Exception as e:
@@ -881,23 +1048,21 @@ def run_deadlift_analysis(video_path,
     try:
         max_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1000)
         processed_frames = 0
-        
+
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-            
-            # Apply rotation if needed (mobile videos)
+
             if rotation_angle != 0:
                 frame = rotate_frame(frame, rotation_angle)
-                
+
             frame_idx += 1
             if frame_idx % frame_skip != 0:
                 continue
 
             processed_frames += 1
-            # Safety: stop if processing too long (avoid server timeout)
-            if processed_frames > 500:  # ~83 seconds of video at 6fps effective
+            if processed_frames > 500:
                 break
 
             work = cv2.resize(frame, (0, 0), fx=scale, fy=scale) if scale != 1.0 else frame.copy()
@@ -954,7 +1119,6 @@ def run_deadlift_analysis(video_path,
             out_vid.release()
         cv2.destroyAllWindows()
 
-    # Final results
     avg = np.mean(rep_detector.all_scores) if rep_detector.all_scores else 0.0
     technique_score = round(round(avg * 2) / 2, 2)
 
@@ -970,7 +1134,6 @@ def run_deadlift_analysis(video_path,
     if not feedback_list:
         feedback_list = ["Great form! Keep it up 💪"]
 
-    # Encode video
     final_video_path = ""
     if return_video:
         encoded_path = output_path.replace(".mp4", "_encoded.mp4")
