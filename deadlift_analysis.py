@@ -237,24 +237,26 @@ class ViewAngleEstimator:
 # ===================== MULTI-SIGNAL REP DETECTOR =====================
 class DeadliftRepDetector:
     """
-    Detects deadlift reps using 5-signal adaptive fusion.
+    Detects deadlift reps using dual-signal detection with adaptive fusion.
 
-    ── Why 5 signals? ──
-    From SIDE view: torso angle & x-delta work great.
-    From FRONT/BACK view: those signals are almost flat!
-      Instead, the shoulder drops in Y and the torso *foreshortens*
-      (the 2D distance shoulder↔hip shrinks because the torso points
-      away from camera). These are the 2 new front-view signals.
+    ── Why dual signal? ──
+    From SIDE view: torso angle works perfectly (like good_morning).
+    From FRONT/BACK view: torso angle is nearly flat!
+      Instead, the torso-to-legs Y ratio changes dramatically:
+      Standing: (hip.y - shoulder.y) / (ankle.y - hip.y) ≈ 0.52
+      Bottom:   ratio drops to ≈ 0.15 (shoulder near hip level)
+      This 60%+ change is the key front-view signal.
+
+    PRIMARY detection: max(signal_A, signal_B) — works from ANY angle.
+    SECONDARY signals (calibration-based) amplify once standing posture learned.
 
     Signals:
-    1. Torso angle (hip→shoulder vs vertical)     — side & diagonal
-    2. Hip angle (shoulder-hip-knee)               — diagonal & moderate front
-    3. X-delta (|shoulder.x − hip.x|)              — side only
-    4. Shoulder Y-drop ratio                       — FRONT view primary signal
-    5. Torso foreshortening ratio                  — FRONT view secondary signal
-
-    The detector auto-calibrates standing posture over the first ~15 frames,
-    and re-calibrates whenever the person is standing between reps.
+    1. Torso angle (hip→shoulder vs vertical)        — side & diagonal
+    2. Hip angle (shoulder-hip-knee)                  — diagonal & moderate front
+    3. X-delta (|shoulder.x − hip.x|)                — side only
+    4. Shoulder Y-drop ratio                         — FRONT view (needs calibration)
+    5. Torso foreshortening ratio                    — FRONT view (needs calibration)
+    6. Torso-to-legs Y ratio  ★PRIMARY FRONT SIGNAL — NO calibration needed!
 
     State machine: STANDING → HINGING → RISING → STANDING (= 1 rep)
     """
@@ -263,15 +265,24 @@ class DeadliftRepDetector:
     HINGING  = 1
     RISING   = 2
 
-    # Composite thresholds (0 = standing, 1 = deep hinge)
-    COMPOSITE_HINGE_START  = 0.18   # enter hinge
-    COMPOSITE_HINGE_DEEP   = 0.40   # "deep enough" to count
-    COMPOSITE_STANDING     = 0.10   # back to standing
-    COMPOSITE_RISING_DELTA = 0.035  # must drop this much from peak to confirm rising
+    # ── Dual-signal thresholds ──
+    # Signal A: torso angle (side/diagonal view)
+    HINGE_START_ANGLE  = 22.0
+    HINGE_BOTTOM_ANGLE = 50.0
+    STAND_ANGLE        = 18.0
+    # Signal B: torso-to-legs Y ratio (front/back view)
+    TLR_STANDING = 0.52
+    TLR_RANGE    = 0.40
+
+    # Composite thresholds (on max(sig_A, sig_B) in [0,1])
+    COMPOSITE_HINGE_START  = 0.22
+    COMPOSITE_HINGE_DEEP   = 0.50
+    COMPOSITE_STANDING     = 0.12
+    COMPOSITE_RISING_DELTA = 0.035
 
     MIN_HINGE_FRAMES  = 3
     MIN_FRAMES_BETWEEN = 10
-    CALIBRATION_FRAMES = 15   # first N frames used for standing calibration
+    CALIBRATION_FRAMES = 15
 
     def __init__(self, fps=10):
         self.fps = max(1, fps)
@@ -289,16 +300,10 @@ class DeadliftRepDetector:
         self.composite_ema  = EMA(0.30)
 
         # ── Adaptive standing calibration ──
-        # Instead of calibrating from first N frames (which may be bent),
-        # we continuously track the MOST UPRIGHT position ever observed:
-        #   - Maximum torso_len (tallest torso = most upright)
-        #   - Minimum shoulder_y (highest shoulder = most upright)
-        # This way even if video starts at bottom, once the person stands
-        # up after first rep, calibration auto-corrects.
-        self.standing_torso_len = None    # max torso_len seen
-        self.standing_shoulder_y = None   # min shoulder_y seen (highest)
+        self.standing_torso_len = None
+        self.standing_shoulder_y = None
         self.standing_hip_y = None
-        self._torso_len_history = []      # rolling buffer for percentile
+        self._torso_len_history = []
         self._shoulder_y_history = []
         self._frames_seen = 0
 
@@ -326,45 +331,63 @@ class DeadliftRepDetector:
     def _update_calibration(self, shoulder, hip):
         """
         Adaptively learn standing posture by tracking the MOST UPRIGHT
-        position observed so far.
-        
-        Key insight: "most upright" = longest torso in 2D + highest shoulder.
-        We use the 95th percentile of torso_len and 5th percentile of shoulder_y
-        (not raw max/min to avoid outliers).
-        
-        This works even if the video starts with the person already bent over,
-        because as soon as they stand up between reps, calibration improves.
+        position observed so far (percentile-based, outlier-resistant).
         """
         torso_len = float(np.linalg.norm(shoulder - hip))
         shoulder_y = float(shoulder[1])
         hip_y = float(hip[1])
-        
+
         self._torso_len_history.append(torso_len)
         self._shoulder_y_history.append(shoulder_y)
-        
-        # Keep rolling buffer (enough to capture a few reps)
+
         max_buf = 120
         if len(self._torso_len_history) > max_buf:
             self._torso_len_history = self._torso_len_history[-max_buf:]
             self._shoulder_y_history = self._shoulder_y_history[-max_buf:]
-        
-        # Use high percentile for torso_len (longest = most upright)
-        # Use low percentile for shoulder_y (highest = most upright, y=0 is top)
+
         arr_tl = np.array(self._torso_len_history)
         arr_sy = np.array(self._shoulder_y_history)
-        
+
         self.standing_torso_len = float(np.percentile(arr_tl, 92))
         self.standing_shoulder_y = float(np.percentile(arr_sy, 8))
-        self.standing_hip_y = hip_y  # hip doesn't move much, just track current
+        self.standing_hip_y = hip_y
+
+    def _compute_dual_signal(self, shoulder, hip, knee, ankle, k_ok, a_ok):
+        """
+        Compute the primary dual-signal hinge depth [0, 1].
+        Signal A: torso angle (side view)
+        Signal B: torso-to-legs Y ratio (front view, NO calibration)
+        Returns max(sig_A, sig_B) and raw torso angle.
+        """
+        torso_ang = _angle_to_vertical(hip, shoulder)
+        sig_a = float(np.clip((torso_ang - self.STAND_ANGLE) /
+                              max(1e-6, self.HINGE_BOTTOM_ANGLE - self.STAND_ANGLE), 0, 1))
+
+        sig_b = 0.0
+        if a_ok:
+            s2h_y = hip[1] - shoulder[1]
+            h2a_y = ankle[1] - hip[1]
+            if h2a_y > 0.03:
+                ratio = s2h_y / h2a_y
+                sig_b = float(np.clip((self.TLR_STANDING - ratio) / self.TLR_RANGE, 0, 1))
+        elif k_ok:
+            s2h_y = hip[1] - shoulder[1]
+            h2k_y = knee[1] - hip[1]
+            if h2k_y > 0.03:
+                ratio = s2h_y / h2k_y
+                sig_b = float(np.clip((self.TLR_STANDING - ratio) / self.TLR_RANGE, 0, 1))
+
+        return max(sig_a, sig_b), torso_ang
 
     def _compute_composite(self, torso_angle, hip_angle, x_delta,
-                           shoulder_y_drop, foreshortening, compression, side_ratio):
+                           shoulder_y_drop, foreshortening, compression, side_ratio,
+                           dual_signal):
         """
-        Fuse 6 signals into composite hinge-depth [0, 1].
-        
-        Signal 6 (compression) is the KEY front-view signal — it needs NO
-        calibration and works from frame 1.  Signals 4 & 5 (ydrop, foreshortening)
-        amplify it once calibration converges.
+        Fuse all signals into composite hinge-depth [0, 1].
+
+        The DUAL SIGNAL (max of torso angle and torso-legs ratio) is the
+        primary driver. Secondary calibration-based signals boost it
+        once standing posture is learned.
         """
         torso_norm    = float(np.clip((torso_angle - 10) / 60.0, 0.0, 1.0))
         hip_norm      = float(np.clip((170 - hip_angle) / 70.0, 0.0, 1.0))
@@ -372,31 +395,32 @@ class DeadliftRepDetector:
         ydrop_norm    = float(np.clip(shoulder_y_drop / 0.55, 0.0, 1.0))
         foreshort_norm = float(np.clip(foreshortening / 0.50, 0.0, 1.0))
         compress_norm = float(np.clip(compression, 0.0, 1.0))
+        dual_norm     = float(np.clip(dual_signal, 0.0, 1.0))
 
         if side_ratio > 0.65:
-            # SIDE view
-            w = {'torso': 0.35, 'hip': 0.20, 'xdelta': 0.25,
-                 'ydrop': 0.05, 'fore': 0.05, 'comp': 0.10}
+            # SIDE view — torso angle dominant, dual as anchor
+            w = {'torso': 0.20, 'hip': 0.12, 'xdelta': 0.15,
+                 'ydrop': 0.03, 'fore': 0.03, 'comp': 0.07, 'dual': 0.40}
         elif side_ratio < 0.25:
-            # FRONT/BACK view — compression is calibration-free anchor,
-            # ydrop & foreshort boost once calibrated
-            w = {'torso': 0.05, 'hip': 0.10, 'xdelta': 0.00,
-                 'ydrop': 0.25, 'fore': 0.20, 'comp': 0.40}
+            # FRONT/BACK view — dual signal is king (no calibration needed)
+            w = {'torso': 0.03, 'hip': 0.05, 'xdelta': 0.00,
+                 'ydrop': 0.10, 'fore': 0.07, 'comp': 0.15, 'dual': 0.60}
         elif side_ratio < 0.45:
             # Diagonal (leaning front)
-            w = {'torso': 0.15, 'hip': 0.18, 'xdelta': 0.05,
-                 'ydrop': 0.17, 'fore': 0.15, 'comp': 0.30}
+            w = {'torso': 0.10, 'hip': 0.10, 'xdelta': 0.03,
+                 'ydrop': 0.07, 'fore': 0.05, 'comp': 0.15, 'dual': 0.50}
         else:
             # Diagonal (leaning side)
-            w = {'torso': 0.28, 'hip': 0.20, 'xdelta': 0.15,
-                 'ydrop': 0.10, 'fore': 0.07, 'comp': 0.20}
+            w = {'torso': 0.18, 'hip': 0.12, 'xdelta': 0.10,
+                 'ydrop': 0.05, 'fore': 0.05, 'comp': 0.10, 'dual': 0.40}
 
         composite = (w['torso'] * torso_norm +
                      w['hip']   * hip_norm +
                      w['xdelta'] * xdelta_norm +
                      w['ydrop'] * ydrop_norm +
                      w['fore']  * foreshort_norm +
-                     w['comp']  * compress_norm)
+                     w['comp']  * compress_norm +
+                     w['dual']  * dual_norm)
 
         return self.composite_ema.update(composite)
 
@@ -413,7 +437,6 @@ class DeadliftRepDetector:
             rp = smoothed_pts.get(r_idx)
             lp = smoothed_pts.get(l_idx)
             if rp is not None and lp is not None:
-                # Average both sides → more stable, especially from front
                 avg = ((rp[0] + lp[0]) / 2.0, (rp[1] + lp[1]) / 2.0)
                 return np.array(avg, dtype=float), True
             if rp is not None:
@@ -423,7 +446,6 @@ class DeadliftRepDetector:
             return None, False
 
         def _get_single(r_idx, l_idx):
-            """Get single side point (not averaged) for angle calcs where side matters."""
             rp = smoothed_pts.get(r_idx)
             lp = smoothed_pts.get(l_idx)
             if rp is not None:
@@ -432,8 +454,8 @@ class DeadliftRepDetector:
                 return np.array(lp, dtype=float), True
             return None, False
 
-        shoulder, s_ok = _get(12, 11)   # averaged shoulder midpoint
-        hip, h_ok = _get(24, 23)        # averaged hip midpoint
+        shoulder, s_ok = _get(12, 11)
+        hip, h_ok = _get(24, 23)
         knee, k_ok = _get_single(26, 25)
         ankle, a_ok = _get_single(28, 27)
 
@@ -444,10 +466,13 @@ class DeadliftRepDetector:
         side_ratio = self.view_estimator.estimate(smoothed_pts)
 
         # ── Update adaptive calibration EVERY frame ──
-        # (it finds the most upright position ever seen, so it's safe to call always)
         self._update_calibration(shoulder, hip)
 
-        # ── Compute all 6 signals ──
+        # ── PRIMARY: Dual-signal detection (works from frame 1, any angle) ──
+        dual_signal, torso_angle_raw = self._compute_dual_signal(
+            shoulder, hip, knee, ankle, k_ok, a_ok)
+
+        # ── SECONDARY: Calibration-based signals ──
 
         # Signal 1: Torso angle vs vertical
         torso_angle = _angle_to_vertical(hip, shoulder)
@@ -462,52 +487,42 @@ class DeadliftRepDetector:
         # Signal 3: X-delta
         x_delta = abs(shoulder[0] - hip[0])
 
-        # Signal 4: Shoulder Y-drop ratio (KEY for front view)
-        # How far shoulder.y has dropped from standing, normalized by standing torso length
+        # Signal 4: Shoulder Y-drop ratio
         shoulder_y_drop = 0.0
         if self.standing_shoulder_y is not None and self.standing_torso_len is not None:
-            raw_drop = (shoulder[1] - self.standing_shoulder_y)  # positive = dropped down
+            raw_drop = (shoulder[1] - self.standing_shoulder_y)
             shoulder_y_drop = raw_drop / max(0.01, self.standing_torso_len)
-            shoulder_y_drop = max(0.0, shoulder_y_drop)  # only count downward movement
+            shoulder_y_drop = max(0.0, shoulder_y_drop)
         shoulder_y_drop_smooth = self.ydrop_ema.update(shoulder_y_drop)
 
-        # Signal 5: Torso foreshortening (KEY for front view)
-        # Current torso length vs standing torso length
+        # Signal 5: Torso foreshortening
         foreshortening = 0.0
         if self.standing_torso_len is not None and self.standing_torso_len > 0.01:
             current_torso_len = float(np.linalg.norm(shoulder - hip))
             foreshortening = (self.standing_torso_len - current_torso_len) / self.standing_torso_len
-            foreshortening = max(0.0, foreshortening)  # only count shortening
+            foreshortening = max(0.0, foreshortening)
         foreshort_smooth = self.foreshort_ema.update(foreshortening)
 
-        # Signal 6: Torso-to-legs Y ratio (NO calibration needed!)
-        # Uses the ratio (hip.y - shoulder.y) / (ankle.y - hip.y).
-        # - "hip-to-ankle" Y distance is STABLE (legs don't change length)
-        # - "shoulder-to-hip" Y distance SHRINKS when bending forward (front view)
-        # Standing: ratio ≈ 0.50-0.55;  Bottom of deadlift: ratio ≈ 0.15-0.25
-        # This is a 60%+ change — very strong signal from front view.
+        # Signal 6: Torso-to-legs Y ratio (NO calibration needed)
         torso_leg_ratio = 0.0
         if a_ok:
-            s2h_y = hip[1] - shoulder[1]   # shoulder-to-hip vertical (positive = upright)
-            h2a_y = ankle[1] - hip[1]       # hip-to-ankle vertical (stable reference)
+            s2h_y = hip[1] - shoulder[1]
+            h2a_y = ankle[1] - hip[1]
             if h2a_y > 0.03:
                 torso_leg_ratio = s2h_y / h2a_y
         elif k_ok:
-            # Fallback: use knee if ankle not visible
             s2h_y = hip[1] - shoulder[1]
             h2k_y = knee[1] - hip[1]
             if h2k_y > 0.03:
                 torso_leg_ratio = s2h_y / h2k_y
-        # Normalize: ratio ~0.52 at standing → 0, ratio ~0.15 at deep hinge → 1
-        # compression = (0.52 - ratio) / 0.40, clipped to [0, 1]
         compression = float(np.clip((0.52 - torso_leg_ratio) / 0.40, 0.0, 1.0))
         compression_smooth = self.compress_ema.update(compression)
 
-        # ── Composite ──
+        # ── Composite (dual-signal weighted heavily) ──
         composite = self._compute_composite(
             torso_smooth, hip_smooth, x_delta,
             shoulder_y_drop_smooth, foreshort_smooth, compression_smooth,
-            side_ratio
+            side_ratio, dual_signal
         )
 
         # --- Back rounding ---
@@ -687,7 +702,7 @@ def draw_skeleton(frame, smoothed_pts, color=(255, 255, 255)):
 
     return frame
 
-# ===================== OVERLAY (same visual standard as good_morning) =====================
+# ===================== OVERLAY (HD upscale approach from good_morning) =====================
 def _wrap2(draw, text, font, maxw):
     words = text.split()
     if not words:
@@ -713,40 +728,44 @@ def _wrap2(draw, text, font, maxw):
     return lines
 
 def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
+    """Reps top-left; donut top-right; feedback bottom — HD upscale approach."""
     h, w, _ = frame.shape
+    HD_H = 1080
+    hd_scale = HD_H / float(h)
+    HD_W = max(1, int(round(w * hd_scale)))
 
-    reps_fs = _scaled_font_size(_REF_REPS_FONT_SIZE, h)
-    fb_fs = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, h)
-    dl_fs = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, h)
-    dp_fs = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, h)
+    reps_font_size = _scaled_font_size(_REF_REPS_FONT_SIZE, HD_H)
+    feedback_font_size = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, HD_H)
+    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, HD_H)
+    depth_pct_font_size = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, HD_H)
 
-    f_reps = _load_font(FONT_PATH, reps_fs)
-    f_fb = _load_font(FONT_PATH, fb_fs)
-    f_dl = _load_font(FONT_PATH, dl_fs)
-    f_dp = _load_font(FONT_PATH, dp_fs)
+    _REPS_FONT = _load_font(FONT_PATH, reps_font_size)
+    _FEEDBACK_FONT = _load_font(FONT_PATH, feedback_font_size)
+    _DEPTH_LABEL_FONT = _load_font(FONT_PATH, depth_label_font_size)
+    _DEPTH_PCT_FONT = _load_font(FONT_PATH, depth_pct_font_size)
 
     pct = float(np.clip(progress_pct, 0, 1))
-    bg_a = int(round(255 * BAR_BG_ALPHA))
+    bg_alpha_val = int(round(255 * BAR_BG_ALPHA))
 
-    ref_h = max(int(h * 0.06), int(reps_fs * 1.6))
+    ref_h = max(int(HD_H * 0.06), int(reps_font_size * 1.6))
     radius = int(ref_h * DONUT_RADIUS_SCALE)
     thick = max(3, int(radius * DONUT_THICKNESS_FRAC))
-    margin = 12
-    cx = w - margin - radius
+    margin = int(12 * hd_scale)
+    cx = HD_W - margin - radius
     cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
 
-    overlay_np = np.zeros((h, w, 4), dtype=np.uint8)
+    overlay_np = np.zeros((HD_H, HD_W, 4), dtype=np.uint8)
 
-    pad_x, pad_y = 10, 6
+    pad_x, pad_y = int(10 * hd_scale), int(6 * hd_scale)
     tmp_pil = Image.new("RGBA", (1, 1))
     tmp_draw = ImageDraw.Draw(tmp_pil)
     txt = f"Reps: {int(reps)}"
-    tw = tmp_draw.textlength(txt, font=f_reps)
-    thh = f_reps.size
-    cv2.rectangle(overlay_np, (0, 0), (int(tw + 2 * pad_x), int(thh + 2 * pad_y)),
-                  (0, 0, 0, bg_a), -1)
+    tw = tmp_draw.textlength(txt, font=_REPS_FONT)
+    thh = _REPS_FONT.size
+    box_w = int(tw + 2 * pad_x)
+    box_h = int(thh + 2 * pad_y)
+    cv2.rectangle(overlay_np, (0, 0), (box_w, box_h), (0, 0, 0, bg_alpha_val), -1)
 
-    # Donut
     cv2.circle(overlay_np, (cx, cy), radius, (*DEPTH_RING_BG, 255), thick, cv2.LINE_AA)
     start_ang = -90
     end_ang = start_ang + int(360 * pct)
@@ -754,50 +773,51 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
         cv2.ellipse(overlay_np, (cx, cy), (radius, radius), 0, start_ang, end_ang,
                     (*DEPTH_COLOR, 255), thick, cv2.LINE_AA)
 
-    # Feedback BG
     fb_y0 = 0
     fb_lines = []
     fb_pad_x = fb_pad_y = line_gap = line_h = 0
     if feedback:
-        safe_m = max(6, int(h * 0.02))
-        fb_pad_x, fb_pad_y, line_gap = 12, 8, 4
-        max_tw = int(w - 2 * fb_pad_x - 20)
-        fb_lines = _wrap2(tmp_draw, feedback, f_fb, max_tw)
-        line_h = f_fb.size + 6
+        safe_margin = max(int(6 * hd_scale), int(HD_H * 0.02))
+        fb_pad_x, fb_pad_y, line_gap = int(12 * hd_scale), int(8 * hd_scale), int(4 * hd_scale)
+        max_text_w = int(HD_W - 2 * fb_pad_x - int(20 * hd_scale))
+        fb_lines = _wrap2(tmp_draw, feedback, _FEEDBACK_FONT, max_text_w)
+        line_h = _FEEDBACK_FONT.size + int(6 * hd_scale)
         block_h = 2 * fb_pad_y + len(fb_lines) * line_h + (len(fb_lines) - 1) * line_gap
-        fb_y0 = max(0, h - safe_m - block_h)
-        y1 = h - safe_m
-        cv2.rectangle(overlay_np, (0, fb_y0), (w, y1), (0, 0, 0, bg_a), -1)
+        fb_y0 = max(0, HD_H - safe_margin - block_h)
+        y1 = HD_H - safe_margin
+        cv2.rectangle(overlay_np, (0, fb_y0), (HD_W, y1), (0, 0, 0, bg_alpha_val), -1)
 
     overlay_pil = Image.fromarray(overlay_np, mode="RGBA")
     draw = ImageDraw.Draw(overlay_pil)
 
-    draw.text((pad_x, pad_y - 1), txt, font=f_reps, fill=(255, 255, 255, 255))
+    draw.text((pad_x, pad_y - 1), txt, font=_REPS_FONT, fill=(255, 255, 255, 255))
 
     gap = max(2, int(radius * 0.10))
-    by = cy - (f_dl.size + gap + f_dp.size) // 2
+    by = cy - (_DEPTH_LABEL_FONT.size + gap + _DEPTH_PCT_FONT.size) // 2
     label = "DEPTH"
     pct_txt = f"{int(pct * 100)}%"
-    lw = draw.textlength(label, font=f_dl)
-    pw = draw.textlength(pct_txt, font=f_dp)
-    draw.text((cx - int(lw // 2), by), label, font=f_dl, fill=(255, 255, 255, 255))
-    draw.text((cx - int(pw // 2), by + f_dl.size + gap), pct_txt, font=f_dp, fill=(255, 255, 255, 255))
+    lw = draw.textlength(label, font=_DEPTH_LABEL_FONT)
+    pw = draw.textlength(pct_txt, font=_DEPTH_PCT_FONT)
+    draw.text((cx - int(lw // 2), by), label, font=_DEPTH_LABEL_FONT, fill=(255, 255, 255, 255))
+    draw.text((cx - int(pw // 2), by + _DEPTH_LABEL_FONT.size + gap), pct_txt, font=_DEPTH_PCT_FONT, fill=(255, 255, 255, 255))
 
     if feedback and fb_lines:
         ty = fb_y0 + fb_pad_y
         for ln in fb_lines:
-            tw2 = draw.textlength(ln, font=f_fb)
-            tx = max(fb_pad_x, (w - int(tw2)) // 2)
-            draw.text((tx, ty), ln, font=f_fb, fill=(255, 255, 255, 255))
+            tw2 = draw.textlength(ln, font=_FEEDBACK_FONT)
+            tx = max(fb_pad_x, (HD_W - int(tw2)) // 2)
+            draw.text((tx, ty), ln, font=_FEEDBACK_FONT, fill=(255, 255, 255, 255))
             ty += line_h + line_gap
 
     overlay_rgba = np.array(overlay_pil)
-    alpha = overlay_rgba[:, :, 3:4].astype(np.float32) / 255.0
-    overlay_bgr = overlay_rgba[:, :, [2, 1, 0]].astype(np.float32)
-    out_f = frame.astype(np.float32) * (1.0 - alpha) + overlay_bgr * alpha
-    return out_f.astype(np.uint8)
+    overlay_small = cv2.resize(overlay_rgba, (w, h), interpolation=cv2.INTER_AREA)
+    alpha = overlay_small[:, :, 3:4].astype(np.float32) / 255.0
+    overlay_bgr_ch = overlay_small[:, :, [2, 1, 0]].astype(np.float32)
+    frame_f = frame.astype(np.float32)
+    result = frame_f * (1.0 - alpha) + overlay_bgr_ch * alpha
+    return result.astype(np.uint8)
 
-# ===================== YOLOv8n Detector (optional, carried from V1) =====================
+# ===================== YOLOv8n Detector (optional) =====================
 class YoloOccluderDetector:
     def __init__(self, onnx_path, providers=None, input_size=640, conf_thres=0.25,
                  iou_thres=0.45, occluder_class_ids=None):
@@ -918,9 +938,8 @@ class PoseEstimator:
         self._is_tasks = False
 
         if _SOLUTIONS_AVAILABLE:
-            # Old API — use model_complexity=2 for best accuracy
             self._impl = _mp_pose.Pose(
-                model_complexity=2,
+                model_complexity=1,
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
@@ -943,18 +962,14 @@ class PoseEstimator:
                 )
 
     def process(self, frame_bgr, timestamp_ms=0):
-        """
-        Returns list of landmarks (each with .x, .y, .visibility) or None.
-        """
+        """Returns list of landmarks (each with .x, .y, .visibility) or None."""
         if not self._is_tasks:
-            # Old solutions API
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             res = self._impl.process(rgb)
             if res.pose_landmarks:
                 return res.pose_landmarks.landmark
             return None
         else:
-            # Tasks API
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
                               data=cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
             res = self._impl.detect_for_video(mp_img, int(timestamp_ms))
@@ -970,8 +985,8 @@ class PoseEstimator:
 
 # ===================== MAIN =====================
 def run_deadlift_analysis(video_path,
-                          frame_skip=2,
-                          scale=0.5,
+                          frame_skip=3,
+                          scale=0.4,
                           output_path="deadlift_analyzed.mp4",
                           feedback_path="deadlift_feedback.txt",
                           detector_onnx_path="barbell_plates_yolov8n.onnx",
@@ -987,8 +1002,8 @@ def run_deadlift_analysis(video_path,
 
     Args:
         video_path: Path to input video
-        frame_skip: Process every Nth frame (2 = every other frame)
-        scale: Downscale factor for pose estimation (0.5 = half resolution)
+        frame_skip: Process every Nth frame (3 = every 3rd frame)
+        scale: Downscale factor for pose estimation (0.4 = 40% resolution)
         output_path: Output video path
         feedback_path: Output text feedback path
         detector_onnx_path: Optional YOLO detector for barbell occlusion
@@ -1041,7 +1056,7 @@ def run_deadlift_analysis(video_path,
     frame_idx = 0
     current_feedback = None
     feedback_hold_frames = 0
-    FEEDBACK_HOLD = max(8, int(1.5 / frame_dt))  # hold feedback for ~1.5s
+    FEEDBACK_HOLD = max(8, int(1.5 / frame_dt))
 
     # Initialize pose estimator
     try:
