@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — V3: robust front-view rep detection
+# deadlift_analysis.py — V3.1: robust front-view + rotation fix + walking rejection
 #
-# BASE: exact V2 code that counted reps correctly from side view
-# IMPROVED: front-view detection using shoulder-drop + body-compression signals
-# with adaptive calibration (first ~1 second calibrates standing pose)
+# FIXES over V3:
+# A. Robust rotation detection (displaymatrix + stream tags + dimension heuristic)
+# B. Walking rejection: hip must stay stable for rep to count
+# C. Adaptive calibration with running baseline (not just first N frames)
 
-import os, cv2, math, numpy as np, subprocess
+import os, cv2, math, numpy as np, subprocess, json
 from collections import deque
 from PIL import ImageFont, ImageDraw, Image
 import mediapipe as mp
@@ -190,35 +191,49 @@ class ViewAngleEstimator:
         return self.ema.update(side_score)
 
 
-# ===================== FRONT-VIEW SIGNAL (NEW V3) =====================
+# ===================== FRONT-VIEW SIGNAL V3.1 =====================
 class FrontViewSignal:
     """
-    Detects deadlift reps from front/back camera angles using signals
-    that are visible even when the depth axis is compressed.
+    Front-view deadlift detection using:
+    1. Shoulder Y drop relative to adaptive standing baseline
+    2. Body compression (shoulder-hip distance shrinks)
+    3. Walking rejection: hip position must stay stable
     
-    Key signals from front view:
-    1. Shoulder Y drop — shoulders move DOWN in frame as person hinges
-    2. Body compression — shoulder-to-hip Y distance shrinks relative to 
-       hip-to-ankle distance as torso bends forward toward camera
-    3. Mid-shoulder Y relative to standing calibration
-    
-    Uses adaptive calibration: collects the first N frames to establish
-    the "standing" baseline, then measures deviation from it.
+    V3.1 improvements:
+    - Adaptive baseline: tracks the HIGHEST shoulder position (= most upright)
+      seen in recent history, not just first N frames
+    - Walking rejection: if hip Y moves more than threshold, signal is suppressed
+    - Scale-invariant: all measurements normalized to body proportions
     """
     
-    def __init__(self, calibration_frames=8):
-        self.calibration_frames = calibration_frames
-        self.calibration_samples = []
-        self.standing_shoulder_y = None      # average shoulder Y when standing
-        self.standing_hip_y = None           # average hip Y when standing  
-        self.standing_ankle_y = None         # average ankle Y when standing
-        self.standing_torso_ratio = None     # shoulder-hip / hip-ankle ratio when standing
-        self.standing_shoulder_hip_dist = None  # absolute Y distance shoulder-hip when standing
-        
+    def __init__(self):
         self.signal_ema = EMA(0.40)
         self.frame_count = 0
-        self.calibrated = False
-    
+        
+        # Adaptive baseline tracking
+        self.baseline_ready = False
+        self.min_frames_for_baseline = 5
+        
+        # Running stats for standing position (shoulder at HIGHEST = most upright)
+        # We track the minimum shoulder_y (highest in frame) as "standing"
+        self.standing_shoulder_y = None
+        self.standing_hip_y = None
+        self.standing_sh_dist = None   # shoulder-to-hip Y distance when standing
+        self.standing_ankle_y = None
+        
+        # Recent history for adaptive baseline (sliding window)
+        self.shoulder_y_history = deque(maxlen=60)  # ~6-10 sec of data
+        self.hip_y_history = deque(maxlen=60)
+        self.sh_dist_history = deque(maxlen=60)
+        
+        # Walking detection
+        self.hip_y_ema = EMA(0.3)
+        self.hip_x_ema = EMA(0.3)
+        self.prev_hip_y = None
+        self.prev_hip_x = None
+        self.hip_movement_acc = 0.0  # accumulated hip movement
+        self.hip_movement_decay = 0.92  # decay factor per frame
+        
     def _get_key_points(self, smoothed_pts):
         """Extract averaged shoulder, hip, ankle Y positions."""
         ls = smoothed_pts.get(11)
@@ -230,14 +245,14 @@ class FrontViewSignal:
         lk = smoothed_pts.get(25)
         rk = smoothed_pts.get(26)
         
-        # Need at least shoulders and hips
         if not ls or not rs or not lh or not rh:
             return None
             
         shoulder_y = (ls[1] + rs[1]) / 2.0
+        shoulder_x = (ls[0] + rs[0]) / 2.0
         hip_y = (lh[1] + rh[1]) / 2.0
+        hip_x = (lh[0] + rh[0]) / 2.0
         
-        # Ankle — use if available, else use knee, else None
         ankle_y = None
         if la and ra:
             ankle_y = (la[1] + ra[1]) / 2.0
@@ -254,17 +269,88 @@ class FrontViewSignal:
             
         return {
             'shoulder_y': shoulder_y,
+            'shoulder_x': shoulder_x,
             'hip_y': hip_y,
+            'hip_x': hip_x,
             'ankle_y': ankle_y,
-            'shoulder_x_mid': (ls[0] + rs[0]) / 2.0,
-            'hip_x_mid': (lh[0] + rh[0]) / 2.0,
+            'sh_dist': hip_y - shoulder_y,  # positive = hip below shoulder
         }
+    
+    def _detect_walking(self, hip_y, hip_x, sh_dist):
+        """
+        Detect if person is walking (vs doing deadlift in place).
+        Walking: hip Y and/or X changes steadily over time.
+        Deadlift: hip stays relatively fixed, shoulders move.
+        
+        Returns a suppression factor: 1.0 = not walking, 0.0 = definitely walking
+        """
+        # Smooth hip position
+        smooth_hy = self.hip_y_ema.update(hip_y)
+        smooth_hx = self.hip_x_ema.update(hip_x)
+        
+        if self.prev_hip_y is not None:
+            dy = abs(smooth_hy - self.prev_hip_y)
+            dx = abs(smooth_hx - self.prev_hip_x)
+            movement = math.sqrt(dy**2 + dx**2)
+            
+            # Accumulate movement with decay
+            self.hip_movement_acc = self.hip_movement_acc * self.hip_movement_decay + movement
+        
+        self.prev_hip_y = smooth_hy
+        self.prev_hip_x = smooth_hx
+        
+        # Normalize movement by body scale (sh_dist)
+        if sh_dist > 0.01:
+            normalized_movement = self.hip_movement_acc / sh_dist
+        else:
+            normalized_movement = self.hip_movement_acc * 10
+        
+        # Threshold: if accumulated normalized movement > 0.8, likely walking
+        # During deadlift, hip barely moves (normalized_movement < 0.3 typically)
+        # During walking, hip shifts continuously (normalized_movement > 1.0)
+        suppression = float(np.clip(1.0 - (normalized_movement - 0.4) / 0.6, 0.0, 1.0))
+        
+        return suppression
+    
+    def _update_baseline(self, shoulder_y, hip_y, sh_dist, ankle_y):
+        """
+        Adaptive baseline: the "standing" position is the frame where
+        the person is most upright = shoulder Y is at its MINIMUM (highest in frame)
+        within recent history.
+        
+        This handles:
+        - Videos where person starts already bent
+        - Standing between reps re-calibrates the baseline
+        """
+        self.shoulder_y_history.append(shoulder_y)
+        self.hip_y_history.append(hip_y)
+        self.sh_dist_history.append(sh_dist)
+        
+        if len(self.shoulder_y_history) >= self.min_frames_for_baseline:
+            # Standing = minimum shoulder Y in recent window (highest point)
+            # But we want a robust estimate, so use the 10th percentile
+            sorted_sy = sorted(self.shoulder_y_history)
+            idx_10pct = max(0, int(len(sorted_sy) * 0.10))
+            self.standing_shoulder_y = sorted_sy[idx_10pct]
+            
+            # Corresponding hip Y at standing (use the 10th percentile too)
+            sorted_hy = sorted(self.hip_y_history)
+            self.standing_hip_y = sorted_hy[idx_10pct]
+            
+            # Max shoulder-hip distance (most upright)
+            sorted_shd = sorted(self.sh_dist_history, reverse=True)
+            idx_90pct = max(0, int(len(sorted_shd) * 0.10))
+            self.standing_sh_dist = sorted_shd[idx_90pct]
+            
+            if ankle_y is not None:
+                self.standing_ankle_y = ankle_y
+            
+            self.baseline_ready = True
     
     def update(self, smoothed_pts):
         """
         Returns a front-view hinge signal in [0, 1].
         0 = standing upright, 1 = fully hinged.
-        Returns None if not enough data.
         """
         self.frame_count += 1
         pts = self._get_key_points(smoothed_pts)
@@ -274,103 +360,71 @@ class FrontViewSignal:
         shoulder_y = pts['shoulder_y']
         hip_y = pts['hip_y']
         ankle_y = pts['ankle_y']
+        sh_dist = pts['sh_dist']
         
-        # --- Calibration phase: collect standing baseline ---
-        if not self.calibrated:
-            self.calibration_samples.append(pts)
-            if len(self.calibration_samples) >= self.calibration_frames:
-                self._calibrate()
-            # During calibration, return 0 (standing)
+        # Update adaptive baseline
+        self._update_baseline(shoulder_y, hip_y, sh_dist, ankle_y)
+        
+        # Walking detection
+        walk_suppression = self._detect_walking(hip_y, pts['hip_x'], sh_dist)
+        
+        if not self.baseline_ready:
             self.signal_ema.update(0.0)
             return 0.0
         
-        # --- Signal computation ---
-        # Signal 1: Shoulder drop (how far shoulder Y has moved down from standing)
-        # In normalized coords, Y increases downward
-        # When hinging forward from front view, shoulders drop in the frame
+        # ── Signal 1: Shoulder drop ──
+        # How far shoulder has dropped from the standing (highest) position
         shoulder_drop = shoulder_y - self.standing_shoulder_y
         
-        # Normalize: at full deadlift from front, shoulders can drop by ~20-40% 
-        # of the standing shoulder-to-hip distance
-        if self.standing_shoulder_hip_dist > 0.01:
+        if self.standing_sh_dist > 0.01:
+            # Normalize: a full deadlift hinge drops shoulders by ~40-70% 
+            # of standing shoulder-hip distance
             sig_shoulder_drop = float(np.clip(
-                shoulder_drop / (self.standing_shoulder_hip_dist * 0.6),
+                shoulder_drop / (self.standing_sh_dist * 0.5),
                 0.0, 1.0
             ))
         else:
             sig_shoulder_drop = 0.0
         
-        # Signal 2: Torso compression — shoulder-hip Y distance shrinks
-        # as torso rotates toward/away from camera
-        current_sh_dist = hip_y - shoulder_y  # positive when hip below shoulder
-        if self.standing_shoulder_hip_dist > 0.01:
-            # Ratio: 1.0 when same as standing, <1.0 when compressed
-            compression_ratio = current_sh_dist / self.standing_shoulder_hip_dist
-            # Convert: more compression = higher signal
+        # ── Signal 2: Body compression ──
+        # Shoulder-hip Y distance shrinks as torso bends forward toward camera
+        if self.standing_sh_dist > 0.01:
+            compression_ratio = sh_dist / self.standing_sh_dist
+            # Standing: ratio ≈ 1.0, Hinged: ratio ≈ 0.5-0.7
             sig_compression = float(np.clip(
-                (1.0 - compression_ratio) / 0.5,  # 50% compression = signal 1.0
+                (1.0 - compression_ratio) / 0.45,
                 0.0, 1.0
             ))
         else:
             sig_compression = 0.0
         
-        # Signal 3: Hip Y stability check — hips shouldn't move much in deadlift
-        # This validates that we're seeing a hinge, not just the person walking away
-        hip_shift = abs(hip_y - self.standing_hip_y)
-        hip_stable = hip_shift < (self.standing_shoulder_hip_dist * 0.3)
+        # ── Combine signals ──
+        # Shoulder drop is primary (changes more from front view)
+        # Compression confirms it's a hinge, not just bending knees
+        raw_signal = 0.6 * sig_shoulder_drop + 0.4 * sig_compression
         
-        # Combine signals
-        # Shoulder drop is the PRIMARY signal for front view
-        # Compression is the SECONDARY signal (confirms hinging vs just bending knees)
-        if hip_stable:
-            combined = 0.65 * sig_shoulder_drop + 0.35 * sig_compression
-        else:
-            # Hip moved a lot — might be walking, reduce confidence
-            combined = 0.4 * sig_shoulder_drop + 0.2 * sig_compression
+        # ── Apply walking suppression ──
+        # If person is walking, suppress the signal heavily
+        suppressed_signal = raw_signal * walk_suppression
         
-        # Additional boost: if ankle is visible and torso ratio changed significantly
-        if ankle_y is not None and self.standing_torso_ratio is not None:
-            hip_ankle_dist = ankle_y - hip_y
-            if hip_ankle_dist > 0.03:
-                current_ratio = current_sh_dist / hip_ankle_dist
-                ratio_change = self.standing_torso_ratio - current_ratio
-                if ratio_change > 0.05:  # torso got shorter relative to legs
-                    ratio_boost = float(np.clip(ratio_change / 0.4, 0.0, 0.3))
-                    combined = min(1.0, combined + ratio_boost)
+        # Debug
+        if self.frame_count % 10 == 0:
+            print(f"  FRONT_SIG: sh_drop={sig_shoulder_drop:.3f} "
+                  f"compress={sig_compression:.3f} raw={raw_signal:.3f} "
+                  f"walk_supp={walk_suppression:.3f} final={suppressed_signal:.3f}")
         
-        smoothed = self.signal_ema.update(combined)
+        smoothed = self.signal_ema.update(suppressed_signal)
         return smoothed
-    
-    def _calibrate(self):
-        """Establish standing baseline from collected samples."""
-        sy = np.mean([s['shoulder_y'] for s in self.calibration_samples])
-        hy = np.mean([s['hip_y'] for s in self.calibration_samples])
-        
-        ankle_samples = [s['ankle_y'] for s in self.calibration_samples if s['ankle_y'] is not None]
-        ay = np.mean(ankle_samples) if ankle_samples else None
-        
-        self.standing_shoulder_y = sy
-        self.standing_hip_y = hy
-        self.standing_ankle_y = ay
-        self.standing_shoulder_hip_dist = hy - sy  # positive (hip below shoulder)
-        
-        if ay is not None and (ay - hy) > 0.01:
-            self.standing_torso_ratio = (hy - sy) / (ay - hy)
-        else:
-            self.standing_torso_ratio = None
-        
-        self.calibrated = True
 
 
-# ===================== REP DETECTOR V3 =====================
+# ===================== REP DETECTOR V3.1 =====================
 class DeadliftRepDetector:
     """
-    V2 proven rep detection with side-view composite (torso angle + hip angle).
-    V3 adds: FrontViewSignal that blends in when side_ratio indicates front/back view.
+    V2 proven side-view detection + V3.1 front-view blending.
     
-    The blending is smooth: 
-    - side_ratio > 0.6 → 100% side-view signals (V2 behavior, untouched)
-    - side_ratio < 0.3 → 100% front-view signal
+    Blending:
+    - side_ratio > 0.6 → 100% side composite (V2, untouched)
+    - side_ratio < 0.3 → 100% front signal
     - between → linear blend
     """
 
@@ -398,8 +452,8 @@ class DeadliftRepDetector:
         self.hip_angle_ema = EMA(0.45)
         self.composite_ema = EMA(0.40)
 
-        # V3: Front-view signal
-        self.front_signal = FrontViewSignal(calibration_frames=8)
+        # V3.1: Front-view signal
+        self.front_signal = FrontViewSignal()
 
         # Per-rep tracking
         self.rep_max_composite = 0.0
@@ -422,7 +476,7 @@ class DeadliftRepDetector:
         self.reps_report = []
 
     def _compute_side_composite(self, torso_angle, hip_angle, side_ratio):
-        """V2 ORIGINAL: 2-signal composite weighted by view angle."""
+        """V2 ORIGINAL: 2-signal composite."""
         torso_norm = float(np.clip((torso_angle - 12) / 55.0, 0.0, 1.0))
         hip_norm = float(np.clip((170 - hip_angle) / 70.0, 0.0, 1.0))
 
@@ -437,7 +491,6 @@ class DeadliftRepDetector:
         return self.composite_ema.update(composite)
 
     def _get_lm_val(self, lm, idx, attr):
-        """Get landmark attribute, handling both APIs and providing safe fallbacks."""
         try:
             if hasattr(idx, 'value'):
                 idx = idx.value
@@ -449,7 +502,6 @@ class DeadliftRepDetector:
             return 0.5 if attr == 'visibility' else 0.0
 
     def process_frame(self, smoothed_pts, raw_landmarks, frame_idx):
-        """V2 state machine with V3 front-view blending."""
         self.frame_count = frame_idx
         lm = raw_landmarks
 
@@ -483,28 +535,22 @@ class DeadliftRepDetector:
 
         side_composite = self._compute_side_composite(torso_angle_smooth, hip_angle_smooth, side_ratio)
 
-        # ── V3: Front-view signal ──
-        front_signal = self.front_signal.update(smoothed_pts)
+        # ── V3.1: Front-view signal ──
+        front_signal_val = self.front_signal.update(smoothed_pts)
 
-        # ── V3: Blend based on view angle ──
-        # side_ratio: 1.0 = pure side view, 0.0 = pure front view
-        # Blend zone: 0.3 to 0.6
+        # ── Blend based on view angle ──
         if side_ratio >= 0.6:
-            # Pure side view → use V2 composite unchanged
             composite = side_composite
         elif side_ratio <= 0.3:
-            # Pure front view → use front signal entirely
-            composite = front_signal
+            composite = front_signal_val
         else:
-            # Transition zone: linear blend
-            blend = (side_ratio - 0.3) / 0.3  # 0 at 0.3, 1 at 0.6
-            composite = blend * side_composite + (1.0 - blend) * front_signal
+            blend = (side_ratio - 0.3) / 0.3
+            composite = blend * side_composite + (1.0 - blend) * front_signal_val
 
-        # Debug logging (every 10 frames)
         if frame_idx % 10 == 0:
             view_str = "SIDE" if side_ratio >= 0.6 else ("FRONT" if side_ratio <= 0.3 else "BLEND")
             print(f"F{frame_idx}: {view_str} sr={side_ratio:.2f} "
-                  f"side_c={side_composite:.3f} front_s={front_signal:.3f} "
+                  f"side_c={side_composite:.3f} front_s={front_signal_val:.3f} "
                   f"final={composite:.3f} state={self.state} reps={self.reps}")
 
         # ── V2 ORIGINAL: back rounding check ──
@@ -523,7 +569,7 @@ class DeadliftRepDetector:
         if k_ok and a_ok:
             knee_angle = _angle_3pt(hip, knee, ankle)
 
-        # ── V2 ORIGINAL state machine (unchanged logic) ──
+        # ── V2 ORIGINAL state machine ──
         rt_feedback = None
         rep_info = None
 
@@ -948,24 +994,81 @@ class PoseEstimator:
         elif hasattr(self._impl, '__exit__'):
             self._impl.__exit__(None, None, None)
 
-# ===================== MAIN =====================
+# ===================== ROBUST ROTATION DETECTION =====================
 def get_video_rotation(video_path):
-    """Get video rotation angle from metadata to fix mobile videos."""
+    """
+    Get video rotation from metadata — handles BOTH methods:
+    1. stream tags (older format): tags.rotate = "90"
+    2. side_data displaymatrix (newer iOS): rotation = -90
+    3. Fallback: dimension heuristic for portrait mobile videos
+    """
+    rotation = 0
+    raw_w, raw_h = 0, 0
+    
     try:
-        import subprocess
+        result = subprocess.run([
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_streams', video_path
+        ], capture_output=True, text=True, timeout=10)
+        
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            for stream in data.get('streams', []):
+                if stream.get('codec_type') != 'video':
+                    continue
+                
+                raw_w = int(stream.get('width', 0))
+                raw_h = int(stream.get('height', 0))
+                
+                # Method 1: Check tags.rotate
+                tags = stream.get('tags', {})
+                if 'rotate' in tags:
+                    rotation = int(tags['rotate'])
+                    print(f"ROTATION: Found via tags.rotate = {rotation}")
+                    return rotation
+                
+                # Method 2: Check side_data_list for displaymatrix
+                for sd in stream.get('side_data_list', []):
+                    if 'rotation' in sd:
+                        rot_val = int(sd['rotation'])
+                        # displaymatrix rotation is often negative
+                        # Convert: -90 → 90, -270 → 270, etc.
+                        rotation = (-rot_val) % 360
+                        print(f"ROTATION: Found via displaymatrix = {sd['rotation']} → {rotation}")
+                        return rotation
+    except Exception as e:
+        print(f"ROTATION: ffprobe JSON failed: {e}")
+    
+    # Method 3: Fallback — try the simple tag method
+    try:
         result = subprocess.run([
             'ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
             '-show_entries', 'stream_tags=rotate', '-of', 'csv=p=0', video_path
         ], capture_output=True, text=True, timeout=10)
-
+        
         if result.returncode == 0 and result.stdout.strip():
-            return int(result.stdout.strip())
-    except:
+            rotation = int(result.stdout.strip())
+            print(f"ROTATION: Found via simple tag query = {rotation}")
+            return rotation
+    except Exception:
         pass
+    
+    # Method 4: Last resort — use ffmpeg to check if it auto-rotates
+    # If raw dimensions are landscape but video should be portrait (mobile),
+    # we can't know for sure, but we log it
+    if raw_w > 0 and raw_h > 0:
+        print(f"ROTATION: No metadata found. Raw dimensions: {raw_w}x{raw_h}")
+        # Note: We do NOT guess here — ffmpeg usually auto-applies rotation
+        # during re-encode, so if we can't find metadata, it might already
+        # be handled. The key fix is Method 2 (displaymatrix).
+    
+    print(f"ROTATION: No rotation metadata found, using 0")
     return 0
+
 
 def rotate_frame(frame, angle):
     """Rotate frame by angle (90, 180, 270 degrees)."""
+    angle = angle % 360
     if angle == 90:
         return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     elif angle == 180:
@@ -974,6 +1077,7 @@ def rotate_frame(frame, angle):
         return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
     return frame
 
+# ===================== MAIN =====================
 def run_deadlift_analysis(video_path,
                           frame_skip=3,
                           scale=0.4,
@@ -1000,6 +1104,7 @@ def run_deadlift_analysis(video_path,
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
 
+    # ── ROTATION FIX (V3.1) ──
     rotation_angle = get_video_rotation(video_path)
 
     detector = None
@@ -1019,10 +1124,16 @@ def run_deadlift_analysis(video_path,
     out_vid = None
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
-    frame_dt = 1.0 / float(effective_fps)
 
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # If rotation is 90 or 270, swap output dimensions
+    if rotation_angle % 360 in (90, 270):
+        out_w, out_h = orig_h, orig_w
+        print(f"OUTPUT DIMENSIONS SWAPPED: {orig_w}x{orig_h} → {out_w}x{out_h} (rotation={rotation_angle})")
+    else:
+        out_w, out_h = orig_w, orig_h
 
     rep_detector = DeadliftRepDetector(fps=effective_fps)
     landmark_smoother = LandmarkSmoother(alpha=0.5, vis_threshold=0.35)
@@ -1046,7 +1157,6 @@ def run_deadlift_analysis(video_path,
         }
 
     try:
-        max_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1000)
         processed_frames = 0
 
         while cap.isOpened():
@@ -1054,6 +1164,7 @@ def run_deadlift_analysis(video_path,
             if not ret:
                 break
 
+            # Apply rotation BEFORE any processing
             if rotation_angle != 0:
                 frame = rotate_frame(frame, rotation_angle)
 
@@ -1068,14 +1179,15 @@ def run_deadlift_analysis(video_path,
             work = cv2.resize(frame, (0, 0), fx=scale, fy=scale) if scale != 1.0 else frame.copy()
 
             if return_video and out_vid is None:
-                out_vid = cv2.VideoWriter(output_path, fourcc, effective_fps, (orig_w, orig_h))
+                # Use corrected dimensions
+                out_vid = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
 
             timestamp_ms = (frame_idx / fps_in) * 1000.0
             landmarks = pose_est.process(work, timestamp_ms=timestamp_ms)
 
             if landmarks is None:
                 if return_video and out_vid is not None:
-                    frame_out = cv2.resize(work, (orig_w, orig_h))
+                    frame_out = cv2.resize(work, (out_w, out_h))
                     prog_val = progress_ema.value or 0.0
                     out_vid.write(draw_overlay(frame_out, reps=rep_detector.reps,
                                                feedback=None, progress_pct=1.0 - prog_val))
@@ -1097,7 +1209,7 @@ def run_deadlift_analysis(video_path,
                 donut_pct = 1.0 - prog_display
 
                 if return_video:
-                    frame_out = cv2.resize(work, (orig_w, orig_h))
+                    frame_out = cv2.resize(work, (out_w, out_h))
                     frame_out = draw_skeleton(frame_out, smoothed)
                     frame_out = draw_overlay(frame_out, reps=rep_detector.reps,
                                              feedback=current_feedback,
@@ -1106,7 +1218,7 @@ def run_deadlift_analysis(video_path,
 
             except Exception:
                 if return_video and out_vid is not None:
-                    frame_out = cv2.resize(work, (orig_w, orig_h))
+                    frame_out = cv2.resize(work, (out_w, out_h))
                     prog_val = progress_ema.value or 0.0
                     out_vid.write(draw_overlay(frame_out, reps=rep_detector.reps,
                                               feedback=None, progress_pct=1.0 - prog_val))
