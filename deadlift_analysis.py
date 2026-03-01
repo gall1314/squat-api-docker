@@ -1,21 +1,24 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — V2: Major upgrade for multi-angle detection & robust reps
+# deadlift_analysis.py — V3: Front-view fix with 5-signal adaptive fusion
 #
-# KEY IMPROVEMENTS OVER V1:
-# ─────────────────────────
-# 1.  MULTI-SIGNAL REP DETECTION: fuses torso angle + hip angle + horizontal delta
-#     → works from side, diagonal, front/back camera angles (not just side)
-# 2.  ADAPTIVE SIGNAL FUSION: auto-weights signals by estimated camera angle
+# KEY IMPROVEMENTS:
+# ─────────────────
+# 1.  5-SIGNAL REP DETECTION with adaptive weighting by camera angle:
+#     a) Torso angle vs vertical           — side & diagonal views
+#     b) Hip angle (shoulder-hip-knee)      — diagonal views
+#     c) X-delta (shoulder.x − hip.x)      — side view
+#     d) Shoulder Y-drop ratio  ★NEW       — FRONT/BACK view primary
+#     e) Torso foreshortening   ★NEW       — FRONT/BACK view secondary
+# 2.  STANDING CALIBRATION: learns standing posture in first ~15 frames
+#     and re-calibrates between reps → signals (d) and (e) measured as
+#     relative change from standing baseline
 # 3.  VIEW-ANGLE ESTIMATION from shoulder-width / torso-height ratio
-# 4.  LANDMARK SMOOTHER: EMA on all 33 points → cleaner skeleton, less jitter
-# 5.  BETTER STATE MACHINE: STANDING→HINGING→RISING→STANDING with hysteresis
-# 6.  HIP-HINGE ANGLE as primary depth signal (view-invariant)
-# 7.  DUAL MediaPipe API: supports both old `mp.solutions.pose` and new Tasks API
-# 8.  MODEL COMPLEXITY 2 (old API) or full model (new API) for best accuracy
-# 9.  FIXED SKELETON DRAWING: all points smoothed before draw, no Kalman jitter
-# 10. PROGRESS DONUT based on composite angle signal (not just x-delta)
-# 11. Removed fragile Kalman leg tracker — landmark smoother handles it better
-# 12. Cleaner feedback aggregation
+#     → auto-shifts weights to front-view signals when needed
+# 4.  AVERAGES BOTH SIDES for shoulder/hip midpoint → more stable from front
+# 5.  LANDMARK SMOOTHER (EMA on all 33 points) → clean skeleton
+# 6.  DUAL MediaPipe API support (old solutions + new Tasks API)
+# 7.  MODEL COMPLEXITY 2 for best accuracy
+# 8.  Proper state machine with hysteresis
 
 import os, cv2, math, sys, numpy as np, subprocess
 from collections import deque
@@ -234,15 +237,26 @@ class ViewAngleEstimator:
 # ===================== MULTI-SIGNAL REP DETECTOR =====================
 class DeadliftRepDetector:
     """
-    Detects deadlift reps using adaptive multi-signal fusion:
+    Detects deadlift reps using 5-signal adaptive fusion.
+
+    ── Why 5 signals? ──
+    From SIDE view: torso angle & x-delta work great.
+    From FRONT/BACK view: those signals are almost flat!
+      Instead, the shoulder drops in Y and the torso *foreshortens*
+      (the 2D distance shoulder↔hip shrinks because the torso points
+      away from camera). These are the 2 new front-view signals.
 
     Signals:
-    1. Torso angle (hip→shoulder vs vertical): reliable from side & diagonal
-    2. Hip angle (shoulder-hip-knee): reliable from ALL angles
-    3. Horizontal delta (|shoulder.x - hip.x|): original signal, side-view only
+    1. Torso angle (hip→shoulder vs vertical)     — side & diagonal
+    2. Hip angle (shoulder-hip-knee)               — diagonal & moderate front
+    3. X-delta (|shoulder.x − hip.x|)              — side only
+    4. Shoulder Y-drop ratio                       — FRONT view primary signal
+    5. Torso foreshortening ratio                  — FRONT view secondary signal
+
+    The detector auto-calibrates standing posture over the first ~15 frames,
+    and re-calibrates whenever the person is standing between reps.
 
     State machine: STANDING → HINGING → RISING → STANDING (= 1 rep)
-    With hysteresis to prevent false triggers.
     """
 
     STANDING = 0
@@ -250,13 +264,14 @@ class DeadliftRepDetector:
     RISING   = 2
 
     # Composite thresholds (0 = standing, 1 = deep hinge)
-    COMPOSITE_HINGE_START = 0.20   # enter hinge
-    COMPOSITE_HINGE_DEEP  = 0.45   # "deep enough" to count
-    COMPOSITE_STANDING    = 0.12   # back to standing
-    COMPOSITE_RISING_DELTA = 0.04  # must drop this much to confirm rising
+    COMPOSITE_HINGE_START  = 0.18   # enter hinge
+    COMPOSITE_HINGE_DEEP   = 0.40   # "deep enough" to count
+    COMPOSITE_STANDING     = 0.10   # back to standing
+    COMPOSITE_RISING_DELTA = 0.035  # must drop this much from peak to confirm rising
 
-    MIN_HINGE_FRAMES = 3
+    MIN_HINGE_FRAMES  = 3
     MIN_FRAMES_BETWEEN = 10
+    CALIBRATION_FRAMES = 15   # first N frames used for standing calibration
 
     def __init__(self, fps=10):
         self.fps = max(1, fps)
@@ -265,9 +280,23 @@ class DeadliftRepDetector:
         self.last_rep_frame = -999
         self.hinge_frames = 0
 
-        self.torso_ema = EMA(0.45)
-        self.hip_ema = EMA(0.45)
-        self.composite_ema = EMA(0.35)
+        # Signal smoothers
+        self.torso_ema      = EMA(0.45)
+        self.hip_ema        = EMA(0.45)
+        self.ydrop_ema      = EMA(0.40)
+        self.foreshort_ema  = EMA(0.40)
+        self.composite_ema  = EMA(0.30)
+
+        # ── Standing calibration ──
+        # We collect torso_len and shoulder_y in the first frames / between reps
+        # to know what "standing" looks like, so we can measure relative change.
+        self._calib_torso_lens = []   # euclidean dist shoulder↔hip while standing
+        self._calib_shoulder_ys = []  # shoulder.y while standing
+        self._calib_hip_ys = []       # hip.y while standing (reference)
+        self.standing_torso_len = None   # calibrated
+        self.standing_shoulder_y = None  # calibrated
+        self.standing_hip_y = None       # calibrated
+        self._frames_seen = 0
 
         # Per-rep quality tracking
         self.rep_max_composite = 0.0
@@ -289,30 +318,72 @@ class DeadliftRepDetector:
         self.all_scores = []
         self.reps_report = []
 
-    def _compute_composite(self, torso_angle, hip_angle, x_delta, side_ratio):
+    # ── Calibration ──
+    def _update_calibration(self, shoulder, hip):
+        """Collect standing-posture measurements."""
+        torso_len = float(np.linalg.norm(shoulder - hip))
+        self._calib_torso_lens.append(torso_len)
+        self._calib_shoulder_ys.append(float(shoulder[1]))
+        self._calib_hip_ys.append(float(hip[1]))
+        # Keep a rolling window
+        max_buf = 30
+        if len(self._calib_torso_lens) > max_buf:
+            self._calib_torso_lens = self._calib_torso_lens[-max_buf:]
+            self._calib_shoulder_ys = self._calib_shoulder_ys[-max_buf:]
+            self._calib_hip_ys = self._calib_hip_ys[-max_buf:]
+        # Use median for robustness
+        self.standing_torso_len = float(np.median(self._calib_torso_lens))
+        self.standing_shoulder_y = float(np.median(self._calib_shoulder_ys))
+        self.standing_hip_y = float(np.median(self._calib_hip_ys))
+
+    def _compute_composite(self, torso_angle, hip_angle, x_delta,
+                           shoulder_y_drop, foreshortening, side_ratio):
         """
-        Fuse signals into composite hinge-depth [0, 1].
+        Fuse 5 signals into composite hinge-depth [0, 1].
         Weights adapt to camera angle.
         """
-        # Normalize each signal to [0, 1] (0 = standing, 1 = deep hinge)
+        # ── Normalize each signal to [0, 1] ──
+        # (0 = standing, 1 = deep hinge)
+
+        # Signal 1: torso angle vs vertical (0°=upright → ~70°=deep hinge)
         torso_norm = float(np.clip((torso_angle - 10) / 60.0, 0.0, 1.0))
+
+        # Signal 2: hip angle (170°=standing → ~100°=deep hinge)
         hip_norm = float(np.clip((170 - hip_angle) / 70.0, 0.0, 1.0))
+
+        # Signal 3: x-delta (side view only)
         xdelta_norm = float(np.clip((x_delta - 0.02) / 0.12, 0.0, 1.0))
 
-        # Adaptive weights based on view angle
-        # Side view → torso angle & x_delta reliable
-        # Front/back → hip angle reliable, torso/x_delta less so
-        if side_ratio > 0.6:
-            # Mostly side view
-            w_torso, w_hip, w_xdelta = 0.40, 0.30, 0.30
-        elif side_ratio < 0.3:
-            # Mostly front/back view
-            w_torso, w_hip, w_xdelta = 0.20, 0.65, 0.15
-        else:
-            # Diagonal
-            w_torso, w_hip, w_xdelta = 0.35, 0.45, 0.20
+        # Signal 4: shoulder Y-drop ratio
+        # How far shoulder has dropped from standing position, normalized by torso length
+        # In standing: ~0.  In deep hinge from front: shoulder drops ~0.5-1.0× torso length
+        ydrop_norm = float(np.clip(shoulder_y_drop / 0.55, 0.0, 1.0))
 
-        composite = w_torso * torso_norm + w_hip * hip_norm + w_xdelta * xdelta_norm
+        # Signal 5: torso foreshortening
+        # Ratio of (standing_torso_len - current_torso_len) / standing_torso_len
+        # In standing: ~0.  In deep hinge from front: torso appears ~40-70% shorter
+        foreshort_norm = float(np.clip(foreshortening / 0.50, 0.0, 1.0))
+
+        # ── Adaptive weights by view angle ──
+        if side_ratio > 0.65:
+            # Mostly SIDE view → torso angle & x_delta are king
+            w = {'torso': 0.38, 'hip': 0.22, 'xdelta': 0.28, 'ydrop': 0.07, 'fore': 0.05}
+        elif side_ratio < 0.25:
+            # Mostly FRONT/BACK view → Y-drop & foreshortening are primary
+            w = {'torso': 0.08, 'hip': 0.15, 'xdelta': 0.02, 'ydrop': 0.45, 'fore': 0.30}
+        elif side_ratio < 0.45:
+            # Diagonal leaning front
+            w = {'torso': 0.18, 'hip': 0.25, 'xdelta': 0.07, 'ydrop': 0.30, 'fore': 0.20}
+        else:
+            # Diagonal leaning side
+            w = {'torso': 0.30, 'hip': 0.28, 'xdelta': 0.17, 'ydrop': 0.15, 'fore': 0.10}
+
+        composite = (w['torso'] * torso_norm +
+                     w['hip']   * hip_norm +
+                     w['xdelta'] * xdelta_norm +
+                     w['ydrop'] * ydrop_norm +
+                     w['fore']  * foreshort_norm)
+
         return self.composite_ema.update(composite)
 
     def process_frame(self, smoothed_pts, landmarks_list, frame_idx):
@@ -321,25 +392,36 @@ class DeadliftRepDetector:
         Returns: (composite_progress, rt_feedback_or_None, rep_info_or_None)
         """
         self.frame_count = frame_idx
+        self._frames_seen += 1
 
-        # --- Extract points (prefer right side, fallback to left) ---
+        # --- Extract points (average both sides when both visible for front view) ---
         def _get(r_idx, l_idx):
-            """Get smoothed point, preferring right side."""
             rp = smoothed_pts.get(r_idx)
             lp = smoothed_pts.get(l_idx)
             if rp is not None and lp is not None:
-                # Use the one with better visibility, or average if both good
-                return np.array(rp, dtype=float), True
+                # Average both sides → more stable, especially from front
+                avg = ((rp[0] + lp[0]) / 2.0, (rp[1] + lp[1]) / 2.0)
+                return np.array(avg, dtype=float), True
             if rp is not None:
                 return np.array(rp, dtype=float), True
             if lp is not None:
                 return np.array(lp, dtype=float), True
             return None, False
 
-        shoulder, s_ok = _get(12, 11)  # RIGHT_SHOULDER, LEFT_SHOULDER
-        hip, h_ok = _get(24, 23)       # RIGHT_HIP, LEFT_HIP
-        knee, k_ok = _get(26, 25)      # RIGHT_KNEE, LEFT_KNEE
-        ankle, a_ok = _get(28, 27)     # RIGHT_ANKLE, LEFT_ANKLE
+        def _get_single(r_idx, l_idx):
+            """Get single side point (not averaged) for angle calcs where side matters."""
+            rp = smoothed_pts.get(r_idx)
+            lp = smoothed_pts.get(l_idx)
+            if rp is not None:
+                return np.array(rp, dtype=float), True
+            if lp is not None:
+                return np.array(lp, dtype=float), True
+            return None, False
+
+        shoulder, s_ok = _get(12, 11)   # averaged shoulder midpoint
+        hip, h_ok = _get(24, 23)        # averaged hip midpoint
+        knee, k_ok = _get_single(26, 25)
+        ankle, a_ok = _get_single(28, 27)
 
         if not (s_ok and h_ok):
             return self.prev_composite, None, None
@@ -347,18 +429,53 @@ class DeadliftRepDetector:
         # View angle
         side_ratio = self.view_estimator.estimate(smoothed_pts)
 
-        # --- Compute signals ---
+        # ── Calibrate standing posture ──
+        # During first N frames, or while in STANDING state between reps
+        is_calibrating = (self._frames_seen <= self.CALIBRATION_FRAMES or
+                          (self.state == self.STANDING and
+                           frame_idx - self.last_rep_frame > 3))
+        if is_calibrating:
+            self._update_calibration(shoulder, hip)
+
+        # ── Compute all 5 signals ──
+
+        # Signal 1: Torso angle vs vertical
         torso_angle = _angle_to_vertical(hip, shoulder)
         torso_smooth = self.torso_ema.update(torso_angle)
 
+        # Signal 2: Hip angle (shoulder-hip-knee)
         hip_angle = 170.0
         if k_ok:
             hip_angle = _angle_3pt(shoulder, hip, knee)
         hip_smooth = self.hip_ema.update(hip_angle)
 
+        # Signal 3: X-delta
         x_delta = abs(shoulder[0] - hip[0])
 
-        composite = self._compute_composite(torso_smooth, hip_smooth, x_delta, side_ratio)
+        # Signal 4: Shoulder Y-drop ratio (KEY for front view)
+        # How far shoulder.y has dropped from standing, normalized by standing torso length
+        shoulder_y_drop = 0.0
+        if self.standing_shoulder_y is not None and self.standing_torso_len is not None:
+            raw_drop = (shoulder[1] - self.standing_shoulder_y)  # positive = dropped down
+            shoulder_y_drop = raw_drop / max(0.01, self.standing_torso_len)
+            shoulder_y_drop = max(0.0, shoulder_y_drop)  # only count downward movement
+        shoulder_y_drop_smooth = self.ydrop_ema.update(shoulder_y_drop)
+
+        # Signal 5: Torso foreshortening (KEY for front view)
+        # Current torso length vs standing torso length
+        foreshortening = 0.0
+        if self.standing_torso_len is not None and self.standing_torso_len > 0.01:
+            current_torso_len = float(np.linalg.norm(shoulder - hip))
+            foreshortening = (self.standing_torso_len - current_torso_len) / self.standing_torso_len
+            foreshortening = max(0.0, foreshortening)  # only count shortening
+        foreshort_smooth = self.foreshort_ema.update(foreshortening)
+
+        # ── Composite ──
+        composite = self._compute_composite(
+            torso_smooth, hip_smooth, x_delta,
+            shoulder_y_drop_smooth, foreshort_smooth,
+            side_ratio
+        )
 
         # --- Back rounding ---
         back_rounded = False
@@ -396,7 +513,7 @@ class DeadliftRepDetector:
 
             # Transition to rising: composite drops significantly from peak
             if (self.hinge_frames >= self.MIN_HINGE_FRAMES and
-                    self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.65 and
+                    self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.60 and
                     composite < self.rep_max_composite - self.COMPOSITE_RISING_DELTA):
                 self.state = self.RISING
 
@@ -408,7 +525,7 @@ class DeadliftRepDetector:
 
             if composite < self.COMPOSITE_STANDING:
                 # Rep completed
-                if self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.55:
+                if self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.50:
                     rep_info = self._finalize_rep(frame_idx)
                 self.state = self.STANDING
                 self.last_rep_frame = frame_idx
