@@ -463,10 +463,6 @@ class DeadliftRepDetector:
         # ── Update adaptive calibration EVERY frame ──
         self._update_calibration(shoulder, hip)
 
-        # ── PRIMARY: Dual-signal detection (works from frame 1, any angle) ──
-        dual_signal, torso_angle_raw = self._compute_dual_signal(
-            shoulder, hip, knee, ankle, k_ok, a_ok)
-
         # ── SECONDARY: Calibration-based signals ──
 
         # Signal 1: Torso angle vs vertical
@@ -514,28 +510,29 @@ class DeadliftRepDetector:
         compression_smooth = self.compress_ema.update(compression)
 
         # ── Composite from calibration-based signals (ORIGINAL, proven) ──
-        composite_base = self._compute_composite(
+        composite = self._compute_composite(
             torso_smooth, hip_smooth, x_delta,
             shoulder_y_drop_smooth, foreshort_smooth, compression_smooth,
             side_ratio
         )
 
-        # ── Front-view boost: take max with Signal B (torso-legs ratio) ──
-        # This ensures front-view detection works even if calibration-based
-        # signals are weak. From side view, sig_b ≈ 0 so composite is unchanged.
-        _, sig_b_raw = dual_signal, 0.0
-        if a_ok:
-            s2h = hip[1] - shoulder[1]
-            h2a = ankle[1] - hip[1]
-            if h2a > 0.03:
-                sig_b_raw = float(np.clip((0.52 - s2h / h2a) / 0.40, 0, 1))
-        elif k_ok:
-            s2h = hip[1] - shoulder[1]
-            h2k = knee[1] - hip[1]
-            if h2k > 0.03:
-                sig_b_raw = float(np.clip((0.52 - s2h / h2k) / 0.40, 0, 1))
-
-        composite = max(composite_base, sig_b_raw)
+        # ── Front-view boost (ONLY when camera is actually front-facing) ──
+        # From side view, sig_b has a noisy floor (~0.10-0.15) that would
+        # prevent the composite from dropping to STANDING threshold.
+        # So we only apply it when the view estimator says "mostly front".
+        if side_ratio < 0.35:
+            sig_b_front = 0.0
+            if a_ok:
+                s2h = hip[1] - shoulder[1]
+                h2a = ankle[1] - hip[1]
+                if h2a > 0.03:
+                    sig_b_front = float(np.clip((0.52 - s2h / h2a) / 0.40, 0, 1))
+            elif k_ok:
+                s2h = hip[1] - shoulder[1]
+                h2k = knee[1] - hip[1]
+                if h2k > 0.03:
+                    sig_b_front = float(np.clip((0.52 - s2h / h2k) / 0.40, 0, 1))
+            composite = max(composite, sig_b_front)
 
         # --- Back rounding ---
         back_rounded = False
