@@ -258,11 +258,16 @@ class DeadliftRepDetector:
         return self.composite_ema.update(composite)
 
     def _get_lm_val(self, lm, idx, attr):
-        """Get landmark attribute, handling both APIs."""
-        if hasattr(idx, 'value'):
-            idx = idx.value
-        val = getattr(lm[idx], attr, None)
-        return float(val) if val is not None else (0.5 if attr == 'visibility' else 0.0)
+        """Get landmark attribute, handling both APIs and providing safe fallbacks."""
+        try:
+            if hasattr(idx, 'value'):
+                idx = idx.value
+            val = getattr(lm[idx], attr, None)
+            if val is None:
+                return 0.5 if attr == 'visibility' else 0.0
+            return float(val)
+        except (IndexError, AttributeError, TypeError):
+            return 0.5 if attr == 'visibility' else 0.0
 
     def process_frame(self, smoothed_pts, raw_landmarks, frame_idx):
         """V2 ORIGINAL state machine + front-view signal B."""
@@ -299,23 +304,32 @@ class DeadliftRepDetector:
 
         composite = self._compute_composite(torso_angle_smooth, hip_angle_smooth, side_ratio)
 
-        # ── NEW: Front-view signal B (ONLY when camera is front-facing) ──
-        # Gated by side_ratio < 0.35 so it NEVER affects side-view detection
-        if side_ratio < 0.35:
+        # ── NEW: Front-view signal B (when camera shows front/back view) ──
+        # More relaxed threshold: side_ratio < 0.45 (was 0.35)
+        # Also compute signal B more robustly
+        if side_ratio < 0.45:
             sig_b = 0.0
-            if a_ok:
-                s2h = hip[1] - shoulder[1]
-                h2a = ankle[1] - hip[1]
-                if h2a > 0.03:
-                    ratio = s2h / h2a
-                    sig_b = float(np.clip((0.52 - ratio) / 0.40, 0.0, 1.0))
-            elif k_ok:
-                s2h = hip[1] - shoulder[1]
-                h2k = knee[1] - hip[1]
-                if h2k > 0.03:
-                    ratio = s2h / h2k
-                    sig_b = float(np.clip((0.52 - ratio) / 0.40, 0.0, 1.0))
-            composite = max(composite, sig_b)
+            
+            # Try ankle first, then knee as fallback
+            ref_point = None
+            if a_ok and ankle[1] > hip[1]:  # ankle below hip
+                ref_point = ankle
+            elif k_ok and knee[1] > hip[1]:  # knee below hip  
+                ref_point = knee
+                
+            if ref_point is not None:
+                s2h_y = hip[1] - shoulder[1]      # shoulder-to-hip Y (positive = shoulder above hip)
+                h2ref_y = ref_point[1] - hip[1]   # hip-to-ref Y (positive = ref below hip)
+                
+                # Only proceed if measurements make sense
+                if h2ref_y > 0.05 and s2h_y > 0:  # hip clearly above ref, shoulder above hip
+                    ratio = s2h_y / h2ref_y
+                    # Standing: ratio ≈ 0.5-0.6, Bottom: ratio ≈ 0.1-0.2
+                    sig_b = float(np.clip((0.55 - ratio) / 0.45, 0.0, 1.0))
+                    
+            # Use signal B as boost (only if stronger than composite)
+            if sig_b > composite:
+                composite = sig_b
 
         # ── V2 ORIGINAL: back rounding check ──
         head_pt = None
