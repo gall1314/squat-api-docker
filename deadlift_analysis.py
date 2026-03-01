@@ -266,7 +266,7 @@ class DeadliftRepDetector:
     RISING   = 2
 
     # ── Dual-signal thresholds ──
-    # Signal A: torso angle (side/diagonal view)
+    # Signal A: torso angle (side/diagonal view) — ORIGINAL V3 values
     HINGE_START_ANGLE  = 22.0
     HINGE_BOTTOM_ANGLE = 50.0
     STAND_ANGLE        = 18.0
@@ -274,10 +274,10 @@ class DeadliftRepDetector:
     TLR_STANDING = 0.52
     TLR_RANGE    = 0.40
 
-    # Composite thresholds (on max(sig_A, sig_B) in [0,1])
-    COMPOSITE_HINGE_START  = 0.22
-    COMPOSITE_HINGE_DEEP   = 0.50
-    COMPOSITE_STANDING     = 0.12
+    # Composite thresholds — ORIGINAL V3 values (proven from side view)
+    COMPOSITE_HINGE_START  = 0.18
+    COMPOSITE_HINGE_DEEP   = 0.40
+    COMPOSITE_STANDING     = 0.10
     COMPOSITE_RISING_DELTA = 0.035
 
     MIN_HINGE_FRAMES  = 3
@@ -380,14 +380,11 @@ class DeadliftRepDetector:
         return max(sig_a, sig_b), torso_ang
 
     def _compute_composite(self, torso_angle, hip_angle, x_delta,
-                           shoulder_y_drop, foreshortening, compression, side_ratio,
-                           dual_signal):
+                           shoulder_y_drop, foreshortening, compression, side_ratio):
         """
-        Fuse all signals into composite hinge-depth [0, 1].
-
-        The DUAL SIGNAL (max of torso angle and torso-legs ratio) is the
-        primary driver. Secondary calibration-based signals boost it
-        once standing posture is learned.
+        Fuse calibration-based signals into composite hinge-depth [0, 1].
+        This is the ORIGINAL proven composite — works from side/diagonal.
+        Front-view boost is applied OUTSIDE this function via max(composite, sig_b).
         """
         torso_norm    = float(np.clip((torso_angle - 10) / 60.0, 0.0, 1.0))
         hip_norm      = float(np.clip((170 - hip_angle) / 70.0, 0.0, 1.0))
@@ -395,32 +392,30 @@ class DeadliftRepDetector:
         ydrop_norm    = float(np.clip(shoulder_y_drop / 0.55, 0.0, 1.0))
         foreshort_norm = float(np.clip(foreshortening / 0.50, 0.0, 1.0))
         compress_norm = float(np.clip(compression, 0.0, 1.0))
-        dual_norm     = float(np.clip(dual_signal, 0.0, 1.0))
 
         if side_ratio > 0.65:
-            # SIDE view — torso angle dominant, dual as anchor
-            w = {'torso': 0.20, 'hip': 0.12, 'xdelta': 0.15,
-                 'ydrop': 0.03, 'fore': 0.03, 'comp': 0.07, 'dual': 0.40}
+            # SIDE view
+            w = {'torso': 0.35, 'hip': 0.20, 'xdelta': 0.25,
+                 'ydrop': 0.05, 'fore': 0.05, 'comp': 0.10}
         elif side_ratio < 0.25:
-            # FRONT/BACK view — dual signal is king (no calibration needed)
-            w = {'torso': 0.03, 'hip': 0.05, 'xdelta': 0.00,
-                 'ydrop': 0.10, 'fore': 0.07, 'comp': 0.15, 'dual': 0.60}
+            # FRONT/BACK view
+            w = {'torso': 0.05, 'hip': 0.10, 'xdelta': 0.00,
+                 'ydrop': 0.25, 'fore': 0.20, 'comp': 0.40}
         elif side_ratio < 0.45:
             # Diagonal (leaning front)
-            w = {'torso': 0.10, 'hip': 0.10, 'xdelta': 0.03,
-                 'ydrop': 0.07, 'fore': 0.05, 'comp': 0.15, 'dual': 0.50}
+            w = {'torso': 0.15, 'hip': 0.18, 'xdelta': 0.05,
+                 'ydrop': 0.17, 'fore': 0.15, 'comp': 0.30}
         else:
             # Diagonal (leaning side)
-            w = {'torso': 0.18, 'hip': 0.12, 'xdelta': 0.10,
-                 'ydrop': 0.05, 'fore': 0.05, 'comp': 0.10, 'dual': 0.40}
+            w = {'torso': 0.28, 'hip': 0.20, 'xdelta': 0.15,
+                 'ydrop': 0.10, 'fore': 0.07, 'comp': 0.20}
 
         composite = (w['torso'] * torso_norm +
                      w['hip']   * hip_norm +
                      w['xdelta'] * xdelta_norm +
                      w['ydrop'] * ydrop_norm +
                      w['fore']  * foreshort_norm +
-                     w['comp']  * compress_norm +
-                     w['dual']  * dual_norm)
+                     w['comp']  * compress_norm)
 
         return self.composite_ema.update(composite)
 
@@ -518,12 +513,29 @@ class DeadliftRepDetector:
         compression = float(np.clip((0.52 - torso_leg_ratio) / 0.40, 0.0, 1.0))
         compression_smooth = self.compress_ema.update(compression)
 
-        # ── Composite (dual-signal weighted heavily) ──
-        composite = self._compute_composite(
+        # ── Composite from calibration-based signals (ORIGINAL, proven) ──
+        composite_base = self._compute_composite(
             torso_smooth, hip_smooth, x_delta,
             shoulder_y_drop_smooth, foreshort_smooth, compression_smooth,
-            side_ratio, dual_signal
+            side_ratio
         )
+
+        # ── Front-view boost: take max with Signal B (torso-legs ratio) ──
+        # This ensures front-view detection works even if calibration-based
+        # signals are weak. From side view, sig_b ≈ 0 so composite is unchanged.
+        _, sig_b_raw = dual_signal, 0.0
+        if a_ok:
+            s2h = hip[1] - shoulder[1]
+            h2a = ankle[1] - hip[1]
+            if h2a > 0.03:
+                sig_b_raw = float(np.clip((0.52 - s2h / h2a) / 0.40, 0, 1))
+        elif k_ok:
+            s2h = hip[1] - shoulder[1]
+            h2k = knee[1] - hip[1]
+            if h2k > 0.03:
+                sig_b_raw = float(np.clip((0.52 - s2h / h2k) / 0.40, 0, 1))
+
+        composite = max(composite_base, sig_b_raw)
 
         # --- Back rounding ---
         back_rounded = False
@@ -985,8 +997,8 @@ class PoseEstimator:
 
 # ===================== MAIN =====================
 def run_deadlift_analysis(video_path,
-                          frame_skip=3,
-                          scale=0.4,
+                          frame_skip=2,
+                          scale=0.5,
                           output_path="deadlift_analyzed.mp4",
                           feedback_path="deadlift_feedback.txt",
                           detector_onnx_path="barbell_plates_yolov8n.onnx",
