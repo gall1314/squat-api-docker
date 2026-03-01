@@ -733,7 +733,7 @@ class PoseEstimator:
 
         if _SOLUTIONS_AVAILABLE:
             self._impl = _mp_pose.Pose(
-                model_complexity=2,
+                model_complexity=1,
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
@@ -775,8 +775,8 @@ class PoseEstimator:
 
 # ===================== MAIN =====================
 def run_deadlift_analysis(video_path,
-                          frame_skip=2,
-                          scale=0.5,
+                          frame_skip=3,
+                          scale=0.4,
                           output_path="deadlift_analyzed.mp4",
                           feedback_path="deadlift_feedback.txt",
                           detector_onnx_path="barbell_plates_yolov8n.onnx",
@@ -847,6 +847,9 @@ def run_deadlift_analysis(video_path,
         }
 
     try:
+        max_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1000)
+        processed_frames = 0
+        
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
@@ -854,6 +857,11 @@ def run_deadlift_analysis(video_path,
             frame_idx += 1
             if frame_idx % frame_skip != 0:
                 continue
+
+            processed_frames += 1
+            # Safety: stop if processing too long (avoid server timeout)
+            if processed_frames > 500:  # ~83 seconds of video at 6fps effective
+                break
 
             work = cv2.resize(frame, (0, 0), fx=scale, fy=scale) if scale != 1.0 else frame.copy()
 
