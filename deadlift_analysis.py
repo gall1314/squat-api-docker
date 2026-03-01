@@ -1,53 +1,32 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — V3: Front-view fix with 5-signal adaptive fusion
+# deadlift_analysis.py — V2 restored + front-view fix
 #
-# KEY IMPROVEMENTS:
-# ─────────────────
-# 1.  5-SIGNAL REP DETECTION with adaptive weighting by camera angle:
-#     a) Torso angle vs vertical           — side & diagonal views
-#     b) Hip angle (shoulder-hip-knee)      — diagonal views
-#     c) X-delta (shoulder.x − hip.x)      — side view
-#     d) Shoulder Y-drop ratio  ★NEW       — FRONT/BACK view primary
-#     e) Torso foreshortening   ★NEW       — FRONT/BACK view secondary
-# 2.  STANDING CALIBRATION: learns standing posture in first ~15 frames
-#     and re-calibrates between reps → signals (d) and (e) measured as
-#     relative change from standing baseline
-# 3.  VIEW-ANGLE ESTIMATION from shoulder-width / torso-height ratio
-#     → auto-shifts weights to front-view signals when needed
-# 4.  AVERAGES BOTH SIDES for shoulder/hip midpoint → more stable from front
-# 5.  LANDMARK SMOOTHER (EMA on all 33 points) → clean skeleton
-# 6.  DUAL MediaPipe API support (old solutions + new Tasks API)
-# 7.  MODEL COMPLEXITY 2 for best accuracy
-# 8.  Proper state machine with hysteresis
+# BASE: exact V2 code that counted reps correctly from side view
+# ADDED: dual MediaPipe API support + front-view signal B (gated by side_ratio)
 
-import os, cv2, math, sys, numpy as np, subprocess
+import os, cv2, math, numpy as np, subprocess
 from collections import deque
 from PIL import ImageFont, ImageDraw, Image
-
-# ===================== MediaPipe import (dual API support) =====================
 import mediapipe as mp
 
+# ===================== MediaPipe import (dual API support) =====================
 _USE_TASKS_API = False
 _SOLUTIONS_AVAILABLE = False
 
-# Try old solutions API first (mediapipe < 0.10.21 typically)
 try:
     _mp_pose = mp.solutions.pose
     _SOLUTIONS_AVAILABLE = True
 except AttributeError:
     _SOLUTIONS_AVAILABLE = False
 
-# If solutions not available, use Tasks API
 if not _SOLUTIONS_AVAILABLE:
     try:
         _tasks_vision = mp.tasks.vision
         _tasks_base = mp.tasks.BaseOptions
         _USE_TASKS_API = True
     except AttributeError:
-        raise ImportError("Neither mp.solutions.pose nor mp.tasks.vision available. "
-                          "Please install mediapipe >= 0.10.0")
+        raise ImportError("Neither mp.solutions.pose nor mp.tasks.vision available.")
 
-# Unified PoseLandmark enum
 if _SOLUTIONS_AVAILABLE:
     PL = _mp_pose.PoseLandmark
     POSE_CONNECTIONS = _mp_pose.POSE_CONNECTIONS
@@ -56,7 +35,7 @@ else:
     _raw_conns = _tasks_vision.PoseLandmarksConnections.POSE_LANDMARKS
     POSE_CONNECTIONS = frozenset((c.start, c.end) for c in _raw_conns)
 
-# ===================== Optional ONNX Runtime =====================
+# ===================== Optional ONNX Runtime (YOLO detector) =====================
 try:
     import onnxruntime as ort
     _ORT_AVAILABLE = True
@@ -114,7 +93,7 @@ def display_half_str(x: float) -> str:
     return str(int(round(q))) if abs(q - round(q)) < 1e-9 else f"{q:.1f}"
 
 # ===================== FACE EXCLUSION =====================
-_FACE_INDICES = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}  # nose, eyes, ears, mouth
+_FACE_INDICES = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
 _BODY_CONNS = tuple((a, b) for (a, b) in POSE_CONNECTIONS
                     if a not in _FACE_INDICES and b not in _FACE_INDICES)
 _BODY_POINTS = tuple(sorted({i for (a, b) in _BODY_CONNS for i in (a, b)}))
@@ -122,16 +101,16 @@ _BODY_POINTS = tuple(sorted({i for (a, b) in _BODY_CONNS for i in (a, b)}))
 # ===================== GEOMETRY HELPERS =====================
 def _angle_3pt(a, b, c):
     """Angle at vertex b formed by points a-b-c, in degrees."""
-    ba = np.asarray(a, dtype=float) - np.asarray(b, dtype=float)
-    bc = np.asarray(c, dtype=float) - np.asarray(b, dtype=float)
+    ba = np.array(a, dtype=float) - np.array(b, dtype=float)
+    bc = np.array(c, dtype=float) - np.array(b, dtype=float)
     nrm = (np.linalg.norm(ba) * np.linalg.norm(bc)) + 1e-9
     cosang = float(np.clip(np.dot(ba, bc) / nrm, -1.0, 1.0))
     return math.degrees(math.acos(cosang))
 
 def _angle_to_vertical(a, b):
-    """Angle of vector a→b relative to straight up (0° = vertical upward)."""
+    """Angle of vector a→b relative to straight up (0° = vertical)."""
     dx = b[0] - a[0]
-    dy = b[1] - a[1]  # y increases downward in image coords
+    dy = b[1] - a[1]
     angle = math.degrees(math.atan2(abs(dx), -dy + 1e-9))
     return abs(angle)
 
@@ -153,68 +132,44 @@ class EMA:
 
 # ===================== LANDMARK SMOOTHER =====================
 class LandmarkSmoother:
-    """
-    Smooths all 33 MediaPipe landmarks with per-landmark EMA.
-    Reduces jitter significantly → cleaner skeleton + stable angle signals.
-    """
-    def __init__(self, alpha=0.5, vis_threshold=0.35):
+    def __init__(self, alpha=0.5, vis_threshold=0.4):
         self.alpha = alpha
         self.vis_threshold = vis_threshold
-        self.smoothed = {}  # idx → (x, y)
-        self.visibility = {}  # idx → float
+        self.smoothed = {}
 
-    def update(self, landmarks_list):
-        """
-        landmarks_list: list of landmarks with .x, .y, .visibility (or .presence)
-        Returns dict of idx → (x, y) for visible/smoothed landmarks.
-        """
+    def update(self, landmarks):
         result = {}
-        for idx in range(min(33, len(landmarks_list))):
-            lm = landmarks_list[idx]
-
-            # Handle both old API (.visibility) and new API (.visibility or .presence)
+        for idx in range(min(33, len(landmarks))):
+            lm = landmarks[idx]
             vis = getattr(lm, 'visibility', None)
             if vis is None:
-                vis = getattr(lm, 'presence', 0.5)  # Tasks API sometimes uses presence
+                vis = getattr(lm, 'presence', 0.5)
             if vis is None:
                 vis = 0.5
 
-            self.visibility[idx] = float(vis)
-
             if float(vis) < self.vis_threshold:
                 if idx in self.smoothed:
-                    result[idx] = self.smoothed[idx]
+                    result[idx] = self.smoothed[idx][:2]
                 continue
 
-            raw_x, raw_y = float(lm.x), float(lm.y)
-
+            raw = np.array([float(lm.x), float(lm.y), getattr(lm, 'z', 0.0)], dtype=float)
             if idx in self.smoothed:
-                prev_x, prev_y = self.smoothed[idx]
-                sx = self.alpha * raw_x + (1 - self.alpha) * prev_x
-                sy = self.alpha * raw_y + (1 - self.alpha) * prev_y
+                prev = np.array(self.smoothed[idx], dtype=float)
+                smooth = self.alpha * raw + (1 - self.alpha) * prev
             else:
-                sx, sy = raw_x, raw_y
+                smooth = raw
 
-            self.smoothed[idx] = (sx, sy)
-            result[idx] = (sx, sy)
+            self.smoothed[idx] = tuple(smooth)
+            result[idx] = (float(smooth[0]), float(smooth[1]))
 
         return result
 
-    def get_visibility(self, idx):
-        return self.visibility.get(idx, 0.0)
-
 # ===================== VIEW ANGLE ESTIMATOR =====================
 class ViewAngleEstimator:
-    """
-    Estimates camera viewing angle:
-    - side_ratio ~1.0 = pure side view (shoulder width appears small)
-    - side_ratio ~0.0 = pure front/back view (shoulder width appears large)
-    """
-    def __init__(self, alpha=0.25):
+    def __init__(self, alpha=0.3):
         self.ema = EMA(alpha)
 
     def estimate(self, smoothed_pts):
-        """Returns side_ratio in [0, 1]."""
         ls = smoothed_pts.get(11)  # LEFT_SHOULDER
         rs = smoothed_pts.get(12)  # RIGHT_SHOULDER
         lh = smoothed_pts.get(23)  # LEFT_HIP
@@ -230,87 +185,47 @@ class ViewAngleEstimator:
             return self.ema.value if self.ema.value is not None else 0.5
 
         ratio = shoulder_width / torso_h
-        # ratio ~0.1-0.3 → side; ratio ~0.8-1.5 → front
         side_score = float(np.clip(1.0 - (ratio - 0.15) / 0.85, 0.0, 1.0))
         return self.ema.update(side_score)
 
-# ===================== MULTI-SIGNAL REP DETECTOR =====================
+# ===================== REP DETECTOR (V2 proven logic + front-view signal) =====================
 class DeadliftRepDetector:
     """
-    Detects deadlift reps using dual-signal detection with adaptive fusion.
-
-    ── Why dual signal? ──
-    From SIDE view: torso angle works perfectly (like good_morning).
-    From FRONT/BACK view: torso angle is nearly flat!
-      Instead, the torso-to-legs Y ratio changes dramatically:
-      Standing: (hip.y - shoulder.y) / (ankle.y - hip.y) ≈ 0.52
-      Bottom:   ratio drops to ≈ 0.15 (shoulder near hip level)
-      This 60%+ change is the key front-view signal.
-
-    PRIMARY detection: max(signal_A, signal_B) — works from ANY angle.
-    SECONDARY signals (calibration-based) amplify once standing posture learned.
-
-    Signals:
-    1. Torso angle (hip→shoulder vs vertical)        — side & diagonal
-    2. Hip angle (shoulder-hip-knee)                  — diagonal & moderate front
-    3. X-delta (|shoulder.x − hip.x|)                — side only
-    4. Shoulder Y-drop ratio                         — FRONT view (needs calibration)
-    5. Torso foreshortening ratio                    — FRONT view (needs calibration)
-    6. Torso-to-legs Y ratio  ★PRIMARY FRONT SIGNAL — NO calibration needed!
-
-    State machine: STANDING → HINGING → RISING → STANDING (= 1 rep)
+    V2 proven rep detection with 2-signal composite (torso angle + hip angle).
+    
+    ADDED for front view: when side_ratio < 0.35, we also compute a 
+    torso-to-legs Y ratio signal and take max(composite, sig_b_front).
+    This is ONLY active for front/back camera angles.
     """
 
     STANDING = 0
     HINGING  = 1
     RISING   = 2
 
-    # ── Dual-signal thresholds ──
-    # Signal A: torso angle (side/diagonal view) — ORIGINAL V3 values
-    HINGE_START_ANGLE  = 22.0
-    HINGE_BOTTOM_ANGLE = 50.0
-    STAND_ANGLE        = 18.0
-    # Signal B: torso-to-legs Y ratio (front/back view)
-    TLR_STANDING = 0.52
-    TLR_RANGE    = 0.40
+    # V2 original thresholds (PROVEN)
+    COMPOSITE_HINGE_START = 0.25
+    COMPOSITE_HINGE_DEEP  = 0.50
+    COMPOSITE_STANDING    = 0.15
 
-    # Composite thresholds — ORIGINAL V3 values (proven from side view)
-    COMPOSITE_HINGE_START  = 0.18
-    COMPOSITE_HINGE_DEEP   = 0.40
-    COMPOSITE_STANDING     = 0.10
-    COMPOSITE_RISING_DELTA = 0.035
-
-    MIN_HINGE_FRAMES  = 3
-    MIN_FRAMES_BETWEEN = 10
-    CALIBRATION_FRAMES = 15
+    MIN_HINGE_FRAMES = 4
+    MIN_FRAMES_BETWEEN = 12
 
     def __init__(self, fps=10):
-        self.fps = max(1, fps)
+        self.fps = fps
         self.state = self.STANDING
         self.frame_count = 0
         self.last_rep_frame = -999
         self.hinge_frames = 0
 
-        # Signal smoothers
-        self.torso_ema      = EMA(0.45)
-        self.hip_ema        = EMA(0.45)
-        self.ydrop_ema      = EMA(0.40)
-        self.foreshort_ema  = EMA(0.40)
-        self.compress_ema   = EMA(0.40)
-        self.composite_ema  = EMA(0.30)
+        # V2 original smoothers
+        self.torso_angle_ema = EMA(0.45)
+        self.hip_angle_ema = EMA(0.45)
+        self.composite_ema = EMA(0.40)
 
-        # ── Adaptive standing calibration ──
-        self.standing_torso_len = None
-        self.standing_shoulder_y = None
-        self.standing_hip_y = None
-        self._torso_len_history = []
-        self._shoulder_y_history = []
-        self._frames_seen = 0
-
-        # Per-rep quality tracking
+        # Per-rep tracking
         self.rep_max_composite = 0.0
-        self.rep_back_round_frames = 0
-        self.rep_leg_back_mismatch = 0
+        self.rep_back_rounding_frames = 0
+        self.rep_leg_back_mismatch_frames = 0
         self.rep_down_frames = 0
         self.rep_up_frames = 0
         self.rep_top_hold_frames = 0
@@ -320,289 +235,155 @@ class DeadliftRepDetector:
 
         self.view_estimator = ViewAngleEstimator()
 
-        # Results
+        # Output
         self.reps = 0
         self.good_reps = 0
         self.bad_reps = 0
         self.all_scores = []
         self.reps_report = []
 
-    # ── Adaptive calibration ──
-    def _update_calibration(self, shoulder, hip):
-        """
-        Adaptively learn standing posture by tracking the MOST UPRIGHT
-        position observed so far (percentile-based, outlier-resistant).
-        """
-        torso_len = float(np.linalg.norm(shoulder - hip))
-        shoulder_y = float(shoulder[1])
-        hip_y = float(hip[1])
+    def _compute_composite(self, torso_angle, hip_angle, side_ratio):
+        """V2 ORIGINAL: 2-signal composite weighted by view angle."""
+        torso_norm = float(np.clip((torso_angle - 12) / 55.0, 0.0, 1.0))
+        hip_norm = float(np.clip((170 - hip_angle) / 70.0, 0.0, 1.0))
 
-        self._torso_len_history.append(torso_len)
-        self._shoulder_y_history.append(shoulder_y)
+        w_torso = 0.3 + 0.5 * side_ratio
+        w_hip   = 0.3 + 0.5 * (1 - side_ratio)
 
-        max_buf = 120
-        if len(self._torso_len_history) > max_buf:
-            self._torso_len_history = self._torso_len_history[-max_buf:]
-            self._shoulder_y_history = self._shoulder_y_history[-max_buf:]
+        total = w_torso + w_hip + 1e-9
+        w_torso /= total
+        w_hip /= total
 
-        arr_tl = np.array(self._torso_len_history)
-        arr_sy = np.array(self._shoulder_y_history)
-
-        self.standing_torso_len = float(np.percentile(arr_tl, 92))
-        self.standing_shoulder_y = float(np.percentile(arr_sy, 8))
-        self.standing_hip_y = hip_y
-
-    def _compute_dual_signal(self, shoulder, hip, knee, ankle, k_ok, a_ok):
-        """
-        Compute the primary dual-signal hinge depth [0, 1].
-        Signal A: torso angle (side view)
-        Signal B: torso-to-legs Y ratio (front view, NO calibration)
-        Returns max(sig_A, sig_B) and raw torso angle.
-        """
-        torso_ang = _angle_to_vertical(hip, shoulder)
-        sig_a = float(np.clip((torso_ang - self.STAND_ANGLE) /
-                              max(1e-6, self.HINGE_BOTTOM_ANGLE - self.STAND_ANGLE), 0, 1))
-
-        sig_b = 0.0
-        if a_ok:
-            s2h_y = hip[1] - shoulder[1]
-            h2a_y = ankle[1] - hip[1]
-            if h2a_y > 0.03:
-                ratio = s2h_y / h2a_y
-                sig_b = float(np.clip((self.TLR_STANDING - ratio) / self.TLR_RANGE, 0, 1))
-        elif k_ok:
-            s2h_y = hip[1] - shoulder[1]
-            h2k_y = knee[1] - hip[1]
-            if h2k_y > 0.03:
-                ratio = s2h_y / h2k_y
-                sig_b = float(np.clip((self.TLR_STANDING - ratio) / self.TLR_RANGE, 0, 1))
-
-        return max(sig_a, sig_b), torso_ang
-
-    def _compute_composite(self, torso_angle, hip_angle, x_delta,
-                           shoulder_y_drop, foreshortening, compression, side_ratio):
-        """
-        Fuse calibration-based signals into composite hinge-depth [0, 1].
-        This is the ORIGINAL proven composite — works from side/diagonal.
-        Front-view boost is applied OUTSIDE this function via max(composite, sig_b).
-        """
-        torso_norm    = float(np.clip((torso_angle - 10) / 60.0, 0.0, 1.0))
-        hip_norm      = float(np.clip((170 - hip_angle) / 70.0, 0.0, 1.0))
-        xdelta_norm   = float(np.clip((x_delta - 0.02) / 0.12, 0.0, 1.0))
-        ydrop_norm    = float(np.clip(shoulder_y_drop / 0.55, 0.0, 1.0))
-        foreshort_norm = float(np.clip(foreshortening / 0.50, 0.0, 1.0))
-        compress_norm = float(np.clip(compression, 0.0, 1.0))
-
-        if side_ratio > 0.65:
-            # SIDE view
-            w = {'torso': 0.35, 'hip': 0.20, 'xdelta': 0.25,
-                 'ydrop': 0.05, 'fore': 0.05, 'comp': 0.10}
-        elif side_ratio < 0.25:
-            # FRONT/BACK view
-            w = {'torso': 0.05, 'hip': 0.10, 'xdelta': 0.00,
-                 'ydrop': 0.25, 'fore': 0.20, 'comp': 0.40}
-        elif side_ratio < 0.45:
-            # Diagonal (leaning front)
-            w = {'torso': 0.15, 'hip': 0.18, 'xdelta': 0.05,
-                 'ydrop': 0.17, 'fore': 0.15, 'comp': 0.30}
-        else:
-            # Diagonal (leaning side)
-            w = {'torso': 0.28, 'hip': 0.20, 'xdelta': 0.15,
-                 'ydrop': 0.10, 'fore': 0.07, 'comp': 0.20}
-
-        composite = (w['torso'] * torso_norm +
-                     w['hip']   * hip_norm +
-                     w['xdelta'] * xdelta_norm +
-                     w['ydrop'] * ydrop_norm +
-                     w['fore']  * foreshort_norm +
-                     w['comp']  * compress_norm)
-
+        composite = w_torso * torso_norm + w_hip * hip_norm
         return self.composite_ema.update(composite)
 
-    def process_frame(self, smoothed_pts, landmarks_list, frame_idx):
-        """
-        Process one frame.
-        Returns: (composite_progress, rt_feedback_or_None, rep_info_or_None)
-        """
+    def _get_lm_val(self, lm, idx, attr):
+        """Get landmark attribute, handling both APIs."""
+        if hasattr(idx, 'value'):
+            idx = idx.value
+        val = getattr(lm[idx], attr, None)
+        return float(val) if val is not None else (0.5 if attr == 'visibility' else 0.0)
+
+    def process_frame(self, smoothed_pts, raw_landmarks, frame_idx):
+        """V2 ORIGINAL state machine + front-view signal B."""
         self.frame_count = frame_idx
-        self._frames_seen += 1
+        lm = raw_landmarks
 
-        # --- Extract points (average both sides when both visible for front view) ---
-        def _get(r_idx, l_idx):
-            rp = smoothed_pts.get(r_idx)
-            lp = smoothed_pts.get(l_idx)
-            if rp is not None and lp is not None:
-                avg = ((rp[0] + lp[0]) / 2.0, (rp[1] + lp[1]) / 2.0)
-                return np.array(avg, dtype=float), True
-            if rp is not None:
-                return np.array(rp, dtype=float), True
-            if lp is not None:
-                return np.array(lp, dtype=float), True
+        def _get_pt(primary_idx, fallback_idx):
+            p_vis = self._get_lm_val(lm, primary_idx, 'visibility')
+            if primary_idx in smoothed_pts and p_vis > 0.4:
+                return np.array(smoothed_pts[primary_idx], dtype=float), True
+            f_vis = self._get_lm_val(lm, fallback_idx, 'visibility')
+            if fallback_idx in smoothed_pts and f_vis > 0.4:
+                return np.array(smoothed_pts[fallback_idx], dtype=float), True
             return None, False
 
-        def _get_single(r_idx, l_idx):
-            rp = smoothed_pts.get(r_idx)
-            lp = smoothed_pts.get(l_idx)
-            if rp is not None:
-                return np.array(rp, dtype=float), True
-            if lp is not None:
-                return np.array(lp, dtype=float), True
-            return None, False
-
-        shoulder, s_ok = _get(12, 11)
-        hip, h_ok = _get(24, 23)
-        knee, k_ok = _get_single(26, 25)
-        ankle, a_ok = _get_single(28, 27)
+        shoulder, s_ok = _get_pt(12, 11)  # RIGHT_SHOULDER, LEFT_SHOULDER
+        hip, h_ok = _get_pt(24, 23)       # RIGHT_HIP, LEFT_HIP
+        knee, k_ok = _get_pt(26, 25)      # RIGHT_KNEE, LEFT_KNEE
+        ankle, a_ok = _get_pt(28, 27)     # RIGHT_ANKLE, LEFT_ANKLE
 
         if not (s_ok and h_ok):
             return self.prev_composite, None, None
 
-        # View angle
         side_ratio = self.view_estimator.estimate(smoothed_pts)
 
-        # ── Update adaptive calibration EVERY frame ──
-        self._update_calibration(shoulder, hip)
-
-        # ── SECONDARY: Calibration-based signals ──
-
-        # Signal 1: Torso angle vs vertical
+        # ── V2 ORIGINAL: torso angle + hip angle ──
         torso_angle = _angle_to_vertical(hip, shoulder)
-        torso_smooth = self.torso_ema.update(torso_angle)
+        torso_angle_smooth = self.torso_angle_ema.update(torso_angle)
 
-        # Signal 2: Hip angle (shoulder-hip-knee)
         hip_angle = 170.0
         if k_ok:
             hip_angle = _angle_3pt(shoulder, hip, knee)
-        hip_smooth = self.hip_ema.update(hip_angle)
+        hip_angle_smooth = self.hip_angle_ema.update(hip_angle)
 
-        # Signal 3: X-delta
-        x_delta = abs(shoulder[0] - hip[0])
+        composite = self._compute_composite(torso_angle_smooth, hip_angle_smooth, side_ratio)
 
-        # Signal 4: Shoulder Y-drop ratio
-        shoulder_y_drop = 0.0
-        if self.standing_shoulder_y is not None and self.standing_torso_len is not None:
-            raw_drop = (shoulder[1] - self.standing_shoulder_y)
-            shoulder_y_drop = raw_drop / max(0.01, self.standing_torso_len)
-            shoulder_y_drop = max(0.0, shoulder_y_drop)
-        shoulder_y_drop_smooth = self.ydrop_ema.update(shoulder_y_drop)
-
-        # Signal 5: Torso foreshortening
-        foreshortening = 0.0
-        if self.standing_torso_len is not None and self.standing_torso_len > 0.01:
-            current_torso_len = float(np.linalg.norm(shoulder - hip))
-            foreshortening = (self.standing_torso_len - current_torso_len) / self.standing_torso_len
-            foreshortening = max(0.0, foreshortening)
-        foreshort_smooth = self.foreshort_ema.update(foreshortening)
-
-        # Signal 6: Torso-to-legs Y ratio (NO calibration needed)
-        torso_leg_ratio = 0.0
-        if a_ok:
-            s2h_y = hip[1] - shoulder[1]
-            h2a_y = ankle[1] - hip[1]
-            if h2a_y > 0.03:
-                torso_leg_ratio = s2h_y / h2a_y
-        elif k_ok:
-            s2h_y = hip[1] - shoulder[1]
-            h2k_y = knee[1] - hip[1]
-            if h2k_y > 0.03:
-                torso_leg_ratio = s2h_y / h2k_y
-        compression = float(np.clip((0.52 - torso_leg_ratio) / 0.40, 0.0, 1.0))
-        compression_smooth = self.compress_ema.update(compression)
-
-        # ── Composite from calibration-based signals (ORIGINAL, proven) ──
-        composite = self._compute_composite(
-            torso_smooth, hip_smooth, x_delta,
-            shoulder_y_drop_smooth, foreshort_smooth, compression_smooth,
-            side_ratio
-        )
-
-        # ── Front-view boost (ONLY when camera is actually front-facing) ──
-        # From side view, sig_b has a noisy floor (~0.10-0.15) that would
-        # prevent the composite from dropping to STANDING threshold.
-        # So we only apply it when the view estimator says "mostly front".
+        # ── NEW: Front-view signal B (ONLY when camera is front-facing) ──
+        # Gated by side_ratio < 0.35 so it NEVER affects side-view detection
         if side_ratio < 0.35:
-            sig_b_front = 0.0
+            sig_b = 0.0
             if a_ok:
                 s2h = hip[1] - shoulder[1]
                 h2a = ankle[1] - hip[1]
                 if h2a > 0.03:
-                    sig_b_front = float(np.clip((0.52 - s2h / h2a) / 0.40, 0, 1))
+                    ratio = s2h / h2a
+                    sig_b = float(np.clip((0.52 - ratio) / 0.40, 0.0, 1.0))
             elif k_ok:
                 s2h = hip[1] - shoulder[1]
                 h2k = knee[1] - hip[1]
                 if h2k > 0.03:
-                    sig_b_front = float(np.clip((0.52 - s2h / h2k) / 0.40, 0, 1))
-            composite = max(composite, sig_b_front)
+                    ratio = s2h / h2k
+                    sig_b = float(np.clip((0.52 - ratio) / 0.40, 0.0, 1.0))
+            composite = max(composite, sig_b)
 
-        # --- Back rounding ---
-        back_rounded = False
+        # ── V2 ORIGINAL: back rounding check ──
         head_pt = None
         for idx in (8, 7, 0):  # RIGHT_EAR, LEFT_EAR, NOSE
-            if idx in smoothed_pts:
+            vis = self._get_lm_val(lm, idx, 'visibility')
+            if idx in smoothed_pts and vis > 0.45:
                 head_pt = np.array(smoothed_pts[idx], dtype=float)
                 break
-        if head_pt is not None:
-            back_rounded = self._check_back(shoulder, hip, head_pt)
 
-        # --- Knee angle for leg-back mismatch ---
+        back_rounded = False
+        if head_pt is not None and s_ok and h_ok:
+            back_rounded = self._check_back_rounding(shoulder, hip, head_pt)
+
         knee_angle = None
         if k_ok and a_ok:
             knee_angle = _angle_3pt(hip, knee, ankle)
 
-        # --- State machine ---
-        rt_fb = None
+        # ── V2 ORIGINAL state machine ──
+        rt_feedback = None
         rep_info = None
 
         if self.state == self.STANDING:
-            if (composite > self.COMPOSITE_HINGE_START and
-                    frame_idx - self.last_rep_frame > self.MIN_FRAMES_BETWEEN):
+            if composite > self.COMPOSITE_HINGE_START and (frame_idx - self.last_rep_frame > self.MIN_FRAMES_BETWEEN):
                 self.state = self.HINGING
                 self.hinge_frames = 0
-                self._reset_rep()
+                self._reset_rep_tracking()
 
         elif self.state == self.HINGING:
             self.hinge_frames += 1
             self.rep_max_composite = max(self.rep_max_composite, composite)
-            self._track_quality(composite, back_rounded, knee_angle, torso_smooth)
+            self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
 
             if back_rounded:
-                rt_fb = "Try to keep your back a bit straighter"
+                rt_feedback = "Try to keep your back a bit straighter"
 
-            # Transition to rising: composite drops significantly from peak
-            if (self.hinge_frames >= self.MIN_HINGE_FRAMES and
-                    self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.60 and
-                    composite < self.rep_max_composite - self.COMPOSITE_RISING_DELTA):
-                self.state = self.RISING
+            # V2 ORIGINAL transition: composite drops 0.03 from previous
+            if composite < self.prev_composite - 0.03 and self.hinge_frames >= self.MIN_HINGE_FRAMES:
+                if self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.7:
+                    self.state = self.RISING
 
         elif self.state == self.RISING:
-            self._track_quality(composite, back_rounded, knee_angle, torso_smooth)
+            self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
 
             if back_rounded:
-                rt_fb = "Try to keep your back a bit straighter"
+                rt_feedback = "Try to keep your back a bit straighter"
 
             if composite < self.COMPOSITE_STANDING:
-                # Rep completed
-                if self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.50:
+                if self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.6:
                     rep_info = self._finalize_rep(frame_idx)
                 self.state = self.STANDING
                 self.last_rep_frame = frame_idx
 
         self.prev_composite = composite
-        return composite, rt_fb, rep_info
+        return composite, rt_feedback, rep_info
 
-    def _reset_rep(self):
+    def _reset_rep_tracking(self):
         self.rep_max_composite = 0.0
-        self.rep_back_round_frames = 0
-        self.rep_leg_back_mismatch = 0
+        self.rep_back_rounding_frames = 0
+        self.rep_leg_back_mismatch_frames = 0
         self.rep_down_frames = 0
         self.rep_up_frames = 0
         self.rep_top_hold_frames = 0
         self.prev_knee_angle = None
         self.prev_torso_raw = None
 
-    def _track_quality(self, composite, back_rounded, knee_angle, torso_angle):
+    def _track_rep_quality(self, composite, back_rounded, knee_angle, torso_angle):
         if back_rounded:
-            self.rep_back_round_frames += 1
+            self.rep_back_rounding_frames += 1
 
         if composite > self.prev_composite + 0.005:
             self.rep_down_frames += 1
@@ -612,43 +393,43 @@ class DeadliftRepDetector:
         if composite < 0.10:
             self.rep_top_hold_frames += 1
 
-        # Leg-back mismatch detection
         if (knee_angle is not None and self.prev_knee_angle is not None
                 and self.prev_torso_raw is not None):
             dk = knee_angle - self.prev_knee_angle
             dt_a = torso_angle - self.prev_torso_raw
             if abs(dk) > 1.5 and abs(dt_a) < 0.3:
-                self.rep_leg_back_mismatch += 1
+                self.rep_leg_back_mismatch_frames += 1
             elif abs(dt_a) > 1.5 and abs(dk) < 0.3:
-                self.rep_leg_back_mismatch += 1
+                self.rep_leg_back_mismatch_frames += 1
 
         self.prev_knee_angle = knee_angle
         self.prev_torso_raw = torso_angle
 
-    def _check_back(self, shoulder, hip, head, max_angle=22.0):
+    def _check_back_rounding(self, shoulder, hip, head, max_angle=22.0):
         torso_vec = shoulder - hip
         head_vec = head - shoulder
-        tn = np.linalg.norm(torso_vec) + 1e-9
-        hn = np.linalg.norm(head_vec) + 1e-9
-        if hn < 0.3 * tn:
+        torso_nrm = np.linalg.norm(torso_vec) + 1e-9
+        head_nrm = np.linalg.norm(head_vec) + 1e-9
+        if head_nrm < 0.3 * torso_nrm:
             return False
-        cos_a = float(np.clip(np.dot(torso_vec, head_vec) / (tn * hn), -1, 1))
-        return math.degrees(math.acos(cos_a)) > max_angle
+        cosang = float(np.clip(np.dot(torso_vec, head_vec) / (torso_nrm * head_nrm), -1.0, 1.0))
+        angle = math.degrees(math.acos(cosang))
+        return angle > max_angle
 
     def _finalize_rep(self, frame_idx):
         self.reps += 1
-        dt = 1.0 / self.fps
+        dt = 1.0 / max(1, self.fps)
 
         penalty = 0.0
         fb = []
 
-        back_min = max(3, int(0.3 / dt))
-        if self.rep_back_round_frames >= back_min:
+        back_min_frames = max(3, int(0.3 / dt))
+        if self.rep_back_rounding_frames >= back_min_frames:
             fb.append("Try to keep your back a bit straighter")
             penalty += 1.5
 
         mismatch_min = max(4, int(0.4 / dt))
-        if self.rep_leg_back_mismatch >= mismatch_min:
+        if self.rep_leg_back_mismatch_frames >= mismatch_min:
             fb.append("Drive the back up with the legs evenly")
             penalty += 1.0
 
@@ -668,11 +449,12 @@ class DeadliftRepDetector:
         rom = self.rep_max_composite
         tip = _choose_tip(down_s, top_s, rom)
 
+        rep_fb = fb if score < 10.0 else []
         info = {
             "rep_index":     self.reps,
             "score":         float(score),
             "score_display": display_half_str(score),
-            "feedback":      fb if score < 10.0 else [],
+            "feedback":      rep_fb,
             "tip":           tip,
         }
         self.all_scores.append(score)
@@ -694,7 +476,6 @@ def _dyn_thickness(h):
     return max(2, int(round(h * 0.003))), max(3, int(round(h * 0.005)))
 
 def draw_skeleton(frame, smoothed_pts, color=(255, 255, 255)):
-    """Draw clean skeleton from smoothed landmarks."""
     h, w = frame.shape[:2]
     line_t, dot_r = _dyn_thickness(h)
 
@@ -711,7 +492,7 @@ def draw_skeleton(frame, smoothed_pts, color=(255, 255, 255)):
 
     return frame
 
-# ===================== OVERLAY (HD upscale approach from good_morning) =====================
+# ===================== OVERLAY =====================
 def _wrap2(draw, text, font, maxw):
     words = text.split()
     if not words:
@@ -737,16 +518,12 @@ def _wrap2(draw, text, font, maxw):
     return lines
 
 def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
-    """Reps top-left; donut top-right; feedback bottom — HD upscale approach."""
     h, w, _ = frame.shape
-    HD_H = 1080
-    hd_scale = HD_H / float(h)
-    HD_W = max(1, int(round(w * hd_scale)))
 
-    reps_font_size = _scaled_font_size(_REF_REPS_FONT_SIZE, HD_H)
-    feedback_font_size = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, HD_H)
-    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, HD_H)
-    depth_pct_font_size = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, HD_H)
+    reps_font_size = _scaled_font_size(_REF_REPS_FONT_SIZE, h)
+    feedback_font_size = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, h)
+    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, h)
+    depth_pct_font_size = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, h)
 
     _REPS_FONT = _load_font(FONT_PATH, reps_font_size)
     _FEEDBACK_FONT = _load_font(FONT_PATH, feedback_font_size)
@@ -756,24 +533,23 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
     pct = float(np.clip(progress_pct, 0, 1))
     bg_alpha_val = int(round(255 * BAR_BG_ALPHA))
 
-    ref_h = max(int(HD_H * 0.06), int(reps_font_size * 1.6))
+    ref_h = max(int(h * 0.06), int(reps_font_size * 1.6))
     radius = int(ref_h * DONUT_RADIUS_SCALE)
     thick = max(3, int(radius * DONUT_THICKNESS_FRAC))
-    margin = int(12 * hd_scale)
-    cx = HD_W - margin - radius
+    margin = 12
+    cx = w - margin - radius
     cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
 
-    overlay_np = np.zeros((HD_H, HD_W, 4), dtype=np.uint8)
+    overlay_np = np.zeros((h, w, 4), dtype=np.uint8)
 
-    pad_x, pad_y = int(10 * hd_scale), int(6 * hd_scale)
+    pad_x, pad_y = 10, 6
     tmp_pil = Image.new("RGBA", (1, 1))
     tmp_draw = ImageDraw.Draw(tmp_pil)
     txt = f"Reps: {int(reps)}"
     tw = tmp_draw.textlength(txt, font=_REPS_FONT)
     thh = _REPS_FONT.size
-    box_w = int(tw + 2 * pad_x)
-    box_h = int(thh + 2 * pad_y)
-    cv2.rectangle(overlay_np, (0, 0), (box_w, box_h), (0, 0, 0, bg_alpha_val), -1)
+    cv2.rectangle(overlay_np, (0, 0), (int(tw + 2 * pad_x), int(thh + 2 * pad_y)),
+                  (0, 0, 0, bg_alpha_val), -1)
 
     cv2.circle(overlay_np, (cx, cy), radius, (*DEPTH_RING_BG, 255), thick, cv2.LINE_AA)
     start_ang = -90
@@ -786,15 +562,15 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
     fb_lines = []
     fb_pad_x = fb_pad_y = line_gap = line_h = 0
     if feedback:
-        safe_margin = max(int(6 * hd_scale), int(HD_H * 0.02))
-        fb_pad_x, fb_pad_y, line_gap = int(12 * hd_scale), int(8 * hd_scale), int(4 * hd_scale)
-        max_text_w = int(HD_W - 2 * fb_pad_x - int(20 * hd_scale))
+        safe_margin = max(6, int(h * 0.02))
+        fb_pad_x, fb_pad_y, line_gap = 12, 8, 4
+        max_text_w = int(w - 2 * fb_pad_x - 20)
         fb_lines = _wrap2(tmp_draw, feedback, _FEEDBACK_FONT, max_text_w)
-        line_h = _FEEDBACK_FONT.size + int(6 * hd_scale)
+        line_h = _FEEDBACK_FONT.size + 6
         block_h = 2 * fb_pad_y + len(fb_lines) * line_h + (len(fb_lines) - 1) * line_gap
-        fb_y0 = max(0, HD_H - safe_margin - block_h)
-        y1 = HD_H - safe_margin
-        cv2.rectangle(overlay_np, (0, fb_y0), (HD_W, y1), (0, 0, 0, bg_alpha_val), -1)
+        fb_y0 = max(0, h - safe_margin - block_h)
+        y1 = h - safe_margin
+        cv2.rectangle(overlay_np, (0, fb_y0), (w, y1), (0, 0, 0, bg_alpha_val), -1)
 
     overlay_pil = Image.fromarray(overlay_np, mode="RGBA")
     draw = ImageDraw.Draw(overlay_pil)
@@ -808,25 +584,24 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
     lw = draw.textlength(label, font=_DEPTH_LABEL_FONT)
     pw = draw.textlength(pct_txt, font=_DEPTH_PCT_FONT)
     draw.text((cx - int(lw // 2), by), label, font=_DEPTH_LABEL_FONT, fill=(255, 255, 255, 255))
-    draw.text((cx - int(pw // 2), by + _DEPTH_LABEL_FONT.size + gap), pct_txt, font=_DEPTH_PCT_FONT, fill=(255, 255, 255, 255))
+    draw.text((cx - int(pw // 2), by + _DEPTH_LABEL_FONT.size + gap), pct_txt, font=_DEPTH_PCT_FONT,
+              fill=(255, 255, 255, 255))
 
     if feedback and fb_lines:
         ty = fb_y0 + fb_pad_y
         for ln in fb_lines:
             tw2 = draw.textlength(ln, font=_FEEDBACK_FONT)
-            tx = max(fb_pad_x, (HD_W - int(tw2)) // 2)
+            tx = max(fb_pad_x, (w - int(tw2)) // 2)
             draw.text((tx, ty), ln, font=_FEEDBACK_FONT, fill=(255, 255, 255, 255))
             ty += line_h + line_gap
 
     overlay_rgba = np.array(overlay_pil)
-    overlay_small = cv2.resize(overlay_rgba, (w, h), interpolation=cv2.INTER_AREA)
-    alpha = overlay_small[:, :, 3:4].astype(np.float32) / 255.0
-    overlay_bgr_ch = overlay_small[:, :, [2, 1, 0]].astype(np.float32)
-    frame_f = frame.astype(np.float32)
-    result = frame_f * (1.0 - alpha) + overlay_bgr_ch * alpha
-    return result.astype(np.uint8)
+    alpha = overlay_rgba[:, :, 3:4].astype(np.float32) / 255.0
+    overlay_bgr = overlay_rgba[:, :, [2, 1, 0]].astype(np.float32)
+    out_f = frame.astype(np.float32) * (1.0 - alpha) + overlay_bgr * alpha
+    return out_f.astype(np.uint8)
 
-# ===================== YOLOv8n Detector (optional) =====================
+# ===================== YOLOv8n-ONNX Detector =====================
 class YoloOccluderDetector:
     def __init__(self, onnx_path, providers=None, input_size=640, conf_thres=0.25,
                  iou_thres=0.45, occluder_class_ids=None):
@@ -938,17 +713,13 @@ class YoloOccluderDetector:
 
 # ===================== POSE WRAPPER (dual API) =====================
 class PoseEstimator:
-    """
-    Wraps both old `mp.solutions.pose.Pose` and new `mp.tasks.vision.PoseLandmarker`.
-    Provides uniform interface: process(frame_bgr) → list of landmarks or None.
-    """
     def __init__(self, model_path=None):
         self._impl = None
         self._is_tasks = False
 
         if _SOLUTIONS_AVAILABLE:
             self._impl = _mp_pose.Pose(
-                model_complexity=1,
+                model_complexity=2,
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5,
             )
@@ -965,13 +736,9 @@ class PoseEstimator:
                 self._is_tasks = True
             else:
                 raise FileNotFoundError(
-                    "Tasks API requires a pose_landmarker.task model file. "
-                    "Download from https://storage.googleapis.com/mediapipe-models/"
-                    "pose_landmarker/pose_landmarker_heavy/float16/latest/pose_landmarker_heavy.task"
-                )
+                    "Tasks API requires a pose_landmarker.task model file.")
 
     def process(self, frame_bgr, timestamp_ms=0):
-        """Returns list of landmarks (each with .x, .y, .visibility) or None."""
         if not self._is_tasks:
             rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             res = self._impl.process(rgb)
@@ -1006,20 +773,6 @@ def run_deadlift_analysis(video_path,
                           return_video=True,
                           fast_mode=None,
                           pose_model_path=None):
-    """
-    Analyze deadlift video for rep counting and technique scoring.
-
-    Args:
-        video_path: Path to input video
-        frame_skip: Process every Nth frame (3 = every 3rd frame)
-        scale: Downscale factor for pose estimation (0.4 = 40% resolution)
-        output_path: Output video path
-        feedback_path: Output text feedback path
-        detector_onnx_path: Optional YOLO detector for barbell occlusion
-        return_video: Whether to produce annotated output video
-        fast_mode: If True, skip video output
-        pose_model_path: Path to pose_landmarker.task (only needed for Tasks API)
-    """
     if fast_mode is True:
         return_video = False
 
@@ -1058,14 +811,12 @@ def run_deadlift_analysis(video_path,
 
     # Core components
     rep_detector = DeadliftRepDetector(fps=effective_fps)
-    smoother = LandmarkSmoother(alpha=0.5, vis_threshold=0.35)
+    landmark_smoother = LandmarkSmoother(alpha=0.5, vis_threshold=0.35)
     progress_ema = EMA(0.35)
     progress_ema.value = 0.0
 
     frame_idx = 0
     current_feedback = None
-    feedback_hold_frames = 0
-    FEEDBACK_HOLD = max(8, int(1.5 / frame_dt))
 
     # Initialize pose estimator
     try:
@@ -1101,31 +852,25 @@ def run_deadlift_analysis(video_path,
             if landmarks is None:
                 if return_video and out_vid is not None:
                     frame_out = cv2.resize(work, (orig_w, orig_h))
-                    pv = progress_ema.value or 0.0
+                    prog_val = progress_ema.value or 0.0
                     out_vid.write(draw_overlay(frame_out, reps=rep_detector.reps,
-                                               feedback=None, progress_pct=1.0 - pv))
+                                               feedback=None, progress_pct=1.0 - prog_val))
                 continue
 
             try:
-                smoothed = smoother.update(landmarks)
+                smoothed = landmark_smoother.update(landmarks)
                 composite, rt_fb, rep_info = rep_detector.process_frame(smoothed, landmarks, frame_idx)
 
-                # Feedback management with hold timer
                 if rt_fb:
                     current_feedback = rt_fb
-                    feedback_hold_frames = FEEDBACK_HOLD
-                elif rep_info and rep_info["feedback"]:
-                    current_feedback = rep_info["feedback"][0]
-                    feedback_hold_frames = FEEDBACK_HOLD
-                else:
-                    if feedback_hold_frames > 0:
-                        feedback_hold_frames -= 1
+                elif rep_info:
+                    if rep_info["feedback"]:
+                        current_feedback = rep_info["feedback"][0]
                     else:
                         current_feedback = None
 
-                # Progress donut: 100% standing, 0% deep hinge
-                prog = progress_ema.update(composite)
-                donut_pct = 1.0 - prog
+                prog_display = progress_ema.update(composite)
+                donut_pct = 1.0 - prog_display
 
                 if return_video:
                     frame_out = cv2.resize(work, (orig_w, orig_h))
@@ -1138,9 +883,9 @@ def run_deadlift_analysis(video_path,
             except Exception:
                 if return_video and out_vid is not None:
                     frame_out = cv2.resize(work, (orig_w, orig_h))
-                    pv = progress_ema.value or 0.0
+                    prog_val = progress_ema.value or 0.0
                     out_vid.write(draw_overlay(frame_out, reps=rep_detector.reps,
-                                              feedback=None, progress_pct=1.0 - pv))
+                                              feedback=None, progress_pct=1.0 - prog_val))
                 continue
 
     finally:
@@ -1166,7 +911,7 @@ def run_deadlift_analysis(video_path,
     if not feedback_list:
         feedback_list = ["Great form! Keep it up 💪"]
 
-    # Encode video with ffmpeg
+    # Encode video
     final_video_path = ""
     if return_video:
         encoded_path = output_path.replace(".mp4", "_encoded.mp4")
