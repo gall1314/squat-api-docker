@@ -794,15 +794,15 @@ def run_romanian_deadlift_analysis(video_path,
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
 
+    # Keep rep-counting behavior aligned with fast path even when rendering video.
+    # This reduces detector/config drift between fast and analyzed-video flows.
+    effective_frame_skip = frame_skip
+    effective_scale = scale * 0.85
+    model_complexity = 0
     if fast_mode:
-        effective_frame_skip = frame_skip
-        effective_scale = scale * 0.85
-        model_complexity = 0
         print(f"[RDL FAST] frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=lite", file=sys.stderr, flush=True)
     else:
-        effective_frame_skip = frame_skip
-        effective_scale = scale
-        model_complexity = 1
+        print(f"[RDL VIDEO] using fast-count config: frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=lite", file=sys.stderr, flush=True)
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
@@ -888,15 +888,6 @@ def run_romanian_deadlift_analysis(video_path,
             # ✅ Compute composite movement signal
             signal_data = compute_movement_signal(all_lm)
 
-            # Smooth depth progress for display
-            display_target = float(np.clip(signal_data["composite"], 0.0, 1.0))
-            # Reset the depth ring cleanly when fully back to standing.
-            if rep_counter.state == "standing" and display_target < 0.12:
-                display_target = 0.0
-            prog = prog + PROG_ALPHA * (display_target - prog)
-            if rep_counter.state == "standing" and prog < 0.03:
-                prog = 0.0
-
             # ✅ Back curvature check (using dominant side 2D)
             pts = _get_side_landmarks(lm)
             back_angle, back_bad = analyze_back_curvature(
@@ -910,6 +901,18 @@ def run_romanian_deadlift_analysis(video_path,
 
             # ✅ Update state machine
             rep_result = rep_counter.update(signal_data, frame_idx)
+
+            # Depth ring: normalize by the same dynamic range used by the counter,
+            # so top resets to 0 and good bottoms can reach ~100%.
+            dyn_span = max(0.20, rep_counter.dynamic_ceil - rep_counter.dynamic_floor)
+            display_target = (signal_data["composite"] - rep_counter.dynamic_floor) / dyn_span
+            display_target = float(np.clip(display_target, 0.0, 1.0))
+            if rep_counter.state == "standing" and display_target < 0.10:
+                display_target = 0.0
+            # More responsive ring than before.
+            prog = prog + 0.55 * (display_target - prog)
+            if rep_counter.state == "standing" and prog < 0.02:
+                prog = 0.0
 
             if rep_result is not None:
                 # Rep completed! Evaluate quality
