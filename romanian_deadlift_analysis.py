@@ -4,6 +4,7 @@
 import os
 import cv2
 import math
+import json
 import numpy as np
 import subprocess
 from PIL import ImageFont, ImageDraw, Image
@@ -33,6 +34,40 @@ def _scaled_font_size(ref_size, canvas_h):
     return max(10, int(round(ref_size * (canvas_h / _REF_H))))
 
 mp_pose = mp.solutions.pose
+
+
+def get_video_rotation(video_path):
+    """Read mobile rotation metadata (tags/displaymatrix)."""
+    try:
+        result = subprocess.run([
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_streams', video_path
+        ], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0 and result.stdout:
+            data = json.loads(result.stdout)
+            for stream in data.get('streams', []):
+                if stream.get('codec_type') != 'video':
+                    continue
+                tags = stream.get('tags', {})
+                if 'rotate' in tags:
+                    return int(tags['rotate']) % 360
+                for sd in stream.get('side_data_list', []):
+                    if 'rotation' in sd:
+                        return (-int(sd['rotation'])) % 360
+    except Exception:
+        pass
+    return 0
+
+
+def rotate_frame(frame, angle):
+    angle = int(angle) % 360
+    if angle == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if angle == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if angle == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
 
 # ===================== FEEDBACK SEVERITY =====================
 FB_SEVERITY = {
@@ -743,8 +778,9 @@ def run_romanian_deadlift_analysis(video_path,
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     duration = total_frames / fps if fps > 0 else 0
+    rotation = get_video_rotation(video_path)
 
-    print(f"[RDL] Video info: {total_frames} frames, {fps:.1f} FPS, {duration:.1f}s duration", file=sys.stderr, flush=True)
+    print(f"[RDL] Video info: {total_frames} frames, {fps:.1f} FPS, {duration:.1f}s duration, rotation={rotation}", file=sys.stderr, flush=True)
 
     if total_frames < 10:
         print(f"[RDL ERROR] File has only {total_frames} frames - not a valid video!", file=sys.stderr, flush=True)
@@ -773,6 +809,7 @@ def run_romanian_deadlift_analysis(video_path,
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, effective_frame_skip))
     dt = 1.0 / float(effective_fps)
+    out_w = out_h = 0
 
     # ✅ NEW: Use RepCounter state machine
     rep_counter = RepCounter()
@@ -803,6 +840,8 @@ def run_romanian_deadlift_analysis(video_path,
             if not ret:
                 break
 
+            frame = rotate_frame(frame, rotation)
+
             elapsed = time.time() - loop_start_time
             if elapsed > MAX_PROCESSING_TIME:
                 print(f"[RDL ERROR] Processing timeout after {elapsed:.1f}s (processed {frames_processed} frames)", file=sys.stderr, flush=True)
@@ -817,17 +856,20 @@ def run_romanian_deadlift_analysis(video_path,
             if frames_processed % 30 == 0:
                 print(f"[RDL] Progress: {frames_processed} frames, {rep_counter.count} reps, {elapsed:.1f}s", file=sys.stderr, flush=True)
 
+            if out_w == 0 or out_h == 0:
+                out_h, out_w = frame.shape[:2]
+
             work = cv2.resize(frame, (0, 0), fx=effective_scale, fy=effective_scale) if effective_scale != 1.0 else frame
             if create_video and out is None:
-                h0, w0 = work.shape[:2]
-                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w0, h0))
+                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
 
             rgb = cv2.cvtColor(work, cv2.COLOR_BGR2RGB)
             res = pose.process(rgb)
 
             if not res.pose_landmarks:
                 if create_video and out is not None:
-                    frame_drawn = draw_overlay(work.copy(), reps=rep_counter.count,
+                    frame_out = cv2.resize(work, (out_w, out_h), interpolation=cv2.INTER_LINEAR) if work.shape[1] != out_w or work.shape[0] != out_h else work.copy()
+                    frame_drawn = draw_overlay(frame_out, reps=rep_counter.count,
                                                feedback=(rt_fb_msg if rt_fb_hold > 0 else None),
                                                depth_pct=prog)
                     out.write(frame_drawn)
@@ -925,7 +967,8 @@ def run_romanian_deadlift_analysis(video_path,
                 rt_fb_hold -= 1
 
             if create_video and out is not None:
-                frame_drawn = draw_overlay(work.copy(), reps=rep_counter.count,
+                frame_out = cv2.resize(work, (out_w, out_h), interpolation=cv2.INTER_LINEAR) if work.shape[1] != out_w or work.shape[0] != out_h else work.copy()
+                frame_drawn = draw_overlay(frame_out, reps=rep_counter.count,
                                            feedback=(rt_fb_msg if rt_fb_hold > 0 else None),
                                            depth_pct=prog)
                 out.write(frame_drawn)
@@ -1026,6 +1069,7 @@ def run_romanian_deadlift_analysis(video_path,
             subprocess.run([
                 "ffmpeg", "-y", "-i", output_path,
                 "-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart", "-pix_fmt", "yuv420p",
+                "-metadata:s:v:0", "rotate=0",
                 encoded_path
             ], check=False, capture_output=True)
 
