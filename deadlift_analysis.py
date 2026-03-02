@@ -1091,6 +1091,9 @@ def run_deadlift_analysis(video_path,
                           return_video=True,
                           fast_mode=None,
                           pose_model_path=None):
+    import time as _time
+    t_start = _time.time()
+
     if fast_mode is True:
         return_video = False
 
@@ -1127,13 +1130,24 @@ def run_deadlift_analysis(video_path,
 
     orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
-    # If rotation is 90 or 270, swap output dimensions
+
+    # ── V3.2 PERF: Compute correct dimensions after rotation ──
     if rotation_angle % 360 in (90, 270):
-        out_w, out_h = orig_h, orig_w
-        print(f"OUTPUT DIMENSIONS SWAPPED: {orig_w}x{orig_h} → {out_w}x{out_h} (rotation={rotation_angle})")
+        rotated_w, rotated_h = orig_h, orig_w
+        print(f"OUTPUT DIMENSIONS SWAPPED: {orig_w}x{orig_h} -> {rotated_w}x{rotated_h} (rotation={rotation_angle})")
     else:
-        out_w, out_h = orig_w, orig_h
+        rotated_w, rotated_h = orig_w, orig_h
+
+    # ── V3.2 PERF: Write video at WORKING resolution ──
+    # Avoids expensive resize-back-to-full for every frame.
+    # ffmpeg will scale up during the final encode step.
+    work_w = int(rotated_w * scale) if scale != 1.0 else rotated_w
+    work_h = int(rotated_h * scale) if scale != 1.0 else rotated_h
+    # Ensure even dimensions for codec compatibility
+    work_w = work_w if work_w % 2 == 0 else work_w + 1
+    work_h = work_h if work_h % 2 == 0 else work_h + 1
+
+    print(f"VIDEO OUTPUT: writing at {work_w}x{work_h} (scale={scale}), will upscale in ffmpeg encode")
 
     rep_detector = DeadliftRepDetector(fps=effective_fps)
     landmark_smoother = LandmarkSmoother(alpha=0.5, vis_threshold=0.35)
@@ -1142,6 +1156,7 @@ def run_deadlift_analysis(video_path,
 
     frame_idx = 0
     current_feedback = None
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
 
     try:
         pose_est = PoseEstimator(model_path=pose_model_path)
@@ -1176,20 +1191,19 @@ def run_deadlift_analysis(video_path,
             if processed_frames > 500:
                 break
 
-            work = cv2.resize(frame, (0, 0), fx=scale, fy=scale) if scale != 1.0 else frame.copy()
+            # ── V3.2 PERF: resize to exact work dimensions ──
+            work = cv2.resize(frame, (work_w, work_h)) if scale != 1.0 else frame.copy()
 
             if return_video and out_vid is None:
-                # Use corrected dimensions
-                out_vid = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
+                out_vid = cv2.VideoWriter(output_path, fourcc, effective_fps, (work_w, work_h))
 
             timestamp_ms = (frame_idx / fps_in) * 1000.0
             landmarks = pose_est.process(work, timestamp_ms=timestamp_ms)
 
             if landmarks is None:
                 if return_video and out_vid is not None:
-                    frame_out = cv2.resize(work, (out_w, out_h))
                     prog_val = progress_ema.value or 0.0
-                    out_vid.write(draw_overlay(frame_out, reps=rep_detector.reps,
+                    out_vid.write(draw_overlay(work, reps=rep_detector.reps,
                                                feedback=None, progress_pct=1.0 - prog_val))
                 continue
 
@@ -1209,8 +1223,8 @@ def run_deadlift_analysis(video_path,
                 donut_pct = 1.0 - prog_display
 
                 if return_video:
-                    frame_out = cv2.resize(work, (out_w, out_h))
-                    frame_out = draw_skeleton(frame_out, smoothed)
+                    # ── V3.2 PERF: draw directly on work frame, no resize back ──
+                    frame_out = draw_skeleton(work, smoothed)
                     frame_out = draw_overlay(frame_out, reps=rep_detector.reps,
                                              feedback=current_feedback,
                                              progress_pct=donut_pct)
@@ -1218,11 +1232,16 @@ def run_deadlift_analysis(video_path,
 
             except Exception:
                 if return_video and out_vid is not None:
-                    frame_out = cv2.resize(work, (out_w, out_h))
                     prog_val = progress_ema.value or 0.0
-                    out_vid.write(draw_overlay(frame_out, reps=rep_detector.reps,
+                    out_vid.write(draw_overlay(work, reps=rep_detector.reps,
                                               feedback=None, progress_pct=1.0 - prog_val))
                 continue
+
+            # Progress logging every 50 processed frames
+            if return_video and processed_frames % 50 == 0:
+                elapsed = _time.time() - t_start
+                pct = (frame_idx / total_frames * 100) if total_frames > 0 else 0
+                print(f"[VIDEO PROGRESS] {processed_frames} frames, ~{pct:.0f}% of video, {elapsed:.1f}s elapsed")
 
     finally:
         pose_est.close()
@@ -1230,6 +1249,9 @@ def run_deadlift_analysis(video_path,
         if return_video and out_vid:
             out_vid.release()
         cv2.destroyAllWindows()
+
+    t_process = _time.time() - t_start
+    print(f"[PERF] Processing done in {t_process:.1f}s ({processed_frames} frames)")
 
     avg = np.mean(rep_detector.all_scores) if rep_detector.all_scores else 0.0
     technique_score = round(round(avg * 2) / 2, 2)
@@ -1250,17 +1272,26 @@ def run_deadlift_analysis(video_path,
     if return_video:
         encoded_path = output_path.replace(".mp4", "_encoded.mp4")
         try:
-            subprocess.run([
+            # ── V3.2 PERF: ffmpeg upscales to target resolution during encode ──
+            ffmpeg_cmd = [
                 "ffmpeg", "-y", "-i", output_path,
+                "-vf", f"scale={rotated_w}:{rotated_h}",
                 "-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart",
                 "-pix_fmt", "yuv420p", encoded_path
-            ], check=False, capture_output=True)
+            ]
+            print(f"[ENCODE] Upscaling {work_w}x{work_h} -> {rotated_w}x{rotated_h}")
+            enc_start = _time.time()
+            subprocess.run(ffmpeg_cmd, check=False, capture_output=True, timeout=120)
+            print(f"[ENCODE] Done in {_time.time() - enc_start:.1f}s")
             if os.path.exists(output_path) and os.path.exists(encoded_path):
                 os.remove(output_path)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[ENCODE] Error: {e}")
         final_video_path = (encoded_path if os.path.exists(encoded_path)
                             else (output_path if os.path.exists(output_path) else ""))
+
+    total_time = _time.time() - t_start
+    print(f"[PERF] Total time: {total_time:.1f}s (process={t_process:.1f}s, encode={total_time - t_process:.1f}s)")
 
     return {
         "squat_count": int(rep_detector.reps),
