@@ -829,7 +829,12 @@ def run_romanian_deadlift_analysis(video_path,
 
     import time
     loop_start_time = time.time()
-    MAX_PROCESSING_TIME = 180
+    # Keep counting stable when rendering video (render path is slower than fast mode)
+    # so we do not stop mid-set and under-count reps.
+    if create_video:
+        MAX_PROCESSING_TIME = max(600, int(duration * 12) if duration > 0 else 600)
+    else:
+        MAX_PROCESSING_TIME = max(180, int(duration * 8) if duration > 0 else 180)
     frames_processed = 0
 
     with mp_pose_mod.Pose(model_complexity=model_complexity,
@@ -884,7 +889,13 @@ def run_romanian_deadlift_analysis(video_path,
             signal_data = compute_movement_signal(all_lm)
 
             # Smooth depth progress for display
-            prog = prog + PROG_ALPHA * (signal_data["composite"] - prog)
+            display_target = float(np.clip(signal_data["composite"], 0.0, 1.0))
+            # Reset the depth ring cleanly when fully back to standing.
+            if rep_counter.state == "standing" and display_target < 0.12:
+                display_target = 0.0
+            prog = prog + PROG_ALPHA * (display_target - prog)
+            if rep_counter.state == "standing" and prog < 0.03:
+                prog = 0.0
 
             # ✅ Back curvature check (using dominant side 2D)
             pts = _get_side_landmarks(lm)
