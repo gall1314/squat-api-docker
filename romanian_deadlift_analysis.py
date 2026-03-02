@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 # romanian_deadlift_analysis_fixed.py — ספירת חזרות משופרת מכל זווית
+# ✅ FIX: Video rotation handling for mobile videos
+# ✅ FIX: Full-resolution overlay (matches good_morning approach)
+# ✅ FIX: Skeleton drawing at original resolution
 
 import os
 import cv2
 import math
-import json
 import numpy as np
 import subprocess
 from PIL import ImageFont, ImageDraw, Image
@@ -24,50 +26,73 @@ _REF_FEEDBACK_FONT_SIZE = 22
 _REF_DEPTH_LABEL_FONT_SIZE = 14
 _REF_DEPTH_PCT_FONT_SIZE = 18
 
+
 def _load_font(path, size):
+    """Load font with robust fallback — works even without Roboto."""
     try:
         return ImageFont.truetype(path, size)
     except Exception:
+        pass
+    for fallback in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]:
+        try:
+            return ImageFont.truetype(fallback, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
         return ImageFont.load_default()
 
+
 def _scaled_font_size(ref_size, canvas_h):
+    """Scale font size proportionally to frame height."""
     return max(10, int(round(ref_size * (canvas_h / _REF_H))))
+
 
 mp_pose = mp.solutions.pose
 
-
-def get_video_rotation(video_path):
-    """Read mobile rotation metadata (tags/displaymatrix)."""
-    try:
-        result = subprocess.run([
-            'ffprobe', '-v', 'quiet', '-print_format', 'json',
-            '-show_streams', video_path
-        ], capture_output=True, text=True, timeout=10)
-        if result.returncode == 0 and result.stdout:
-            data = json.loads(result.stdout)
-            for stream in data.get('streams', []):
-                if stream.get('codec_type') != 'video':
-                    continue
-                tags = stream.get('tags', {})
-                if 'rotate' in tags:
-                    return int(tags['rotate']) % 360
-                for sd in stream.get('side_data_list', []):
-                    if 'rotation' in sd:
-                        return (-int(sd['rotation'])) % 360
-    except Exception:
-        pass
-    return 0
+# ===================== SKELETON =====================
+_FACE_LMS = set()
+_BODY_CONNECTIONS = tuple()
+_BODY_POINTS = tuple()
 
 
-def rotate_frame(frame, angle):
-    angle = int(angle) % 360
-    if angle == 90:
-        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    if angle == 180:
-        return cv2.rotate(frame, cv2.ROTATE_180)
-    if angle == 270:
-        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+def _init_skeleton_data():
+    global _FACE_LMS, _BODY_CONNECTIONS, _BODY_POINTS
+    if not _BODY_CONNECTIONS:
+        _FACE_LMS = {
+            mp_pose.PoseLandmark.NOSE.value,
+            mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value, mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
+            mp_pose.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose.PoseLandmark.RIGHT_EYE.value, mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
+            mp_pose.PoseLandmark.LEFT_EAR.value, mp_pose.PoseLandmark.RIGHT_EAR.value,
+            mp_pose.PoseLandmark.MOUTH_LEFT.value, mp_pose.PoseLandmark.MOUTH_RIGHT.value,
+        }
+        _BODY_CONNECTIONS = tuple((a, b) for (a, b) in mp_pose.POSE_CONNECTIONS if a not in _FACE_LMS and b not in _FACE_LMS)
+        _BODY_POINTS = tuple(sorted({i for conn in _BODY_CONNECTIONS for i in conn}))
+
+
+def _dyn_thickness(h):
+    return max(2, int(round(h * 0.003))), max(3, int(round(h * 0.005)))
+
+
+def draw_body_only(frame, lms, color=(255, 255, 255)):
+    h, w = frame.shape[:2]
+    line, dot = _dyn_thickness(h)
+    for a, b in _BODY_CONNECTIONS:
+        pa, pb = lms[a], lms[b]
+        ax, ay = int(pa.x * w), int(pa.y * h)
+        bx, by = int(pb.x * w), int(pb.y * h)
+        cv2.line(frame, (ax, ay), (bx, by), color, line, cv2.LINE_AA)
+    for i in _BODY_POINTS:
+        p = lms[i]
+        x, y = int(p.x * w), int(p.y * h)
+        cv2.circle(frame, (x, y), dot, color, -1, cv2.LINE_AA)
     return frame
+
 
 # ===================== FEEDBACK SEVERITY =====================
 FB_SEVERITY = {
@@ -84,6 +109,7 @@ FEEDBACK_CATEGORY = {
     "Try to keep your back neutral": "back",
 }
 
+
 def pick_strongest_feedback(feedback_list):
     best, score = "", -1
     for f in feedback_list or []:
@@ -91,6 +117,7 @@ def pick_strongest_feedback(feedback_list):
         if s > score:
             best, score = f, s
     return best
+
 
 def pick_strongest_per_category(feedback_list):
     best_by_cat = {}
@@ -101,6 +128,7 @@ def pick_strongest_per_category(feedback_list):
             best_by_cat[cat] = f
     return list(best_by_cat.values()), best_by_cat
 
+
 def merge_feedback(global_best, new_list):
     cand = pick_strongest_feedback(new_list)
     if not cand:
@@ -108,6 +136,7 @@ def merge_feedback(global_best, new_list):
     if not global_best:
         return cand
     return cand if FB_SEVERITY.get(cand, 1) >= FB_SEVERITY.get(global_best, 1) else global_best
+
 
 def dedupe_feedback(feedback_list):
     seen = set()
@@ -119,6 +148,7 @@ def dedupe_feedback(feedback_list):
         unique.append(fb)
     return unique
 
+
 # ===================== SCORE DISPLAY =====================
 def score_label(s):
     s = float(s)
@@ -128,11 +158,13 @@ def score_label(s):
     if s >= 5.5: return "Fair"
     return "Needs work"
 
+
 def display_half_str(x):
     q = round(float(x) * 2) / 2.0
     if abs(q - round(q)) < 1e-9:
         return str(int(round(q)))
     return f"{q:.1f}"
+
 
 # ===================== OVERLAY =====================
 def draw_depth_donut(frame, center, radius, thickness, pct):
@@ -146,6 +178,7 @@ def draw_depth_donut(frame, center, radius, thickness, pct):
     cv2.ellipse(frame, (cx, cy), (radius, radius), 0, start_ang, end_ang,
                 DEPTH_COLOR, thickness, lineType=cv2.LINE_AA)
     return frame
+
 
 def _wrap_two_lines(draw, text, font, max_width):
     words = (text or "").split()
@@ -172,8 +205,9 @@ def _wrap_two_lines(draw, text, font, max_width):
         lines[-1] = last
     return lines
 
+
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Reps בפינת שמאל-עליון; דונאט ימני-עליון; פידבק תחתון — זהה לסקוואט."""
+    """Reps top-left; donut top-right; feedback bottom — matches pullup overlay sizing."""
     h, w, _ = frame.shape
     HD_H = 1080
     hd_scale = HD_H / float(h)
@@ -262,6 +296,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     result = frame_f * (1.0 - alpha) + overlay_bgr_ch * alpha
     return result.astype(np.uint8)
 
+
 # ===================== GEOMETRY =====================
 def angle_deg(a, b, c):
     ba = a - b
@@ -271,12 +306,14 @@ def angle_deg(a, b, c):
     cosang = float(np.clip(cosang, -1.0, 1.0))
     return float(math.degrees(math.acos(cosang)))
 
+
 def torso_angle_to_vertical(hip, shoulder):
     vec = shoulder - hip
     nrm = np.linalg.norm(vec) + 1e-9
     cosang = float(np.dot(vec, np.array([0.0, -1.0])) / nrm)
     cosang = float(np.clip(cosang, -1.0, 1.0))
     return float(math.degrees(math.acos(cosang)))
+
 
 def analyze_back_curvature(shoulder, hip, head_like, max_angle_deg=45.0, min_head_dist_ratio=0.35):
     torso_vec = shoulder - hip
@@ -320,11 +357,9 @@ def _get_all_landmarks(lm):
         "ear": _pt(PL.RIGHT_EAR),
     }
 
-    # Visibility per side
     left_vis = sum(_vis(i) for i in [PL.LEFT_SHOULDER, PL.LEFT_HIP, PL.LEFT_KNEE, PL.LEFT_ANKLE, PL.LEFT_EAR])
     right_vis = sum(_vis(i) for i in [PL.RIGHT_SHOULDER, PL.RIGHT_HIP, PL.RIGHT_KNEE, PL.RIGHT_ANKLE, PL.RIGHT_EAR])
 
-    # Pick dominant side for side-view metrics
     if left_vis >= right_vis:
         dominant = left
         dominant_vis = left_vis
@@ -332,7 +367,6 @@ def _get_all_landmarks(lm):
         dominant = right
         dominant_vis = right_vis
 
-    # Midpoint (average both sides) — works well from front/back views
     mid = {}
     for key in left:
         mid[key] = (left[key] + right[key]) / 2.0
@@ -373,58 +407,45 @@ def _get_side_landmarks(lm):
 def compute_movement_signal(all_lm):
     """
     מחשב סיגנל תנועה מורכב שעובד מכל זווית מצלמה.
-    
+
     הרעיון: במקום להסתמך רק על זווית הגו (שמשתנה דרמטית לפי זווית מצלמה),
     משלבים כמה סיגנלים:
-    
+
     1. shoulder_drop: כמה הכתפיים ירדו ביחס לירכיים (Y axis) — עובד מכל זווית
     2. hip_shoulder_ratio: יחס המרחק האנכי כתף-ירך / גובה כולל — עובד מכל זווית
     3. torso_angle: זווית הגו מול אנך — עובד טוב מהצד
     4. shoulder_y_normalized: מיקום Y מנורמל של הכתפיים — עובד מכל זווית
-    
-    הסיגנל הסופי הוא ממוצע משוקלל שנותן משקל גבוה יותר לסיגנלים
-    שרלוונטיים לזווית המצלמה הנוכחית.
     """
     mid = all_lm["mid"]
     dom = all_lm["dominant"]
 
     # Signal 1: Shoulder drop relative to hip (normalized)
-    # בדדליפט רומני הכתפיים יורדות ביחס לירכיים
     hip_y = mid["hip"][1]
     shoulder_y = mid["shoulder"][1]
     ankle_y = mid["ankle"][1]
 
-    # body_height = distance from ankle to shoulder at standing
     body_height = abs(ankle_y - shoulder_y) + 1e-6
-    # shoulder_drop = how much shoulders dropped relative to hip
-    # At standing: shoulder is above hip → negative value
-    # At bottom: shoulder approaches hip level → value approaches 0 or positive
-    shoulder_hip_diff = (shoulder_y - hip_y)  # positive = shoulder below hip
+    shoulder_hip_diff = (shoulder_y - hip_y)
     shoulder_drop_signal = shoulder_hip_diff / body_height
-    # Normalize: at standing ~= -0.3 to -0.4, at bottom ~= -0.05 to +0.1
-    # Map to 0..1
     shoulder_drop_norm = float(np.clip((shoulder_drop_signal + 0.4) / 0.5, 0.0, 1.0))
 
     # Signal 2: Shoulder Y position (normalized to body)
-    # Simple but effective — shoulders go down during RDL from any angle
     shoulder_y_norm = float(np.clip((shoulder_y - hip_y + 0.3) / 0.4, 0.0, 1.0))
 
     # Signal 3: Torso angle (2D, works best from side)
     dom_shoulder_2d = dom["shoulder"][:2]
     dom_hip_2d = dom["hip"][:2]
     torso_ang = torso_angle_to_vertical(dom_hip_2d, dom_shoulder_2d)
-    torso_signal = float(np.clip(torso_ang / 80.0, 0.0, 1.0))  # 80° = very deep hinge
+    torso_signal = float(np.clip(torso_ang / 80.0, 0.0, 1.0))
 
     # Signal 4: Hip-knee-ankle angle change (knee bend)
     dom_knee_2d = dom["knee"][:2]
     dom_ankle_2d = dom["ankle"][:2]
     knee_ang = angle_deg(dom_hip_2d, dom_knee_2d, dom_ankle_2d)
-    # RDL: slight knee bend, ~160-170 standing, ~140-160 at bottom
     knee_signal = float(np.clip((180.0 - knee_ang) / 40.0, 0.0, 1.0))
 
     # Signal 5: 3D torso angle using Z coordinate
-    # MediaPipe provides z (depth) — use it for better angle from front/back views
-    torso_3d = dom["shoulder"] - dom["hip"]  # 3D vector
+    torso_3d = dom["shoulder"] - dom["hip"]
     up_3d = np.array([0.0, -1.0, 0.0])
     torso_3d_norm = np.linalg.norm(torso_3d) + 1e-9
     cos_3d = float(np.dot(torso_3d, up_3d) / torso_3d_norm)
@@ -433,37 +454,25 @@ def compute_movement_signal(all_lm):
     torso_3d_signal = float(np.clip(torso_3d_angle / 80.0, 0.0, 1.0))
 
     # Determine camera angle to weight signals appropriately
-    # If both sides are similarly visible → front/back view → rely more on Y-based signals
-    # If one side is much more visible → side view → torso angle is reliable
     vis_ratio = min(all_lm["left_vis"], all_lm["right_vis"]) / (max(all_lm["left_vis"], all_lm["right_vis"]) + 1e-6)
-    # vis_ratio close to 1.0 = front/back view, close to 0.0 = side view
 
     if vis_ratio > 0.7:
-        # Front/back view — torso 2D angle is unreliable, use Y-based + 3D
+        # Front/back view
         weights = {
-            "shoulder_drop": 0.30,
-            "shoulder_y": 0.20,
-            "torso_2d": 0.05,
-            "torso_3d": 0.30,
-            "knee": 0.15,
+            "shoulder_drop": 0.30, "shoulder_y": 0.20,
+            "torso_2d": 0.05, "torso_3d": 0.30, "knee": 0.15,
         }
     elif vis_ratio > 0.4:
-        # Diagonal view — blend everything
+        # Diagonal view
         weights = {
-            "shoulder_drop": 0.20,
-            "shoulder_y": 0.15,
-            "torso_2d": 0.20,
-            "torso_3d": 0.25,
-            "knee": 0.20,
+            "shoulder_drop": 0.20, "shoulder_y": 0.15,
+            "torso_2d": 0.20, "torso_3d": 0.25, "knee": 0.20,
         }
     else:
-        # Side view — torso 2D is most reliable
+        # Side view
         weights = {
-            "shoulder_drop": 0.10,
-            "shoulder_y": 0.10,
-            "torso_2d": 0.40,
-            "torso_3d": 0.20,
-            "knee": 0.20,
+            "shoulder_drop": 0.10, "shoulder_y": 0.10,
+            "torso_2d": 0.40, "torso_3d": 0.20, "knee": 0.20,
         }
 
     composite = (
@@ -473,7 +482,6 @@ def compute_movement_signal(all_lm):
         weights["torso_3d"] * torso_3d_signal +
         weights["knee"] * knee_signal
     )
-
     composite = float(np.clip(composite, 0.0, 1.0))
 
     return {
@@ -496,22 +504,17 @@ class RepCounter:
     """
     State machine לספירת חזרות עם peak/valley detection.
 
-    עובד על סיגנל מורכב (0=עמידה, 1=תחתית) עם היסטרזיס:
-    - מזהה מעבר לאזור "כניסה" (threshold_enter)
-    - מחפש שיא (peak) של הסיגנל
-    - מזהה חזרה לאזור "עמידה" (threshold_exit)
-    - סופר חזרה רק אם ה-peak עבר סף מינימלי
+    עובד על סיגנל מורכב (0=עמידה, 1=תחתית) עם היסטרזיס.
     """
 
-    # Adaptive thresholds — will be calibrated from first movements
-    ENTER_THRESHOLD = 0.25       # סיגנל מעל לזה = התחלת תנועה
-    EXIT_THRESHOLD = 0.15        # סיגנל מתחת לזה = חזרה לעמידה
-    MIN_PEAK_FOR_REP = 0.40      # שיא מינימלי כדי לספור חזרה
-    GOOD_DEPTH_PEAK = 0.55       # שיא שנחשב לעומק טוב
-    MIN_FRAMES_BETWEEN = 5       # מינימום פריימים בין חזרות
-    MAX_REP_FRAMES = 120         # timeout safety for noisy / oblique angles
-    REBOUND_DELTA = 0.015        # rise after valley means movement turned down again
-    MIN_RETURN_FROM_PEAK = 0.04  # require partial return toward top between reps
+    ENTER_THRESHOLD = 0.25
+    EXIT_THRESHOLD = 0.15
+    MIN_PEAK_FOR_REP = 0.40
+    GOOD_DEPTH_PEAK = 0.55
+    MIN_FRAMES_BETWEEN = 5
+    MAX_REP_FRAMES = 120
+    REBOUND_DELTA = 0.015
+    MIN_RETURN_FROM_PEAK = 0.04
     NORMALIZED_PEAK_THRESHOLD = 0.58
     NORMALIZED_DROP_THRESHOLD = 0.10
     MIN_REP_DURATION_FRAMES = 6
@@ -519,18 +522,17 @@ class RepCounter:
     MIN_NORMALIZED_PEAK_DELTA = 0.18
 
     def __init__(self):
-        self.state = "standing"  # standing | descending | ascending
+        self.state = "standing"
         self.count = 0
         self.current_peak = 0.0
         self.frames_in_state = 0
         self.last_rep_frame = -999
-        self.signal_history = []  # for smoothing
+        self.signal_history = []
         self.smoothed = 0.0
         self.rep_start_frame = -1
         self.ascent_valley = 1.0
         self.rep_start_signal = 0.0
 
-        # Per-rep metrics
         self.rep_max_torso_2d = 0.0
         self.rep_max_torso_3d = 0.0
         self.rep_min_knee = 999.0
@@ -538,7 +540,6 @@ class RepCounter:
         self.rep_back_issue = False
         self.rep_back_angle = 0.0
 
-        # Adaptive calibration
         self.calibration_signals = []
         self.calibrated = False
         self.standing_baseline = 0.0
@@ -552,31 +553,22 @@ class RepCounter:
         return self.smoothed
 
     def _normalize_by_session_range(self, smoothed_signal):
-        """
-        Normalize by evolving floor/ceiling so counting works better
-        when camera angle compresses the raw signal range.
-        """
-        # Slow floor update, slightly faster ceiling update.
+        """Normalize by evolving floor/ceiling."""
         self.dynamic_floor = 0.98 * self.dynamic_floor + 0.02 * min(self.dynamic_floor, smoothed_signal)
         self.dynamic_ceil = 0.95 * self.dynamic_ceil + 0.05 * max(self.dynamic_ceil, smoothed_signal)
-
         rng = max(0.20, self.dynamic_ceil - self.dynamic_floor)
         normalized = (smoothed_signal - self.dynamic_floor) / rng
         return float(np.clip(normalized, 0.0, 1.0))
 
     def _calibrate(self, signal):
-        """
-        Collect signals for first ~15 frames to establish standing baseline.
-        """
+        """Collect signals for first ~15 frames to establish standing baseline."""
         if self.calibrated:
             return
         self.calibration_signals.append(signal)
         if len(self.calibration_signals) >= 15:
-            # Standing baseline = minimum of first signals (likely standing)
             self.standing_baseline = float(np.percentile(self.calibration_signals, 25))
             self.dynamic_floor = self.standing_baseline
             self.dynamic_ceil = max(self.standing_baseline + 0.35, float(np.percentile(self.calibration_signals, 90)))
-            # Adjust thresholds relative to baseline
             self.ENTER_THRESHOLD = max(0.15, self.standing_baseline + 0.15)
             self.EXIT_THRESHOLD = max(0.10, self.standing_baseline + 0.08)
             self.calibrated = True
@@ -625,10 +617,7 @@ class RepCounter:
         self.rep_start_signal = 0.0
 
     def finalize_pending_rep(self, frame_idx):
-        """
-        Count a likely last rep when video ends mid-ascent.
-        Useful when the last lockout is cut off by the clip ending.
-        """
+        """Count a likely last rep when video ends mid-ascent."""
         if self.state != "ascending":
             return None
 
@@ -647,17 +636,13 @@ class RepCounter:
         return None
 
     def update(self, signal_data, frame_idx):
-        """
-        מעדכן את ה-state machine עם סיגנל חדש.
-        מחזיר dict אם חזרה הושלמה, None אחרת.
-        """
+        """מעדכן את ה-state machine עם סיגנל חדש."""
         raw = signal_data["composite"]
         self._calibrate(raw)
         smoothed = self._smooth(raw)
         normalized = self._normalize_by_session_range(smoothed)
         self.frames_in_state += 1
 
-        # Track per-rep metrics regardless of state
         if self.state in ("descending", "ascending"):
             self.rep_max_torso_2d = max(self.rep_max_torso_2d, signal_data.get("torso_2d_angle", 0))
             self.rep_max_torso_3d = max(self.rep_max_torso_3d, signal_data.get("torso_3d_angle", 0))
@@ -674,7 +659,6 @@ class RepCounter:
             if smoothed > self.current_peak:
                 self.current_peak = smoothed
 
-            # If signal starts dropping, we're now ascending.
             if smoothed < self.current_peak - 0.015 and self.frames_in_state >= 2:
                 self.state = "ascending"
                 self.frames_in_state = 0
@@ -687,7 +671,7 @@ class RepCounter:
             self.ascent_valley = min(self.ascent_valley, smoothed)
             normalized_exit = normalized <= 0.28
 
-            # Standard completion by returning near standing.
+            # Standard completion by returning near standing
             if (smoothed <= self.EXIT_THRESHOLD or normalized_exit) and (frame_idx - self.last_rep_frame) >= self.MIN_FRAMES_BETWEEN:
                 if (self.current_peak >= self.MIN_PEAK_FOR_REP or self._normalized_peak() >= self.NORMALIZED_PEAK_THRESHOLD) and self._has_meaningful_excursion() and (frame_idx - self.rep_start_frame) >= self.MIN_REP_DURATION_FRAMES:
                     self.count += 1
@@ -697,7 +681,7 @@ class RepCounter:
                     return rep_info
                 self._reset_to_standing()
 
-            # Touch-and-go completion: ascent reverses before full exit.
+            # Touch-and-go completion
             valley_drop = self.current_peak - self.ascent_valley
             if smoothed > (self.ascent_valley + self.REBOUND_DELTA) and self.frames_in_state >= 2:
                 normalized_drop = valley_drop / max(0.20, self.dynamic_ceil - self.dynamic_floor)
@@ -711,7 +695,7 @@ class RepCounter:
                     self._start_rep_tracking(signal_data, frame_idx, smoothed)
                     return rep_info
 
-            # Handle case where person goes much deeper again without clear valley.
+            # Handle deeper descent without clear valley
             if smoothed > self.current_peak:
                 self.current_peak = smoothed
                 self.state = "descending"
@@ -724,7 +708,7 @@ class RepCounter:
 
 
 # ===================== PARAMETERS =====================
-HINGE_BOTTOM_ANGLE = 55.0  # For depth quality check
+HINGE_BOTTOM_ANGLE = 55.0
 KNEE_MIN_ANGLE = 172.0
 KNEE_OPTIMAL_MIN = 160.0
 KNEE_OPTIMAL_MAX = 170.0
@@ -737,6 +721,85 @@ MAX_SCORE = 10.0
 PROG_ALPHA = 0.3
 
 
+# ===================== ROTATION HELPER =====================
+def _get_rotation_angle(video_path):
+    """
+    Extract rotation metadata from video using ffprobe.
+    Mobile videos often have rotation metadata that OpenCV ignores,
+    causing the video to appear sideways.
+    Returns rotation angle (0, 90, 180, 270).
+    """
+    # Method 1: stream tags rotate
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+             "-show_entries", "stream_tags=rotate",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             video_path],
+            capture_output=True, text=True, timeout=10
+        )
+        rotate_str = result.stdout.strip()
+        if rotate_str:
+            return int(rotate_str)
+    except Exception:
+        pass
+
+    # Method 2: side_data displaymatrix rotation
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+             "-show_entries", "stream_side_data=rotation",
+             "-of", "default=noprint_wrappers=1:nokey=1",
+             video_path],
+            capture_output=True, text=True, timeout=10
+        )
+        rotate_str = result.stdout.strip()
+        if rotate_str:
+            angle = int(float(rotate_str))
+            if angle < 0:
+                angle = 360 + angle
+            return angle
+    except Exception:
+        pass
+
+    # Method 3: Parse full ffprobe output for displaymatrix
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-show_streams", "-of", "json", video_path],
+            capture_output=True, text=True, timeout=10
+        )
+        import json
+        info = json.loads(result.stdout)
+        for stream in info.get("streams", []):
+            if stream.get("codec_type") == "video":
+                tags = stream.get("tags", {})
+                if "rotate" in tags:
+                    return int(tags["rotate"])
+                # Check side_data_list
+                for sd in stream.get("side_data_list", []):
+                    if "rotation" in sd:
+                        angle = int(float(sd["rotation"]))
+                        if angle < 0:
+                            angle = 360 + angle
+                        return angle
+    except Exception:
+        pass
+
+    return 0
+
+
+def _apply_rotation(frame, rotation):
+    """Apply rotation to a frame based on metadata angle."""
+    if rotation == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    elif rotation == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    elif rotation == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    return frame
+
+
+# ===================== MAIN ANALYSIS =====================
 def run_romanian_deadlift_analysis(video_path,
                                    frame_skip=3,
                                    scale=0.4,
@@ -745,7 +808,11 @@ def run_romanian_deadlift_analysis(video_path,
                                    return_video=True,
                                    fast_mode=False):
     """
-    Romanian Deadlift analysis — improved multi-angle rep counting:
+    Romanian Deadlift analysis — improved multi-angle rep counting.
+
+    ✅ FIX 1: Video output at ORIGINAL resolution (overlay is sharp)
+    ✅ FIX 2: Handles mobile video rotation metadata
+    ✅ FIX 3: Skeleton drawn at full resolution
     ✅ Composite movement signal from multiple body metrics
     ✅ Works from side, front, diagonal, and full profile views
     ✅ Adaptive calibration for standing baseline
@@ -764,6 +831,10 @@ def run_romanian_deadlift_analysis(video_path,
 
     print(f"[RDL] create_video={create_video}", file=sys.stderr, flush=True)
 
+    # ✅ FIX: Detect rotation BEFORE opening with OpenCV
+    rotation = _get_rotation_angle(video_path)
+    print(f"[RDL] Detected rotation metadata: {rotation}°", file=sys.stderr, flush=True)
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"[RDL ERROR] Cannot open video: {video_path}", file=sys.stderr, flush=True)
@@ -778,9 +849,8 @@ def run_romanian_deadlift_analysis(video_path,
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     duration = total_frames / fps if fps > 0 else 0
-    rotation = get_video_rotation(video_path)
 
-    print(f"[RDL] Video info: {total_frames} frames, {fps:.1f} FPS, {duration:.1f}s duration, rotation={rotation}", file=sys.stderr, flush=True)
+    print(f"[RDL] Video info: {total_frames} frames, {fps:.1f} FPS, {duration:.1f}s duration", file=sys.stderr, flush=True)
 
     if total_frames < 10:
         print(f"[RDL ERROR] File has only {total_frames} frames - not a valid video!", file=sys.stderr, flush=True)
@@ -794,24 +864,35 @@ def run_romanian_deadlift_analysis(video_path,
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
 
-    # Keep rep-counting behavior aligned with fast path even when rendering video.
-    # This reduces detector/config drift between fast and analyzed-video flows.
-    effective_frame_skip = frame_skip
-    effective_scale = scale * 0.85
-    model_complexity = 0
     if fast_mode:
+        effective_frame_skip = frame_skip
+        effective_scale = scale * 0.85
+        model_complexity = 0
         print(f"[RDL FAST] frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=lite", file=sys.stderr, flush=True)
     else:
-        print(f"[RDL VIDEO] using fast-count config: frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=lite", file=sys.stderr, flush=True)
+        effective_frame_skip = frame_skip
+        effective_scale = scale
+        model_complexity = 1
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
     fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
     effective_fps = max(1.0, fps_in / max(1, effective_frame_skip))
     dt = 1.0 / float(effective_fps)
-    out_w = out_h = 0
 
-    # ✅ NEW: Use RepCounter state machine
+    # ✅ FIX: Read original dimensions and account for rotation
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # If rotated 90 or 270, swap width and height for the output
+    if rotation in (90, 270):
+        out_w, out_h = orig_h, orig_w
+    else:
+        out_w, out_h = orig_w, orig_h
+
+    print(f"[RDL] Original: {orig_w}x{orig_h}, Output (after rotation): {out_w}x{out_h}", file=sys.stderr, flush=True)
+
+    # ✅ State
     rep_counter = RepCounter()
     good_reps = bad_reps = 0
     all_scores = []
@@ -829,23 +910,17 @@ def run_romanian_deadlift_analysis(video_path,
 
     import time
     loop_start_time = time.time()
-    # Keep counting stable when rendering video (render path is slower than fast mode)
-    # so we do not stop mid-set and under-count reps.
-    if create_video:
-        MAX_PROCESSING_TIME = max(600, int(duration * 12) if duration > 0 else 600)
-    else:
-        MAX_PROCESSING_TIME = max(180, int(duration * 8) if duration > 0 else 180)
+    MAX_PROCESSING_TIME = 180
     frames_processed = 0
 
     with mp_pose_mod.Pose(model_complexity=model_complexity,
                           min_detection_confidence=0.5,
                           min_tracking_confidence=0.5) as pose:
+        _init_skeleton_data()
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-
-            frame = rotate_frame(frame, rotation)
 
             elapsed = time.time() - loop_start_time
             if elapsed > MAX_PROCESSING_TIME:
@@ -861,10 +936,13 @@ def run_romanian_deadlift_analysis(video_path,
             if frames_processed % 30 == 0:
                 print(f"[RDL] Progress: {frames_processed} frames, {rep_counter.count} reps, {elapsed:.1f}s", file=sys.stderr, flush=True)
 
-            if out_w == 0 or out_h == 0:
-                out_h, out_w = frame.shape[:2]
+            # ✅ FIX: Apply rotation to raw frame BEFORE any processing
+            frame = _apply_rotation(frame, rotation)
 
+            # Scale down for pose detection (speed)
             work = cv2.resize(frame, (0, 0), fx=effective_scale, fy=effective_scale) if effective_scale != 1.0 else frame
+
+            # ✅ FIX: VideoWriter at ORIGINAL resolution (after rotation) — overlay will be sharp
             if create_video and out is None:
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
 
@@ -873,7 +951,8 @@ def run_romanian_deadlift_analysis(video_path,
 
             if not res.pose_landmarks:
                 if create_video and out is not None:
-                    frame_out = cv2.resize(work, (out_w, out_h), interpolation=cv2.INTER_LINEAR) if work.shape[1] != out_w or work.shape[0] != out_h else work.copy()
+                    # ✅ FIX: Upscale to original resolution, then overlay
+                    frame_out = cv2.resize(work, (out_w, out_h))
                     frame_drawn = draw_overlay(frame_out, reps=rep_counter.count,
                                                feedback=(rt_fb_msg if rt_fb_hold > 0 else None),
                                                depth_pct=prog)
@@ -887,6 +966,9 @@ def run_romanian_deadlift_analysis(video_path,
 
             # ✅ Compute composite movement signal
             signal_data = compute_movement_signal(all_lm)
+
+            # Smooth depth progress for display
+            prog = prog + PROG_ALPHA * (signal_data["composite"] - prog)
 
             # ✅ Back curvature check (using dominant side 2D)
             pts = _get_side_landmarks(lm)
@@ -902,24 +984,12 @@ def run_romanian_deadlift_analysis(video_path,
             # ✅ Update state machine
             rep_result = rep_counter.update(signal_data, frame_idx)
 
-            # Depth ring: normalize by the same dynamic range used by the counter,
-            # so top resets to 0 and good bottoms can reach ~100%.
-            dyn_span = max(0.20, rep_counter.dynamic_ceil - rep_counter.dynamic_floor)
-            display_target = (signal_data["composite"] - rep_counter.dynamic_floor) / dyn_span
-            display_target = float(np.clip(display_target, 0.0, 1.0))
-            if rep_counter.state == "standing" and display_target < 0.10:
-                display_target = 0.0
-            # More responsive ring than before.
-            prog = prog + 0.55 * (display_target - prog)
-            if rep_counter.state == "standing" and prog < 0.02:
-                prog = 0.0
-
             if rep_result is not None:
                 # Rep completed! Evaluate quality
                 feedback = []
                 score = MAX_SCORE
 
-                # Depth check — use the best torso angle available
+                # Depth check
                 best_torso = max(rep_result["max_torso_2d"], rep_result["max_torso_3d"])
                 if not rep_result["good_depth"] and best_torso < HINGE_BOTTOM_ANGLE:
                     feedback.append("Go deeper - hinge more at the hips")
@@ -981,7 +1051,9 @@ def run_romanian_deadlift_analysis(video_path,
                 rt_fb_hold -= 1
 
             if create_video and out is not None:
-                frame_out = cv2.resize(work, (out_w, out_h), interpolation=cv2.INTER_LINEAR) if work.shape[1] != out_w or work.shape[0] != out_h else work.copy()
+                # ✅ FIX: Upscale small frame → draw skeleton + overlay at FULL resolution
+                frame_out = cv2.resize(work, (out_w, out_h))
+                frame_out = draw_body_only(frame_out, lm)
                 frame_drawn = draw_overlay(frame_out, reps=rep_counter.count,
                                            feedback=(rt_fb_msg if rt_fb_hold > 0 else None),
                                            depth_pct=prog)
@@ -1083,7 +1155,6 @@ def run_romanian_deadlift_analysis(video_path,
             subprocess.run([
                 "ffmpeg", "-y", "-i", output_path,
                 "-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart", "-pix_fmt", "yuv420p",
-                "-metadata:s:v:0", "rotate=0",
                 encoded_path
             ], check=False, capture_output=True)
 
