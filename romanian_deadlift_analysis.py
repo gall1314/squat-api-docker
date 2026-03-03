@@ -799,6 +799,74 @@ def _apply_rotation(frame, rotation):
     return frame
 
 
+# ===================== PERSON LOCKER =====================
+class PersonLocker:
+    """Tracks the locked person's hip centroid and rejects detections that jump too far."""
+
+    def __init__(self):
+        self.locked_centroid = None       # (x, y) normalized coordinates
+        self.locked_body_size = None      # approximate body height in normalized coords
+        self.consecutive_rejects = 0
+        self.frames_since_lock = 0
+        self.lock_established = False
+        self.RELOCK_AFTER_REJECTS = 8     # re-lock after this many consecutive rejects
+        self.MAX_JUMP_RATIO = 0.6         # max jump as fraction of body size
+        self.MIN_JUMP_THRESHOLD = 0.15    # minimum absolute jump threshold
+        self.WARMUP_FRAMES = 3            # accept first N frames unconditionally
+
+    def _compute_centroid_and_size(self, lm):
+        """Compute hip centroid and body size from landmarks."""
+        PL = mp_pose.PoseLandmark
+        lhip = lm[PL.LEFT_HIP.value]
+        rhip = lm[PL.RIGHT_HIP.value]
+        cx = (lhip.x + rhip.x) / 2.0
+        cy = (lhip.y + rhip.y) / 2.0
+        lshoulder = lm[PL.LEFT_SHOULDER.value]
+        rshoulder = lm[PL.RIGHT_SHOULDER.value]
+        lankle = lm[PL.LEFT_ANKLE.value]
+        rankle = lm[PL.RIGHT_ANKLE.value]
+        shoulder_y = (lshoulder.y + rshoulder.y) / 2.0
+        ankle_y = (lankle.y + rankle.y) / 2.0
+        body_size = abs(ankle_y - shoulder_y)
+        avg_vis = (lhip.visibility + rhip.visibility + lshoulder.visibility + rshoulder.visibility) / 4.0
+        return (cx, cy), body_size, avg_vis
+
+    def check(self, lm):
+        """Returns True if detection belongs to locked person, False if jumped."""
+        centroid, body_size, avg_vis = self._compute_centroid_and_size(lm)
+        if avg_vis < 0.3:
+            return False
+        if not self.lock_established:
+            self.locked_centroid = centroid
+            self.locked_body_size = body_size
+            self.frames_since_lock += 1
+            if self.frames_since_lock >= self.WARMUP_FRAMES:
+                self.lock_established = True
+            return True
+        dx = centroid[0] - self.locked_centroid[0]
+        dy = centroid[1] - self.locked_centroid[1]
+        dist = math.sqrt(dx * dx + dy * dy)
+        ref_size = max(self.locked_body_size or 0.3, 0.15)
+        threshold = max(self.MIN_JUMP_THRESHOLD, ref_size * self.MAX_JUMP_RATIO)
+        if dist <= threshold:
+            alpha = 0.3
+            self.locked_centroid = (
+                self.locked_centroid[0] + alpha * (centroid[0] - self.locked_centroid[0]),
+                self.locked_centroid[1] + alpha * (centroid[1] - self.locked_centroid[1]),
+            )
+            self.locked_body_size = self.locked_body_size + alpha * (body_size - self.locked_body_size)
+            self.consecutive_rejects = 0
+            return True
+        else:
+            self.consecutive_rejects += 1
+            if self.consecutive_rejects >= self.RELOCK_AFTER_REJECTS:
+                self.locked_centroid = centroid
+                self.locked_body_size = body_size
+                self.consecutive_rejects = 0
+                return True
+            return False
+
+
 # ===================== MAIN ANALYSIS =====================
 def run_romanian_deadlift_analysis(video_path,
                                    frame_skip=3,
@@ -894,6 +962,8 @@ def run_romanian_deadlift_analysis(video_path,
 
     # ✅ State
     rep_counter = RepCounter()
+    person_locker = PersonLocker()
+    last_valid_lm = None
     good_reps = bad_reps = 0
     all_scores = []
     rep_reports = []
@@ -953,6 +1023,8 @@ def run_romanian_deadlift_analysis(video_path,
                 if create_video and out is not None:
                     # ✅ FIX: Upscale to original resolution, then overlay
                     frame_out = cv2.resize(work, (out_w, out_h))
+                    if last_valid_lm is not None:
+                        frame_out = draw_body_only(frame_out, last_valid_lm)
                     frame_drawn = draw_overlay(frame_out, reps=rep_counter.count,
                                                feedback=(rt_fb_msg if rt_fb_hold > 0 else None),
                                                depth_pct=prog)
@@ -960,6 +1032,19 @@ def run_romanian_deadlift_analysis(video_path,
                 continue
 
             lm = res.pose_landmarks.landmark
+
+            # ✅ FIX 4: Person locking — reject detections that jump to another person
+            if not person_locker.check(lm):
+                if create_video and out is not None:
+                    frame_out = cv2.resize(work, (out_w, out_h))
+                    if last_valid_lm is not None:
+                        frame_out = draw_body_only(frame_out, last_valid_lm)
+                    frame_drawn = draw_overlay(frame_out, reps=rep_counter.count,
+                                               feedback=(rt_fb_msg if rt_fb_hold > 0 else None),
+                                               depth_pct=prog)
+                    out.write(frame_drawn)
+                continue
+            last_valid_lm = lm  # accepted, update reference
 
             # ✅ Get all landmarks (both sides + mid)
             all_lm = _get_all_landmarks(lm)
