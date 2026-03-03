@@ -809,10 +809,10 @@ class PersonLocker:
         self.consecutive_rejects = 0
         self.frames_since_lock = 0
         self.lock_established = False
-        self.RELOCK_AFTER_REJECTS = 8     # re-lock after this many consecutive rejects
-        self.MAX_JUMP_RATIO = 0.6         # max jump as fraction of body size
-        self.MIN_JUMP_THRESHOLD = 0.15    # minimum absolute jump threshold
-        self.WARMUP_FRAMES = 3            # accept first N frames unconditionally
+        self.RELOCK_AFTER_REJECTS = 25    # re-lock after this many consecutive rejects
+        self.MAX_JUMP_RATIO = 0.35        # max jump as fraction of body size (stricter)
+        self.MIN_JUMP_THRESHOLD = 0.12    # minimum absolute jump threshold
+        self.WARMUP_FRAMES = 5            # accept first N frames unconditionally
 
     def _compute_centroid_and_size(self, lm):
         """Compute hip centroid and body size from landmarks."""
@@ -932,15 +932,16 @@ def run_romanian_deadlift_analysis(video_path,
             "reps": [], "video_path": "", "feedback_path": feedback_path
         }
 
+    # Use identical detection parameters in both fast and video modes so that
+    # rep counts are consistent regardless of whether a video is rendered.
+    # model_complexity=0 (lite) avoids multi-person jumps that occur with model 1.
+    effective_frame_skip = frame_skip
+    effective_scale = scale * 0.85
+    model_complexity = 0
     if fast_mode:
-        effective_frame_skip = frame_skip
-        effective_scale = scale * 0.85
-        model_complexity = 0
         print(f"[RDL FAST] frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=lite", file=sys.stderr, flush=True)
     else:
-        effective_frame_skip = frame_skip
-        effective_scale = scale
-        model_complexity = 1
+        print(f"[RDL VIDEO] frame_skip={effective_frame_skip}, scale={effective_scale:.2f}, model=lite (aligned with fast)", file=sys.stderr, flush=True)
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = None
