@@ -302,11 +302,12 @@ class DeadliftRepDetector:
     HINGING  = 1
     RISING   = 2
 
-    COMPOSITE_HINGE_START = 0.25
+    # Raw thresholds — overridden after calibration
+    COMPOSITE_HINGE_START = 0.32
     COMPOSITE_HINGE_DEEP  = 0.50
-    COMPOSITE_STANDING    = 0.15
-    MIN_HINGE_FRAMES      = 4
-    MIN_FRAMES_BETWEEN    = 12
+    COMPOSITE_STANDING    = 0.18
+    MIN_HINGE_FRAMES      = 8
+    MIN_FRAMES_BETWEEN    = 20
 
     def __init__(self, fps=10):
         self.fps = fps
@@ -333,6 +334,41 @@ class DeadliftRepDetector:
         self.bad_reps = 0
         self.all_scores = []
         self.reps_report = []
+
+        # Dynamic calibration — learns session baseline & range
+        self._cal_signals    = []
+        self._calibrated     = False
+        self._cal_floor      = 0.0   # standing composite
+        self._cal_range      = 0.50  # typical rep range
+
+    def _calibrate(self, composite):
+        """
+        Collect first 20 frames to estimate standing baseline.
+        Then set HINGE_START = baseline + 35% of expected range,
+        HINGE_DEEP = baseline + 80% of expected range.
+        """
+        if self._calibrated:
+            return
+        self._cal_signals.append(composite)
+        if len(self._cal_signals) >= 20:
+            floor = float(np.percentile(self._cal_signals, 20))
+            ceil  = float(np.percentile(self._cal_signals, 90))
+            rng   = max(0.15, ceil - floor)
+            self._cal_floor = floor
+            self._cal_range = rng
+            # HINGE_START: baseline + 30% of range — need real movement
+            self.COMPOSITE_HINGE_START = min(0.55, floor + 0.30 * rng)
+            # COMPOSITE_STANDING: baseline + 10% of range — truly back upright
+            self.COMPOSITE_STANDING    = min(0.30, floor + 0.10 * rng)
+            # COMPOSITE_HINGE_DEEP: baseline + 75% of range
+            self.COMPOSITE_HINGE_DEEP  = min(0.75, floor + 0.75 * rng)
+            self._calibrated = True
+            import sys
+            print(f"[DL] Calibrated: floor={floor:.3f} rng={rng:.3f} "
+                  f"start={self.COMPOSITE_HINGE_START:.3f} "
+                  f"deep={self.COMPOSITE_HINGE_DEEP:.3f} "
+                  f"standing={self.COMPOSITE_STANDING:.3f}",
+                  file=sys.stderr, flush=True)
 
     def _compute_side_composite(self, torso_angle, hip_angle, side_ratio):
         torso_norm = float(np.clip((torso_angle - 12) / 55.0, 0.0, 1.0))
@@ -414,7 +450,7 @@ class DeadliftRepDetector:
                 rt_feedback = "Try to keep your back a bit straighter"
             if (composite < self.prev_composite - 0.03
                     and self.hinge_frames >= self.MIN_HINGE_FRAMES
-                    and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.7):
+                    and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.85):
                 self.state = self.RISING
 
         elif self.state == self.RISING:
@@ -422,11 +458,12 @@ class DeadliftRepDetector:
             if back_rounded:
                 rt_feedback = "Try to keep your back a bit straighter"
             if composite < self.COMPOSITE_STANDING:
-                if self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.6:
+                if self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.80:
                     rep_info = self._finalize_rep(frame_idx)
                 self.state = self.STANDING
                 self.last_rep_frame = frame_idx
 
+        self._calibrate(composite)   # learn baseline from first 20 frames
         self.prev_composite = composite
         return composite, rt_feedback, rep_info
 
