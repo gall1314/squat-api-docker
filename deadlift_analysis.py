@@ -352,21 +352,23 @@ class DeadliftRepDetector:
         self._cal_signals.append(composite)
         if len(self._cal_signals) >= 40:
             # Use more frames + higher percentiles for better floor estimate
-            # floor = median of early frames (person mostly standing)
-            floor = float(np.percentile(self._cal_signals, 55))
-            ceil  = float(np.percentile(self._cal_signals, 98))
-            rng   = max(0.20, ceil - floor)
-            self._cal_floor = floor
+            # Use 5th percentile as true floor (lowest = most upright)
+            true_floor = float(np.percentile(self._cal_signals, 5))
+            true_ceil  = float(np.percentile(self._cal_signals, 95))
+            rng = max(0.20, true_ceil - true_floor)
+            self._cal_floor = true_floor
             self._cal_range = rng
-            # HINGE_START: floor + 45% — must be well above standing noise
-            self.COMPOSITE_HINGE_START = min(0.65, floor + 0.45 * rng)
-            # COMPOSITE_STANDING: floor + 8% — must return very close to upright
-            self.COMPOSITE_STANDING    = min(0.35, floor + 0.08 * rng)
-            # COMPOSITE_HINGE_DEEP: floor + 82% — real deadlift depth
-            self.COMPOSITE_HINGE_DEEP  = min(0.90, floor + 0.82 * rng)
+
+            self.COMPOSITE_HINGE_START = true_floor + 0.45 * rng
+            self.COMPOSITE_STANDING    = true_floor + 0.08 * rng
+            self.COMPOSITE_HINGE_DEEP  = true_floor + 0.82 * rng
+            # Hard clamps
+            self.COMPOSITE_HINGE_START = max(0.15, min(0.70, self.COMPOSITE_HINGE_START))
+            self.COMPOSITE_STANDING    = max(0.05, min(0.40, self.COMPOSITE_STANDING))
+            self.COMPOSITE_HINGE_DEEP  = max(0.30, min(0.92, self.COMPOSITE_HINGE_DEEP))
             self._calibrated = True
             import sys
-            print(f"[DL] Calibrated: floor={floor:.3f} rng={rng:.3f} "
+            print(f"[DL] Calibrated: floor={true_floor:.3f} rng={rng:.3f} "
                   f"start={self.COMPOSITE_HINGE_START:.3f} "
                   f"deep={self.COMPOSITE_HINGE_DEEP:.3f} "
                   f"standing={self.COMPOSITE_STANDING:.3f}",
@@ -416,13 +418,16 @@ class DeadliftRepDetector:
         side_composite = self._compute_side_composite(torso_angle_smooth, hip_angle_smooth, side_ratio)
         front_val = self.front_signal.update(smoothed_pts)
 
-        if side_ratio >= 0.6:
+        if side_ratio >= 0.65:
+            # Clear side view
             composite = side_composite
-        elif side_ratio <= 0.3:
-            composite = front_val
-        else:
-            blend = (side_ratio - 0.3) / 0.3
+        elif side_ratio >= 0.45:
+            # Diagonal — blend, weight front more
+            blend = (side_ratio - 0.45) / 0.20
             composite = blend * side_composite + (1.0 - blend) * front_val
+        else:
+            # Front view — front signal only (side_composite is unreliable here)
+            composite = front_val
 
         # Calibrate BEFORE state machine — learns floor/ceiling from early frames
         self._calibrate(composite)
@@ -835,8 +840,10 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
             _store(snap, composite)   # store AFTER rep count update
 
             if frame_idx % (frame_skip * 50) == 0:
+                fd_last = frame_data.get(frame_idx, {})
                 print(f"[DL] Pass1 fi={frame_idx} reps={rep_detector.reps} "
-                      f"comp={composite:.3f}", file=sys.stderr, flush=True)
+                      f"comp={composite:.3f} state={rep_detector.state}",
+                      file=sys.stderr, flush=True)
 
     finally:
         pose_est.close()
