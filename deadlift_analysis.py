@@ -61,6 +61,15 @@ _REF_FEEDBACK_FONT_SIZE    = 22
 _REF_DEPTH_LABEL_FONT_SIZE = 14
 _REF_DEPTH_PCT_FONT_SIZE   = 18
 
+# Font cache: (path, size) -> ImageFont  — avoids reloading every frame
+_FONT_CACHE: dict = {}
+
+def _get_font(path, size):
+    key = (path, size)
+    if key not in _FONT_CACHE:
+        _FONT_CACHE[key] = _load_font(path, size)
+    return _FONT_CACHE[key]
+
 
 def _scaled_font_size(ref_size, frame_h):
     return max(10, int(round(ref_size * (frame_h / _REF_H))))
@@ -306,8 +315,8 @@ class DeadliftRepDetector:
     COMPOSITE_HINGE_START = 0.32
     COMPOSITE_HINGE_DEEP  = 0.50
     COMPOSITE_STANDING    = 0.18
-    MIN_HINGE_FRAMES      = 14     # ~1.4s at 10fps — real deadlift takes time
-    MIN_FRAMES_BETWEEN    = 40     # ~4s min between reps at 10fps
+    MIN_HINGE_FRAMES      = 15     # ~1.5s at 10fps
+    MIN_FRAMES_BETWEEN    = 50     # ~5s min between reps — deadlift needs recovery
 
     def __init__(self, fps=10):
         self.fps = fps
@@ -343,14 +352,13 @@ class DeadliftRepDetector:
 
     def _calibrate(self, composite):
         """
-        Collect first 20 frames to estimate standing baseline.
-        Then set HINGE_START = baseline + 35% of expected range,
-        HINGE_DEEP = baseline + 80% of expected range.
+        Collect frames to estimate standing baseline.
+        Only use LOW-signal frames (person upright) for floor estimation.
         """
         if self._calibrated:
             return
         self._cal_signals.append(composite)
-        if len(self._cal_signals) >= 40:
+        if len(self._cal_signals) >= 50:
             # Use more frames + higher percentiles for better floor estimate
             # Use 5th percentile as true floor (lowest = most upright)
             true_floor = float(np.percentile(self._cal_signals, 5))
@@ -446,10 +454,16 @@ class DeadliftRepDetector:
         rep_info    = None
 
         if self.state == self.STANDING:
-            if (composite > self.COMPOSITE_HINGE_START
+            if composite > self.COMPOSITE_HINGE_START:
+                self._pre_hinge_frames = getattr(self, '_pre_hinge_frames', 0) + 1
+            else:
+                self._pre_hinge_frames = 0
+            # Require 3 consecutive frames above threshold before committing
+            if (self._pre_hinge_frames >= 3
                     and (frame_idx - self.last_rep_frame > self.MIN_FRAMES_BETWEEN)):
                 self.state = self.HINGING
                 self.hinge_frames = 0
+                self._pre_hinge_frames = 0
                 self._reset_rep_tracking()
 
         elif self.state == self.HINGING:
@@ -601,10 +615,10 @@ def _wrap2(draw, text, font, maxw):
 
 def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
     h, w, _ = frame.shape
-    _REPS_F  = _load_font(FONT_PATH, _scaled_font_size(_REF_REPS_FONT_SIZE,       h))
-    _FB_F    = _load_font(FONT_PATH, _scaled_font_size(_REF_FEEDBACK_FONT_SIZE,    h))
-    _DL_F    = _load_font(FONT_PATH, _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, h))
-    _DP_F    = _load_font(FONT_PATH, _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE,   h))
+    _REPS_F  = _get_font(FONT_PATH, _scaled_font_size(_REF_REPS_FONT_SIZE,       h))
+    _FB_F    = _get_font(FONT_PATH, _scaled_font_size(_REF_FEEDBACK_FONT_SIZE,    h))
+    _DL_F    = _get_font(FONT_PATH, _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, h))
+    _DP_F    = _get_font(FONT_PATH, _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE,   h))
 
     pct       = float(np.clip(progress_pct, 0, 1))
     bg_alpha  = int(round(255 * BAR_BG_ALPHA))
@@ -615,7 +629,8 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
     cy        = max(ref_h + radius // 8, radius + thick // 2 + 2)
 
     ov        = np.zeros((h, w, 4), dtype=np.uint8)
-    tmp_draw  = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    _tmp_img  = Image.new("RGBA", (1, 1))
+    tmp_draw  = ImageDraw.Draw(_tmp_img)
     txt       = f"Reps: {int(reps)}"
     tw        = tmp_draw.textlength(txt, font=_REPS_F)
     cv2.rectangle(ov, (0, 0), (int(tw + 20), int(_REPS_F.size + 12)), (0, 0, 0, bg_alpha), -1)
