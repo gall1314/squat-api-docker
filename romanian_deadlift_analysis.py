@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
-# romanian_deadlift_analysis_fixed.py  v5 — TWO-PASS
+# romanian_deadlift_analysis_fixed.py  v5.1 — TWO-PASS
 #
-# PASS 1: Analysis only (model_complexity=0 always — fast & consistent)
-#         Saves per-frame landmarks + overlay state in frame_data dict
-# PASS 2: Video rendering using frame_data — NO mediapipe in this pass
+# FIXES vs v5:
+#   1. DEPTH donut is now responsive: DepthNormalizer maps raw signal to 0-100%
+#      based on observed session min/max -> ~0% upright, ~100% at bottom
+#   2. RepCounter thresholds raised to prevent false reps
+#   3. Calibration: 25 frames + 40th percentile for stable standing baseline
+#   4. _snapshot_lm() freezes landmarks — stable skeleton, no flickering
 #
-# This guarantees:
-#   - fast_mode and video mode produce IDENTICAL rep counts
-#   - The skeleton in the video CANNOT jump to a background person
-#     because pass 2 never runs mediapipe at all
+# ARCHITECTURE:
+#   PASS 1: mediapipe (model_complexity=0) -> counts reps, stores frame_data
+#   PASS 2: renders video from frame_data — NO mediapipe (skeleton can't jump)
 
 import os
 import cv2
@@ -371,20 +373,50 @@ def compute_movement_signal(all_lm):
             "vis_ratio": vr, "weights": w}
 
 
+# =====================================================================
+# DEPTH NORMALIZER
+# Maps raw composite signal to 0.0–1.0 for the depth donut display.
+# Learns session floor (standing) and ceiling (bottom of hinge) in real time.
+# ~0% when fully upright, ~100% at deepest hinge point.
+# =====================================================================
+class DepthNormalizer:
+    def __init__(self):
+        self.floor   = 0.50
+        self.ceiling = 0.50
+        self.n       = 0
+
+    def update(self, raw):
+        self.n += 1
+        # Floor: fast downward adaptation (captures standing = low signal)
+        if raw < self.floor:
+            self.floor = 0.85 * self.floor + 0.15 * raw
+        else:
+            self.floor = 0.995 * self.floor + 0.005 * raw
+
+        # Ceiling: fast upward adaptation (captures bottom of hinge = high signal)
+        if raw > self.ceiling:
+            self.ceiling = 0.80 * self.ceiling + 0.20 * raw
+        else:
+            self.ceiling = 0.995 * self.ceiling + 0.005 * raw
+
+        rng = max(0.12, self.ceiling - self.floor)
+        return float(np.clip((raw - self.floor) / rng, 0.0, 1.0))
+
+
 class RepCounter:
-    ENTER_THRESHOLD           = 0.25
-    EXIT_THRESHOLD            = 0.15
-    MIN_PEAK_FOR_REP          = 0.40
-    GOOD_DEPTH_PEAK           = 0.55
-    MIN_FRAMES_BETWEEN        = 5
+    ENTER_THRESHOLD           = 0.30
+    EXIT_THRESHOLD            = 0.18
+    MIN_PEAK_FOR_REP          = 0.45
+    GOOD_DEPTH_PEAK           = 0.58
+    MIN_FRAMES_BETWEEN        = 8
     MAX_REP_FRAMES            = 120
-    REBOUND_DELTA             = 0.015
-    MIN_RETURN_FROM_PEAK      = 0.04
-    NORMALIZED_PEAK_THRESHOLD = 0.58
-    NORMALIZED_DROP_THRESHOLD = 0.10
-    MIN_REP_DURATION_FRAMES   = 6
-    MIN_PEAK_DELTA            = 0.07
-    MIN_NORMALIZED_PEAK_DELTA = 0.18
+    REBOUND_DELTA             = 0.06
+    MIN_RETURN_FROM_PEAK      = 0.10
+    NORMALIZED_PEAK_THRESHOLD = 0.62
+    NORMALIZED_DROP_THRESHOLD = 0.18
+    MIN_REP_DURATION_FRAMES   = 10
+    MIN_PEAK_DELTA            = 0.12
+    MIN_NORMALIZED_PEAK_DELTA = 0.25
 
     def __init__(self):
         self.state             = "standing"
@@ -423,13 +455,13 @@ class RepCounter:
         if self.calibrated:
             return
         self.calibration_signals.append(signal)
-        if len(self.calibration_signals) >= 15:
-            self.standing_baseline = float(np.percentile(self.calibration_signals, 25))
+        if len(self.calibration_signals) >= 25:
+            self.standing_baseline = float(np.percentile(self.calibration_signals, 40))
             self.dynamic_floor     = self.standing_baseline
-            self.dynamic_ceil      = max(self.standing_baseline + 0.35,
-                                         float(np.percentile(self.calibration_signals, 90)))
-            self.ENTER_THRESHOLD   = max(0.15, self.standing_baseline + 0.15)
-            self.EXIT_THRESHOLD    = max(0.10, self.standing_baseline + 0.08)
+            self.dynamic_ceil      = max(self.standing_baseline + 0.40,
+                                         float(np.percentile(self.calibration_signals, 95)))
+            self.ENTER_THRESHOLD   = max(0.20, self.standing_baseline + 0.20)
+            self.EXIT_THRESHOLD    = max(0.14, self.standing_baseline + 0.10)
             self.calibrated        = True
 
     def _start_rep(self, sd, fi, sm):
@@ -571,7 +603,6 @@ KNEE_MAX_ANGLE     = 125.0
 BACK_MAX_ANGLE     = 60.0
 MIN_SCORE          = 4.0
 MAX_SCORE          = 10.0
-PROG_ALPHA         = 0.3
 
 
 def _get_rotation_angle(video_path):
@@ -632,22 +663,33 @@ def _evaluate_rep(rep_result):
     return float(max(MIN_SCORE, min(MAX_SCORE, score))), feedback
 
 
+def _snapshot_lm(lm):
+    """Freeze mediapipe landmarks into a plain list of objects.
+    Without this lm is a live buffer that gets overwritten each frame,
+    causing the skeleton to flicker between frames."""
+    if lm is None:
+        return None
+
+    class _P:
+        __slots__ = ("x", "y", "z", "visibility")
+        def __init__(self, src):
+            self.x = src.x; self.y = src.y
+            self.z = src.z; self.visibility = src.visibility
+
+    return [_P(p) for p in lm]
+
+
 # =====================================================================
-# PASS 1 — analysis, saves per-frame data for video rendering
+# PASS 1 — analysis, saves per-frame data
 # =====================================================================
 def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
-    """
-    Runs mediapipe (model_complexity=0) on every sampled frame.
-    Stores per-frame overlay data in frame_data dict for pass 2.
-    Returns: (analysis_dict, frame_data, effective_fps)
-    """
     import sys, time
-    mp_pose_mod    = mp.solutions.pose
     effective_skip = frame_skip
     effective_fps  = max(1.0, fps_in / max(1, effective_skip))
     dt             = 1.0 / float(effective_fps)
 
     rep_counter          = RepCounter()
+    depth_norm           = DepthNormalizer()
     good_reps = bad_reps = 0
     all_scores              = []
     rep_reports             = []
@@ -655,18 +697,18 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
     session_feedback_by_cat = {}
 
     frame_idx     = 0
-    prog          = 0.0
+    depth_pct     = 0.0
     rt_fb_msg     = None
     rt_fb_hold    = 0
-    frame_data    = {}   # frame_idx -> {lm, reps, fb, prog}
-    last_valid_lm = None
+    frame_data    = {}
+    last_valid_lm = None   # frozen snapshot
 
     cap = cv2.VideoCapture(video_path)
     t0  = time.time()
 
-    with mp_pose_mod.Pose(model_complexity=0,
-                          min_detection_confidence=0.5,
-                          min_tracking_confidence=0.5) as pose:
+    with mp_pose.Pose(model_complexity=0,
+                      min_detection_confidence=0.5,
+                      min_tracking_confidence=0.5) as pose:
         _init_skeleton_data()
 
         while cap.isOpened():
@@ -687,12 +729,12 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
 
             res = pose.process(cv2.cvtColor(work, cv2.COLOR_BGR2RGB))
 
-            def _store(lm_to_draw):
+            def _store(snap):
                 frame_data[frame_idx] = {
-                    "lm":   lm_to_draw,
+                    "lm":   snap,
                     "reps": rep_counter.count,
                     "fb":   rt_fb_msg if rt_fb_hold > 0 else None,
-                    "prog": prog,
+                    "prog": depth_pct,
                 }
 
             if not res.pose_landmarks:
@@ -701,12 +743,15 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
                     rt_fb_hold -= 1
                 continue
 
-            lm            = res.pose_landmarks.landmark
-            last_valid_lm = lm
+            lm   = res.pose_landmarks.landmark
+            snap = _snapshot_lm(lm)
+            last_valid_lm = snap
 
             all_lm      = _get_all_landmarks(lm)
             signal_data = compute_movement_signal(all_lm)
-            prog        = prog + PROG_ALPHA * (signal_data["composite"] - prog)
+
+            # Depth display — responsive, normalized to session range
+            depth_pct = depth_norm.update(signal_data["composite"])
 
             pts = _get_side_landmarks(lm)
             back_angle, back_bad = analyze_back_curvature(
@@ -751,10 +796,8 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
             if rt_fb_hold > 0:
                 rt_fb_hold -= 1
 
-            # Store AFTER updating rep count so the counter is already incremented
-            _store(lm)
+            _store(snap)   # store AFTER rep count update
 
-    # Finalize last rep if video ended mid-ascent
     rep_result = rep_counter.finalize_pending_rep(frame_idx)
     if rep_result is not None:
         score, feedback = _evaluate_rep(rep_result)
@@ -808,7 +851,7 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
     else:
         tip = "Great technique! Keep building that posterior chain 💪"
 
-    analysis = {
+    return {
         "squat_count":             int(counter),
         "technique_score":         float(technique_score),
         "technique_score_display": str(display_half_str(technique_score)),
@@ -818,36 +861,27 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
         "feedback":                [str(f) for f in feedback_list],
         "tip":                     str(tip),
         "reps":                    rep_reports,
-    }
-    return analysis, frame_data, effective_fps
+    }, frame_data, effective_fps
 
 
 # =====================================================================
-# PASS 2 — render video using frame_data from pass 1, NO mediapipe
+# PASS 2 — video rendering, NO mediapipe
 # =====================================================================
 def _render_pass(video_path, rotation, frame_skip, output_path,
                  out_w, out_h, fps_in, frame_data):
-    """
-    Re-reads the video and draws skeleton + overlay using data from pass 1.
-    No mediapipe runs here — skeleton cannot jump to a background person.
-    """
     import sys
-    effective_skip = frame_skip
-    effective_fps  = max(1.0, fps_in / max(1, effective_skip))
-
+    effective_fps = max(1.0, fps_in / max(1, frame_skip))
     cap    = cv2.VideoCapture(video_path)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out    = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
-
-    frame_idx = 0
-    written   = 0
+    frame_idx = written = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         frame_idx += 1
-        if frame_idx % effective_skip != 0:
+        if frame_idx % frame_skip != 0:
             continue
 
         frame = _apply_rotation(frame, rotation)
@@ -855,17 +889,12 @@ def _render_pass(video_path, rotation, frame_skip, output_path,
 
         if fd is None:
             out.write(draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0))
-            written += 1
-            continue
-
-        f = frame.copy()
-        if fd["lm"] is not None:
-            f = draw_body_only(f, fd["lm"])
-
-        out.write(draw_overlay(f,
-                               reps=fd["reps"],
-                               feedback=fd["fb"],
-                               depth_pct=fd["prog"]))
+        else:
+            f = frame.copy()
+            if fd["lm"] is not None:
+                f = draw_body_only(f, fd["lm"])
+            out.write(draw_overlay(f, reps=fd["reps"],
+                                   feedback=fd["fb"], depth_pct=fd["prog"]))
         written += 1
 
     cap.release()
@@ -883,22 +912,6 @@ def run_romanian_deadlift_analysis(video_path,
                                    feedback_path="romanian_deadlift_feedback.txt",
                                    return_video=True,
                                    fast_mode=False):
-    """
-    Two-pass Romanian Deadlift analysis.
-
-    Pass 1 (always runs):
-        - mediapipe model_complexity=0 on sampled frames
-        - Counts reps, computes scores and feedback
-        - Stores per-frame {landmarks, rep_count, feedback, depth} in frame_data
-
-    Pass 2 (only when return_video=True):
-        - Re-reads video, draws skeleton from frame_data
-        - No mediapipe — skeleton CANNOT jump to a background person
-        - Rep counter shown in video is identical to JSON result
-
-    fast_mode=True  → skips pass 2 (JSON only)
-    fast_mode=False → runs both passes (JSON + video)
-    """
     import sys
     print(f"[RDL] Start fast_mode={fast_mode} return_video={return_video}",
           file=sys.stderr, flush=True)
@@ -910,13 +923,11 @@ def run_romanian_deadlift_analysis(video_path,
     rotation = _get_rotation_angle(video_path)
     print(f"[RDL] rotation={rotation}deg", file=sys.stderr, flush=True)
 
-    # Quick validation
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {"squat_count": 0, "technique_score": 0.0,
                 "technique_score_display": "0", "technique_label": score_label(0),
-                "good_reps": 0, "bad_reps": 0,
-                "feedback": ["Could not open video"],
+                "good_reps": 0, "bad_reps": 0, "feedback": ["Could not open video"],
                 "reps": [], "video_path": "", "feedback_path": feedback_path}
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -936,11 +947,9 @@ def run_romanian_deadlift_analysis(video_path,
     print(f"[RDL] {total_frames}fr @ {fps_in:.1f}fps  out={out_w}x{out_h}",
           file=sys.stderr, flush=True)
 
-    # === PASS 1 — analysis (same for both fast_mode and video mode) ===
-    analysis, frame_data, effective_fps = _analysis_pass(
+    analysis, frame_data, _ = _analysis_pass(
         video_path, rotation, frame_skip, scale, fps_in)
 
-    # Write feedback file
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
             f.write(f"Total Reps: {analysis['squat_count']}\n"
@@ -950,14 +959,12 @@ def run_romanian_deadlift_analysis(video_path,
     except Exception as e:
         print(f"Warning feedback file: {e}")
 
-    # === PASS 2 — video rendering (only if requested) ===
     final_video_path = ""
     if create_video:
-        print("[RDL] Pass2 rendering video...", file=sys.stderr, flush=True)
+        print("[RDL] Pass2 rendering...", file=sys.stderr, flush=True)
         _render_pass(video_path, rotation, frame_skip, output_path,
                      out_w, out_h, fps_in, frame_data)
 
-        # Encode for browser compatibility
         encoded = output_path.replace(".mp4", "_encoded.mp4")
         try:
             proc = subprocess.run(
@@ -974,15 +981,11 @@ def run_romanian_deadlift_analysis(video_path,
 
         encoded_ok = os.path.exists(encoded) and os.path.getsize(encoded) > 1000
         if encoded_ok:
-            try:
-                os.remove(output_path)
-            except Exception:
-                pass
+            try: os.remove(output_path)
+            except Exception: pass
             final_video_path = encoded
         elif os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
             final_video_path = output_path
-        else:
-            final_video_path = ""
 
         print(f"[RDL] video='{final_video_path}' "
               f"exists={bool(final_video_path and os.path.exists(final_video_path))}",
