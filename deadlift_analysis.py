@@ -306,8 +306,8 @@ class DeadliftRepDetector:
     COMPOSITE_HINGE_START = 0.32
     COMPOSITE_HINGE_DEEP  = 0.50
     COMPOSITE_STANDING    = 0.18
-    MIN_HINGE_FRAMES      = 8
-    MIN_FRAMES_BETWEEN    = 20
+    MIN_HINGE_FRAMES      = 10     # ~1s at 10fps
+    MIN_FRAMES_BETWEEN    = 35     # ~3.5s min between reps at 10fps
 
     def __init__(self, fps=10):
         self.fps = fps
@@ -350,18 +350,19 @@ class DeadliftRepDetector:
         if self._calibrated:
             return
         self._cal_signals.append(composite)
-        if len(self._cal_signals) >= 20:
-            floor = float(np.percentile(self._cal_signals, 20))
-            ceil  = float(np.percentile(self._cal_signals, 90))
-            rng   = max(0.15, ceil - floor)
+        if len(self._cal_signals) >= 30:
+            # 40th percentile = stable standing baseline (ignores early movement)
+            floor = float(np.percentile(self._cal_signals, 40))
+            ceil  = float(np.percentile(self._cal_signals, 95))
+            rng   = max(0.20, ceil - floor)
             self._cal_floor = floor
             self._cal_range = rng
-            # HINGE_START: baseline + 30% of range — need real movement
-            self.COMPOSITE_HINGE_START = min(0.55, floor + 0.30 * rng)
-            # COMPOSITE_STANDING: baseline + 10% of range — truly back upright
-            self.COMPOSITE_STANDING    = min(0.30, floor + 0.10 * rng)
-            # COMPOSITE_HINGE_DEEP: baseline + 75% of range
-            self.COMPOSITE_HINGE_DEEP  = min(0.75, floor + 0.75 * rng)
+            # HINGE_START: floor + 40% of range — needs substantial hinge
+            self.COMPOSITE_HINGE_START = min(0.60, floor + 0.40 * rng)
+            # COMPOSITE_STANDING: floor + 12% — truly back upright
+            self.COMPOSITE_STANDING    = min(0.35, floor + 0.12 * rng)
+            # COMPOSITE_HINGE_DEEP: floor + 80% of range — real deadlift depth
+            self.COMPOSITE_HINGE_DEEP  = min(0.85, floor + 0.80 * rng)
             self._calibrated = True
             import sys
             print(f"[DL] Calibrated: floor={floor:.3f} rng={rng:.3f} "
@@ -422,6 +423,9 @@ class DeadliftRepDetector:
             blend = (side_ratio - 0.3) / 0.3
             composite = blend * side_composite + (1.0 - blend) * front_val
 
+        # Calibrate BEFORE state machine — learns floor/ceiling from early frames
+        self._calibrate(composite)
+
         # Back rounding check
         head_pt = None
         for idx in (8, 7, 0):
@@ -448,7 +452,7 @@ class DeadliftRepDetector:
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
             if back_rounded:
                 rt_feedback = "Try to keep your back a bit straighter"
-            if (composite < self.prev_composite - 0.03
+            if (composite < self.prev_composite - 0.06
                     and self.hinge_frames >= self.MIN_HINGE_FRAMES
                     and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.85):
                 self.state = self.RISING
@@ -463,7 +467,6 @@ class DeadliftRepDetector:
                 self.state = self.STANDING
                 self.last_rep_frame = frame_idx
 
-        self._calibrate(composite)   # learn baseline from first 20 frames
         self.prev_composite = composite
         return composite, rt_feedback, rep_info
 
@@ -661,7 +664,7 @@ class PoseEstimator:
         self._is_tasks = False
         if _SOLUTIONS_AVAILABLE:
             self._impl = _mp_pose.Pose(
-                model_complexity=1,
+                model_complexity=0,
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5)
         elif _USE_TASKS_API:
