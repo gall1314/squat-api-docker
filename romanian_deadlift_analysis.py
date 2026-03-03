@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
-# romanian_deadlift_analysis_fixed.py  v4
-# KEY FIX: PersonLocker now uses Z-DEPTH from mediapipe landmarks
-# The person closest to the camera has the most negative z values.
-# When mediapipe snaps to a background person, their z jumps positive.
-# We lock on the z-baseline of the first person and reject z-jumps.
+# romanian_deadlift_analysis_fixed.py  v5 — TWO-PASS
+#
+# PASS 1: Analysis only (model_complexity=0 always — fast & consistent)
+#         Saves per-frame landmarks + overlay state in frame_data dict
+# PASS 2: Video rendering using frame_data — NO mediapipe in this pass
+#
+# This guarantees:
+#   - fast_mode and video mode produce IDENTICAL rep counts
+#   - The skeleton in the video CANNOT jump to a background person
+#     because pass 2 never runs mediapipe at all
 
 import os
 import cv2
@@ -63,11 +68,16 @@ def _init_skeleton_data():
     if not _BODY_CONNECTIONS:
         _FACE_LMS = {
             mp_pose.PoseLandmark.NOSE.value,
-            mp_pose.PoseLandmark.LEFT_EYE_INNER.value,  mp_pose.PoseLandmark.LEFT_EYE.value,
-            mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,  mp_pose.PoseLandmark.RIGHT_EYE_INNER.value,
-            mp_pose.PoseLandmark.RIGHT_EYE.value,        mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
-            mp_pose.PoseLandmark.LEFT_EAR.value,         mp_pose.PoseLandmark.RIGHT_EAR.value,
-            mp_pose.PoseLandmark.MOUTH_LEFT.value,       mp_pose.PoseLandmark.MOUTH_RIGHT.value,
+            mp_pose.PoseLandmark.LEFT_EYE_INNER.value,
+            mp_pose.PoseLandmark.LEFT_EYE.value,
+            mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
+            mp_pose.PoseLandmark.RIGHT_EYE_INNER.value,
+            mp_pose.PoseLandmark.RIGHT_EYE.value,
+            mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
+            mp_pose.PoseLandmark.LEFT_EAR.value,
+            mp_pose.PoseLandmark.RIGHT_EAR.value,
+            mp_pose.PoseLandmark.MOUTH_LEFT.value,
+            mp_pose.PoseLandmark.MOUTH_RIGHT.value,
         }
         _BODY_CONNECTIONS = tuple(
             (a, b) for (a, b) in mp_pose.POSE_CONNECTIONS
@@ -230,10 +240,10 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     draw = ImageDraw.Draw(pil)
     draw.text((pad_x, pad_y - 1), txt, font=REPS_F, fill=(255, 255, 255, 255))
 
-    gap  = max(2, int(radius * 0.10))
-    by   = cy - (DL_F.size + gap + DP_F.size) // 2
-    lbl  = "DEPTH"
-    pt   = f"{int(pct * 100)}%"
+    gap = max(2, int(radius * 0.10))
+    by  = cy - (DL_F.size + gap + DP_F.size) // 2
+    lbl = "DEPTH"
+    pt  = f"{int(pct * 100)}%"
     draw.text((cx - int(draw.textlength(lbl, font=DL_F) // 2), by),
               lbl, font=DL_F, fill=(255, 255, 255, 255))
     draw.text((cx - int(draw.textlength(pt, font=DP_F) // 2), by + DL_F.size + gap),
@@ -405,8 +415,9 @@ class RepCounter:
     def _normalize(self, s):
         self.dynamic_floor = 0.98 * self.dynamic_floor + 0.02 * min(self.dynamic_floor, s)
         self.dynamic_ceil  = 0.95 * self.dynamic_ceil  + 0.05 * max(self.dynamic_ceil,  s)
-        rng = max(0.20, self.dynamic_ceil - self.dynamic_floor)
-        return float(np.clip((s - self.dynamic_floor) / rng, 0.0, 1.0))
+        return float(np.clip(
+            (s - self.dynamic_floor) / max(0.20, self.dynamic_ceil - self.dynamic_floor),
+            0.0, 1.0))
 
     def _calibrate(self, signal):
         if self.calibrated:
@@ -600,132 +611,6 @@ def _apply_rotation(frame, rotation):
     return frame
 
 
-class PersonLocker:
-    """
-    Locks onto the CLOSEST person to the camera using mediapipe's Z coordinate.
-
-    Mediapipe z is normalized relative to hip width:
-      - Negative z = closer to camera (foreground person)
-      - Positive z = farther from camera (background person)
-
-    Strategy:
-      1. During warmup (first 5 accepted frames), record the average hip Z
-         as the "locked Z baseline" — this is the foreground person.
-      2. Every subsequent frame: compute mean hip Z of detection.
-         If it jumps more than Z_MAX_JUMP (0.35) from baseline → reject.
-         Background people always have a significantly different (more positive) Z.
-      3. Also check XY centroid distance as secondary guard.
-      4. RELOCK_AFTER_REJECTS raised to 25 — very hard to accidentally snap
-         to someone else.
-    """
-
-    def __init__(self):
-        self.locked_centroid     = None
-        self.locked_body_size    = None
-        self.locked_z_baseline   = None      # mean hip Z of locked person
-        self.consecutive_rejects = 0
-        self.frames_since_lock   = 0
-        self.lock_established    = False
-
-        # Tuning
-        self.WARMUP_FRAMES        = 5
-        self.RELOCK_AFTER_REJECTS = 25       # very hard to snap to new person
-        self.MAX_JUMP_RATIO       = 0.45     # XY: fraction of body size
-        self.MIN_JUMP_THRESHOLD   = 0.12     # XY: absolute minimum
-        self.MIN_VIS              = 0.35
-        self.MIN_SIZE_RATIO       = 0.45     # body size: reject if < 45% of locked
-        self.Z_MAX_JUMP           = 0.35     # Z: reject if hip Z shifts this much
-                                             # (background person is typically +0.3 to +0.6
-                                             #  while foreground is -0.1 to -0.3)
-
-    def _extract(self, lm):
-        """Returns centroid (x,y), body_size, mean_hip_z, visibility."""
-        PL  = mp_pose.PoseLandmark
-        lh  = lm[PL.LEFT_HIP.value];      rh  = lm[PL.RIGHT_HIP.value]
-        ls  = lm[PL.LEFT_SHOULDER.value]; rs  = lm[PL.RIGHT_SHOULDER.value]
-        la  = lm[PL.LEFT_ANKLE.value];    ra  = lm[PL.RIGHT_ANKLE.value]
-
-        cx       = (lh.x + rh.x) / 2.0
-        cy       = (lh.y + rh.y) / 2.0
-        mean_z   = (lh.z + rh.z) / 2.0      # negative = closer to camera
-        body_sz  = abs((ls.y + rs.y) / 2.0 - (la.y + ra.y) / 2.0)
-        vis      = (lh.visibility + rh.visibility +
-                    ls.visibility + rs.visibility) / 4.0
-        return (cx, cy), body_sz, mean_z, vis
-
-    def check(self, lm):
-        centroid, body_size, mean_z, vis = self._extract(lm)
-
-        if vis < self.MIN_VIS:
-            return False
-
-        # Warmup: accept and build baseline
-        if not self.lock_established:
-            if self.locked_z_baseline is None:
-                self.locked_z_baseline = mean_z
-            else:
-                # Smooth Z baseline during warmup
-                self.locked_z_baseline = (self.locked_z_baseline * 0.7
-                                          + mean_z * 0.3)
-            self.locked_centroid  = centroid
-            self.locked_body_size = body_size
-            self.frames_since_lock += 1
-            if self.frames_since_lock >= self.WARMUP_FRAMES:
-                self.lock_established = True
-            return True
-
-        # --- PRIMARY CHECK: Z-depth ---
-        # If Z shifts significantly, it's a different (background) person
-        z_jump = mean_z - self.locked_z_baseline
-        if z_jump > self.Z_MAX_JUMP:
-            # Detection jumped to a background person (more positive Z)
-            self.consecutive_rejects += 1
-            print(f"[PersonLocker] Z-reject: z={mean_z:.3f} baseline={self.locked_z_baseline:.3f} "
-                  f"jump={z_jump:.3f}", flush=True)
-            if self.consecutive_rejects >= self.RELOCK_AFTER_REJECTS:
-                # Truly lost the person — relock
-                self._relock(centroid, body_size, mean_z)
-                return True
-            return False
-
-        # --- SECONDARY CHECK: body size (background person appears smaller) ---
-        if self.locked_body_size and body_size > 0.05:
-            size_ratio = body_size / (self.locked_body_size + 1e-6)
-            if size_ratio < self.MIN_SIZE_RATIO:
-                self.consecutive_rejects += 1
-                return False
-
-        # --- TERTIARY CHECK: XY centroid jump ---
-        dx   = centroid[0] - self.locked_centroid[0]
-        dy   = centroid[1] - self.locked_centroid[1]
-        dist = math.sqrt(dx * dx + dy * dy)
-        ref  = max(self.locked_body_size or 0.3, 0.15)
-        thr  = max(self.MIN_JUMP_THRESHOLD, ref * self.MAX_JUMP_RATIO)
-
-        if dist > thr:
-            self.consecutive_rejects += 1
-            if self.consecutive_rejects >= self.RELOCK_AFTER_REJECTS:
-                self._relock(centroid, body_size, mean_z)
-                return True
-            return False
-
-        # Accepted — smooth update
-        a = 0.25
-        self.locked_centroid   = (self.locked_centroid[0] + a * dx,
-                                   self.locked_centroid[1] + a * dy)
-        self.locked_body_size  += a * (body_size - self.locked_body_size)
-        # Only update Z baseline slowly (don't chase the background)
-        self.locked_z_baseline += 0.05 * (mean_z - self.locked_z_baseline)
-        self.consecutive_rejects = 0
-        return True
-
-    def _relock(self, centroid, body_size, mean_z):
-        self.locked_centroid     = centroid
-        self.locked_body_size    = body_size
-        self.locked_z_baseline   = mean_z
-        self.consecutive_rejects = 0
-
-
 def _evaluate_rep(rep_result):
     feedback = []
     score    = MAX_SCORE
@@ -747,81 +632,39 @@ def _evaluate_rep(rep_result):
     return float(max(MIN_SCORE, min(MAX_SCORE, score))), feedback
 
 
-def run_romanian_deadlift_analysis(video_path,
-                                   frame_skip=3,
-                                   scale=0.4,
-                                   output_path="romanian_deadlift_analyzed.mp4",
-                                   feedback_path="romanian_deadlift_feedback.txt",
-                                   return_video=True,
-                                   fast_mode=False):
-    import sys
-    print(f"[RDL] Start fast_mode={fast_mode} return_video={return_video}",
-          file=sys.stderr, flush=True)
-
-    mp_pose_mod = mp.solutions.pose
-
-    if fast_mode:
-        return_video = False
-    create_video = bool(return_video) and bool(output_path)
-
-    rotation = _get_rotation_angle(video_path)
-    print(f"[RDL] rotation={rotation}deg", file=sys.stderr, flush=True)
-
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        return {"squat_count": 0, "technique_score": 0.0,
-                "technique_score_display": "0", "technique_label": score_label(0),
-                "good_reps": 0, "bad_reps": 0,
-                "feedback": ["Could not open video"],
-                "reps": [], "video_path": "", "feedback_path": feedback_path}
-
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps_in       = cap.get(cv2.CAP_PROP_FPS) or 25
-
-    if total_frames < 10:
-        cap.release()
-        return {"squat_count": 0, "technique_score": 0.0,
-                "technique_score_display": "0", "technique_label": score_label(0),
-                "good_reps": 0, "bad_reps": 0,
-                "feedback": [f"Invalid video – only {total_frames} frames"],
-                "reps": [], "video_path": "", "feedback_path": feedback_path}
-
-    # Same params for both modes — only model_complexity differs
-    effective_frame_skip = frame_skip
-    effective_scale      = scale
-    model_complexity     = 0 if fast_mode else 1
-
-    effective_fps = max(1.0, fps_in / max(1, effective_frame_skip))
-    dt            = 1.0 / float(effective_fps)
-
-    orig_w  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    orig_h  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out_w, out_h = (orig_h, orig_w) if rotation in (90, 270) else (orig_w, orig_h)
-
-    print(f"[RDL] {total_frames}fr @ {fps_in:.1f}fps  out={out_w}x{out_h}",
-          file=sys.stderr, flush=True)
-
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out    = None
+# =====================================================================
+# PASS 1 — analysis, saves per-frame data for video rendering
+# =====================================================================
+def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
+    """
+    Runs mediapipe (model_complexity=0) on every sampled frame.
+    Stores per-frame overlay data in frame_data dict for pass 2.
+    Returns: (analysis_dict, frame_data, effective_fps)
+    """
+    import sys, time
+    mp_pose_mod    = mp.solutions.pose
+    effective_skip = frame_skip
+    effective_fps  = max(1.0, fps_in / max(1, effective_skip))
+    dt             = 1.0 / float(effective_fps)
 
     rep_counter          = RepCounter()
-    person_locker        = PersonLocker()
-    last_valid_lm        = None
     good_reps = bad_reps = 0
     all_scores              = []
     rep_reports             = []
     session_feedbacks       = []
     session_feedback_by_cat = {}
 
-    frame_idx  = 0
-    prog       = 0.0
-    rt_fb_msg  = None
-    rt_fb_hold = 0
+    frame_idx     = 0
+    prog          = 0.0
+    rt_fb_msg     = None
+    rt_fb_hold    = 0
+    frame_data    = {}   # frame_idx -> {lm, reps, fb, prog}
+    last_valid_lm = None
 
-    import time
-    t0 = time.time()
+    cap = cv2.VideoCapture(video_path)
+    t0  = time.time()
 
-    with mp_pose_mod.Pose(model_complexity=model_complexity,
+    with mp_pose_mod.Pose(model_complexity=0,
                           min_detection_confidence=0.5,
                           min_tracking_confidence=0.5) as pose:
         _init_skeleton_data()
@@ -831,44 +674,34 @@ def run_romanian_deadlift_analysis(video_path,
             if not ret:
                 break
             if time.time() - t0 > 180:
-                print("[RDL] Timeout", file=sys.stderr, flush=True)
+                print("[RDL] Pass1 timeout", file=sys.stderr, flush=True)
                 break
 
             frame_idx += 1
-            if frame_idx % effective_frame_skip != 0:
+            if frame_idx % effective_skip != 0:
                 continue
 
             frame = _apply_rotation(frame, rotation)
-            work  = (cv2.resize(frame, (0, 0), fx=effective_scale, fy=effective_scale)
-                     if effective_scale != 1.0 else frame)
-
-            if create_video and out is None:
-                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
+            work  = (cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+                     if scale != 1.0 else frame)
 
             res = pose.process(cv2.cvtColor(work, cv2.COLOR_BGR2RGB))
 
-            def _write(lm_draw):
-                if out is None:
-                    return
-                f = frame.copy()
-                if lm_draw is not None:
-                    f = draw_body_only(f, lm_draw)
-                out.write(draw_overlay(f, reps=rep_counter.count,
-                                       feedback=(rt_fb_msg if rt_fb_hold > 0 else None),
-                                       depth_pct=prog))
+            def _store(lm_to_draw):
+                frame_data[frame_idx] = {
+                    "lm":   lm_to_draw,
+                    "reps": rep_counter.count,
+                    "fb":   rt_fb_msg if rt_fb_hold > 0 else None,
+                    "prog": prog,
+                }
 
             if not res.pose_landmarks:
-                if create_video:
-                    _write(last_valid_lm)
+                _store(last_valid_lm)
+                if rt_fb_hold > 0:
+                    rt_fb_hold -= 1
                 continue
 
-            lm = res.pose_landmarks.landmark
-
-            if not person_locker.check(lm):
-                if create_video:
-                    _write(last_valid_lm)
-                continue
-
+            lm            = res.pose_landmarks.landmark
             last_valid_lm = lm
 
             all_lm      = _get_all_landmarks(lm)
@@ -891,7 +724,6 @@ def run_romanian_deadlift_analysis(video_path,
                 else:            bad_reps  += 1
                 session_feedbacks.extend(feedback)
                 _, session_feedback_by_cat = pick_strongest_per_category(session_feedbacks)
-
                 vt = ("front/back" if signal_data["vis_ratio"] > 0.7 else
                       ("diagonal"  if signal_data["vis_ratio"] > 0.4 else "side"))
                 rep_reports.append({
@@ -913,16 +745,16 @@ def run_romanian_deadlift_analysis(video_path,
                 print(f"[RDL] Rep {rep_result['rep']} score={score:.1f} "
                       f"peak={rep_result['peak_signal']:.3f}",
                       file=sys.stderr, flush=True)
-
                 rt_fb_msg  = pick_strongest_feedback(feedback)
                 rt_fb_hold = int(0.7 / dt)
 
             if rt_fb_hold > 0:
                 rt_fb_hold -= 1
 
-            if create_video:
-                _write(lm)
+            # Store AFTER updating rep count so the counter is already incremented
+            _store(lm)
 
+    # Finalize last rep if video ended mid-ascent
     rep_result = rep_counter.finalize_pending_rep(frame_idx)
     if rep_result is not None:
         score, feedback = _evaluate_rep(rep_result)
@@ -949,12 +781,8 @@ def run_romanian_deadlift_analysis(video_path,
         })
 
     cap.release()
-    if out:
-        out.release()
-    cv2.destroyAllWindows()
-
     counter = rep_counter.count
-    print(f"[RDL] Done reps={counter}", file=sys.stderr, flush=True)
+    print(f"[RDL] Pass1 done reps={counter}", file=sys.stderr, flush=True)
 
     avg = float(np.mean(all_scores)) if all_scores else 0.0
     if not np.isfinite(avg):
@@ -971,23 +799,165 @@ def run_romanian_deadlift_analysis(video_path,
     )
 
     if session_feedback_by_cat:
-        if "depth"  in session_feedback_by_cat: tip = "Focus on pushing your hips back further to reach full depth"
-        elif "knees" in session_feedback_by_cat: tip = "Romanian deadlifts need a soft knee bend throughout the movement"
-        else:                                    tip = "Keep your core tight and chest up"
+        if "depth"  in session_feedback_by_cat:
+            tip = "Focus on pushing your hips back further to reach full depth"
+        elif "knees" in session_feedback_by_cat:
+            tip = "Romanian deadlifts need a soft knee bend throughout the movement"
+        else:
+            tip = "Keep your core tight and chest up"
     else:
         tip = "Great technique! Keep building that posterior chain 💪"
 
+    analysis = {
+        "squat_count":             int(counter),
+        "technique_score":         float(technique_score),
+        "technique_score_display": str(display_half_str(technique_score)),
+        "technique_label":         str(score_label(technique_score)),
+        "good_reps":               int(good_reps),
+        "bad_reps":                int(bad_reps),
+        "feedback":                [str(f) for f in feedback_list],
+        "tip":                     str(tip),
+        "reps":                    rep_reports,
+    }
+    return analysis, frame_data, effective_fps
+
+
+# =====================================================================
+# PASS 2 — render video using frame_data from pass 1, NO mediapipe
+# =====================================================================
+def _render_pass(video_path, rotation, frame_skip, output_path,
+                 out_w, out_h, fps_in, frame_data):
+    """
+    Re-reads the video and draws skeleton + overlay using data from pass 1.
+    No mediapipe runs here — skeleton cannot jump to a background person.
+    """
+    import sys
+    effective_skip = frame_skip
+    effective_fps  = max(1.0, fps_in / max(1, effective_skip))
+
+    cap    = cv2.VideoCapture(video_path)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out    = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
+
+    frame_idx = 0
+    written   = 0
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        frame_idx += 1
+        if frame_idx % effective_skip != 0:
+            continue
+
+        frame = _apply_rotation(frame, rotation)
+        fd    = frame_data.get(frame_idx)
+
+        if fd is None:
+            out.write(draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0))
+            written += 1
+            continue
+
+        f = frame.copy()
+        if fd["lm"] is not None:
+            f = draw_body_only(f, fd["lm"])
+
+        out.write(draw_overlay(f,
+                               reps=fd["reps"],
+                               feedback=fd["fb"],
+                               depth_pct=fd["prog"]))
+        written += 1
+
+    cap.release()
+    out.release()
+    print(f"[RDL] Pass2 done frames_written={written}", file=sys.stderr, flush=True)
+
+
+# =====================================================================
+# PUBLIC ENTRY POINT
+# =====================================================================
+def run_romanian_deadlift_analysis(video_path,
+                                   frame_skip=3,
+                                   scale=0.4,
+                                   output_path="romanian_deadlift_analyzed.mp4",
+                                   feedback_path="romanian_deadlift_feedback.txt",
+                                   return_video=True,
+                                   fast_mode=False):
+    """
+    Two-pass Romanian Deadlift analysis.
+
+    Pass 1 (always runs):
+        - mediapipe model_complexity=0 on sampled frames
+        - Counts reps, computes scores and feedback
+        - Stores per-frame {landmarks, rep_count, feedback, depth} in frame_data
+
+    Pass 2 (only when return_video=True):
+        - Re-reads video, draws skeleton from frame_data
+        - No mediapipe — skeleton CANNOT jump to a background person
+        - Rep counter shown in video is identical to JSON result
+
+    fast_mode=True  → skips pass 2 (JSON only)
+    fast_mode=False → runs both passes (JSON + video)
+    """
+    import sys
+    print(f"[RDL] Start fast_mode={fast_mode} return_video={return_video}",
+          file=sys.stderr, flush=True)
+
+    if fast_mode:
+        return_video = False
+    create_video = bool(return_video) and bool(output_path)
+
+    rotation = _get_rotation_angle(video_path)
+    print(f"[RDL] rotation={rotation}deg", file=sys.stderr, flush=True)
+
+    # Quick validation
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return {"squat_count": 0, "technique_score": 0.0,
+                "technique_score_display": "0", "technique_label": score_label(0),
+                "good_reps": 0, "bad_reps": 0,
+                "feedback": ["Could not open video"],
+                "reps": [], "video_path": "", "feedback_path": feedback_path}
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps_in       = cap.get(cv2.CAP_PROP_FPS) or 25
+    orig_w       = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+
+    if total_frames < 10:
+        return {"squat_count": 0, "technique_score": 0.0,
+                "technique_score_display": "0", "technique_label": score_label(0),
+                "good_reps": 0, "bad_reps": 0,
+                "feedback": [f"Invalid video - only {total_frames} frames"],
+                "reps": [], "video_path": "", "feedback_path": feedback_path}
+
+    out_w, out_h = (orig_h, orig_w) if rotation in (90, 270) else (orig_w, orig_h)
+    print(f"[RDL] {total_frames}fr @ {fps_in:.1f}fps  out={out_w}x{out_h}",
+          file=sys.stderr, flush=True)
+
+    # === PASS 1 — analysis (same for both fast_mode and video mode) ===
+    analysis, frame_data, effective_fps = _analysis_pass(
+        video_path, rotation, frame_skip, scale, fps_in)
+
+    # Write feedback file
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
-            f.write(f"Total Reps: {counter}\nTechnique Score: {technique_score}/10\n")
-            for fb in feedback_list:
+            f.write(f"Total Reps: {analysis['squat_count']}\n"
+                    f"Technique Score: {analysis['technique_score']}/10\n")
+            for fb in analysis["feedback"]:
                 f.write(f"- {fb}\n")
     except Exception as e:
         print(f"Warning feedback file: {e}")
 
-    # Robust video encoding with fallback
+    # === PASS 2 — video rendering (only if requested) ===
     final_video_path = ""
-    if create_video and output_path:
+    if create_video:
+        print("[RDL] Pass2 rendering video...", file=sys.stderr, flush=True)
+        _render_pass(video_path, rotation, frame_skip, output_path,
+                     out_w, out_h, fps_in, frame_data)
+
+        # Encode for browser compatibility
         encoded = output_path.replace(".mp4", "_encoded.mp4")
         try:
             proc = subprocess.run(
@@ -1014,22 +984,13 @@ def run_romanian_deadlift_analysis(video_path,
         else:
             final_video_path = ""
 
-        print(f"[RDL] video='{final_video_path}' exists={bool(final_video_path and os.path.exists(final_video_path))}",
+        print(f"[RDL] video='{final_video_path}' "
+              f"exists={bool(final_video_path and os.path.exists(final_video_path))}",
               file=sys.stderr, flush=True)
 
-    return {
-        "squat_count":             int(counter),
-        "technique_score":         float(technique_score),
-        "technique_score_display": str(display_half_str(technique_score)),
-        "technique_label":         str(score_label(technique_score)),
-        "good_reps":               int(good_reps),
-        "bad_reps":                int(bad_reps),
-        "feedback":                [str(f) for f in feedback_list],
-        "tip":                     str(tip),
-        "reps":                    rep_reports,
-        "video_path":              str(final_video_path),
-        "feedback_path":           str(feedback_path),
-    }
+    analysis["video_path"]    = str(final_video_path)
+    analysis["feedback_path"] = str(feedback_path)
+    return analysis
 
 
 def run_analysis(*args, **kwargs):
