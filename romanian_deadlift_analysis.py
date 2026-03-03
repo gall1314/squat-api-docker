@@ -1,5 +1,9 @@
 # -*- coding: utf-8 -*-
-# romanian_deadlift_analysis_fixed.py  v3
+# romanian_deadlift_analysis_fixed.py  v4
+# KEY FIX: PersonLocker now uses Z-DEPTH from mediapipe landmarks
+# The person closest to the camera has the most negative z values.
+# When mediapipe snaps to a background person, their z jumps positive.
+# We lock on the z-baseline of the first person and reject z-jumps.
 
 import os
 import cv2
@@ -81,8 +85,10 @@ def draw_body_only(frame, lms, color=(255, 255, 255)):
     line, dot = _dyn_thickness(h)
     for a, b in _BODY_CONNECTIONS:
         pa, pb = lms[a], lms[b]
-        cv2.line(frame, (int(pa.x * w), int(pa.y * h)),
-                        (int(pb.x * w), int(pb.y * h)), color, line, cv2.LINE_AA)
+        cv2.line(frame,
+                 (int(pa.x * w), int(pa.y * h)),
+                 (int(pb.x * w), int(pb.y * h)),
+                 color, line, cv2.LINE_AA)
     for i in _BODY_POINTS:
         p = lms[i]
         cv2.circle(frame, (int(p.x * w), int(p.y * h)), dot, color, -1, cv2.LINE_AA)
@@ -231,7 +237,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     draw.text((cx - int(draw.textlength(lbl, font=DL_F) // 2), by),
               lbl, font=DL_F, fill=(255, 255, 255, 255))
     draw.text((cx - int(draw.textlength(pt, font=DP_F) // 2), by + DL_F.size + gap),
-              pt, font=DP_F, fill=(255, 255, 255, 255))
+              pt,  font=DP_F, fill=(255, 255, 255, 255))
 
     if feedback and fb_lines:
         ty = fb_y0 + fb_pad_y
@@ -286,8 +292,10 @@ def _get_all_landmarks(lm):
               "knee":    _pt(PL.RIGHT_KNEE),       "ankle": _pt(PL.RIGHT_ANKLE),
               "ear":     _pt(PL.RIGHT_EAR)}
 
-    lv  = sum(_v(i) for i in [PL.LEFT_SHOULDER,  PL.LEFT_HIP,  PL.LEFT_KNEE,  PL.LEFT_ANKLE,  PL.LEFT_EAR])
-    rv  = sum(_v(i) for i in [PL.RIGHT_SHOULDER, PL.RIGHT_HIP, PL.RIGHT_KNEE, PL.RIGHT_ANKLE, PL.RIGHT_EAR])
+    lv  = sum(_v(i) for i in [PL.LEFT_SHOULDER,  PL.LEFT_HIP,  PL.LEFT_KNEE,
+                                PL.LEFT_ANKLE,     PL.LEFT_EAR])
+    rv  = sum(_v(i) for i in [PL.RIGHT_SHOULDER, PL.RIGHT_HIP, PL.RIGHT_KNEE,
+                                PL.RIGHT_ANKLE,    PL.RIGHT_EAR])
     mid = {k: (left[k] + right[k]) / 2.0 for k in left}
     return {"left": left, "right": right,
             "dominant": left if lv >= rv else right,
@@ -437,15 +445,15 @@ class RepCounter:
         return d >= self.MIN_PEAK_DELTA or nd >= self.MIN_NORMALIZED_PEAK_DELTA
 
     def _rep_info(self):
-        return {"rep":        self.count,
-                "peak_signal":self.current_peak,
-                "good_depth": self.current_peak >= self.GOOD_DEPTH_PEAK,
+        return {"rep":          self.count,
+                "peak_signal":  self.current_peak,
+                "good_depth":   self.current_peak >= self.GOOD_DEPTH_PEAK,
                 "max_torso_2d": self.rep_max_torso_2d,
                 "max_torso_3d": self.rep_max_torso_3d,
-                "min_knee":   self.rep_min_knee,
-                "max_knee":   self.rep_max_knee,
-                "back_issue": self.rep_back_issue,
-                "back_angle": self.rep_back_angle}
+                "min_knee":     self.rep_min_knee,
+                "max_knee":     self.rep_max_knee,
+                "back_issue":   self.rep_back_issue,
+                "back_angle":   self.rep_back_angle}
 
     def _reset(self):
         self.state            = "standing"
@@ -594,47 +602,71 @@ def _apply_rotation(frame, rotation):
 
 class PersonLocker:
     """
-    Prevents skeleton from jumping to background people.
+    Locks onto the CLOSEST person to the camera using mediapipe's Z coordinate.
 
-    Tuned values (vs original):
-      MAX_JUMP_RATIO        0.60 -> 0.42   tighter spatial lock
-      RELOCK_AFTER_REJECTS     8 -> 20     much harder to snap to new person
-      MIN_VIS               0.30 -> 0.35   slightly stricter
-      WARMUP_FRAMES            3 ->  5
-      MIN_SIZE_RATIO  (new) 0.45           reject if body < 45% of locked size
+    Mediapipe z is normalized relative to hip width:
+      - Negative z = closer to camera (foreground person)
+      - Positive z = farther from camera (background person)
+
+    Strategy:
+      1. During warmup (first 5 accepted frames), record the average hip Z
+         as the "locked Z baseline" — this is the foreground person.
+      2. Every subsequent frame: compute mean hip Z of detection.
+         If it jumps more than Z_MAX_JUMP (0.35) from baseline → reject.
+         Background people always have a significantly different (more positive) Z.
+      3. Also check XY centroid distance as secondary guard.
+      4. RELOCK_AFTER_REJECTS raised to 25 — very hard to accidentally snap
+         to someone else.
     """
 
     def __init__(self):
-        self.locked_centroid      = None
-        self.locked_body_size     = None
-        self.consecutive_rejects  = 0
-        self.frames_since_lock    = 0
-        self.lock_established     = False
-        self.RELOCK_AFTER_REJECTS = 20
-        self.MAX_JUMP_RATIO       = 0.42
-        self.MIN_JUMP_THRESHOLD   = 0.12
-        self.WARMUP_FRAMES        = 5
-        self.MIN_VIS              = 0.35
-        self.MIN_SIZE_RATIO       = 0.45
+        self.locked_centroid     = None
+        self.locked_body_size    = None
+        self.locked_z_baseline   = None      # mean hip Z of locked person
+        self.consecutive_rejects = 0
+        self.frames_since_lock   = 0
+        self.lock_established    = False
 
-    def _csz(self, lm):
+        # Tuning
+        self.WARMUP_FRAMES        = 5
+        self.RELOCK_AFTER_REJECTS = 25       # very hard to snap to new person
+        self.MAX_JUMP_RATIO       = 0.45     # XY: fraction of body size
+        self.MIN_JUMP_THRESHOLD   = 0.12     # XY: absolute minimum
+        self.MIN_VIS              = 0.35
+        self.MIN_SIZE_RATIO       = 0.45     # body size: reject if < 45% of locked
+        self.Z_MAX_JUMP           = 0.35     # Z: reject if hip Z shifts this much
+                                             # (background person is typically +0.3 to +0.6
+                                             #  while foreground is -0.1 to -0.3)
+
+    def _extract(self, lm):
+        """Returns centroid (x,y), body_size, mean_hip_z, visibility."""
         PL  = mp_pose.PoseLandmark
-        lh  = lm[PL.LEFT_HIP.value];      rh = lm[PL.RIGHT_HIP.value]
-        ls  = lm[PL.LEFT_SHOULDER.value]; rs = lm[PL.RIGHT_SHOULDER.value]
-        la  = lm[PL.LEFT_ANKLE.value];    ra = lm[PL.RIGHT_ANKLE.value]
-        cx  = (lh.x + rh.x) / 2.0
-        cy  = (lh.y + rh.y) / 2.0
-        bsz = abs((ls.y + rs.y) / 2.0 - (la.y + ra.y) / 2.0)
-        vis = (lh.visibility + rh.visibility + ls.visibility + rs.visibility) / 4.0
-        return (cx, cy), bsz, vis
+        lh  = lm[PL.LEFT_HIP.value];      rh  = lm[PL.RIGHT_HIP.value]
+        ls  = lm[PL.LEFT_SHOULDER.value]; rs  = lm[PL.RIGHT_SHOULDER.value]
+        la  = lm[PL.LEFT_ANKLE.value];    ra  = lm[PL.RIGHT_ANKLE.value]
+
+        cx       = (lh.x + rh.x) / 2.0
+        cy       = (lh.y + rh.y) / 2.0
+        mean_z   = (lh.z + rh.z) / 2.0      # negative = closer to camera
+        body_sz  = abs((ls.y + rs.y) / 2.0 - (la.y + ra.y) / 2.0)
+        vis      = (lh.visibility + rh.visibility +
+                    ls.visibility + rs.visibility) / 4.0
+        return (cx, cy), body_sz, mean_z, vis
 
     def check(self, lm):
-        centroid, body_size, vis = self._csz(lm)
+        centroid, body_size, mean_z, vis = self._extract(lm)
 
         if vis < self.MIN_VIS:
             return False
 
+        # Warmup: accept and build baseline
         if not self.lock_established:
+            if self.locked_z_baseline is None:
+                self.locked_z_baseline = mean_z
+            else:
+                # Smooth Z baseline during warmup
+                self.locked_z_baseline = (self.locked_z_baseline * 0.7
+                                          + mean_z * 0.3)
             self.locked_centroid  = centroid
             self.locked_body_size = body_size
             self.frames_since_lock += 1
@@ -642,33 +674,56 @@ class PersonLocker:
                 self.lock_established = True
             return True
 
-        # Reject detections much smaller than locked person (background)
+        # --- PRIMARY CHECK: Z-depth ---
+        # If Z shifts significantly, it's a different (background) person
+        z_jump = mean_z - self.locked_z_baseline
+        if z_jump > self.Z_MAX_JUMP:
+            # Detection jumped to a background person (more positive Z)
+            self.consecutive_rejects += 1
+            print(f"[PersonLocker] Z-reject: z={mean_z:.3f} baseline={self.locked_z_baseline:.3f} "
+                  f"jump={z_jump:.3f}", flush=True)
+            if self.consecutive_rejects >= self.RELOCK_AFTER_REJECTS:
+                # Truly lost the person — relock
+                self._relock(centroid, body_size, mean_z)
+                return True
+            return False
+
+        # --- SECONDARY CHECK: body size (background person appears smaller) ---
         if self.locked_body_size and body_size > 0.05:
-            if body_size / (self.locked_body_size + 1e-6) < self.MIN_SIZE_RATIO:
+            size_ratio = body_size / (self.locked_body_size + 1e-6)
+            if size_ratio < self.MIN_SIZE_RATIO:
                 self.consecutive_rejects += 1
                 return False
 
+        # --- TERTIARY CHECK: XY centroid jump ---
         dx   = centroid[0] - self.locked_centroid[0]
         dy   = centroid[1] - self.locked_centroid[1]
         dist = math.sqrt(dx * dx + dy * dy)
-        thr  = max(self.MIN_JUMP_THRESHOLD,
-                   max(self.locked_body_size or 0.3, 0.15) * self.MAX_JUMP_RATIO)
+        ref  = max(self.locked_body_size or 0.3, 0.15)
+        thr  = max(self.MIN_JUMP_THRESHOLD, ref * self.MAX_JUMP_RATIO)
 
-        if dist <= thr:
-            a = 0.3
-            self.locked_centroid  = (self.locked_centroid[0] + a * dx,
-                                     self.locked_centroid[1] + a * dy)
-            self.locked_body_size += a * (body_size - self.locked_body_size)
-            self.consecutive_rejects = 0
-            return True
+        if dist > thr:
+            self.consecutive_rejects += 1
+            if self.consecutive_rejects >= self.RELOCK_AFTER_REJECTS:
+                self._relock(centroid, body_size, mean_z)
+                return True
+            return False
 
-        self.consecutive_rejects += 1
-        if self.consecutive_rejects >= self.RELOCK_AFTER_REJECTS:
-            self.locked_centroid     = centroid
-            self.locked_body_size    = body_size
-            self.consecutive_rejects = 0
-            return True
-        return False
+        # Accepted — smooth update
+        a = 0.25
+        self.locked_centroid   = (self.locked_centroid[0] + a * dx,
+                                   self.locked_centroid[1] + a * dy)
+        self.locked_body_size  += a * (body_size - self.locked_body_size)
+        # Only update Z baseline slowly (don't chase the background)
+        self.locked_z_baseline += 0.05 * (mean_z - self.locked_z_baseline)
+        self.consecutive_rejects = 0
+        return True
+
+    def _relock(self, centroid, body_size, mean_z):
+        self.locked_centroid     = centroid
+        self.locked_body_size    = body_size
+        self.locked_z_baseline   = mean_z
+        self.consecutive_rejects = 0
 
 
 def _evaluate_rep(rep_result):
@@ -783,12 +838,9 @@ def run_romanian_deadlift_analysis(video_path,
             if frame_idx % effective_frame_skip != 0:
                 continue
 
-            # Rotate — frame is now out_w x out_h
             frame = _apply_rotation(frame, rotation)
-
-            # Scale down only for pose detection
-            work = (cv2.resize(frame, (0, 0), fx=effective_scale, fy=effective_scale)
-                    if effective_scale != 1.0 else frame)
+            work  = (cv2.resize(frame, (0, 0), fx=effective_scale, fy=effective_scale)
+                     if effective_scale != 1.0 else frame)
 
             if create_video and out is None:
                 out = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
@@ -798,7 +850,6 @@ def run_romanian_deadlift_analysis(video_path,
             def _write(lm_draw):
                 if out is None:
                     return
-                # Draw skeleton on original full-res frame (not upscaled small frame)
                 f = frame.copy()
                 if lm_draw is not None:
                     f = draw_body_only(f, lm_draw)
@@ -836,10 +887,8 @@ def run_romanian_deadlift_analysis(video_path,
             if rep_result is not None:
                 score, feedback = _evaluate_rep(rep_result)
                 all_scores.append(score)
-                if score >= 9.0:
-                    good_reps += 1
-                else:
-                    bad_reps  += 1
+                if score >= 9.0: good_reps += 1
+                else:            bad_reps  += 1
                 session_feedbacks.extend(feedback)
                 _, session_feedback_by_cat = pick_strongest_per_category(session_feedbacks)
 
@@ -862,7 +911,7 @@ def run_romanian_deadlift_analysis(video_path,
                     }
                 })
                 print(f"[RDL] Rep {rep_result['rep']} score={score:.1f} "
-                      f"peak={rep_result['peak_signal']:.3f} view={vt}",
+                      f"peak={rep_result['peak_signal']:.3f}",
                       file=sys.stderr, flush=True)
 
                 rt_fb_msg  = pick_strongest_feedback(feedback)
@@ -874,7 +923,6 @@ def run_romanian_deadlift_analysis(video_path,
             if create_video:
                 _write(lm)
 
-    # Finalise last rep if video ended mid-ascent
     rep_result = rep_counter.finalize_pending_rep(frame_idx)
     if rep_result is not None:
         score, feedback = _evaluate_rep(rep_result)
@@ -923,12 +971,9 @@ def run_romanian_deadlift_analysis(video_path,
     )
 
     if session_feedback_by_cat:
-        if "depth" in session_feedback_by_cat:
-            tip = "Focus on pushing your hips back further to reach full depth"
-        elif "knees" in session_feedback_by_cat:
-            tip = "Romanian deadlifts need a soft knee bend throughout the movement"
-        else:
-            tip = "Keep your core tight and chest up"
+        if "depth"  in session_feedback_by_cat: tip = "Focus on pushing your hips back further to reach full depth"
+        elif "knees" in session_feedback_by_cat: tip = "Romanian deadlifts need a soft knee bend throughout the movement"
+        else:                                    tip = "Keep your core tight and chest up"
     else:
         tip = "Great technique! Keep building that posterior chain 💪"
 
@@ -940,11 +985,7 @@ def run_romanian_deadlift_analysis(video_path,
     except Exception as e:
         print(f"Warning feedback file: {e}")
 
-    # ----------------------------------------------------------------
-    # VIDEO ENCODING — robust fallback chain
-    # app.py checks os.path.exists(video_path) before building the URL,
-    # so we MUST return a path that actually exists on disk.
-    # ----------------------------------------------------------------
+    # Robust video encoding with fallback
     final_video_path = ""
     if create_video and output_path:
         encoded = output_path.replace(".mp4", "_encoded.mp4")
@@ -956,13 +997,11 @@ def run_romanian_deadlift_analysis(video_path,
                 capture_output=True, timeout=300)
             print(f"[RDL] ffmpeg rc={proc.returncode}", file=sys.stderr, flush=True)
             if proc.returncode != 0:
-                # Log stderr so we can debug encoding failures
-                print(f"[RDL] ffmpeg stderr: {proc.stderr.decode(errors='replace')[-800:]}",
+                print(f"[RDL] ffmpeg stderr: {proc.stderr.decode(errors='replace')[-500:]}",
                       file=sys.stderr, flush=True)
         except Exception as e:
             print(f"[RDL] ffmpeg exception: {e}", file=sys.stderr, flush=True)
 
-        # Remove raw file only if encoding actually succeeded
         encoded_ok = os.path.exists(encoded) and os.path.getsize(encoded) > 1000
         if encoded_ok:
             try:
@@ -971,12 +1010,11 @@ def run_romanian_deadlift_analysis(video_path,
                 pass
             final_video_path = encoded
         elif os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
-            # Encoding failed but raw file exists — return it as fallback
             final_video_path = output_path
         else:
             final_video_path = ""
 
-        print(f"[RDL] video exists={bool(final_video_path)} path='{final_video_path}'",
+        print(f"[RDL] video='{final_video_path}' exists={bool(final_video_path and os.path.exists(final_video_path))}",
               file=sys.stderr, flush=True)
 
     return {
