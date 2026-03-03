@@ -306,8 +306,8 @@ class DeadliftRepDetector:
     COMPOSITE_HINGE_START = 0.32
     COMPOSITE_HINGE_DEEP  = 0.50
     COMPOSITE_STANDING    = 0.18
-    MIN_HINGE_FRAMES      = 10     # ~1s at 10fps
-    MIN_FRAMES_BETWEEN    = 35     # ~3.5s min between reps at 10fps
+    MIN_HINGE_FRAMES      = 14     # ~1.4s at 10fps — real deadlift takes time
+    MIN_FRAMES_BETWEEN    = 40     # ~4s min between reps at 10fps
 
     def __init__(self, fps=10):
         self.fps = fps
@@ -350,19 +350,20 @@ class DeadliftRepDetector:
         if self._calibrated:
             return
         self._cal_signals.append(composite)
-        if len(self._cal_signals) >= 30:
-            # 40th percentile = stable standing baseline (ignores early movement)
-            floor = float(np.percentile(self._cal_signals, 40))
-            ceil  = float(np.percentile(self._cal_signals, 95))
+        if len(self._cal_signals) >= 40:
+            # Use more frames + higher percentiles for better floor estimate
+            # floor = median of early frames (person mostly standing)
+            floor = float(np.percentile(self._cal_signals, 55))
+            ceil  = float(np.percentile(self._cal_signals, 98))
             rng   = max(0.20, ceil - floor)
             self._cal_floor = floor
             self._cal_range = rng
-            # HINGE_START: floor + 40% of range — needs substantial hinge
-            self.COMPOSITE_HINGE_START = min(0.60, floor + 0.40 * rng)
-            # COMPOSITE_STANDING: floor + 12% — truly back upright
-            self.COMPOSITE_STANDING    = min(0.35, floor + 0.12 * rng)
-            # COMPOSITE_HINGE_DEEP: floor + 80% of range — real deadlift depth
-            self.COMPOSITE_HINGE_DEEP  = min(0.85, floor + 0.80 * rng)
+            # HINGE_START: floor + 45% — must be well above standing noise
+            self.COMPOSITE_HINGE_START = min(0.65, floor + 0.45 * rng)
+            # COMPOSITE_STANDING: floor + 8% — must return very close to upright
+            self.COMPOSITE_STANDING    = min(0.35, floor + 0.08 * rng)
+            # COMPOSITE_HINGE_DEEP: floor + 82% — real deadlift depth
+            self.COMPOSITE_HINGE_DEEP  = min(0.90, floor + 0.82 * rng)
             self._calibrated = True
             import sys
             print(f"[DL] Calibrated: floor={floor:.3f} rng={rng:.3f} "
@@ -452,9 +453,9 @@ class DeadliftRepDetector:
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
             if back_rounded:
                 rt_feedback = "Try to keep your back a bit straighter"
-            if (composite < self.prev_composite - 0.06
+            if (composite < self.prev_composite - 0.08
                     and self.hinge_frames >= self.MIN_HINGE_FRAMES
-                    and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.85):
+                    and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88):
                 self.state = self.RISING
 
         elif self.state == self.RISING:
@@ -462,7 +463,7 @@ class DeadliftRepDetector:
             if back_rounded:
                 rt_feedback = "Try to keep your back a bit straighter"
             if composite < self.COMPOSITE_STANDING:
-                if self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.80:
+                if self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88:
                     rep_info = self._finalize_rep(frame_idx)
                 self.state = self.STANDING
                 self.last_rep_frame = frame_idx
@@ -637,7 +638,7 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
 
     gap = max(2, int(radius * 0.10))
     by  = cy - (_DL_F.size + gap + _DP_F.size) // 2
-    lbl = "DEPTH"
+    lbl = "HEIGHT"
     pt  = f"{int(pct * 100)}%"
     draw.text((cx - int(draw.textlength(lbl, font=_DL_F) // 2), by),
               lbl, font=_DL_F, fill=(255, 255, 255, 255))
