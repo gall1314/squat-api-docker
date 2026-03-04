@@ -368,8 +368,8 @@ class DeadliftRepDetector:
         if len(self._cal_signals) >= 25:
             # Use more frames + higher percentiles for better floor estimate
             # Use 5th percentile as true floor (lowest = most upright)
-            true_floor = float(np.percentile(self._cal_signals, 2))
-            true_ceil  = float(np.percentile(self._cal_signals, 95))
+            true_floor = float(np.min(self._cal_signals))
+            true_ceil  = float(np.percentile(self._cal_signals, 98))
             rng = max(0.20, true_ceil - true_floor)
             self._cal_floor = true_floor
             self._cal_range = rng
@@ -506,7 +506,7 @@ class DeadliftRepDetector:
                                    self.rep_max_composite * 0.30)
             if composite < return_threshold:
                 if self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88:
-                    rep_info = self._finalize_rep(frame_idx)
+                    rep_info = self._finalize_rep(frame_idx, side_ratio)
                 self.state = self.STANDING
                 self.last_rep_frame = frame_idx
 
@@ -550,12 +550,12 @@ class DeadliftRepDetector:
             return False
         return math.degrees(math.acos(float(np.clip(np.dot(tv, hv) / (tn * hn), -1.0, 1.0)))) > max_angle
 
-    def _finalize_rep(self, frame_idx):
+    def _finalize_rep(self, frame_idx, side_ratio=1.0):
         self.reps += 1
         dt = 1.0 / max(1, self.fps)
         penalty = 0.0
         fb = []
-        if self.rep_back_rounding_frames >= max(3, int(0.3 / dt)):
+        if side_ratio >= 0.55 and self.rep_back_rounding_frames >= max(3, int(0.3 / dt)):
             fb.append("Try to keep your back a bit straighter")
             penalty += 1.5
         if self.rep_leg_back_mismatch_frames >= max(4, int(0.4 / dt)):
