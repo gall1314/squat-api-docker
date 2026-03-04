@@ -512,8 +512,8 @@ class DeadliftRepDetector:
                 if (self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
                         and self.rep_max_composite >= 0.45):
                     rep_info = self._finalize_rep(frame_idx, side_ratio)
+                    self.last_rep_frame = frame_idx  # only block next rep if we counted
                 self.state = self.STANDING
-                self.last_rep_frame = frame_idx
 
         self.prev_composite = composite
         return composite, rt_feedback, rep_info
