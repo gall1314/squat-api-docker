@@ -303,7 +303,7 @@ class DeadliftRepDetector:
     COMPOSITE_HINGE_DEEP  = 0.50
     COMPOSITE_STANDING    = 0.18
     MIN_HINGE_FRAMES      = 15     # ~1.5s at 10fps
-    MIN_FRAMES_BETWEEN    = 50     # ~5s min between reps — deadlift needs recovery
+    MIN_FRAMES_BETWEEN    = 40     # ~4s min between reps
 
     def __init__(self, fps=10):
         self.fps = fps
@@ -345,7 +345,7 @@ class DeadliftRepDetector:
         if self._calibrated:
             return
         self._cal_signals.append(composite)
-        if len(self._cal_signals) >= 50:
+        if len(self._cal_signals) >= 20:
             # Use more frames + higher percentiles for better floor estimate
             # Use 5th percentile as true floor (lowest = most upright)
             true_floor = float(np.percentile(self._cal_signals, 5))
@@ -452,8 +452,9 @@ class DeadliftRepDetector:
                 self._pre_hinge_frames = getattr(self, '_pre_hinge_frames', 0) + 1
             else:
                 self._pre_hinge_frames = 0
-            # Require 3 consecutive frames above threshold before committing
-            if (self._pre_hinge_frames >= 3
+            # Require 4 consecutive frames above threshold before committing
+            # AND minimum time since last rep (blocks barbell-lowering false rep)
+            if (self._pre_hinge_frames >= 4
                     and (frame_idx - self.last_rep_frame > self.MIN_FRAMES_BETWEEN)):
                 self.state = self.HINGING
                 self.hinge_frames = 0
