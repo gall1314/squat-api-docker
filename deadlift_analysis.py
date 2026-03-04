@@ -462,7 +462,18 @@ class DeadliftRepDetector:
         # Run calibration on every frame (updates thresholds once enough data)
         self._calibrate(composite)
 
-        # State machine runs from frame 1 — never misses first rep
+        # Require core landmarks (hips + knees) to be visible before counting
+        # This prevents false reps during camera shake / person not in frame
+        core_ids = [23, 24, 25, 26]  # left hip, right hip, left knee, right knee
+        core_vis = [self._get_lm_val(lm, idx, 'visibility') for idx in core_ids
+                    if idx < len(lm) if hasattr(lm, '__len__') or True]
+        core_vis = [self._get_lm_val(lm, idx, 'visibility') for idx in core_ids]
+        min_core_vis = min(core_vis) if core_vis else 0.0
+        if min_core_vis < 0.50:
+            self.prev_composite = composite
+            return composite, None, None
+
+        # State machine runs — never misses first rep
         if self.state == self.STANDING:
             if composite > self.COMPOSITE_HINGE_START:
                 self._pre_hinge_frames = getattr(self, '_pre_hinge_frames', 0) + 1
