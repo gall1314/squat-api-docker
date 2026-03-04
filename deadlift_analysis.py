@@ -357,7 +357,7 @@ class DeadliftRepDetector:
         if self._calibrated:
             if composite < self._cal_floor - 0.03:
                 self._cal_floor = composite
-                rng = max(0.20, self._cal_range)
+                rng = max(0.50, self._cal_range)
                 self.COMPOSITE_HINGE_START = max(0.15, min(0.70, self._cal_floor + 0.38 * rng))
                 self.COMPOSITE_STANDING    = max(0.05, min(0.40, self._cal_floor + 0.08 * rng))
                 self.COMPOSITE_HINGE_DEEP  = max(0.30, min(0.92, self._cal_floor + 0.82 * rng))
@@ -373,7 +373,7 @@ class DeadliftRepDetector:
             if raw_rng < 0.35 and len(self._cal_signals) < 30:
                 return  # keep collecting
 
-            rng = max(0.35, raw_rng)
+            rng = max(0.50, raw_rng)
             self._cal_floor = true_floor
             self._cal_range = rng
 
@@ -383,7 +383,7 @@ class DeadliftRepDetector:
             # Hard clamps
             self.COMPOSITE_HINGE_START = max(0.15, min(0.70, self.COMPOSITE_HINGE_START))
             self.COMPOSITE_STANDING    = max(0.05, min(0.40, self.COMPOSITE_STANDING))
-            self.COMPOSITE_HINGE_DEEP  = max(0.30, min(0.92, self.COMPOSITE_HINGE_DEEP))
+            self.COMPOSITE_HINGE_DEEP  = max(0.41, min(0.92, self.COMPOSITE_HINGE_DEEP))
             self._calibrated = True
             import sys
             print(f"[DL] Calibrated: floor={true_floor:.3f} rng={rng:.3f} "
