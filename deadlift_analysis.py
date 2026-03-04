@@ -275,8 +275,9 @@ class FrontViewSignal:
         if len(self.knee_history) >= 8:
             sorted_k = sorted(self.knee_history)
             n = len(sorted_k)
-            self.standing_knee_angle = sorted_k[max(0, int(n * 0.92))]
-            self.bent_knee_angle     = sorted_k[max(0, int(n * 0.08))]
+            # 97th percentile = the very straightest the person ever stands
+            self.standing_knee_angle = sorted_k[max(0, int(n * 0.97))]
+            self.bent_knee_angle     = sorted_k[max(0, int(n * 0.05))]
 
         if self.standing_knee_angle is None:
             return self.signal_ema.update(0.0)
@@ -284,7 +285,7 @@ class FrontViewSignal:
         # Signal: how bent are the knees right now?
         standing = self.standing_knee_angle   # ~170-180°
         bent_ref  = min(self.bent_knee_angle or 90.0, standing - 20.0)
-        rng = max(20.0, standing - bent_ref)
+        rng = max(30.0, standing - bent_ref)
         raw = float(np.clip((standing - angle) / rng, 0.0, 1.0))
 
         walk_supp = self._walk_suppressor(smoothed_pts)
@@ -427,9 +428,6 @@ class DeadliftRepDetector:
                   f"sc={side_composite:.3f} fv={front_val:.3f} comp={composite:.3f} st={self.state}",
                   file=_sys.stderr, flush=True)
 
-        # Calibrate BEFORE state machine — learns floor/ceiling from early frames
-        self._calibrate(composite)
-
         # Back rounding check
         head_pt = None
         for idx in (8, 7, 0):
@@ -442,6 +440,12 @@ class DeadliftRepDetector:
 
         rt_feedback = None
         rep_info    = None
+
+        # Don't count reps until calibration is complete
+        if not self._calibrated:
+            self._calibrate(composite)
+            self.prev_composite = composite
+            return composite, None, None
 
         if self.state == self.STANDING:
             if composite > self.COMPOSITE_HINGE_START:
