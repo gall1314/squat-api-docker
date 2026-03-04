@@ -466,16 +466,25 @@ class DeadliftRepDetector:
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
             if back_rounded:
                 rt_feedback = "Try to keep your back a bit straighter"
-            if (composite < self.prev_composite - 0.08
-                    and self.hinge_frames >= self.MIN_HINGE_FRAMES
-                    and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88):
+            # Transition to RISING when:
+            # 1. We've been hinging long enough
+            # 2. We reached a real peak (deep enough)
+            # 3. Signal has dropped significantly from peak (returning upright)
+            drop_from_peak = self.rep_max_composite - composite
+            if (self.hinge_frames >= self.MIN_HINGE_FRAMES
+                    and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
+                    and drop_from_peak >= 0.20):
                 self.state = self.RISING
 
         elif self.state == self.RISING:
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
             if back_rounded:
                 rt_feedback = "Try to keep your back a bit straighter"
-            if composite < self.COMPOSITE_STANDING:
+            # Return to standing: signal dropped to < 30% of the peak
+            # This is more robust than an absolute threshold
+            return_threshold = max(self.COMPOSITE_STANDING,
+                                   self.rep_max_composite * 0.30)
+            if composite < return_threshold:
                 if self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88:
                     rep_info = self._finalize_rep(frame_idx)
                 self.state = self.STANDING
