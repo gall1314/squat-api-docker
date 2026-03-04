@@ -349,11 +349,22 @@ class DeadliftRepDetector:
     def _calibrate(self, composite):
         """
         Collect frames to estimate standing baseline.
-        Only use LOW-signal frames (person upright) for floor estimation.
+        Continues adapting after initial calibration to track floor drift.
         """
-        if self._calibrated:
-            return
         self._cal_signals.append(composite)
+
+        # After calibration, keep adapting floor downward if we see lower values
+        if self._calibrated:
+            if composite < self.COMPOSITE_STANDING * 1.5:
+                # Person is near standing — update floor estimate
+                new_floor = min(self._cal_floor, composite)
+                if new_floor < self._cal_floor - 0.02:
+                    self._cal_floor = new_floor
+                    rng = max(0.20, self._cal_range)
+                    self.COMPOSITE_HINGE_START = max(0.15, min(0.70, self._cal_floor + 0.38 * rng))
+                    self.COMPOSITE_STANDING    = max(0.05, min(0.40, self._cal_floor + 0.08 * rng))
+            return
+
         if len(self._cal_signals) >= 25:
             # Use more frames + higher percentiles for better floor estimate
             # Use 5th percentile as true floor (lowest = most upright)
@@ -461,8 +472,8 @@ class DeadliftRepDetector:
                 self._pre_hinge_frames = getattr(self, '_pre_hinge_frames', 0) + 1
             else:
                 self._pre_hinge_frames = 0
-            # Require 3 consecutive frames above threshold before committing
-            if (self._pre_hinge_frames >= 3
+            # Require 2 consecutive frames above threshold before committing
+            if (self._pre_hinge_frames >= 2
                     and (frame_idx - self.last_rep_frame > self.MIN_FRAMES_BETWEEN)):
                 self.state = self.HINGING
                 self.hinge_frames = 0
@@ -473,7 +484,7 @@ class DeadliftRepDetector:
             self.hinge_frames += 1
             self.rep_max_composite = max(self.rep_max_composite, composite)
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
-            if back_rounded:
+            if back_rounded and side_ratio >= 0.55:
                 rt_feedback = "Try to keep your back a bit straighter"
             # Transition to RISING when:
             # 1. We've been hinging long enough
@@ -487,7 +498,7 @@ class DeadliftRepDetector:
 
         elif self.state == self.RISING:
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
-            if back_rounded:
+            if back_rounded and side_ratio >= 0.55:
                 rt_feedback = "Try to keep your back a bit straighter"
             # Return to standing: signal dropped to < 30% of the peak
             # This is more robust than an absolute threshold
