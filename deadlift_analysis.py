@@ -251,7 +251,7 @@ class FrontViewSignal:
         avg = sum(angles) / len(angles)
         # Symmetric = both knees bend similarly (deadlift)
         # Asymmetric = one knee much more bent (walking/stepping)
-        is_symmetric = len(angles) < 2 or abs(angles[0] - angles[1]) < 25.0
+        is_symmetric = len(angles) < 2 or abs(angles[0] - angles[1]) < 35.0
         return avg, is_symmetric
 
     def _walk_suppressor(self, smoothed_pts):
@@ -357,13 +357,13 @@ class DeadliftRepDetector:
         if len(self._cal_signals) >= 25:
             # Use more frames + higher percentiles for better floor estimate
             # Use 5th percentile as true floor (lowest = most upright)
-            true_floor = float(np.percentile(self._cal_signals, 5))
+            true_floor = float(np.percentile(self._cal_signals, 2))
             true_ceil  = float(np.percentile(self._cal_signals, 95))
             rng = max(0.20, true_ceil - true_floor)
             self._cal_floor = true_floor
             self._cal_range = rng
 
-            self.COMPOSITE_HINGE_START = true_floor + 0.45 * rng
+            self.COMPOSITE_HINGE_START = true_floor + 0.38 * rng
             self.COMPOSITE_STANDING    = true_floor + 0.08 * rng
             self.COMPOSITE_HINGE_DEEP  = true_floor + 0.82 * rng
             # Hard clamps
@@ -1054,10 +1054,11 @@ def run_deadlift_analysis(video_path,
         try:
             proc = subprocess.run(
                 ["ffmpeg", "-y", "-i", output_path,
-                 "-vf", f"scale={out_w}:{out_h}",
-                 "-c:v", "libx264", "-preset", "fast",
+                 "-vf", f"scale={out_w}:{out_h}:flags=bilinear",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                 "-threads", "2",
                  "-movflags", "+faststart", "-pix_fmt", "yuv420p", encoded],
-                capture_output=True, timeout=300)
+                capture_output=True, timeout=120)
             print(f"[DL] ffmpeg rc={proc.returncode}", file=sys.stderr, flush=True)
             if proc.returncode != 0:
                 print(f"[DL] ffmpeg stderr: {proc.stderr.decode(errors='replace')[-500:]}",
