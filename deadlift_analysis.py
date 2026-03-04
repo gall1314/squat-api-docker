@@ -475,16 +475,29 @@ class DeadliftRepDetector:
 
         # State machine runs — never misses first rep
         if self.state == self.STANDING:
+            if composite <= self.COMPOSITE_HINGE_START:
+                # Count frames spent clearly in standing position
+                self._standing_frames = getattr(self, '_standing_frames', 0) + 1
+            else:
+                self._standing_frames = 0
+
             if composite > self.COMPOSITE_HINGE_START:
                 self._pre_hinge_frames = getattr(self, '_pre_hinge_frames', 0) + 1
             else:
                 self._pre_hinge_frames = 0
-            # Require 2 consecutive frames above threshold before committing
+
+            # Before entering HINGING, require:
+            # 1. 2+ consecutive frames above threshold
+            # 2. Saw at least 8 "standing" frames recently (person was upright)
+            # 3. Minimum time since last rep
+            standing_ready = getattr(self, '_standing_frames', 0) >= 8
             if (self._pre_hinge_frames >= 2
+                    and standing_ready
                     and (frame_idx - self.last_rep_frame > self.MIN_FRAMES_BETWEEN)):
                 self.state = self.HINGING
                 self.hinge_frames = 0
                 self._pre_hinge_frames = 0
+                self._standing_frames = 0
                 self._reset_rep_tracking()
 
         elif self.state == self.HINGING:
