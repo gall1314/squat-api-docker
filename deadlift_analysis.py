@@ -271,12 +271,12 @@ class FrontViewSignal:
         self.knee_history.append(angle)
 
         # Learn standing baseline = highest (straightest) knee angle seen
-        # Use 85th percentile — most frames are standing, few are bent
+        # Use 92nd percentile = captures the truly upright moments
         if len(self.knee_history) >= 8:
             sorted_k = sorted(self.knee_history)
             n = len(sorted_k)
-            self.standing_knee_angle = sorted_k[max(0, int(n * 0.85))]
-            self.bent_knee_angle     = sorted_k[max(0, int(n * 0.10))]
+            self.standing_knee_angle = sorted_k[max(0, int(n * 0.92))]
+            self.bent_knee_angle     = sorted_k[max(0, int(n * 0.08))]
 
         if self.standing_knee_angle is None:
             return self.signal_ema.update(0.0)
@@ -412,15 +412,12 @@ class DeadliftRepDetector:
         side_composite = self._compute_side_composite(torso_angle_smooth, hip_angle_smooth, side_ratio)
         front_val = self.front_signal.update(smoothed_pts)
 
-        if side_ratio >= 0.65:
-            # Clear side view — side composite is reliable
+        if side_ratio >= 0.70:
+            # Clear side view — use side composite only
             composite = side_composite
-        elif side_ratio >= 0.45:
-            # Diagonal — weight front heavily since side is unreliable
-            blend = (side_ratio - 0.45) / 0.20  # 0 at sr=0.45, 1 at sr=0.65
-            composite = blend * side_composite + (1.0 - blend) * front_val
         else:
-            # Front view — front signal only
+            # Front or diagonal — front signal only
+            # side_composite is unreliable from front (gives wrong torso/hip angles)
             composite = front_val
 
         import sys as _sys
