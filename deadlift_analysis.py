@@ -217,7 +217,7 @@ class FrontViewSignal:
     - Shoulder/hip position drift
     """
     def __init__(self):
-        self.signal_ema   = EMA(0.35)
+        self.signal_ema   = EMA(0.20)
         self.knee_history = deque(maxlen=90)   # ~9-15s of data
         self.standing_knee_angle = None        # learned "straight" baseline
         self.bent_knee_angle     = None        # learned "bent" baseline
@@ -311,7 +311,7 @@ class DeadliftRepDetector:
     COMPOSITE_HINGE_START = 0.32
     COMPOSITE_HINGE_DEEP  = 0.50
     COMPOSITE_STANDING    = 0.18
-    MIN_HINGE_FRAMES      = 15     # ~1.5s at 10fps
+    MIN_HINGE_FRAMES      = 20     # ~2s at 10fps — filters noise spikes
     MIN_FRAMES_BETWEEN    = 50     # ~5s min between reps — deadlift needs recovery
 
     def __init__(self, fps=10):
@@ -475,29 +475,16 @@ class DeadliftRepDetector:
 
         # State machine runs — never misses first rep
         if self.state == self.STANDING:
-            if composite <= self.COMPOSITE_HINGE_START:
-                # Count frames spent clearly in standing position
-                self._standing_frames = getattr(self, '_standing_frames', 0) + 1
-            else:
-                self._standing_frames = 0
-
             if composite > self.COMPOSITE_HINGE_START:
                 self._pre_hinge_frames = getattr(self, '_pre_hinge_frames', 0) + 1
             else:
                 self._pre_hinge_frames = 0
-
-            # Before entering HINGING, require:
-            # 1. 2+ consecutive frames above threshold
-            # 2. Saw at least 8 "standing" frames recently (person was upright)
-            # 3. Minimum time since last rep
-            standing_ready = getattr(self, '_standing_frames', 0) >= 8
+            # Require 2 consecutive frames above threshold before committing
             if (self._pre_hinge_frames >= 2
-                    and standing_ready
                     and (frame_idx - self.last_rep_frame > self.MIN_FRAMES_BETWEEN)):
                 self.state = self.HINGING
                 self.hinge_frames = 0
                 self._pre_hinge_frames = 0
-                self._standing_frames = 0
                 self._reset_rep_tracking()
 
         elif self.state == self.HINGING:
@@ -513,7 +500,7 @@ class DeadliftRepDetector:
             drop_from_peak = self.rep_max_composite - composite
             if (self.hinge_frames >= self.MIN_HINGE_FRAMES
                     and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
-                    and drop_from_peak >= 0.20):
+                    and drop_from_peak >= 0.25):
                 self.state = self.RISING
 
         elif self.state == self.RISING:
