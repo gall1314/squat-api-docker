@@ -363,7 +363,7 @@ class DeadliftRepDetector:
                 self.COMPOSITE_HINGE_DEEP  = max(0.30, min(0.92, self._cal_floor + 0.82 * rng))
             return
 
-        if len(self._cal_signals) >= 25:
+        if len(self._cal_signals) >= 5:
             # Use more frames + higher percentiles for better floor estimate
             # Use 5th percentile as true floor (lowest = most upright)
             true_floor = float(np.min(self._cal_signals))
@@ -459,21 +459,17 @@ class DeadliftRepDetector:
         rt_feedback = None
         rep_info    = None
 
-        # Run calibration on every frame (updates thresholds once enough data)
+        # Run calibration on every frame
         self._calibrate(composite)
 
-        # Require core landmarks (hips + knees) to be visible before counting
-        # This prevents false reps during camera shake / person not in frame
-        core_ids = [23, 24, 25, 26]  # left hip, right hip, left knee, right knee
-        core_vis = [self._get_lm_val(lm, idx, 'visibility') for idx in core_ids
-                    if idx < len(lm) if hasattr(lm, '__len__') or True]
-        core_vis = [self._get_lm_val(lm, idx, 'visibility') for idx in core_ids]
-        min_core_vis = min(core_vis) if core_vis else 0.0
-        if min_core_vis < 0.50:
+        # Block state machine until quick initial calibration is done (5 frames = ~0.5s)
+        # This prevents false reps from camera shake at video start
+        # 5 frames is fast enough to not miss any real first rep
+        if not self._calibrated:
             self.prev_composite = composite
             return composite, None, None
 
-        # State machine runs — never misses first rep
+        # State machine runs
         if self.state == self.STANDING:
             if composite > self.COMPOSITE_HINGE_START:
                 self._pre_hinge_frames = getattr(self, '_pre_hinge_frames', 0) + 1
