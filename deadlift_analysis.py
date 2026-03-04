@@ -268,14 +268,26 @@ class FrontViewSignal:
         self.hip_y_history.append(hip_y)
         self.sh_dist_history.append(sh_dist)
         if len(self.shoulder_y_history) >= self.min_frames_for_baseline:
+            # Use 5th percentile = the highest shoulder position = most upright stance
+            # This is more robust than 10th percentile
             sorted_sy = sorted(self.shoulder_y_history)
-            idx_10 = max(0, int(len(sorted_sy) * 0.10))
-            self.standing_shoulder_y = sorted_sy[idx_10]
+            idx_5 = max(0, int(len(sorted_sy) * 0.05))
+            new_standing = sorted_sy[idx_5]
+            # Only update baseline if it would make it LOWER (more upright)
+            # This prevents the baseline drifting up when person bends repeatedly
+            if self.standing_shoulder_y is None:
+                self.standing_shoulder_y = new_standing
+            else:
+                # Slow adaptation downward (toward more upright), no upward drift
+                if new_standing < self.standing_shoulder_y:
+                    self.standing_shoulder_y = (0.9 * self.standing_shoulder_y
+                                                + 0.1 * new_standing)
+                # else: don't update — person isn't more upright than baseline
+
             sorted_hy = sorted(self.hip_y_history)
-            self.standing_hip_y = sorted_hy[idx_10]
+            self.standing_hip_y = sorted_hy[max(0, int(len(sorted_hy) * 0.05))]
             sorted_shd = sorted(self.sh_dist_history, reverse=True)
-            idx_90 = max(0, int(len(sorted_shd) * 0.10))
-            self.standing_sh_dist = sorted_shd[idx_90]
+            self.standing_sh_dist = sorted_shd[max(0, int(len(sorted_shd) * 0.05))]
             if ankle_y is not None:
                 self.standing_ankle_y = ankle_y
             self.baseline_ready = True
@@ -427,15 +439,22 @@ class DeadliftRepDetector:
         front_val = self.front_signal.update(smoothed_pts)
 
         if side_ratio >= 0.65:
-            # Clear side view
+            # Clear side view — side composite is reliable
             composite = side_composite
         elif side_ratio >= 0.45:
-            # Diagonal — blend, weight front more
-            blend = (side_ratio - 0.45) / 0.20
+            # Diagonal — weight front heavily since side is unreliable
+            blend = (side_ratio - 0.45) / 0.20  # 0 at sr=0.45, 1 at sr=0.65
             composite = blend * side_composite + (1.0 - blend) * front_val
         else:
-            # Front view — front signal only (side_composite is unreliable here)
+            # Front view — front signal only
             composite = front_val
+
+        import sys as _sys
+        if frame_idx % 150 == 0:
+            view_str = "SIDE" if side_ratio >= 0.65 else ("FRONT" if side_ratio < 0.45 else "DIAG")
+            print(f"[DL] F{frame_idx}: {view_str} sr={side_ratio:.2f} "
+                  f"sc={side_composite:.3f} fv={front_val:.3f} comp={composite:.3f} st={self.state}",
+                  file=_sys.stderr, flush=True)
 
         # Calibrate BEFORE state machine — learns floor/ceiling from early frames
         self._calibrate(composite)
