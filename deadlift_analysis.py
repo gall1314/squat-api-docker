@@ -498,6 +498,9 @@ class DeadliftRepDetector:
             if (self.hinge_frames >= self.MIN_HINGE_FRAMES
                     and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
                     and drop_from_peak >= 0.25):
+                import sys as _sys4
+                print(f"[DL] HINGING->RISING fi={frame_idx} hf={self.hinge_frames} "                      f"peak={self.rep_max_composite:.3f} drop={drop_from_peak:.3f}",
+                      file=_sys4.stderr, flush=True)
                 self.state = self.RISING
 
         elif self.state == self.RISING:
@@ -509,6 +512,8 @@ class DeadliftRepDetector:
             return_threshold = max(self.COMPOSITE_STANDING,
                                    self.rep_max_composite * 0.30)
             if composite < return_threshold:
+                import sys as _sys3
+                print(f"[DL] RISING->STANDING fi={frame_idx} peak={self.rep_max_composite:.3f} "                      f"deep={self.COMPOSITE_HINGE_DEEP:.3f} thresh={self.COMPOSITE_HINGE_DEEP*0.88:.3f} "                      f"abs_ok={self.rep_max_composite>=0.45}", file=_sys3.stderr, flush=True)
                 # Only count rep if peak was deep enough AND above absolute minimum
                 if (self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
                         and self.rep_max_composite >= 0.45):
