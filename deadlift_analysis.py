@@ -899,21 +899,20 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
 # PASS 2 — video rendering from pass-1 data, NO mediapipe
 # =====================================================================
 def _render_pass(video_path, rotation, frame_skip, output_path,
-                 out_w, out_h, fps_in, frame_data):
+                 out_w, out_h, work_w, work_h, fps_in, frame_data):
     """
-    Re-reads video and draws skeleton + overlay using stored frame_data.
-    No mediapipe here — skeleton cannot jump to a background person.
+    Re-reads video and draws skeleton + overlay at WORK resolution (small).
+    ffmpeg upscales to out_w x out_h afterward — much faster.
     """
     import sys
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out    = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
+    out    = cv2.VideoWriter(output_path, fourcc, effective_fps, (work_w, work_h))
 
-    # Validate VideoWriter opened correctly
     if not out.isOpened():
         print(f"[DL] ERROR: VideoWriter failed to open {output_path} "
-              f"({out_w}x{out_h} @ {effective_fps:.1f}fps)", file=sys.stderr, flush=True)
+              f"({work_w}x{work_h} @ {effective_fps:.1f}fps)", file=sys.stderr, flush=True)
         return
 
     cap       = cv2.VideoCapture(video_path)
@@ -928,9 +927,9 @@ def _render_pass(video_path, rotation, frame_skip, output_path,
             continue
 
         frame = _apply_rotation(frame, rotation)
-        # Resize to output dimensions
-        if frame.shape[1] != out_w or frame.shape[0] != out_h:
-            frame = cv2.resize(frame, (out_w, out_h))
+        # Always work at small resolution
+        if frame.shape[1] != work_w or frame.shape[0] != work_h:
+            frame = cv2.resize(frame, (work_w, work_h))
 
         fd = frame_data.get(frame_idx)
         if fd is None:
@@ -1036,13 +1035,14 @@ def run_deadlift_analysis(video_path,
     if create_video:
         print("[DL] Pass2 rendering video...", file=sys.stderr, flush=True)
         _render_pass(video_path, rotation, frame_skip, output_path,
-                     out_w, out_h, fps_in, frame_data)
+                     out_w, out_h, work_w, work_h, fps_in, frame_data)
 
-        # Encode for browser compatibility
+        # Encode + upscale for browser compatibility
         encoded = output_path.replace(".mp4", "_encoded.mp4")
         try:
             proc = subprocess.run(
                 ["ffmpeg", "-y", "-i", output_path,
+                 "-vf", f"scale={out_w}:{out_h}",
                  "-c:v", "libx264", "-preset", "fast",
                  "-movflags", "+faststart", "-pix_fmt", "yuv420p", encoded],
                 capture_output=True, timeout=300)
