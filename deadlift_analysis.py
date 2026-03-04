@@ -494,10 +494,6 @@ class DeadliftRepDetector:
             if back_rounded and side_ratio >= 0.55:
                 rt_feedback = "Try to keep your back a bit straighter"
             drop_from_peak = self.rep_max_composite - composite
-            import sys as _sys2
-            if self.hinge_frames % 3 == 0:
-                print(f"[DL] HINGE fi={frame_idx} hf={self.hinge_frames} "                      f"comp={composite:.3f} peak={self.rep_max_composite:.3f} "                      f"drop={drop_from_peak:.3f} deep={self.COMPOSITE_HINGE_DEEP:.3f}",
-                      file=_sys2.stderr, flush=True)
             if (self.hinge_frames >= self.MIN_HINGE_FRAMES
                     and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
                     and drop_from_peak >= 0.25):
@@ -512,7 +508,9 @@ class DeadliftRepDetector:
             return_threshold = max(self.COMPOSITE_STANDING,
                                    self.rep_max_composite * 0.30)
             if composite < return_threshold:
-                if self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88:
+                # Only count rep if peak was deep enough AND above absolute minimum
+                if (self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
+                        and self.rep_max_composite >= 0.45):
                     rep_info = self._finalize_rep(frame_idx, side_ratio)
                 self.state = self.STANDING
                 self.last_rep_frame = frame_idx
