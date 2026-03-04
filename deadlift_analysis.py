@@ -364,11 +364,16 @@ class DeadliftRepDetector:
             return
 
         if len(self._cal_signals) >= 5:
-            # Use more frames + higher percentiles for better floor estimate
-            # Use 5th percentile as true floor (lowest = most upright)
             true_floor = float(np.min(self._cal_signals))
             true_ceil  = float(np.percentile(self._cal_signals, 98))
-            rng = max(0.20, true_ceil - true_floor)
+            raw_rng    = true_ceil - true_floor
+
+            # Don't accept calibration until we've seen meaningful range (>= 0.35)
+            # OR we've collected 30+ frames (fallback with safe defaults)
+            if raw_rng < 0.35 and len(self._cal_signals) < 30:
+                return  # keep collecting
+
+            rng = max(0.35, raw_rng)
             self._cal_floor = true_floor
             self._cal_range = rng
 
