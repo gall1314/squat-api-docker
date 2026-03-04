@@ -353,16 +353,14 @@ class DeadliftRepDetector:
         """
         self._cal_signals.append(composite)
 
-        # After calibration, keep adapting floor downward if we see lower values
+        # Keep adapting floor downward after calibration
         if self._calibrated:
-            if composite < self.COMPOSITE_STANDING * 1.5:
-                # Person is near standing — update floor estimate
-                new_floor = min(self._cal_floor, composite)
-                if new_floor < self._cal_floor - 0.02:
-                    self._cal_floor = new_floor
-                    rng = max(0.20, self._cal_range)
-                    self.COMPOSITE_HINGE_START = max(0.15, min(0.70, self._cal_floor + 0.38 * rng))
-                    self.COMPOSITE_STANDING    = max(0.05, min(0.40, self._cal_floor + 0.08 * rng))
+            if composite < self._cal_floor - 0.03:
+                self._cal_floor = composite
+                rng = max(0.20, self._cal_range)
+                self.COMPOSITE_HINGE_START = max(0.15, min(0.70, self._cal_floor + 0.38 * rng))
+                self.COMPOSITE_STANDING    = max(0.05, min(0.40, self._cal_floor + 0.08 * rng))
+                self.COMPOSITE_HINGE_DEEP  = max(0.30, min(0.92, self._cal_floor + 0.82 * rng))
             return
 
         if len(self._cal_signals) >= 25:
@@ -461,12 +459,10 @@ class DeadliftRepDetector:
         rt_feedback = None
         rep_info    = None
 
-        # Don't count reps until calibration is complete
-        if not self._calibrated:
-            self._calibrate(composite)
-            self.prev_composite = composite
-            return composite, None, None
+        # Run calibration on every frame (updates thresholds once enough data)
+        self._calibrate(composite)
 
+        # State machine runs from frame 1 — never misses first rep
         if self.state == self.STANDING:
             if composite > self.COMPOSITE_HINGE_START:
                 self._pre_hinge_frames = getattr(self, '_pre_hinge_frames', 0) + 1
