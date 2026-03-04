@@ -230,7 +230,8 @@ class FrontViewSignal:
     def _knee_angle(self, smoothed_pts):
         """
         Average left+right knee angle (hip-knee-ankle).
-        Returns angle in degrees, or None if points missing.
+        Returns (avg_angle, is_symmetric) or (None, False).
+        Asymmetric = one knee bent, other straight = walking/stepping.
         """
         angles = []
         for hip_id, knee_id, ankle_id in [(23, 25, 27), (24, 26, 28)]:
@@ -246,8 +247,12 @@ class FrontViewSignal:
                 ang  = math.degrees(math.acos(float(np.clip(dot/(mag1*mag2), -1, 1))))
                 angles.append(ang)
         if not angles:
-            return None
-        return sum(angles) / len(angles)
+            return None, False
+        avg = sum(angles) / len(angles)
+        # Symmetric = both knees bend similarly (deadlift)
+        # Asymmetric = one knee much more bent (walking/stepping)
+        is_symmetric = len(angles) < 2 or abs(angles[0] - angles[1]) < 25.0
+        return avg, is_symmetric
 
     def _walk_suppressor(self, smoothed_pts):
         lh = smoothed_pts.get(23)
@@ -264,9 +269,13 @@ class FrontViewSignal:
 
     def update(self, smoothed_pts):
         self.frame_count += 1
-        angle = self._knee_angle(smoothed_pts)
+        angle, is_symmetric = self._knee_angle(smoothed_pts)
         if angle is None:
             return self.signal_ema.value if self.signal_ema.value is not None else 0.0
+
+        # Asymmetric knee bend = walking or stepping — suppress signal
+        if not is_symmetric:
+            return self.signal_ema.update(0.0)
 
         self.knee_history.append(angle)
 
@@ -345,7 +354,7 @@ class DeadliftRepDetector:
         if self._calibrated:
             return
         self._cal_signals.append(composite)
-        if len(self._cal_signals) >= 50:
+        if len(self._cal_signals) >= 25:
             # Use more frames + higher percentiles for better floor estimate
             # Use 5th percentile as true floor (lowest = most upright)
             true_floor = float(np.percentile(self._cal_signals, 5))
