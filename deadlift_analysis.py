@@ -204,116 +204,90 @@ class ViewAngleEstimator:
 
 # ===================== FRONT-VIEW SIGNAL =====================
 class FrontViewSignal:
-    def __init__(self):
-        self.signal_ema = EMA(0.40)
-        self.frame_count = 0
-        self.baseline_ready = False
-        self.min_frames_for_baseline = 5
-        self.standing_shoulder_y = None
-        self.standing_hip_y = None
-        self.standing_sh_dist = None
-        self.standing_ankle_y = None
-        self.shoulder_y_history = deque(maxlen=60)
-        self.hip_y_history = deque(maxlen=60)
-        self.sh_dist_history = deque(maxlen=60)
-        self.hip_y_ema = EMA(0.3)
-        self.hip_x_ema = EMA(0.3)
-        self.prev_hip_y = None
-        self.prev_hip_x = None
-        self.hip_movement_acc = 0.0
-        self.hip_movement_decay = 0.92
+    """
+    Front-view signal for deadlift based on knee bend angle.
 
-    def _get_key_points(self, smoothed_pts):
-        ls = smoothed_pts.get(11)
-        rs = smoothed_pts.get(12)
+    When standing upright: knee angle ~170-180° → signal ~0
+    When at bottom of deadlift: knee angle ~90-120° → signal ~1
+
+    This is robust to:
+    - Walking (knee angle changes differently — detected and suppressed)
+    - Camera position / height
+    - Different body proportions
+    - Shoulder/hip position drift
+    """
+    def __init__(self):
+        self.signal_ema   = EMA(0.35)
+        self.knee_history = deque(maxlen=90)   # ~9-15s of data
+        self.standing_knee_angle = None        # learned "straight" baseline
+        self.bent_knee_angle     = None        # learned "bent" baseline
+        self.frame_count  = 0
+        # walking suppressor
+        self.hip_x_ema    = EMA(0.3)
+        self.prev_hip_x   = None
+        self.walk_acc     = 0.0
+
+    def _knee_angle(self, smoothed_pts):
+        """
+        Average left+right knee angle (hip-knee-ankle).
+        Returns angle in degrees, or None if points missing.
+        """
+        angles = []
+        for hip_id, knee_id, ankle_id in [(23, 25, 27), (24, 26, 28)]:
+            h = smoothed_pts.get(hip_id)
+            k = smoothed_pts.get(knee_id)
+            a = smoothed_pts.get(ankle_id)
+            if h and k and a:
+                v1 = (h[0]-k[0], h[1]-k[1])
+                v2 = (a[0]-k[0], a[1]-k[1])
+                dot  = v1[0]*v2[0] + v1[1]*v2[1]
+                mag1 = math.sqrt(v1[0]**2 + v1[1]**2) + 1e-9
+                mag2 = math.sqrt(v2[0]**2 + v2[1]**2) + 1e-9
+                ang  = math.degrees(math.acos(float(np.clip(dot/(mag1*mag2), -1, 1))))
+                angles.append(ang)
+        if not angles:
+            return None
+        return sum(angles) / len(angles)
+
+    def _walk_suppressor(self, smoothed_pts):
         lh = smoothed_pts.get(23)
         rh = smoothed_pts.get(24)
-        la = smoothed_pts.get(27)
-        ra = smoothed_pts.get(28)
-        lk = smoothed_pts.get(25)
-        rk = smoothed_pts.get(26)
-        if not ls or not rs or not lh or not rh:
-            return None
-        shoulder_y = (ls[1] + rs[1]) / 2.0
-        shoulder_x = (ls[0] + rs[0]) / 2.0
-        hip_y = (lh[1] + rh[1]) / 2.0
-        hip_x = (lh[0] + rh[0]) / 2.0
-        ankle_y = None
-        if la and ra:   ankle_y = (la[1] + ra[1]) / 2.0
-        elif la:        ankle_y = la[1]
-        elif ra:        ankle_y = ra[1]
-        elif lk and rk: ankle_y = (lk[1] + rk[1]) / 2.0
-        elif lk:        ankle_y = lk[1]
-        elif rk:        ankle_y = rk[1]
-        return {'shoulder_y': shoulder_y, 'shoulder_x': shoulder_x,
-                'hip_y': hip_y, 'hip_x': hip_x,
-                'ankle_y': ankle_y, 'sh_dist': hip_y - shoulder_y}
-
-    def _detect_walking(self, hip_y, hip_x, sh_dist):
-        smooth_hy = self.hip_y_ema.update(hip_y)
-        smooth_hx = self.hip_x_ema.update(hip_x)
-        if self.prev_hip_y is not None:
-            dy = abs(smooth_hy - self.prev_hip_y)
-            dx = abs(smooth_hx - self.prev_hip_x)
-            self.hip_movement_acc = (self.hip_movement_acc * self.hip_movement_decay
-                                     + math.sqrt(dy**2 + dx**2))
-        self.prev_hip_y = smooth_hy
-        self.prev_hip_x = smooth_hx
-        nm = (self.hip_movement_acc / sh_dist if sh_dist > 0.01
-              else self.hip_movement_acc * 10)
-        return float(np.clip(1.0 - (nm - 0.4) / 0.6, 0.0, 1.0))
-
-    def _update_baseline(self, shoulder_y, hip_y, sh_dist, ankle_y):
-        self.shoulder_y_history.append(shoulder_y)
-        self.hip_y_history.append(hip_y)
-        self.sh_dist_history.append(sh_dist)
-        if len(self.shoulder_y_history) >= self.min_frames_for_baseline:
-            # Use 5th percentile = the highest shoulder position = most upright stance
-            # This is more robust than 10th percentile
-            sorted_sy = sorted(self.shoulder_y_history)
-            idx_5 = max(0, int(len(sorted_sy) * 0.05))
-            new_standing = sorted_sy[idx_5]
-            # Only update baseline if it would make it LOWER (more upright)
-            # This prevents the baseline drifting up when person bends repeatedly
-            if self.standing_shoulder_y is None:
-                self.standing_shoulder_y = new_standing
-            else:
-                # Slow adaptation downward (toward more upright), no upward drift
-                if new_standing < self.standing_shoulder_y:
-                    self.standing_shoulder_y = (0.9 * self.standing_shoulder_y
-                                                + 0.1 * new_standing)
-                # else: don't update — person isn't more upright than baseline
-
-            sorted_hy = sorted(self.hip_y_history)
-            self.standing_hip_y = sorted_hy[max(0, int(len(sorted_hy) * 0.05))]
-            sorted_shd = sorted(self.sh_dist_history, reverse=True)
-            self.standing_sh_dist = sorted_shd[max(0, int(len(sorted_shd) * 0.05))]
-            if ankle_y is not None:
-                self.standing_ankle_y = ankle_y
-            self.baseline_ready = True
+        if lh and rh:
+            hip_x = (lh[0] + rh[0]) / 2.0
+            sx = self.hip_x_ema.update(hip_x)
+            if self.prev_hip_x is not None:
+                dx = abs(sx - self.prev_hip_x)
+                self.walk_acc = self.walk_acc * 0.88 + dx
+            self.prev_hip_x = sx
+        # suppress if lateral hip movement is large (walking)
+        return float(np.clip(1.0 - (self.walk_acc - 0.03) / 0.05, 0.0, 1.0))
 
     def update(self, smoothed_pts):
         self.frame_count += 1
-        pts = self._get_key_points(smoothed_pts)
-        if pts is None:
+        angle = self._knee_angle(smoothed_pts)
+        if angle is None:
             return self.signal_ema.value if self.signal_ema.value is not None else 0.0
-        shoulder_y = pts['shoulder_y']
-        hip_y      = pts['hip_y']
-        ankle_y    = pts['ankle_y']
-        sh_dist    = pts['sh_dist']
-        self._update_baseline(shoulder_y, hip_y, sh_dist, ankle_y)
-        walk_supp = self._detect_walking(hip_y, pts['hip_x'], sh_dist)
-        if not self.baseline_ready:
-            self.signal_ema.update(0.0)
-            return 0.0
-        shoulder_drop = shoulder_y - self.standing_shoulder_y
-        if self.standing_sh_dist > 0.01:
-            sig_drop = float(np.clip(shoulder_drop / (self.standing_sh_dist * 0.5), 0.0, 1.0))
-            compression_ratio = sh_dist / self.standing_sh_dist
-            sig_comp = float(np.clip((1.0 - compression_ratio) / 0.45, 0.0, 1.0))
-        else:
-            sig_drop = sig_comp = 0.0
-        raw = 0.6 * sig_drop + 0.4 * sig_comp
+
+        self.knee_history.append(angle)
+
+        # Learn standing baseline = highest (straightest) knee angle seen
+        # Use 85th percentile — most frames are standing, few are bent
+        if len(self.knee_history) >= 8:
+            sorted_k = sorted(self.knee_history)
+            n = len(sorted_k)
+            self.standing_knee_angle = sorted_k[max(0, int(n * 0.85))]
+            self.bent_knee_angle     = sorted_k[max(0, int(n * 0.10))]
+
+        if self.standing_knee_angle is None:
+            return self.signal_ema.update(0.0)
+
+        # Signal: how bent are the knees right now?
+        standing = self.standing_knee_angle   # ~170-180°
+        bent_ref  = min(self.bent_knee_angle or 90.0, standing - 20.0)
+        rng = max(20.0, standing - bent_ref)
+        raw = float(np.clip((standing - angle) / rng, 0.0, 1.0))
+
+        walk_supp = self._walk_suppressor(smoothed_pts)
         return self.signal_ema.update(raw * walk_supp)
 
 
