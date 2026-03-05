@@ -1,21 +1,12 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — V4.0: two-pass architecture (from romanian_deadlift v5.1)
-#
-# KEY FIXES over V3.1:
-#   1. TWO-PASS: Pass 1 = analysis only (no video writing) → no black video
-#                Pass 2 = render video from stored frame_data → fast & reliable
-#   2. No more lazy VideoWriter creation → consistent dimensions guaranteed
-#   3. frame_skip applied correctly (read all frames, skip before processing)
-#   4. Hard cap replaced with time-based timeout (180s)
-#   5. _snapshot_smoothed() freezes landmark dict — no flickering skeleton
-#   6. ffmpeg encode with robust fallback chain
+# deadlift_analysis.py — V4.3: restored from working version
+# ONE change from the version in doc5: calibration 50→5 frames + rng>=0.50 requirement
 
 import os, cv2, math, numpy as np, subprocess, json, time
 from collections import deque
 from PIL import ImageFont, ImageDraw, Image
 import mediapipe as mp
 
-# ===================== MediaPipe import (dual API support) =====================
 _USE_TASKS_API = False
 _SOLUTIONS_AVAILABLE = False
 
@@ -47,7 +38,6 @@ try:
 except Exception:
     _ORT_AVAILABLE = False
 
-# ===================== STYLE / FONTS =====================
 BAR_BG_ALPHA         = 0.55
 DONUT_RADIUS_SCALE   = 0.72
 DONUT_THICKNESS_FRAC = 0.28
@@ -61,7 +51,6 @@ _REF_FEEDBACK_FONT_SIZE    = 22
 _REF_DEPTH_LABEL_FONT_SIZE = 14
 _REF_DEPTH_PCT_FONT_SIZE   = 18
 
-# Font cache: (path, size) -> ImageFont  — avoids reloading every frame
 _FONT_CACHE: dict = {}
 
 def _get_font(path, size):
@@ -70,10 +59,8 @@ def _get_font(path, size):
         _FONT_CACHE[key] = _load_font(path, size)
     return _FONT_CACHE[key]
 
-
 def _scaled_font_size(ref_size, frame_h):
     return max(10, int(round(ref_size * (frame_h / _REF_H))))
-
 
 def _load_font(path, size):
     try:
@@ -94,7 +81,6 @@ def _load_font(path, size):
     except TypeError:
         return ImageFont.load_default()
 
-
 def score_label(s: float) -> str:
     s = float(s)
     if s >= 9.5: return "Excellent"
@@ -103,17 +89,14 @@ def score_label(s: float) -> str:
     if s >= 5.5: return "Fair"
     return "Needs work"
 
-
 def display_half_str(x: float) -> str:
     q = round(float(x) * 2) / 2.0
     return str(int(round(q))) if abs(q - round(q)) < 1e-9 else f"{q:.1f}"
-
 
 _FACE_INDICES = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
 _BODY_CONNS = tuple((a, b) for (a, b) in POSE_CONNECTIONS
                     if a not in _FACE_INDICES and b not in _FACE_INDICES)
 _BODY_POINTS = tuple(sorted({i for (a, b) in _BODY_CONNS for i in (a, b)}))
-
 
 def _angle_3pt(a, b, c):
     ba = np.array(a, dtype=float) - np.array(b, dtype=float)
@@ -121,37 +104,29 @@ def _angle_3pt(a, b, c):
     nrm = (np.linalg.norm(ba) * np.linalg.norm(bc)) + 1e-9
     return math.degrees(math.acos(float(np.clip(np.dot(ba, bc) / nrm, -1.0, 1.0))))
 
-
 def _angle_to_vertical(a, b):
     dx = b[0] - a[0]
     dy = b[1] - a[1]
     return abs(math.degrees(math.atan2(abs(dx), -dy + 1e-9)))
 
-
-# ===================== EMA =====================
 class EMA:
     def __init__(self, alpha=0.4):
         self.alpha = alpha
         self.value = None
-
     def update(self, x):
         if self.value is None:
             self.value = float(x)
         else:
             self.value = self.alpha * float(x) + (1 - self.alpha) * self.value
         return self.value
-
     def reset(self):
         self.value = None
 
-
-# ===================== LANDMARK SMOOTHER =====================
 class LandmarkSmoother:
     def __init__(self, alpha=0.5, vis_threshold=0.4):
         self.alpha = alpha
         self.vis_threshold = vis_threshold
         self.smoothed = {}
-
     def update(self, landmarks):
         result = {}
         for idx in range(min(33, len(landmarks))):
@@ -175,17 +150,12 @@ class LandmarkSmoother:
             result[idx] = (float(smooth[0]), float(smooth[1]))
         return result
 
-
 def _snapshot_smoothed(smoothed_pts):
-    """Freeze a copy of smoothed_pts so it can't be mutated later."""
     return {k: (float(v[0]), float(v[1])) for k, v in smoothed_pts.items()}
 
-
-# ===================== VIEW ANGLE ESTIMATOR =====================
 class ViewAngleEstimator:
     def __init__(self, alpha=0.3):
         self.ema = EMA(alpha)
-
     def estimate(self, smoothed_pts):
         ls = smoothed_pts.get(11)
         rs = smoothed_pts.get(12)
@@ -201,38 +171,18 @@ class ViewAngleEstimator:
         side_score = float(np.clip(1.0 - (ratio - 0.15) / 0.85, 0.0, 1.0))
         return self.ema.update(side_score)
 
-
-# ===================== FRONT-VIEW SIGNAL =====================
 class FrontViewSignal:
-    """
-    Front-view signal for deadlift based on knee bend angle.
-
-    When standing upright: knee angle ~170-180° → signal ~0
-    When at bottom of deadlift: knee angle ~90-120° → signal ~1
-
-    This is robust to:
-    - Walking (knee angle changes differently — detected and suppressed)
-    - Camera position / height
-    - Different body proportions
-    - Shoulder/hip position drift
-    """
     def __init__(self):
         self.signal_ema   = EMA(0.20)
-        self.knee_history = deque(maxlen=90)   # ~9-15s of data
-        self.standing_knee_angle = None        # learned "straight" baseline
-        self.bent_knee_angle     = None        # learned "bent" baseline
+        self.knee_history = deque(maxlen=90)
+        self.standing_knee_angle = None
+        self.bent_knee_angle     = None
         self.frame_count  = 0
-        # walking suppressor
         self.hip_x_ema    = EMA(0.3)
         self.prev_hip_x   = None
         self.walk_acc     = 0.0
 
     def _knee_angle(self, smoothed_pts):
-        """
-        Average left+right knee angle (hip-knee-ankle).
-        Returns (avg_angle, is_symmetric) or (None, False).
-        Asymmetric = one knee bent, other straight = walking/stepping.
-        """
         angles = []
         for hip_id, knee_id, ankle_id in [(23, 25, 27), (24, 26, 28)]:
             h = smoothed_pts.get(hip_id)
@@ -249,8 +199,6 @@ class FrontViewSignal:
         if not angles:
             return None, False
         avg = sum(angles) / len(angles)
-        # Symmetric = both knees bend similarly (deadlift)
-        # Asymmetric = one knee much more bent (walking/stepping)
         is_symmetric = len(angles) < 2 or abs(angles[0] - angles[1]) < 35.0
         return avg, is_symmetric
 
@@ -264,7 +212,6 @@ class FrontViewSignal:
                 dx = abs(sx - self.prev_hip_x)
                 self.walk_acc = self.walk_acc * 0.88 + dx
             self.prev_hip_x = sx
-        # suppress if lateral hip movement is large (walking)
         return float(np.clip(1.0 - (self.walk_acc - 0.03) / 0.05, 0.0, 1.0))
 
     def update(self, smoothed_pts):
@@ -272,47 +219,34 @@ class FrontViewSignal:
         angle, is_symmetric = self._knee_angle(smoothed_pts)
         if angle is None:
             return self.signal_ema.value if self.signal_ema.value is not None else 0.0
-
-        # Asymmetric knee bend = walking or stepping — suppress signal
         if not is_symmetric:
             return self.signal_ema.update(0.0)
-
         self.knee_history.append(angle)
-
-        # Learn standing baseline = highest (straightest) knee angle seen
-        # Use 92nd percentile = captures the truly upright moments
         if len(self.knee_history) >= 8:
             sorted_k = sorted(self.knee_history)
             n = len(sorted_k)
-            # 97th percentile = the very straightest the person ever stands
             self.standing_knee_angle = sorted_k[max(0, int(n * 0.97))]
             self.bent_knee_angle     = sorted_k[max(0, int(n * 0.05))]
-
         if self.standing_knee_angle is None:
             return self.signal_ema.update(0.0)
-
-        # Signal: how bent are the knees right now?
-        standing = self.standing_knee_angle   # ~170-180°
+        standing = self.standing_knee_angle
         bent_ref  = min(self.bent_knee_angle or 90.0, standing - 20.0)
         rng = max(30.0, standing - bent_ref)
         raw = float(np.clip((standing - angle) / rng, 0.0, 1.0))
-
         walk_supp = self._walk_suppressor(smoothed_pts)
         return self.signal_ema.update(raw * walk_supp)
 
 
-# ===================== REP DETECTOR =====================
 class DeadliftRepDetector:
     STANDING = 0
     HINGING  = 1
     RISING   = 2
 
-    # Raw thresholds — overridden after calibration
     COMPOSITE_HINGE_START = 0.32
     COMPOSITE_HINGE_DEEP  = 0.50
     COMPOSITE_STANDING    = 0.18
-    MIN_HINGE_FRAMES      = 20     # ~2s at 10fps — filters noise spikes
-    MIN_FRAMES_BETWEEN    = 50     # ~5s min between reps — deadlift needs recovery
+    MIN_HINGE_FRAMES      = 15
+    MIN_FRAMES_BETWEEN    = 50
 
     def __init__(self, fps=10):
         self.fps = fps
@@ -339,39 +273,32 @@ class DeadliftRepDetector:
         self.bad_reps = 0
         self.all_scores = []
         self.reps_report = []
-
-        # Dynamic calibration — learns session baseline & range
         self._cal_signals    = []
         self._calibrated     = False
-        self._cal_floor      = 0.0   # standing composite
-        self._cal_range      = 0.50  # typical rep range
+        self._cal_floor      = 0.0
+        self._cal_range      = 0.50
 
     def _calibrate(self, composite):
-        """
-        Collect frames to estimate standing baseline.
-        Continues adapting after initial calibration to track floor drift.
-        """
-        self._cal_signals.append(composite)
-
-        # Keep adapting floor downward after calibration
         if self._calibrated:
+            # adaptive: lower floor if we see lower values
             if composite < self._cal_floor - 0.03:
                 self._cal_floor = composite
                 rng = max(0.50, self._cal_range)
                 self.COMPOSITE_HINGE_START = max(0.15, min(0.70, self._cal_floor + 0.38 * rng))
                 self.COMPOSITE_STANDING    = max(0.05, min(0.40, self._cal_floor + 0.08 * rng))
-                self.COMPOSITE_HINGE_DEEP  = max(0.30, min(0.92, self._cal_floor + 0.82 * rng))
+                self.COMPOSITE_HINGE_DEEP  = max(0.41, min(0.92, self._cal_floor + 0.82 * rng))
             return
+
+        self._cal_signals.append(composite)
 
         if len(self._cal_signals) >= 5:
             true_floor = float(np.min(self._cal_signals))
             true_ceil  = float(np.percentile(self._cal_signals, 98))
             raw_rng    = true_ceil - true_floor
 
-            # Don't accept calibration until we've seen meaningful range (>= 0.35)
-            # OR we've collected 30+ frames (fallback with safe defaults)
-            if raw_rng < 0.35 and len(self._cal_signals) < 30:
-                return  # keep collecting
+            # Need meaningful range OR 30 frames collected
+            if raw_rng < 0.50 and len(self._cal_signals) < 30:
+                return
 
             rng = max(0.50, raw_rng)
             self._cal_floor = true_floor
@@ -380,7 +307,6 @@ class DeadliftRepDetector:
             self.COMPOSITE_HINGE_START = true_floor + 0.38 * rng
             self.COMPOSITE_STANDING    = true_floor + 0.08 * rng
             self.COMPOSITE_HINGE_DEEP  = true_floor + 0.82 * rng
-            # Hard clamps
             self.COMPOSITE_HINGE_START = max(0.15, min(0.70, self.COMPOSITE_HINGE_START))
             self.COMPOSITE_STANDING    = max(0.05, min(0.40, self.COMPOSITE_STANDING))
             self.COMPOSITE_HINGE_DEEP  = max(0.41, min(0.92, self.COMPOSITE_HINGE_DEEP))
@@ -437,11 +363,8 @@ class DeadliftRepDetector:
         front_val = self.front_signal.update(smoothed_pts)
 
         if side_ratio >= 0.70:
-            # Clear side view — use side composite only
             composite = side_composite
         else:
-            # Front or diagonal — front signal only
-            # side_composite is unreliable from front (gives wrong torso/hip angles)
             composite = front_val
 
         import sys as _sys
@@ -451,7 +374,6 @@ class DeadliftRepDetector:
                   f"sc={side_composite:.3f} fv={front_val:.3f} comp={composite:.3f} st={self.state}",
                   file=_sys.stderr, flush=True)
 
-        # Back rounding check
         head_pt = None
         for idx in (8, 7, 0):
             if idx in smoothed_pts and self._get_lm_val(lm, idx, 'visibility') > 0.45:
@@ -464,28 +386,23 @@ class DeadliftRepDetector:
         rt_feedback = None
         rep_info    = None
 
-        # Run calibration on every frame
         self._calibrate(composite)
 
-        # Block state machine until quick initial calibration is done (5 frames = ~0.5s)
-        # This prevents false reps from camera shake at video start
-        # 5 frames is fast enough to not miss any real first rep
         if not self._calibrated:
             self.prev_composite = composite
             return composite, None, None
 
-        # State machine runs
         if self.state == self.STANDING:
             if composite > self.COMPOSITE_HINGE_START:
                 self._pre_hinge_frames = getattr(self, '_pre_hinge_frames', 0) + 1
             else:
                 self._pre_hinge_frames = 0
-            # Require 2 consecutive frames above threshold before committing
             if (self._pre_hinge_frames >= 2
                     and (frame_idx - self.last_rep_frame > self.MIN_FRAMES_BETWEEN)):
                 self.state = self.HINGING
                 self.hinge_frames = 0
                 self._pre_hinge_frames = 0
+                self._deep_frames = 0
                 self._reset_rep_tracking()
 
         elif self.state == self.HINGING:
@@ -494,43 +411,28 @@ class DeadliftRepDetector:
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
             if back_rounded and side_ratio >= 0.55:
                 rt_feedback = "Try to keep your back a bit straighter"
-
-            # Abort: if signal drops below HINGE_START while peak not yet reached,
-            # count consecutive low frames. After 5 low frames → not a real rep.
-            if composite < self.COMPOSITE_HINGE_START:
-                self._hinge_low_frames = getattr(self, '_hinge_low_frames', 0) + 1
-            else:
-                self._hinge_low_frames = 0
-
-            peak_reached = self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
-            if (not peak_reached and self._hinge_low_frames >= 5):
-                # Signal returned to baseline before real peak → noise, not a rep
-                self.state = self.STANDING
-                self._reset_rep_tracking()
-                self._pre_hinge_frames = 0
-                self._hinge_low_frames = 0
-            else:
-                drop_from_peak = self.rep_max_composite - composite
-                if (self.hinge_frames >= self.MIN_HINGE_FRAMES
-                        and peak_reached
-                        and drop_from_peak >= 0.25):
-                    self._hinge_low_frames = 0
-                    self.state = self.RISING
+            # Count frames spent above the deep threshold (real reps stay there, spikes don't)
+            if composite >= self.COMPOSITE_HINGE_DEEP * 0.88:
+                self._deep_frames = getattr(self, '_deep_frames', 0) + 1
+            drop_from_peak = self.rep_max_composite - composite
+            if (self.hinge_frames >= self.MIN_HINGE_FRAMES
+                    and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
+                    and getattr(self, '_deep_frames', 0) >= 8
+                    and drop_from_peak >= 0.25):
+                self._deep_frames = 0
+                self.state = self.RISING
 
         elif self.state == self.RISING:
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
             if back_rounded and side_ratio >= 0.55:
                 rt_feedback = "Try to keep your back a bit straighter"
-            # Return to standing: signal dropped to < 30% of the peak
-            # This is more robust than an absolute threshold
             return_threshold = max(self.COMPOSITE_STANDING,
                                    self.rep_max_composite * 0.30)
             if composite < return_threshold:
-                # Only count rep if peak was deep enough AND above absolute minimum
                 if (self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
                         and self.rep_max_composite >= 0.45):
                     rep_info = self._finalize_rep(frame_idx, side_ratio)
-                    self.last_rep_frame = frame_idx  # only block next rep if we counted
+                    self.last_rep_frame = frame_idx
                 self.state = self.STANDING
 
         self.prev_composite = composite
@@ -611,7 +513,6 @@ def _choose_tip(down_s, top_s, rom):
     return "Keep the bar close and move smoothly"
 
 
-# ===================== SKELETON DRAWING =====================
 def _dyn_thickness(h):
     return max(2, int(round(h * 0.003))), max(3, int(round(h * 0.005)))
 
@@ -633,7 +534,6 @@ def draw_skeleton(frame, smoothed_pts, color=(255, 255, 255)):
     return frame
 
 
-# ===================== OVERLAY =====================
 def _wrap2(draw, text, font, maxw):
     words = text.split()
     if not words:
@@ -724,7 +624,6 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
     return out_f.astype(np.uint8)
 
 
-# ===================== POSE WRAPPER =====================
 class PoseEstimator:
     def __init__(self, model_path=None):
         self._impl    = None
@@ -766,7 +665,6 @@ class PoseEstimator:
             self._impl.__exit__(None, None, None)
 
 
-# ===================== ROTATION HELPERS =====================
 def get_video_rotation(video_path):
     try:
         result = subprocess.run(
@@ -805,22 +703,14 @@ def _apply_rotation(frame, angle):
     return frame
 
 
-# =====================================================================
-# PASS 1 — analysis only, stores per-frame data
-# =====================================================================
 def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
-    """
-    Runs mediapipe on sampled frames.
-    Stores per-frame {smoothed_pts, reps, feedback, composite} in frame_data.
-    Returns (analysis_result_dict, frame_data, effective_fps)
-    """
     import sys
     effective_fps  = max(1.0, fps_in / max(1, frame_skip))
     dt             = 1.0 / float(effective_fps)
 
-    rep_detector     = DeadliftRepDetector(fps=effective_fps)
+    rep_detector      = DeadliftRepDetector(fps=effective_fps)
     landmark_smoother = LandmarkSmoother(alpha=0.5, vis_threshold=0.35)
-    progress_ema     = EMA(0.35)
+    progress_ema      = EMA(0.35)
     progress_ema.value = 0.0
 
     frame_idx        = 0
@@ -868,9 +758,9 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
 
             def _store(snap, composite):
                 frame_data[frame_idx] = {
-                    "snap":     snap,
-                    "reps":     rep_detector.reps,
-                    "fb":       current_feedback if fb_hold > 0 else None,
+                    "snap":      snap,
+                    "reps":      rep_detector.reps,
+                    "fb":        current_feedback if fb_hold > 0 else None,
                     "composite": composite,
                 }
 
@@ -898,10 +788,9 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
             if fb_hold > 0:
                 fb_hold -= 1
 
-            _store(snap, composite)   # store AFTER rep count update
+            _store(snap, composite)
 
             if frame_idx % (frame_skip * 50) == 0:
-                fd_last = frame_data.get(frame_idx, {})
                 print(f"[DL] Pass1 fi={frame_idx} reps={rep_detector.reps} "
                       f"comp={composite:.3f} state={rep_detector.state}",
                       file=sys.stderr, flush=True)
@@ -941,15 +830,8 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
     return analysis, frame_data, effective_fps
 
 
-# =====================================================================
-# PASS 2 — video rendering from pass-1 data, NO mediapipe
-# =====================================================================
 def _render_pass(video_path, rotation, frame_skip, output_path,
                  out_w, out_h, work_w, work_h, fps_in, frame_data):
-    """
-    Re-reads video and draws skeleton + overlay at WORK resolution (small).
-    ffmpeg upscales to out_w x out_h afterward — much faster.
-    """
     import sys
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
 
@@ -957,8 +839,7 @@ def _render_pass(video_path, rotation, frame_skip, output_path,
     out    = cv2.VideoWriter(output_path, fourcc, effective_fps, (work_w, work_h))
 
     if not out.isOpened():
-        print(f"[DL] ERROR: VideoWriter failed to open {output_path} "
-              f"({work_w}x{work_h} @ {effective_fps:.1f}fps)", file=sys.stderr, flush=True)
+        print(f"[DL] ERROR: VideoWriter failed", file=sys.stderr, flush=True)
         return
 
     cap       = cv2.VideoCapture(video_path)
@@ -973,7 +854,6 @@ def _render_pass(video_path, rotation, frame_skip, output_path,
             continue
 
         frame = _apply_rotation(frame, rotation)
-        # Always work at small resolution
         if frame.shape[1] != work_w or frame.shape[0] != work_h:
             frame = cv2.resize(frame, (work_w, work_h))
 
@@ -995,9 +875,6 @@ def _render_pass(video_path, rotation, frame_skip, output_path,
     print(f"[DL] Pass2 done frames_written={written}", file=sys.stderr, flush=True)
 
 
-# =====================================================================
-# PUBLIC ENTRY POINT
-# =====================================================================
 def run_deadlift_analysis(video_path,
                           frame_skip=3,
                           scale=0.4,
@@ -1047,13 +924,11 @@ def run_deadlift_analysis(video_path,
                 "feedback": [f"Invalid video — only {total_frames} frames"],
                 "reps": [], "video_path": "", "feedback_path": feedback_path}
 
-    # Output dimensions (after rotation)
     if rotation % 360 in (90, 270):
         out_w, out_h = orig_h, orig_w
     else:
         out_w, out_h = orig_w, orig_h
 
-    # Working dimensions for analysis (scaled down)
     work_w = int(out_w * scale) if scale != 1.0 else out_w
     work_h = int(out_h * scale) if scale != 1.0 else out_h
     work_w = work_w if work_w % 2 == 0 else work_w + 1
@@ -1062,11 +937,9 @@ def run_deadlift_analysis(video_path,
     print(f"[DL] {total_frames}fr @ {fps_in:.1f}fps  out={out_w}x{out_h}  work={work_w}x{work_h}",
           file=sys.stderr, flush=True)
 
-    # === PASS 1 — analysis ===
     analysis, frame_data, effective_fps = _analysis_pass(
         video_path, rotation, frame_skip, scale, fps_in)
 
-    # Write feedback file
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
             f.write(f"Total Reps: {analysis['squat_count']}\n"
@@ -1076,14 +949,12 @@ def run_deadlift_analysis(video_path,
     except Exception as e:
         print(f"[DL] Warning feedback file: {e}")
 
-    # === PASS 2 — video rendering ===
     final_video_path = ""
     if create_video:
         print("[DL] Pass2 rendering video...", file=sys.stderr, flush=True)
         _render_pass(video_path, rotation, frame_skip, output_path,
                      out_w, out_h, work_w, work_h, fps_in, frame_data)
 
-        # Encode + upscale for browser compatibility
         encoded = output_path.replace(".mp4", "_encoded.mp4")
         try:
             proc = subprocess.run(
