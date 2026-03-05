@@ -494,14 +494,28 @@ class DeadliftRepDetector:
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
             if back_rounded and side_ratio >= 0.55:
                 rt_feedback = "Try to keep your back a bit straighter"
-            drop_from_peak = self.rep_max_composite - composite
-            if (self.hinge_frames >= self.MIN_HINGE_FRAMES
-                    and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
-                    and drop_from_peak >= 0.25):
-                import sys as _sys4
-                print(f"[DL] HINGING->RISING fi={frame_idx} hf={self.hinge_frames} "                      f"peak={self.rep_max_composite:.3f} drop={drop_from_peak:.3f}",
-                      file=_sys4.stderr, flush=True)
-                self.state = self.RISING
+
+            # Abort: if signal drops below HINGE_START while peak not yet reached,
+            # count consecutive low frames. After 5 low frames → not a real rep.
+            if composite < self.COMPOSITE_HINGE_START:
+                self._hinge_low_frames = getattr(self, '_hinge_low_frames', 0) + 1
+            else:
+                self._hinge_low_frames = 0
+
+            peak_reached = self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
+            if (not peak_reached and self._hinge_low_frames >= 5):
+                # Signal returned to baseline before real peak → noise, not a rep
+                self.state = self.STANDING
+                self._reset_rep_tracking()
+                self._pre_hinge_frames = 0
+                self._hinge_low_frames = 0
+            else:
+                drop_from_peak = self.rep_max_composite - composite
+                if (self.hinge_frames >= self.MIN_HINGE_FRAMES
+                        and peak_reached
+                        and drop_from_peak >= 0.25):
+                    self._hinge_low_frames = 0
+                    self.state = self.RISING
 
         elif self.state == self.RISING:
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
@@ -512,8 +526,6 @@ class DeadliftRepDetector:
             return_threshold = max(self.COMPOSITE_STANDING,
                                    self.rep_max_composite * 0.30)
             if composite < return_threshold:
-                import sys as _sys3
-                print(f"[DL] RISING->STANDING fi={frame_idx} peak={self.rep_max_composite:.3f} "                      f"deep={self.COMPOSITE_HINGE_DEEP:.3f} thresh={self.COMPOSITE_HINGE_DEEP*0.88:.3f} "                      f"abs_ok={self.rep_max_composite>=0.45}", file=_sys3.stderr, flush=True)
                 # Only count rep if peak was deep enough AND above absolute minimum
                 if (self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
                         and self.rep_max_composite >= 0.45):
