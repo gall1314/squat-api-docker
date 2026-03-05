@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — V4.4: fix false rep from walk-to-bar
-# Changes: stationary gate, knee_history 60 frames, hip-Y walk suppressor, deep_frames 12
+# deadlift_analysis.py — V4.4b: fix false first rep from walk-to-bar
+# Changes: stationary gate (first rep only), hip-Y walk suppressor
 
 import os, cv2, math, numpy as np, subprocess, json, time
 from collections import deque
@@ -236,7 +236,7 @@ class FrontViewSignal:
         if not is_symmetric:
             return self.signal_ema.update(0.0)
         self.knee_history.append(angle)
-        if len(self.knee_history) >= 60:
+        if len(self.knee_history) >= 30:
             sorted_k = sorted(self.knee_history)
             n = len(sorted_k)
             self.standing_knee_angle = sorted_k[max(0, int(n * 0.97))]
@@ -411,6 +411,8 @@ class DeadliftRepDetector:
             return composite, None, None
 
         # --- Stationary gate: track whether person is standing still ---
+        # Only used to gate the FIRST rep (walk-to-bar rejection).
+        # After first rep is counted, person is at bar, no gate needed.
         lh_pt = smoothed_pts.get(23)
         rh_pt = smoothed_pts.get(24)
         if lh_pt and rh_pt:
@@ -422,15 +424,13 @@ class DeadliftRepDetector:
                 ys = [p[1] for p in self._hip_center_history]
                 x_range = max(xs) - min(xs)
                 y_range = max(ys) - min(ys)
-                # Stationary: hip center barely moves (< 0.02 normalized)
                 if x_range < 0.025 and y_range < 0.020:
-                    self._stationary_frames += 1
+                    self._stationary_frames = min(self._stationary_frames + 1, 100)
                 else:
                     self._stationary_frames = max(0, self._stationary_frames - 2)
-            else:
-                self._stationary_frames = 0
 
-        is_stationary = self._stationary_frames >= 15
+        # Gate: require stationary only before the very first rep
+        first_rep_ready = (self.reps > 0) or (self._stationary_frames >= 15)
 
         if self.state == self.STANDING:
             if composite > self.COMPOSITE_HINGE_START:
@@ -438,7 +438,7 @@ class DeadliftRepDetector:
             else:
                 self._pre_hinge_frames = 0
             if (self._pre_hinge_frames >= 2
-                    and is_stationary
+                    and first_rep_ready
                     and (frame_idx - self.last_rep_frame > self.MIN_FRAMES_BETWEEN)):
                 self.state = self.HINGING
                 self.hinge_frames = 0
@@ -458,7 +458,7 @@ class DeadliftRepDetector:
             drop_from_peak = self.rep_max_composite - composite
             if (self.hinge_frames >= self.MIN_HINGE_FRAMES
                     and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
-                    and getattr(self, '_deep_frames', 0) >= 12
+                    and getattr(self, '_deep_frames', 0) >= 8
                     and drop_from_peak >= 0.25):
                 self._deep_frames = 0
                 self.state = self.RISING
@@ -475,9 +475,6 @@ class DeadliftRepDetector:
                     rep_info = self._finalize_rep(frame_idx, side_ratio)
                     self.last_rep_frame = frame_idx
                 self.state = self.STANDING
-                # Reset stationary gate so it must rebuild before next rep
-                self._stationary_frames = 0
-                self._hip_center_history.clear()
 
         self.prev_composite = composite
         return composite, rt_feedback, rep_info
