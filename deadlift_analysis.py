@@ -296,6 +296,7 @@ class DeadliftRepDetector:
         self._calibrated     = False
         self._cal_floor      = 0.0
         self._cal_range      = 0.50
+        self._post_cal_checked = False
 
     def _calibrate(self, composite):
         if self._calibrated:
@@ -410,6 +411,21 @@ class DeadliftRepDetector:
         if not self._calibrated:
             self.prev_composite = composite
             return composite, None, None
+
+        # V4.5: If calibration just completed and we're already mid-rep
+        # (composite is high), jump straight into HINGING so we don't
+        # miss the first rep. This handles side-view videos where the
+        # person starts their first rep before calibration finishes.
+        if (self.state == self.STANDING
+                and not getattr(self, '_post_cal_checked', False)):
+            self._post_cal_checked = True
+            if composite > self.COMPOSITE_HINGE_START:
+                self.state = self.HINGING
+                self.hinge_frames = 1
+                self._pre_hinge_frames = 0
+                self._deep_frames = 1 if composite >= self.COMPOSITE_HINGE_DEEP * 0.88 else 0
+                self._reset_rep_tracking()
+                self.rep_max_composite = composite
 
         if self.state == self.STANDING:
             if composite > self.COMPOSITE_HINGE_START:
