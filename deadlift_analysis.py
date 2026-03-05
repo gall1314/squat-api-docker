@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — V4.4b: fix false first rep from walk-to-bar
-# Changes: stationary gate (first rep only), hip-Y walk suppressor
+# deadlift_analysis.py — V4.5: fix false first rep from walk-to-bar
+# ONLY CHANGE from V4.3: FrontViewSignal resets knee_history when walking
+# stops, so baseline is learned from standing data only. No state machine changes.
 
 import os, cv2, math, numpy as np, subprocess, json, time
 from collections import deque
@@ -181,6 +182,8 @@ class FrontViewSignal:
         self.hip_x_ema    = EMA(0.3)
         self.prev_hip_x   = None
         self.walk_acc     = 0.0
+        # V4.5: track walk→stand transition for baseline reset
+        self._was_walking = False
 
     def _knee_angle(self, smoothed_pts):
         angles = []
@@ -207,26 +210,12 @@ class FrontViewSignal:
         rh = smoothed_pts.get(24)
         if lh and rh:
             hip_x = (lh[0] + rh[0]) / 2.0
-            hip_y = (lh[1] + rh[1]) / 2.0
             sx = self.hip_x_ema.update(hip_x)
             if self.prev_hip_x is not None:
                 dx = abs(sx - self.prev_hip_x)
                 self.walk_acc = self.walk_acc * 0.88 + dx
             self.prev_hip_x = sx
-            # Also track hip-Y variance (walking causes vertical oscillation)
-            self._hip_y_history = getattr(self, '_hip_y_history', deque(maxlen=30))
-            self._hip_y_history.append(hip_y)
-            if len(self._hip_y_history) >= 10:
-                y_std = float(np.std(list(self._hip_y_history)))
-                # Walking typically shows y_std > 0.008; standing < 0.004
-                y_walk = float(np.clip((y_std - 0.004) / 0.006, 0.0, 1.0))
-            else:
-                y_walk = 0.0
-        else:
-            y_walk = 0.0
-        x_supp = float(np.clip(1.0 - (self.walk_acc - 0.03) / 0.05, 0.0, 1.0))
-        # Combined: suppress if either X or Y indicates walking
-        return min(x_supp, 1.0 - y_walk)
+        return float(np.clip(1.0 - (self.walk_acc - 0.03) / 0.05, 0.0, 1.0))
 
     def update(self, smoothed_pts):
         self.frame_count += 1
@@ -235,6 +224,23 @@ class FrontViewSignal:
             return self.signal_ema.value if self.signal_ema.value is not None else 0.0
         if not is_symmetric:
             return self.signal_ema.update(0.0)
+
+        walk_supp = self._walk_suppressor(smoothed_pts)
+
+        # V4.5: detect walk→stand transition and reset knee baseline
+        # walk_acc > 0.06 means sustained lateral movement (walking)
+        # walk_acc < 0.035 means stopped
+        if self.walk_acc > 0.06:
+            self._was_walking = True
+        elif self._was_walking and self.walk_acc < 0.035:
+            # Walking just stopped — clear history so baseline rebuilds
+            # from standing-still data only
+            self.knee_history.clear()
+            self.standing_knee_angle = None
+            self.bent_knee_angle = None
+            self.signal_ema.reset()
+            self._was_walking = False
+
         self.knee_history.append(angle)
         if len(self.knee_history) >= 30:
             sorted_k = sorted(self.knee_history)
@@ -247,7 +253,6 @@ class FrontViewSignal:
         bent_ref  = min(self.bent_knee_angle or 90.0, standing - 20.0)
         rng = max(30.0, standing - bent_ref)
         raw = float(np.clip((standing - angle) / rng, 0.0, 1.0))
-        walk_supp = self._walk_suppressor(smoothed_pts)
         return self.signal_ema.update(raw * walk_supp)
 
 
@@ -291,12 +296,6 @@ class DeadliftRepDetector:
         self._calibrated     = False
         self._cal_floor      = 0.0
         self._cal_range      = 0.50
-        # Walk-to-bar gate: latch-based. Once person is stable, stays True.
-        # Only resets on sustained horizontal drift (actual walking).
-        self._hip_x_gate_ema  = None   # smoothed hip X for gate
-        self._stable_count    = 0      # frames of horizontal stability
-        self._was_stable      = False  # latch: True once stable detected
-        self._walk_drift_acc  = 0.0    # accumulated horizontal drift
 
     def _calibrate(self, composite):
         if self._calibrated:
@@ -391,9 +390,7 @@ class DeadliftRepDetector:
         if frame_idx % 150 == 0:
             view_str = "SIDE" if side_ratio >= 0.65 else ("FRONT" if side_ratio < 0.45 else "DIAG")
             print(f"[DL] F{frame_idx}: {view_str} sr={side_ratio:.2f} "
-                  f"sc={side_composite:.3f} fv={front_val:.3f} comp={composite:.3f} "
-                  f"st={self.state} gate={'ON' if self._was_stable else 'off'} "
-                  f"drift={self._walk_drift_acc:.4f}",
+                  f"sc={side_composite:.3f} fv={front_val:.3f} comp={composite:.3f} st={self.state}",
                   file=_sys.stderr, flush=True)
 
         head_pt = None
@@ -414,38 +411,12 @@ class DeadliftRepDetector:
             self.prev_composite = composite
             return composite, None, None
 
-        # --- Walk-to-bar gate (first rep only) ---
-        # Track horizontal hip drift. Deadlift hinge is vertical in front view
-        # but horizontal in side view — so we use a PERMANENT latch:
-        # once the person has been stable, they're at the bar. Period.
-        lh_pt = smoothed_pts.get(23)
-        rh_pt = smoothed_pts.get(24)
-        if not self._was_stable and lh_pt and rh_pt:
-            hc_x = (lh_pt[0] + rh_pt[0]) / 2.0
-            if self._hip_x_gate_ema is None:
-                self._hip_x_gate_ema = hc_x
-            else:
-                self._hip_x_gate_ema = 0.3 * hc_x + 0.7 * self._hip_x_gate_ema
-                dx = abs(hc_x - self._hip_x_gate_ema)
-                self._walk_drift_acc = self._walk_drift_acc * 0.85 + dx
-                if self._walk_drift_acc < 0.015:
-                    self._stable_count += 1
-                else:
-                    self._stable_count = max(0, self._stable_count - 3)
-                # Permanent latch: once stable for 8 frames, done
-                if self._stable_count >= 8:
-                    self._was_stable = True
-
-        # Gate: require stable-latch only before the very first rep
-        first_rep_ready = (self.reps > 0) or self._was_stable
-
         if self.state == self.STANDING:
             if composite > self.COMPOSITE_HINGE_START:
                 self._pre_hinge_frames = getattr(self, '_pre_hinge_frames', 0) + 1
             else:
                 self._pre_hinge_frames = 0
             if (self._pre_hinge_frames >= 2
-                    and first_rep_ready
                     and (frame_idx - self.last_rep_frame > self.MIN_FRAMES_BETWEEN)):
                 self.state = self.HINGING
                 self.hinge_frames = 0
