@@ -291,9 +291,12 @@ class DeadliftRepDetector:
         self._calibrated     = False
         self._cal_floor      = 0.0
         self._cal_range      = 0.50
-        # Stationary gate: track hip position stability to reject walking
-        self._hip_center_history = deque(maxlen=30)
-        self._stationary_frames  = 0
+        # Walk-to-bar gate: latch-based. Once person is stable, stays True.
+        # Only resets on sustained horizontal drift (actual walking).
+        self._hip_x_gate_ema  = None   # smoothed hip X for gate
+        self._stable_count    = 0      # frames of horizontal stability
+        self._was_stable      = False  # latch: True once stable detected
+        self._walk_drift_acc  = 0.0    # accumulated horizontal drift
 
     def _calibrate(self, composite):
         if self._calibrated:
@@ -389,7 +392,8 @@ class DeadliftRepDetector:
             view_str = "SIDE" if side_ratio >= 0.65 else ("FRONT" if side_ratio < 0.45 else "DIAG")
             print(f"[DL] F{frame_idx}: {view_str} sr={side_ratio:.2f} "
                   f"sc={side_composite:.3f} fv={front_val:.3f} comp={composite:.3f} "
-                  f"st={self.state} stat={self._stationary_frames}",
+                  f"st={self.state} gate={'ON' if self._was_stable else 'off'} "
+                  f"drift={self._walk_drift_acc:.4f}",
                   file=_sys.stderr, flush=True)
 
         head_pt = None
@@ -410,27 +414,35 @@ class DeadliftRepDetector:
             self.prev_composite = composite
             return composite, None, None
 
-        # --- Stationary gate: track whether person is standing still ---
-        # Only used to gate the FIRST rep (walk-to-bar rejection).
-        # After first rep is counted, person is at bar, no gate needed.
+        # --- Walk-to-bar gate (first rep only) ---
+        # Track horizontal hip drift. Deadlift hinge is vertical, walking is horizontal.
+        # Once person has been horizontally stable → latch on. Only sustained
+        # horizontal drift (walking) can unlatch.
         lh_pt = smoothed_pts.get(23)
         rh_pt = smoothed_pts.get(24)
         if lh_pt and rh_pt:
             hc_x = (lh_pt[0] + rh_pt[0]) / 2.0
-            hc_y = (lh_pt[1] + rh_pt[1]) / 2.0
-            self._hip_center_history.append((hc_x, hc_y))
-            if len(self._hip_center_history) >= 15:
-                xs = [p[0] for p in self._hip_center_history]
-                ys = [p[1] for p in self._hip_center_history]
-                x_range = max(xs) - min(xs)
-                y_range = max(ys) - min(ys)
-                if x_range < 0.025 and y_range < 0.020:
-                    self._stationary_frames = min(self._stationary_frames + 1, 100)
+            if self._hip_x_gate_ema is None:
+                self._hip_x_gate_ema = hc_x
+            else:
+                self._hip_x_gate_ema = 0.3 * hc_x + 0.7 * self._hip_x_gate_ema
+                dx = abs(hc_x - self._hip_x_gate_ema)
+                # Accumulate drift — walking causes sustained dx > 0.003
+                self._walk_drift_acc = self._walk_drift_acc * 0.85 + dx
+                if self._walk_drift_acc < 0.015:
+                    self._stable_count += 1
                 else:
-                    self._stationary_frames = max(0, self._stationary_frames - 2)
+                    self._stable_count = max(0, self._stable_count - 3)
+                # Latch on after 8 stable frames (~0.8s)
+                if self._stable_count >= 8:
+                    self._was_stable = True
+                # Unlatch only on strong sustained walking
+                if self._walk_drift_acc > 0.04:
+                    self._was_stable = False
+                    self._stable_count = 0
 
-        # Gate: require stationary only before the very first rep
-        first_rep_ready = (self.reps > 0) or (self._stationary_frames >= 15)
+        # Gate: require stable-latch only before the very first rep
+        first_rep_ready = (self.reps > 0) or self._was_stable
 
         if self.state == self.STANDING:
             if composite > self.COMPOSITE_HINGE_START:
