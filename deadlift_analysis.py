@@ -222,7 +222,7 @@ class FrontViewSignal:
         if not is_symmetric:
             return self.signal_ema.update(0.0)
         self.knee_history.append(angle)
-        if len(self.knee_history) >= 8:
+        if len(self.knee_history) >= 30:
             sorted_k = sorted(self.knee_history)
             n = len(sorted_k)
             self.standing_knee_angle = sorted_k[max(0, int(n * 0.97))]
