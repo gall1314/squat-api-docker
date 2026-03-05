@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — V4.3: restored from working version
-# ONE change from the version in doc5: calibration 50→5 frames + rng>=0.50 requirement
+# deadlift_analysis.py — V4.4: fix false rep from walk-to-bar
+# Changes: stationary gate, knee_history 60 frames, hip-Y walk suppressor, deep_frames 12
 
 import os, cv2, math, numpy as np, subprocess, json, time
 from collections import deque
@@ -207,12 +207,26 @@ class FrontViewSignal:
         rh = smoothed_pts.get(24)
         if lh and rh:
             hip_x = (lh[0] + rh[0]) / 2.0
+            hip_y = (lh[1] + rh[1]) / 2.0
             sx = self.hip_x_ema.update(hip_x)
             if self.prev_hip_x is not None:
                 dx = abs(sx - self.prev_hip_x)
                 self.walk_acc = self.walk_acc * 0.88 + dx
             self.prev_hip_x = sx
-        return float(np.clip(1.0 - (self.walk_acc - 0.03) / 0.05, 0.0, 1.0))
+            # Also track hip-Y variance (walking causes vertical oscillation)
+            self._hip_y_history = getattr(self, '_hip_y_history', deque(maxlen=30))
+            self._hip_y_history.append(hip_y)
+            if len(self._hip_y_history) >= 10:
+                y_std = float(np.std(list(self._hip_y_history)))
+                # Walking typically shows y_std > 0.008; standing < 0.004
+                y_walk = float(np.clip((y_std - 0.004) / 0.006, 0.0, 1.0))
+            else:
+                y_walk = 0.0
+        else:
+            y_walk = 0.0
+        x_supp = float(np.clip(1.0 - (self.walk_acc - 0.03) / 0.05, 0.0, 1.0))
+        # Combined: suppress if either X or Y indicates walking
+        return min(x_supp, 1.0 - y_walk)
 
     def update(self, smoothed_pts):
         self.frame_count += 1
@@ -222,7 +236,7 @@ class FrontViewSignal:
         if not is_symmetric:
             return self.signal_ema.update(0.0)
         self.knee_history.append(angle)
-        if len(self.knee_history) >= 30:
+        if len(self.knee_history) >= 60:
             sorted_k = sorted(self.knee_history)
             n = len(sorted_k)
             self.standing_knee_angle = sorted_k[max(0, int(n * 0.97))]
@@ -277,6 +291,9 @@ class DeadliftRepDetector:
         self._calibrated     = False
         self._cal_floor      = 0.0
         self._cal_range      = 0.50
+        # Stationary gate: track hip position stability to reject walking
+        self._hip_center_history = deque(maxlen=30)
+        self._stationary_frames  = 0
 
     def _calibrate(self, composite):
         if self._calibrated:
@@ -371,7 +388,8 @@ class DeadliftRepDetector:
         if frame_idx % 150 == 0:
             view_str = "SIDE" if side_ratio >= 0.65 else ("FRONT" if side_ratio < 0.45 else "DIAG")
             print(f"[DL] F{frame_idx}: {view_str} sr={side_ratio:.2f} "
-                  f"sc={side_composite:.3f} fv={front_val:.3f} comp={composite:.3f} st={self.state}",
+                  f"sc={side_composite:.3f} fv={front_val:.3f} comp={composite:.3f} "
+                  f"st={self.state} stat={self._stationary_frames}",
                   file=_sys.stderr, flush=True)
 
         head_pt = None
@@ -392,12 +410,35 @@ class DeadliftRepDetector:
             self.prev_composite = composite
             return composite, None, None
 
+        # --- Stationary gate: track whether person is standing still ---
+        lh_pt = smoothed_pts.get(23)
+        rh_pt = smoothed_pts.get(24)
+        if lh_pt and rh_pt:
+            hc_x = (lh_pt[0] + rh_pt[0]) / 2.0
+            hc_y = (lh_pt[1] + rh_pt[1]) / 2.0
+            self._hip_center_history.append((hc_x, hc_y))
+            if len(self._hip_center_history) >= 15:
+                xs = [p[0] for p in self._hip_center_history]
+                ys = [p[1] for p in self._hip_center_history]
+                x_range = max(xs) - min(xs)
+                y_range = max(ys) - min(ys)
+                # Stationary: hip center barely moves (< 0.02 normalized)
+                if x_range < 0.025 and y_range < 0.020:
+                    self._stationary_frames += 1
+                else:
+                    self._stationary_frames = max(0, self._stationary_frames - 2)
+            else:
+                self._stationary_frames = 0
+
+        is_stationary = self._stationary_frames >= 15
+
         if self.state == self.STANDING:
             if composite > self.COMPOSITE_HINGE_START:
                 self._pre_hinge_frames = getattr(self, '_pre_hinge_frames', 0) + 1
             else:
                 self._pre_hinge_frames = 0
             if (self._pre_hinge_frames >= 2
+                    and is_stationary
                     and (frame_idx - self.last_rep_frame > self.MIN_FRAMES_BETWEEN)):
                 self.state = self.HINGING
                 self.hinge_frames = 0
@@ -417,7 +458,7 @@ class DeadliftRepDetector:
             drop_from_peak = self.rep_max_composite - composite
             if (self.hinge_frames >= self.MIN_HINGE_FRAMES
                     and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
-                    and getattr(self, '_deep_frames', 0) >= 8
+                    and getattr(self, '_deep_frames', 0) >= 12
                     and drop_from_peak >= 0.25):
                 self._deep_frames = 0
                 self.state = self.RISING
@@ -434,6 +475,9 @@ class DeadliftRepDetector:
                     rep_info = self._finalize_rep(frame_idx, side_ratio)
                     self.last_rep_frame = frame_idx
                 self.state = self.STANDING
+                # Reset stationary gate so it must rebuild before next rep
+                self._stationary_frames = 0
+                self._hip_center_history.clear()
 
         self.prev_composite = composite
         return composite, rt_feedback, rep_info
