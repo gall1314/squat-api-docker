@@ -410,27 +410,40 @@ class DeadliftRepDetector:
         self._calibrate(composite)
 
         if not self._calibrated:
-            # V4.5: Track composite peak during calibration for retroactive rep detection
+            # V4.5: Track peaks during calibration for retroactive rep detection
             self._cal_max_composite = max(self._cal_max_composite, composite)
+            self._cal_max_side_composite = max(
+                getattr(self, '_cal_max_side_composite', 0.0), side_composite)
             self._cal_frame_count += 1
+            # Track early side_composite values for started_high check
+            if self._cal_frame_count <= 3:
+                self._cal_early_side = getattr(self, '_cal_early_side', [])
+                self._cal_early_side.append(side_composite)
             self.prev_composite = composite
             return composite, None, None
 
         # V4.5: Retroactive first-rep detection.
-        # If during calibration the composite went high (person was bent) and now
-        # it's low (person is standing), a full rep occurred during calibration.
-        # Safety: only if FIRST few signals were high (person started bent, not walking).
+        # If during calibration the person was bent and now standing, count first rep.
+        # Use BOTH composite and side_composite peaks to handle diagonal views
+        # where composite=front_val=0 but side_composite is high.
         if not getattr(self, '_cal_retro_checked', False):
             self._cal_retro_checked = True
-            cal_peak = self._cal_max_composite
-            early_signals = self._cal_signals[:3] if len(self._cal_signals) >= 3 else []
-            started_high = (len(early_signals) >= 3
-                            and (sum(early_signals) / len(early_signals)) > self.COMPOSITE_HINGE_START)
+            cal_peak = max(self._cal_max_composite,
+                           getattr(self, '_cal_max_side_composite', 0.0))
+            # Check if started high using either composite or side_composite
+            early_comp = self._cal_signals[:3] if len(self._cal_signals) >= 3 else []
+            early_side = getattr(self, '_cal_early_side', [])
+            started_high_comp = (len(early_comp) >= 3
+                                 and (sum(early_comp) / len(early_comp)) > self.COMPOSITE_HINGE_START)
+            started_high_side = (len(early_side) >= 3
+                                 and (sum(early_side) / len(early_side)) > self.COMPOSITE_HINGE_START)
+            started_high = started_high_comp or started_high_side
             if (started_high
                     and cal_peak >= self.COMPOSITE_HINGE_DEEP * 0.88
-                    and composite < self.COMPOSITE_STANDING + 0.05
+                    and composite < self.COMPOSITE_STANDING + 0.10
+                    and side_composite < self.COMPOSITE_STANDING + 0.10
                     and self._cal_frame_count >= 8
-                    and (cal_peak - composite) >= 0.25):
+                    and (cal_peak - min(composite, side_composite)) >= 0.25):
                 rep_info = self._finalize_rep(frame_idx, side_ratio)
                 self.last_rep_frame = frame_idx
 
