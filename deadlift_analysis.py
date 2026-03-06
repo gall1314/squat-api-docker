@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — V4.3: restored from working version
-# ONE change from the version in doc5: calibration 50→5 frames + rng>=0.50 requirement
+# deadlift_analysis.py — V4.5: fix false first rep from walk-to-bar
+# ONLY CHANGE from V4.3: FrontViewSignal resets knee_history when walking
+# stops, so baseline is learned from standing data only. No state machine changes.
 
 import os, cv2, math, numpy as np, subprocess, json, time
 from collections import deque
@@ -181,6 +182,8 @@ class FrontViewSignal:
         self.hip_x_ema    = EMA(0.3)
         self.prev_hip_x   = None
         self.walk_acc     = 0.0
+        # V4.5: track walk→stand transition for baseline reset
+        self._was_walking = False
 
     def _knee_angle(self, smoothed_pts):
         angles = []
@@ -221,8 +224,25 @@ class FrontViewSignal:
             return self.signal_ema.value if self.signal_ema.value is not None else 0.0
         if not is_symmetric:
             return self.signal_ema.update(0.0)
+
+        walk_supp = self._walk_suppressor(smoothed_pts)
+
+        # V4.5: detect walk→stand transition and reset knee baseline
+        # walk_acc > 0.06 means sustained lateral movement (walking)
+        # walk_acc < 0.035 means stopped
+        if self.walk_acc > 0.06:
+            self._was_walking = True
+        elif self._was_walking and self.walk_acc < 0.035:
+            # Walking just stopped — clear history so baseline rebuilds
+            # from standing-still data only
+            self.knee_history.clear()
+            self.standing_knee_angle = None
+            self.bent_knee_angle = None
+            self.signal_ema.reset()
+            self._was_walking = False
+
         self.knee_history.append(angle)
-        if len(self.knee_history) >= 8:
+        if len(self.knee_history) >= 30:
             sorted_k = sorted(self.knee_history)
             n = len(sorted_k)
             self.standing_knee_angle = sorted_k[max(0, int(n * 0.97))]
@@ -233,7 +253,6 @@ class FrontViewSignal:
         bent_ref  = min(self.bent_knee_angle or 90.0, standing - 20.0)
         rng = max(30.0, standing - bent_ref)
         raw = float(np.clip((standing - angle) / rng, 0.0, 1.0))
-        walk_supp = self._walk_suppressor(smoothed_pts)
         return self.signal_ema.update(raw * walk_supp)
 
 
@@ -291,12 +310,15 @@ class DeadliftRepDetector:
 
         self._cal_signals.append(composite)
 
-        if len(self._cal_signals) >= 90:
+        if len(self._cal_signals) >= 5:
             true_floor = float(np.min(self._cal_signals))
             true_ceil  = float(np.percentile(self._cal_signals, 98))
             raw_rng    = true_ceil - true_floor
 
             # Need meaningful range OR 30 frames collected
+            if raw_rng < 0.50 and len(self._cal_signals) < 30:
+                return
+
             rng = max(0.50, raw_rng)
             self._cal_floor = true_floor
             self._cal_range = rng
@@ -399,6 +421,7 @@ class DeadliftRepDetector:
                 self.state = self.HINGING
                 self.hinge_frames = 0
                 self._pre_hinge_frames = 0
+                self._deep_frames = 0
                 self._reset_rep_tracking()
 
         elif self.state == self.HINGING:
@@ -407,10 +430,15 @@ class DeadliftRepDetector:
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
             if back_rounded and side_ratio >= 0.55:
                 rt_feedback = "Try to keep your back a bit straighter"
+            # Count frames spent above the deep threshold (real reps stay there, spikes don't)
+            if composite >= self.COMPOSITE_HINGE_DEEP * 0.88:
+                self._deep_frames = getattr(self, '_deep_frames', 0) + 1
             drop_from_peak = self.rep_max_composite - composite
             if (self.hinge_frames >= self.MIN_HINGE_FRAMES
                     and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
+                    and getattr(self, '_deep_frames', 0) >= 8
                     and drop_from_peak >= 0.25):
+                self._deep_frames = 0
                 self.state = self.RISING
 
         elif self.state == self.RISING:
