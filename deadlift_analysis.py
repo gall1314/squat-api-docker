@@ -251,6 +251,11 @@ class FrontViewSignal:
             return self.signal_ema.update(0.0)
         standing = self.standing_knee_angle
         bent_ref  = min(self.bent_knee_angle or 90.0, standing - 20.0)
+        actual_rng = standing - (self.bent_knee_angle or 90.0)
+        # V4.5: Require minimum observed knee range to produce signal.
+        # Minor posture changes (< 20°) are not real deadlift hinge motion.
+        if actual_rng < 20.0:
+            return self.signal_ema.update(0.0)
         rng = max(30.0, standing - bent_ref)
         raw = float(np.clip((standing - angle) / rng, 0.0, 1.0))
         return self.signal_ema.update(raw * walk_supp)
