@@ -296,6 +296,8 @@ class DeadliftRepDetector:
         self._calibrated     = False
         self._cal_floor      = 0.0
         self._cal_range      = 0.50
+        self._cal_max_composite = 0.0   # V4.5: track peak during calibration
+        self._cal_frame_count   = 0     # V4.5: frames during calibration
 
     def _calibrate(self, composite):
         if self._calibrated:
@@ -408,8 +410,30 @@ class DeadliftRepDetector:
         self._calibrate(composite)
 
         if not self._calibrated:
+            # V4.5: Track composite peak during calibration for retroactive rep detection
+            self._cal_max_composite = max(self._cal_max_composite, composite)
+            self._cal_frame_count += 1
             self.prev_composite = composite
             return composite, None, None
+
+        # V4.5: Retroactive first-rep detection.
+        # If during calibration the composite went high (person was bent) and now
+        # it's low (person is standing), a full rep occurred during calibration.
+        # Safety: only if FIRST few signals were high (person started bent, not walking).
+        if not getattr(self, '_cal_retro_checked', False):
+            self._cal_retro_checked = True
+            cal_peak = self._cal_max_composite
+            early_signals = self._cal_signals[:3] if len(self._cal_signals) >= 3 else []
+            started_high = (len(early_signals) >= 3
+                            and (sum(early_signals) / len(early_signals)) > self.COMPOSITE_HINGE_START)
+            if (started_high
+                    and cal_peak >= self.COMPOSITE_HINGE_DEEP * 0.88
+                    and cal_peak >= 0.45
+                    and composite < self.COMPOSITE_STANDING + 0.05
+                    and self._cal_frame_count >= 8
+                    and (cal_peak - composite) >= 0.25):
+                rep_info = self._finalize_rep(frame_idx, side_ratio)
+                self.last_rep_frame = frame_idx
 
         if self.state == self.STANDING:
             if composite > self.COMPOSITE_HINGE_START:
