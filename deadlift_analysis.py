@@ -428,7 +428,6 @@ class DeadliftRepDetector:
                             and (sum(early_signals) / len(early_signals)) > self.COMPOSITE_HINGE_START)
             if (started_high
                     and cal_peak >= self.COMPOSITE_HINGE_DEEP * 0.88
-                    and cal_peak >= 0.45
                     and composite < self.COMPOSITE_STANDING + 0.05
                     and self._cal_frame_count >= 8
                     and (cal_peak - composite) >= 0.25):
