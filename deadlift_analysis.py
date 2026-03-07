@@ -902,6 +902,38 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
 
     print(f"[DL] Pass1 done reps={rep_detector.reps}", file=sys.stderr, flush=True)
 
+    # V4.5: Post-analysis putdown filter.
+    # After the last real rep, the lifter puts the bar down and stands up.
+    # This "stand up" can be falsely counted as a rep. Detect and remove it.
+    # Heuristic: if last rep's gap from previous rep is much larger than
+    # the average inter-rep gap, and it's near the end of the video.
+    total_processed = frame_idx  # last frame_idx from the loop
+    if len(rep_detector.reps_report) >= 3:
+        # Get frame indices from rep timing (approximate from rep_index and last_rep_frame)
+        # Use the frame_data to find when each rep was counted
+        rep_frames = []
+        for fi in sorted(frame_data.keys()):
+            fd = frame_data[fi]
+            if fd["reps"] > len(rep_frames):
+                rep_frames.append(fi)
+        if len(rep_frames) >= 3:
+            gaps = [rep_frames[i] - rep_frames[i-1] for i in range(1, len(rep_frames))]
+            last_gap = gaps[-1]
+            avg_gap = sum(gaps[:-1]) / len(gaps[:-1])  # average of gaps EXCLUDING last
+            last_rep_late = rep_frames[-1] > total_processed * 0.75  # in last 25% of video
+            if avg_gap > 0 and last_gap > avg_gap * 1.5 and last_rep_late:
+                print(f"[DL] PUTDOWN FILTER: removing last rep "
+                      f"(gaps={gaps}, avg={avg_gap:.0f}, last={last_gap}, "
+                      f"ratio={last_gap/avg_gap:.1f}x, late={last_rep_late})",
+                      file=sys.stderr, flush=True)
+                removed = rep_detector.reps_report.pop()
+                rep_detector.all_scores.pop()
+                rep_detector.reps -= 1
+                if float(removed.get("score") or 0) >= 10.0:
+                    rep_detector.good_reps = max(0, rep_detector.good_reps - 1)
+                else:
+                    rep_detector.bad_reps = max(0, rep_detector.bad_reps - 1)
+
     avg = float(np.mean(rep_detector.all_scores)) if rep_detector.all_scores else 0.0
     if not np.isfinite(avg):
         avg = 0.0
