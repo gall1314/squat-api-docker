@@ -452,13 +452,33 @@ class DeadliftRepDetector:
                                  and (sum(early_comp) / len(early_comp)) > self.COMPOSITE_HINGE_START)
             started_high = started_high_comp or started_high_side
 
+            import sys as _sys2
+            print(f"[DL] RETRO CHECK: avg_sr={avg_sr:.3f} use_side={use_side} "
+                  f"cal_peak={cal_peak:.3f} comp={composite:.3f} "
+                  f"started_high={started_high} (comp={started_high_comp} side={started_high_side}) "
+                  f"early_side={[f'{x:.3f}' for x in self._cal_early_side]} "
+                  f"early_comp={[f'{x:.3f}' for x in early_comp[:3]]} "
+                  f"DEEP={self.COMPOSITE_HINGE_DEEP:.3f} STAND={self.COMPOSITE_STANDING:.3f} "
+                  f"cal_fc={self._cal_frame_count} "
+                  f"max_sc={self._cal_max_side_composite:.3f}",
+                  file=_sys2.stderr, flush=True)
+
             if (started_high
                     and cal_peak >= self.COMPOSITE_HINGE_DEEP * 0.88
                     and composite < self.COMPOSITE_STANDING + 0.10
                     and self._cal_frame_count >= 8
                     and (cal_peak - composite) >= 0.25):
+                print(f"[DL] RETRO REP COUNTED!", file=_sys2.stderr, flush=True)
                 rep_info = self._finalize_rep(frame_idx, side_ratio)
                 self.last_rep_frame = frame_idx
+            else:
+                reasons = []
+                if not started_high: reasons.append("started_high=F")
+                if not (cal_peak >= self.COMPOSITE_HINGE_DEEP * 0.88): reasons.append(f"peak({cal_peak:.3f})<deep*0.88({self.COMPOSITE_HINGE_DEEP*0.88:.3f})")
+                if not (composite < self.COMPOSITE_STANDING + 0.10): reasons.append(f"comp({composite:.3f})>=stand+0.10({self.COMPOSITE_STANDING+0.10:.3f})")
+                if not (self._cal_frame_count >= 8): reasons.append(f"frames({self._cal_frame_count})<8")
+                if not ((cal_peak - composite) >= 0.25): reasons.append(f"drop({cal_peak-composite:.3f})<0.25")
+                print(f"[DL] RETRO REJECTED: {', '.join(reasons)}", file=_sys2.stderr, flush=True)
 
         if self.state == self.STANDING:
             if composite > self.COMPOSITE_HINGE_START:
