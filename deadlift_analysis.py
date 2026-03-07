@@ -549,12 +549,12 @@ class DeadliftRepDetector:
                 and self.prev_torso_raw is not None):
             dk  = knee_angle - self.prev_knee_angle
             dta = torso_angle - self.prev_torso_raw
-            if (abs(dk) > 3.0 and abs(dta) < 0.8) or (abs(dta) > 3.0 and abs(dk) < 0.8):
+            if (abs(dk) > 4.0 and abs(dta) < 1.0) or (abs(dta) > 4.0 and abs(dk) < 1.0):
                 self.rep_leg_back_mismatch_frames += 1
         self.prev_knee_angle = knee_angle
         self.prev_torso_raw  = torso_angle
 
-    def _check_back_rounding(self, shoulder, hip, head, max_angle=28.0):
+    def _check_back_rounding(self, shoulder, hip, head, max_angle=32.0):
         tv   = shoulder - hip
         hv   = head - shoulder
         tn   = np.linalg.norm(tv) + 1e-9
@@ -568,18 +568,22 @@ class DeadliftRepDetector:
         dt = 1.0 / max(1, self.fps)
         penalty = 0.0
         fb = []
-        if side_ratio >= 0.55 and self.rep_back_rounding_frames >= max(5, int(0.5 / dt)):
+        # Back rounding: need sustained rounding (>0.8s) at clear angle (>32°)
+        if side_ratio >= 0.55 and self.rep_back_rounding_frames >= max(8, int(0.8 / dt)):
             fb.append("Try to keep your back a bit straighter")
-            penalty += 1.0
-        if self.rep_leg_back_mismatch_frames >= max(6, int(0.6 / dt)):
+            penalty += 1.5
+        # Leg-back mismatch: need clear independent movement (>4° diff for >0.8s)
+        if self.rep_leg_back_mismatch_frames >= max(8, int(0.8 / dt)):
             fb.append("Drive the back up with the legs evenly")
-            penalty += 0.5
-        if self.rep_max_composite < self.COMPOSITE_HINGE_DEEP * 0.60:
+            penalty += 1.0
+        # Depth: only flag if very shallow
+        if self.rep_max_composite < self.COMPOSITE_HINGE_DEEP * 0.50:
             fb.append("Try to hinge a bit deeper")
             penalty += 0.5
         score = round(max(4, 10 - penalty) * 2) / 2.0
-        if score >= 7.5: self.good_reps += 1
-        else:            self.bad_reps  += 1
+        # Proper rep = perfect score (10), no feedback at all
+        if score >= 10.0: self.good_reps += 1
+        else:             self.bad_reps  += 1
         down_s = self.rep_down_frames * dt
         top_s  = self.rep_top_hold_frames * dt
         tip = _choose_tip(down_s, top_s, self.rep_max_composite)
