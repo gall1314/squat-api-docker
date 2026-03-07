@@ -549,12 +549,12 @@ class DeadliftRepDetector:
                 and self.prev_torso_raw is not None):
             dk  = knee_angle - self.prev_knee_angle
             dta = torso_angle - self.prev_torso_raw
-            if (abs(dk) > 1.5 and abs(dta) < 0.3) or (abs(dta) > 1.5 and abs(dk) < 0.3):
+            if (abs(dk) > 3.0 and abs(dta) < 0.8) or (abs(dta) > 3.0 and abs(dk) < 0.8):
                 self.rep_leg_back_mismatch_frames += 1
         self.prev_knee_angle = knee_angle
         self.prev_torso_raw  = torso_angle
 
-    def _check_back_rounding(self, shoulder, hip, head, max_angle=22.0):
+    def _check_back_rounding(self, shoulder, hip, head, max_angle=28.0):
         tv   = shoulder - hip
         hv   = head - shoulder
         tn   = np.linalg.norm(tv) + 1e-9
@@ -568,17 +568,17 @@ class DeadliftRepDetector:
         dt = 1.0 / max(1, self.fps)
         penalty = 0.0
         fb = []
-        if side_ratio >= 0.55 and self.rep_back_rounding_frames >= max(3, int(0.3 / dt)):
+        if side_ratio >= 0.55 and self.rep_back_rounding_frames >= max(5, int(0.5 / dt)):
             fb.append("Try to keep your back a bit straighter")
-            penalty += 1.5
-        if self.rep_leg_back_mismatch_frames >= max(4, int(0.4 / dt)):
-            fb.append("Drive the back up with the legs evenly")
             penalty += 1.0
-        if self.rep_max_composite < self.COMPOSITE_HINGE_DEEP * 0.75:
+        if self.rep_leg_back_mismatch_frames >= max(6, int(0.6 / dt)):
+            fb.append("Drive the back up with the legs evenly")
+            penalty += 0.5
+        if self.rep_max_composite < self.COMPOSITE_HINGE_DEEP * 0.60:
             fb.append("Try to hinge a bit deeper")
             penalty += 0.5
         score = round(max(4, 10 - penalty) * 2) / 2.0
-        if score >= 9.5: self.good_reps += 1
+        if score >= 7.5: self.good_reps += 1
         else:            self.bad_reps  += 1
         down_s = self.rep_down_frames * dt
         top_s  = self.rep_top_hold_frames * dt
