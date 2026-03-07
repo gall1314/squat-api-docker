@@ -436,7 +436,7 @@ class DeadliftRepDetector:
         if not getattr(self, '_cal_retro_checked', False):
             self._cal_retro_checked = True
             avg_sr = self._cal_side_ratio_sum / max(1, self._cal_frame_count)
-            use_side = avg_sr >= 0.45
+            use_side = avg_sr >= 0.30
 
             if use_side:
                 cal_peak = max(self._cal_max_composite, self._cal_max_side_composite)
