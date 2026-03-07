@@ -301,8 +301,11 @@ class DeadliftRepDetector:
         self._calibrated     = False
         self._cal_floor      = 0.0
         self._cal_range      = 0.50
-        self._cal_max_composite = 0.0   # V4.5: track peak during calibration
-        self._cal_frame_count   = 0     # V4.5: frames during calibration
+        self._cal_max_composite = 0.0       # V4.5: track peak during calibration
+        self._cal_max_side_composite = 0.0  # V4.5: track side_composite peak
+        self._cal_frame_count   = 0         # V4.5: frames during calibration
+        self._cal_early_side    = []        # V4.5: first 3 side_composite values
+        self._cal_side_ratio_sum = 0.0      # V4.5: sum of side_ratio for averaging
 
     def _calibrate(self, composite):
         if self._calibrated:
@@ -417,13 +420,10 @@ class DeadliftRepDetector:
         if not self._calibrated:
             # V4.5: Track peaks during calibration for retroactive rep detection
             self._cal_max_composite = max(self._cal_max_composite, composite)
-            self._cal_max_side_composite = max(
-                getattr(self, '_cal_max_side_composite', 0.0), side_composite)
+            self._cal_max_side_composite = max(self._cal_max_side_composite, side_composite)
             self._cal_frame_count += 1
-            # Track early values and average side_ratio
-            self._cal_side_ratio_sum = getattr(self, '_cal_side_ratio_sum', 0.0) + side_ratio
+            self._cal_side_ratio_sum += side_ratio
             if self._cal_frame_count <= 3:
-                self._cal_early_side = getattr(self, '_cal_early_side', [])
                 self._cal_early_side.append(side_composite)
             self.prev_composite = composite
             return composite, None, None
@@ -435,13 +435,12 @@ class DeadliftRepDetector:
         # which starts at 0 (FrontViewSignal needs warmup) → no false retro.
         if not getattr(self, '_cal_retro_checked', False):
             self._cal_retro_checked = True
-            avg_sr = getattr(self, '_cal_side_ratio_sum', 0.0) / max(1, self._cal_frame_count)
+            avg_sr = self._cal_side_ratio_sum / max(1, self._cal_frame_count)
             use_side = avg_sr >= 0.45
 
             if use_side:
-                cal_peak = max(self._cal_max_composite,
-                               getattr(self, '_cal_max_side_composite', 0.0))
-                early_side = getattr(self, '_cal_early_side', [])
+                cal_peak = max(self._cal_max_composite, self._cal_max_side_composite)
+                early_side = self._cal_early_side
                 started_high_side = (len(early_side) >= 3
                                      and (sum(early_side) / len(early_side)) > self.COMPOSITE_HINGE_START)
             else:
