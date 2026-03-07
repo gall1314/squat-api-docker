@@ -496,6 +496,8 @@ class DeadliftRepDetector:
         elif self.state == self.HINGING:
             self.hinge_frames += 1
             self.rep_max_composite = max(self.rep_max_composite, composite)
+            self._rep_sr_sum += side_ratio
+            self._rep_sr_count += 1
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
             if back_rounded and side_ratio >= 0.70:
                 rt_feedback = "Try to keep your back a bit straighter"
@@ -511,6 +513,8 @@ class DeadliftRepDetector:
                 self.state = self.RISING
 
         elif self.state == self.RISING:
+            self._rep_sr_sum += side_ratio
+            self._rep_sr_count += 1
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
             if back_rounded and side_ratio >= 0.70:
                 rt_feedback = "Try to keep your back a bit straighter"
@@ -519,7 +523,8 @@ class DeadliftRepDetector:
             if composite < return_threshold:
                 if (self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
                         and self.rep_max_composite >= 0.45):
-                    rep_info = self._finalize_rep(frame_idx, side_ratio)
+                    avg_rep_sr = self._rep_sr_sum / max(1, self._rep_sr_count)
+                    rep_info = self._finalize_rep(frame_idx, avg_rep_sr)
                     self.last_rep_frame = frame_idx
                 self.state = self.STANDING
 
@@ -535,6 +540,8 @@ class DeadliftRepDetector:
         self.rep_top_hold_frames = 0
         self.prev_knee_angle = None
         self.prev_torso_raw = None
+        self._rep_sr_sum = 0.0
+        self._rep_sr_count = 0
 
     def _track_rep_quality(self, composite, back_rounded, knee_angle, torso_angle):
         if back_rounded:
