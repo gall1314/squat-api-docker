@@ -578,8 +578,9 @@ class DeadliftRepDetector:
             if self.rep_leg_back_mismatch_frames >= max(6, int(0.5 / dt)):
                 fb.append("Drive the back up with the legs evenly")
                 penalty += 1.0
-        # Depth: checked from any angle
-        if self.rep_max_composite < self.COMPOSITE_HINGE_DEEP * 0.50:
+        # Depth: only from side view where depth is reliably measured,
+        # and only if significantly shallow (< 35% of calibrated deep)
+        if side_ratio >= 0.70 and self.rep_max_composite < self.COMPOSITE_HINGE_DEEP * 0.35:
             fb.append("Try to hinge a bit deeper")
             penalty += 0.5
         score = round(max(4, 10 - penalty) * 2) / 2.0
