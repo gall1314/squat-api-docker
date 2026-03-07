@@ -497,7 +497,7 @@ class DeadliftRepDetector:
             self.hinge_frames += 1
             self.rep_max_composite = max(self.rep_max_composite, composite)
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
-            if back_rounded and side_ratio >= 0.55:
+            if back_rounded and side_ratio >= 0.70:
                 rt_feedback = "Try to keep your back a bit straighter"
             # Count frames spent above the deep threshold (real reps stay there, spikes don't)
             if composite >= self.COMPOSITE_HINGE_DEEP * 0.88:
@@ -512,7 +512,7 @@ class DeadliftRepDetector:
 
         elif self.state == self.RISING:
             self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
-            if back_rounded and side_ratio >= 0.55:
+            if back_rounded and side_ratio >= 0.70:
                 rt_feedback = "Try to keep your back a bit straighter"
             return_threshold = max(self.COMPOSITE_STANDING,
                                    self.rep_max_composite * 0.30)
@@ -568,20 +568,21 @@ class DeadliftRepDetector:
         dt = 1.0 / max(1, self.fps)
         penalty = 0.0
         fb = []
-        # Back rounding: side/diagonal view, sustained for >0.5s
-        if side_ratio >= 0.55 and self.rep_back_rounding_frames >= max(6, int(0.5 / dt)):
-            fb.append("Try to keep your back a bit straighter")
-            penalty += 1.5
-        # Leg-back mismatch: sustained for >0.5s
-        if self.rep_leg_back_mismatch_frames >= max(6, int(0.5 / dt)):
-            fb.append("Drive the back up with the legs evenly")
-            penalty += 1.0
-        # Depth: only flag if clearly shallow
+        # Back rounding & mismatch: ONLY from clear side view (>=0.70)
+        # From diagonal/front, head and joint landmarks are too noisy
+        # for reliable form assessment — only depth is checked.
+        if side_ratio >= 0.70:
+            if self.rep_back_rounding_frames >= max(6, int(0.5 / dt)):
+                fb.append("Try to keep your back a bit straighter")
+                penalty += 1.5
+            if self.rep_leg_back_mismatch_frames >= max(6, int(0.5 / dt)):
+                fb.append("Drive the back up with the legs evenly")
+                penalty += 1.0
+        # Depth: checked from any angle
         if self.rep_max_composite < self.COMPOSITE_HINGE_DEEP * 0.50:
             fb.append("Try to hinge a bit deeper")
             penalty += 0.5
         score = round(max(4, 10 - penalty) * 2) / 2.0
-        # Proper rep = perfect score (10), no feedback
         if score >= 10.0: self.good_reps += 1
         else:             self.bad_reps  += 1
         down_s = self.rep_down_frames * dt
