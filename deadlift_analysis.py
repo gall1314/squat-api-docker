@@ -566,29 +566,22 @@ class DeadliftRepDetector:
     def _finalize_rep(self, frame_idx, side_ratio=1.0):
         self.reps += 1
         dt = 1.0 / max(1, self.fps)
-        total_rep_frames = self.rep_down_frames + self.rep_up_frames + self.rep_top_hold_frames
-        total_rep_frames = max(1, total_rep_frames)
         penalty = 0.0
         fb = []
-        # Back rounding: only from clear side view, sustained for >30% of rep
-        back_rounding_ratio = self.rep_back_rounding_frames / max(1, self.hinge_frames)
-        if (side_ratio >= 0.70
-                and self.rep_back_rounding_frames >= max(10, int(1.0 / dt))
-                and back_rounding_ratio >= 0.30):
+        # Back rounding: side/diagonal view, sustained for >0.5s
+        if side_ratio >= 0.55 and self.rep_back_rounding_frames >= max(6, int(0.5 / dt)):
             fb.append("Try to keep your back a bit straighter")
             penalty += 1.5
-        # Leg-back mismatch: sustained for >30% of rep
-        mismatch_ratio = self.rep_leg_back_mismatch_frames / max(1, self.hinge_frames)
-        if (self.rep_leg_back_mismatch_frames >= max(10, int(1.0 / dt))
-                and mismatch_ratio >= 0.30):
+        # Leg-back mismatch: sustained for >0.5s
+        if self.rep_leg_back_mismatch_frames >= max(6, int(0.5 / dt)):
             fb.append("Drive the back up with the legs evenly")
             penalty += 1.0
         # Depth: only flag if clearly shallow
-        if self.rep_max_composite < self.COMPOSITE_HINGE_DEEP * 0.45:
+        if self.rep_max_composite < self.COMPOSITE_HINGE_DEEP * 0.50:
             fb.append("Try to hinge a bit deeper")
             penalty += 0.5
         score = round(max(4, 10 - penalty) * 2) / 2.0
-        # Proper rep = perfect score (10), no feedback at all
+        # Proper rep = perfect score (10), no feedback
         if score >= 10.0: self.good_reps += 1
         else:             self.bad_reps  += 1
         down_s = self.rep_down_frames * dt
@@ -905,16 +898,19 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
         avg = 0.0
     technique_score = round(round(avg * 2) / 2, 2)
 
+    # V4.5: If ANY rep had feedback (not perfect), cap overall score at 9.5
+    any_imperfect = any(float(r.get("score") or 0) < 10.0 for r in rep_detector.reps_report)
+    if any_imperfect and technique_score >= 10.0:
+        technique_score = 9.5
+
     seen, feedback_list = set(), []
-    # Only show feedback if overall score < 10 (not a perfect set)
-    if technique_score < 10.0:
-        for r in rep_detector.reps_report:
-            if float(r.get("score") or 0.0) >= 10.0:
-                continue
-            for msg in (r.get("feedback") or []):
-                if msg and msg not in seen:
-                    seen.add(msg)
-                    feedback_list.append(msg)
+    for r in rep_detector.reps_report:
+        if float(r.get("score") or 0.0) >= 10.0:
+            continue
+        for msg in (r.get("feedback") or []):
+            if msg and msg not in seen:
+                seen.add(msg)
+                feedback_list.append(msg)
     if not feedback_list:
         feedback_list = ["Great form! Keep it up 💪"]
 
