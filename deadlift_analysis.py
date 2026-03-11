@@ -1,58 +1,29 @@
 # -*- coding: utf-8 -*-
-# deadlift_analysis.py — V4.5: fix false first rep from walk-to-bar
-# ONLY CHANGE from V4.3: FrontViewSignal resets knee_history when walking
-# stops, so baseline is learned from standing data only. No state machine changes.
+# pushup_analysis.py — V5: Deadlift-matching overlay + 2-pass + fast ffmpeg
+# Analysis logic: UNCHANGED from original HD OVERLAY VERSION 2026-02-27
+# Architecture: 2-pass like deadlift (analysis stores data, render draws)
+# Overlay: work-resolution like deadlift (not 1080p upscale)
+# ffmpeg: ultrafast crf=28 bilinear upscale like deadlift
 
 import os, cv2, math, numpy as np, subprocess, json, time
 from collections import deque
 from PIL import ImageFont, ImageDraw, Image
-import mediapipe as mp
 
-_USE_TASKS_API = False
-_SOLUTIONS_AVAILABLE = False
-
-try:
-    _mp_pose = mp.solutions.pose
-    _SOLUTIONS_AVAILABLE = True
-except AttributeError:
-    _SOLUTIONS_AVAILABLE = False
-
-if not _SOLUTIONS_AVAILABLE:
-    try:
-        _tasks_vision = mp.tasks.vision
-        _tasks_base = mp.tasks.BaseOptions
-        _USE_TASKS_API = True
-    except AttributeError:
-        raise ImportError("Neither mp.solutions.pose nor mp.tasks.vision available.")
-
-if _SOLUTIONS_AVAILABLE:
-    PL = _mp_pose.PoseLandmark
-    POSE_CONNECTIONS = _mp_pose.POSE_CONNECTIONS
-else:
-    PL = _tasks_vision.PoseLandmark
-    _raw_conns = _tasks_vision.PoseLandmarksConnections.POSE_LANDMARKS
-    POSE_CONNECTIONS = frozenset((c.start, c.end) for c in _raw_conns)
-
-try:
-    import onnxruntime as ort
-    _ORT_AVAILABLE = True
-except Exception:
-    _ORT_AVAILABLE = False
-
-BAR_BG_ALPHA         = 0.55
-DONUT_RADIUS_SCALE   = 0.72
+# ============ Styles (identical to deadlift) ============
+BAR_BG_ALPHA = 0.55
+DONUT_RADIUS_SCALE = 0.72
 DONUT_THICKNESS_FRAC = 0.28
-DEPTH_COLOR          = (40, 200, 80)
-DEPTH_RING_BG        = (70, 70, 70)
+DEPTH_COLOR = (40, 200, 80)
+DEPTH_RING_BG = (70, 70, 70)
 
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
-_REF_H                     = 480.0
-_REF_REPS_FONT_SIZE        = 28
-_REF_FEEDBACK_FONT_SIZE    = 22
+_REF_H = 480.0
+_REF_REPS_FONT_SIZE = 28
+_REF_FEEDBACK_FONT_SIZE = 22
 _REF_DEPTH_LABEL_FONT_SIZE = 14
-_REF_DEPTH_PCT_FONT_SIZE   = 18
+_REF_DEPTH_PCT_FONT_SIZE = 18
 
-_FONT_CACHE: dict = {}
+_FONT_CACHE = {}
 
 def _get_font(path, size):
     key = (path, size)
@@ -68,13 +39,13 @@ def _load_font(path, size):
         return ImageFont.truetype(path, size)
     except Exception:
         pass
-    for fallback in [
+    for fb in [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     ]:
         try:
-            return ImageFont.truetype(fallback, size)
+            return ImageFont.truetype(fb, size)
         except Exception:
             continue
     try:
@@ -82,546 +53,78 @@ def _load_font(path, size):
     except TypeError:
         return ImageFont.load_default()
 
-def score_label(s: float) -> str:
-    s = float(s)
-    if s >= 9.5: return "Excellent"
-    if s >= 8.5: return "Very good"
-    if s >= 7.0: return "Good"
-    if s >= 5.5: return "Fair"
-    return "Needs work"
-
-def display_half_str(x: float) -> str:
+def display_half_str(x):
     q = round(float(x) * 2) / 2.0
     return str(int(round(q))) if abs(q - round(q)) < 1e-9 else f"{q:.1f}"
 
-_FACE_INDICES = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
-_BODY_CONNS = tuple((a, b) for (a, b) in POSE_CONNECTIONS
-                    if a not in _FACE_INDICES and b not in _FACE_INDICES)
-_BODY_POINTS = tuple(sorted({i for (a, b) in _BODY_CONNS for i in (a, b)}))
+def score_label(s):
+    s = float(s)
+    if s >= 9.0:
+        return "Excellent"
+    if s >= 7.0:
+        return "Good"
+    if s >= 5.5:
+        return "Fair"
+    return "Needs work"
 
-def _angle_3pt(a, b, c):
-    ba = np.array(a, dtype=float) - np.array(b, dtype=float)
-    bc = np.array(c, dtype=float) - np.array(b, dtype=float)
-    nrm = (np.linalg.norm(ba) * np.linalg.norm(bc)) + 1e-9
-    return math.degrees(math.acos(float(np.clip(np.dot(ba, bc) / nrm, -1.0, 1.0))))
+# ============ MediaPipe ============
+try:
+    import mediapipe as mp
+    mp_pose = mp.solutions.pose
+except Exception:
+    mp_pose = None
 
-def _angle_to_vertical(a, b):
-    dx = b[0] - a[0]
-    dy = b[1] - a[1]
-    return abs(math.degrees(math.atan2(abs(dx), -dy + 1e-9)))
+# ============ Helpers ============
+def _ang(a, b, c):
+    ba = np.array([a[0] - b[0], a[1] - b[1]])
+    bc = np.array([c[0] - b[0], c[1] - b[1]])
+    den = (np.linalg.norm(ba) * np.linalg.norm(bc)) + 1e-9
+    cos = float(np.clip(np.dot(ba, bc) / den, -1, 1))
+    return float(np.degrees(np.arccos(cos)))
 
-class EMA:
-    def __init__(self, alpha=0.4):
-        self.alpha = alpha
-        self.value = None
-    def update(self, x):
-        if self.value is None:
-            self.value = float(x)
-        else:
-            self.value = self.alpha * float(x) + (1 - self.alpha) * self.value
-        return self.value
-    def reset(self):
-        self.value = None
+def _ema(prev, new, a):
+    return float(new) if prev is None else (a * float(new) + (1 - a) * float(prev))
 
-class LandmarkSmoother:
-    def __init__(self, alpha=0.5, vis_threshold=0.4):
-        self.alpha = alpha
-        self.vis_threshold = vis_threshold
-        self.smoothed = {}
-    def update(self, landmarks):
-        result = {}
-        for idx in range(min(33, len(landmarks))):
-            lm = landmarks[idx]
-            vis = getattr(lm, 'visibility', None)
-            if vis is None:
-                vis = getattr(lm, 'presence', 0.5)
-            if vis is None:
-                vis = 0.5
-            if float(vis) < self.vis_threshold:
-                if idx in self.smoothed:
-                    result[idx] = self.smoothed[idx][:2]
-                continue
-            raw = np.array([float(lm.x), float(lm.y), getattr(lm, 'z', 0.0)], dtype=float)
-            if idx in self.smoothed:
-                prev = np.array(self.smoothed[idx], dtype=float)
-                smooth = self.alpha * raw + (1 - self.alpha) * prev
-            else:
-                smooth = raw
-            self.smoothed[idx] = tuple(smooth)
-            result[idx] = (float(smooth[0]), float(smooth[1]))
-        return result
-
-def _snapshot_smoothed(smoothed_pts):
-    return {k: (float(v[0]), float(v[1])) for k, v in smoothed_pts.items()}
-
-class ViewAngleEstimator:
-    def __init__(self, alpha=0.3):
-        self.ema = EMA(alpha)
-    def estimate(self, smoothed_pts):
-        ls = smoothed_pts.get(11)
-        rs = smoothed_pts.get(12)
-        lh = smoothed_pts.get(23)
-        rh = smoothed_pts.get(24)
-        if not all([ls, rs, lh, rh]):
-            return self.ema.value if self.ema.value is not None else 0.5
-        shoulder_width = abs(ls[0] - rs[0])
-        torso_h = (abs(ls[1] - lh[1]) + abs(rs[1] - rh[1])) / 2.0
-        if torso_h < 1e-4:
-            return self.ema.value if self.ema.value is not None else 0.5
-        ratio = shoulder_width / torso_h
-        side_score = float(np.clip(1.0 - (ratio - 0.15) / 0.85, 0.0, 1.0))
-        return self.ema.update(side_score)
-
-class FrontViewSignal:
-    def __init__(self):
-        self.signal_ema   = EMA(0.20)
-        self.knee_history = deque(maxlen=90)
-        self.standing_knee_angle = None
-        self.bent_knee_angle     = None
-        self.frame_count  = 0
-        self.hip_x_ema    = EMA(0.3)
-        self.prev_hip_x   = None
-        self.walk_acc     = 0.0
-        # V4.5: track walk→stand transition for baseline reset
-        self._was_walking = False
-
-    def _knee_angle(self, smoothed_pts):
-        angles = []
-        for hip_id, knee_id, ankle_id in [(23, 25, 27), (24, 26, 28)]:
-            h = smoothed_pts.get(hip_id)
-            k = smoothed_pts.get(knee_id)
-            a = smoothed_pts.get(ankle_id)
-            if h and k and a:
-                v1 = (h[0]-k[0], h[1]-k[1])
-                v2 = (a[0]-k[0], a[1]-k[1])
-                dot  = v1[0]*v2[0] + v1[1]*v2[1]
-                mag1 = math.sqrt(v1[0]**2 + v1[1]**2) + 1e-9
-                mag2 = math.sqrt(v2[0]**2 + v2[1]**2) + 1e-9
-                ang  = math.degrees(math.acos(float(np.clip(dot/(mag1*mag2), -1, 1))))
-                angles.append(ang)
-        if not angles:
-            return None, False
-        avg = sum(angles) / len(angles)
-        is_symmetric = len(angles) < 2 or abs(angles[0] - angles[1]) < 35.0
-        return avg, is_symmetric
-
-    def _walk_suppressor(self, smoothed_pts):
-        lh = smoothed_pts.get(23)
-        rh = smoothed_pts.get(24)
-        if lh and rh:
-            hip_x = (lh[0] + rh[0]) / 2.0
-            sx = self.hip_x_ema.update(hip_x)
-            if self.prev_hip_x is not None:
-                dx = abs(sx - self.prev_hip_x)
-                self.walk_acc = self.walk_acc * 0.88 + dx
-            self.prev_hip_x = sx
-        return float(np.clip(1.0 - (self.walk_acc - 0.03) / 0.05, 0.0, 1.0))
-
-    def update(self, smoothed_pts):
-        self.frame_count += 1
-        angle, is_symmetric = self._knee_angle(smoothed_pts)
-        if angle is None:
-            return self.signal_ema.value if self.signal_ema.value is not None else 0.0
-        if not is_symmetric:
-            return self.signal_ema.update(0.0)
-
-        walk_supp = self._walk_suppressor(smoothed_pts)
-
-        # V4.5: detect walk→stand transition and reset knee baseline
-        # walk_acc > 0.06 means sustained lateral movement (walking)
-        # walk_acc < 0.035 means stopped
-        if self.walk_acc > 0.06:
-            self._was_walking = True
-        elif self._was_walking and self.walk_acc < 0.035:
-            # Walking just stopped — clear history so baseline rebuilds
-            # from standing-still data only
-            self.knee_history.clear()
-            self.standing_knee_angle = None
-            self.bent_knee_angle = None
-            self.signal_ema.reset()
-            self._was_walking = False
-
-        self.knee_history.append(angle)
-        if len(self.knee_history) >= 30:
-            sorted_k = sorted(self.knee_history)
-            n = len(sorted_k)
-            self.standing_knee_angle = sorted_k[max(0, int(n * 0.97))]
-            self.bent_knee_angle     = sorted_k[max(0, int(n * 0.05))]
-        if self.standing_knee_angle is None:
-            return self.signal_ema.update(0.0)
-        standing = self.standing_knee_angle
-        bent_ref  = min(self.bent_knee_angle or 90.0, standing - 20.0)
-        actual_rng = standing - (self.bent_knee_angle or 90.0)
-        # V4.5: Require minimum observed knee range to produce signal.
-        # Minor posture changes (< 20°) are not real deadlift hinge motion.
-        if actual_rng < 20.0:
-            return self.signal_ema.update(0.0)
-        rng = max(30.0, standing - bent_ref)
-        raw = float(np.clip((standing - angle) / rng, 0.0, 1.0))
-        return self.signal_ema.update(raw * walk_supp)
-
-
-class DeadliftRepDetector:
-    STANDING = 0
-    HINGING  = 1
-    RISING   = 2
-
-    COMPOSITE_HINGE_START = 0.32
-    COMPOSITE_HINGE_DEEP  = 0.50
-    COMPOSITE_STANDING    = 0.18
-    MIN_HINGE_FRAMES      = 15
-    MIN_FRAMES_BETWEEN    = 50
-
-    def __init__(self, fps=10):
-        self.fps = fps
-        self.state = self.STANDING
-        self.frame_count = 0
-        self.last_rep_frame = -999
-        self.hinge_frames = 0
-        self.torso_angle_ema = EMA(0.45)
-        self.hip_angle_ema = EMA(0.45)
-        self.composite_ema = EMA(0.40)
-        self.front_signal = FrontViewSignal()
-        self.rep_max_composite = 0.0
-        self.rep_back_rounding_frames = 0
-        self.rep_leg_back_mismatch_frames = 0
-        self.rep_down_frames = 0
-        self.rep_up_frames = 0
-        self.rep_top_hold_frames = 0
-        self.prev_composite = 0.0
-        self.prev_knee_angle = None
-        self.prev_torso_raw = None
-        self.view_estimator = ViewAngleEstimator()
-        self.reps = 0
-        self.good_reps = 0
-        self.bad_reps = 0
-        self.all_scores = []
-        self.reps_report = []
-        self._cal_signals    = []
-        self._calibrated     = False
-        self._cal_floor      = 0.0
-        self._cal_range      = 0.50
-        self._cal_max_composite = 0.0       # V4.5: track peak during calibration
-        self._cal_max_side_composite = 0.0  # V4.5: track side_composite peak
-        self._cal_frame_count   = 0         # V4.5: frames during calibration
-        self._cal_early_side    = []        # V4.5: first 3 side_composite values
-        self._cal_side_ratio_sum = 0.0      # V4.5: sum of side_ratio for averaging
-
-    def _calibrate(self, composite):
-        if self._calibrated:
-            # adaptive: lower floor if we see lower values
-            if composite < self._cal_floor - 0.03:
-                self._cal_floor = composite
-                rng = max(0.50, self._cal_range)
-                self.COMPOSITE_HINGE_START = max(0.15, min(0.70, self._cal_floor + 0.38 * rng))
-                self.COMPOSITE_STANDING    = max(0.05, min(0.40, self._cal_floor + 0.08 * rng))
-                self.COMPOSITE_HINGE_DEEP  = max(0.41, min(0.92, self._cal_floor + 0.82 * rng))
-            return
-
-        self._cal_signals.append(composite)
-
-        if len(self._cal_signals) >= 5:
-            true_floor = float(np.min(self._cal_signals))
-            true_ceil  = float(np.percentile(self._cal_signals, 98))
-            raw_rng    = true_ceil - true_floor
-
-            # Need meaningful range OR 30 frames collected
-            if raw_rng < 0.50 and len(self._cal_signals) < 30:
-                return
-
-            rng = max(0.50, raw_rng)
-            self._cal_floor = true_floor
-            self._cal_range = rng
-
-            self.COMPOSITE_HINGE_START = true_floor + 0.38 * rng
-            self.COMPOSITE_STANDING    = true_floor + 0.08 * rng
-            self.COMPOSITE_HINGE_DEEP  = true_floor + 0.82 * rng
-            self.COMPOSITE_HINGE_START = max(0.15, min(0.70, self.COMPOSITE_HINGE_START))
-            self.COMPOSITE_STANDING    = max(0.05, min(0.40, self.COMPOSITE_STANDING))
-            self.COMPOSITE_HINGE_DEEP  = max(0.41, min(0.92, self.COMPOSITE_HINGE_DEEP))
-            self._calibrated = True
-            import sys
-            print(f"[DL] Calibrated: floor={true_floor:.3f} rng={rng:.3f} "
-                  f"start={self.COMPOSITE_HINGE_START:.3f} "
-                  f"deep={self.COMPOSITE_HINGE_DEEP:.3f} "
-                  f"standing={self.COMPOSITE_STANDING:.3f}",
-                  file=sys.stderr, flush=True)
-
-    def _compute_side_composite(self, torso_angle, hip_angle, side_ratio):
-        torso_norm = float(np.clip((torso_angle - 12) / 55.0, 0.0, 1.0))
-        hip_norm   = float(np.clip((170 - hip_angle) / 70.0, 0.0, 1.0))
-        w_torso = 0.3 + 0.5 * side_ratio
-        w_hip   = 0.3 + 0.5 * (1 - side_ratio)
-        total   = w_torso + w_hip + 1e-9
-        composite = (w_torso / total) * torso_norm + (w_hip / total) * hip_norm
-        return self.composite_ema.update(composite)
-
-    def _get_lm_val(self, lm, idx, attr):
-        try:
-            if hasattr(idx, 'value'):
-                idx = idx.value
-            val = getattr(lm[idx], attr, None)
-            return (0.5 if attr == 'visibility' else 0.0) if val is None else float(val)
-        except (IndexError, AttributeError, TypeError):
-            return 0.5 if attr == 'visibility' else 0.0
-
-    def process_frame(self, smoothed_pts, raw_landmarks, frame_idx):
-        self.frame_count = frame_idx
-        lm = raw_landmarks
-
-        def _get_pt(primary_idx, fallback_idx):
-            if primary_idx in smoothed_pts and self._get_lm_val(lm, primary_idx, 'visibility') > 0.4:
-                return np.array(smoothed_pts[primary_idx], dtype=float), True
-            if fallback_idx in smoothed_pts and self._get_lm_val(lm, fallback_idx, 'visibility') > 0.4:
-                return np.array(smoothed_pts[fallback_idx], dtype=float), True
-            return None, False
-
-        shoulder, s_ok = _get_pt(12, 11)
-        hip,      h_ok = _get_pt(24, 23)
-        knee,     k_ok = _get_pt(26, 25)
-        ankle,    a_ok = _get_pt(28, 27)
-
-        if not (s_ok and h_ok):
-            return self.prev_composite, None, None
-
-        side_ratio = self.view_estimator.estimate(smoothed_pts)
-        torso_angle_smooth = self.torso_angle_ema.update(_angle_to_vertical(hip, shoulder))
-        hip_angle_smooth = self.hip_angle_ema.update(
-            _angle_3pt(shoulder, hip, knee) if k_ok else 170.0)
-        side_composite = self._compute_side_composite(torso_angle_smooth, hip_angle_smooth, side_ratio)
-        front_val = self.front_signal.update(smoothed_pts)
-
-        if side_ratio >= 0.70:
-            composite = side_composite
-        else:
-            composite = front_val
-
-        import sys as _sys
-        if frame_idx % 150 == 0:
-            view_str = "SIDE" if side_ratio >= 0.65 else ("FRONT" if side_ratio < 0.45 else "DIAG")
-            print(f"[DL] F{frame_idx}: {view_str} sr={side_ratio:.2f} "
-                  f"sc={side_composite:.3f} fv={front_val:.3f} comp={composite:.3f} st={self.state}",
-                  file=_sys.stderr, flush=True)
-
-        head_pt = None
-        for idx in (8, 7, 0):
-            if idx in smoothed_pts and self._get_lm_val(lm, idx, 'visibility') > 0.45:
-                head_pt = np.array(smoothed_pts[idx], dtype=float)
-                break
-        back_rounded = (self._check_back_rounding(shoulder, hip, head_pt)
-                        if head_pt is not None else False)
-        knee_angle = _angle_3pt(hip, knee, ankle) if (k_ok and a_ok) else None
-
-        rt_feedback = None
-        rep_info    = None
-
-        self._calibrate(composite)
-
-        if not self._calibrated:
-            # V4.5: Track peaks during calibration for retroactive rep detection
-            self._cal_max_composite = max(self._cal_max_composite, composite)
-            self._cal_max_side_composite = max(self._cal_max_side_composite, side_composite)
-            self._cal_frame_count += 1
-            self._cal_side_ratio_sum += side_ratio
-            if self._cal_frame_count <= 3:
-                self._cal_early_side.append(side_composite)
-            self.prev_composite = composite
-            return composite, None, None
-
-        # V4.5: Retroactive first-rep detection.
-        # Only use side_composite signal when the camera is actually
-        # showing a side/diagonal view (avg side_ratio >= 0.45).
-        # For front-view videos, only composite (front_val) is used,
-        # which starts at 0 (FrontViewSignal needs warmup) → no false retro.
-        if not getattr(self, '_cal_retro_checked', False):
-            self._cal_retro_checked = True
-            avg_sr = self._cal_side_ratio_sum / max(1, self._cal_frame_count)
-            use_side = avg_sr >= 0.30
-
-            if use_side:
-                cal_peak = max(self._cal_max_composite, self._cal_max_side_composite)
-                early_side = self._cal_early_side
-                started_high_side = (len(early_side) >= 3
-                                     and (sum(early_side) / len(early_side)) > self.COMPOSITE_HINGE_START)
-            else:
-                cal_peak = self._cal_max_composite
-                started_high_side = False
-
-            early_comp = self._cal_signals[:3] if len(self._cal_signals) >= 3 else []
-            started_high_comp = (len(early_comp) >= 3
-                                 and (sum(early_comp) / len(early_comp)) > self.COMPOSITE_HINGE_START)
-            started_high = started_high_comp or started_high_side
-
-            import sys as _sys2
-            print(f"[DL] RETRO CHECK: avg_sr={avg_sr:.3f} use_side={use_side} "
-                  f"cal_peak={cal_peak:.3f} comp={composite:.3f} "
-                  f"started_high={started_high} (comp={started_high_comp} side={started_high_side}) "
-                  f"early_side={[f'{x:.3f}' for x in self._cal_early_side]} "
-                  f"early_comp={[f'{x:.3f}' for x in early_comp[:3]]} "
-                  f"DEEP={self.COMPOSITE_HINGE_DEEP:.3f} STAND={self.COMPOSITE_STANDING:.3f} "
-                  f"cal_fc={self._cal_frame_count} "
-                  f"max_sc={self._cal_max_side_composite:.3f}",
-                  file=_sys2.stderr, flush=True)
-
-            if (started_high
-                    and cal_peak >= self.COMPOSITE_HINGE_DEEP * 0.88
-                    and composite < self.COMPOSITE_STANDING + 0.10
-                    and self._cal_frame_count >= 8
-                    and (cal_peak - composite) >= 0.25):
-                print(f"[DL] RETRO REP COUNTED!", file=_sys2.stderr, flush=True)
-                rep_info = self._finalize_rep(frame_idx, side_ratio)
-                self.last_rep_frame = frame_idx
-            else:
-                reasons = []
-                if not started_high: reasons.append("started_high=F")
-                if not (cal_peak >= self.COMPOSITE_HINGE_DEEP * 0.88): reasons.append(f"peak({cal_peak:.3f})<deep*0.88({self.COMPOSITE_HINGE_DEEP*0.88:.3f})")
-                if not (composite < self.COMPOSITE_STANDING + 0.10): reasons.append(f"comp({composite:.3f})>=stand+0.10({self.COMPOSITE_STANDING+0.10:.3f})")
-                if not (self._cal_frame_count >= 8): reasons.append(f"frames({self._cal_frame_count})<8")
-                if not ((cal_peak - composite) >= 0.25): reasons.append(f"drop({cal_peak-composite:.3f})<0.25")
-                print(f"[DL] RETRO REJECTED: {', '.join(reasons)}", file=_sys2.stderr, flush=True)
-
-        if self.state == self.STANDING:
-            if composite > self.COMPOSITE_HINGE_START:
-                self._pre_hinge_frames = getattr(self, '_pre_hinge_frames', 0) + 1
-            else:
-                self._pre_hinge_frames = 0
-            if (self._pre_hinge_frames >= 2
-                    and (frame_idx - self.last_rep_frame > self.MIN_FRAMES_BETWEEN)):
-                self.state = self.HINGING
-                self.hinge_frames = 0
-                self._pre_hinge_frames = 0
-                self._deep_frames = 0
-                self._reset_rep_tracking()
-
-        elif self.state == self.HINGING:
-            self.hinge_frames += 1
-            self.rep_max_composite = max(self.rep_max_composite, composite)
-            self._rep_sr_sum += side_ratio
-            self._rep_sr_count += 1
-            self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
-            if back_rounded and side_ratio >= 0.70:
-                rt_feedback = "Try to keep your back a bit straighter"
-            # Count frames spent above the deep threshold (real reps stay there, spikes don't)
-            if composite >= self.COMPOSITE_HINGE_DEEP * 0.88:
-                self._deep_frames = getattr(self, '_deep_frames', 0) + 1
-            drop_from_peak = self.rep_max_composite - composite
-            if (self.hinge_frames >= self.MIN_HINGE_FRAMES
-                    and self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
-                    and getattr(self, '_deep_frames', 0) >= 8
-                    and drop_from_peak >= 0.25):
-                self._deep_frames = 0
-                self.state = self.RISING
-
-        elif self.state == self.RISING:
-            self._rep_sr_sum += side_ratio
-            self._rep_sr_count += 1
-            self._track_rep_quality(composite, back_rounded, knee_angle, torso_angle_smooth)
-            if back_rounded and side_ratio >= 0.70:
-                rt_feedback = "Try to keep your back a bit straighter"
-            return_threshold = max(self.COMPOSITE_STANDING,
-                                   self.rep_max_composite * 0.30)
-            if composite < return_threshold:
-                if (self.rep_max_composite >= self.COMPOSITE_HINGE_DEEP * 0.88
-                        and self.rep_max_composite >= 0.45):
-                    avg_rep_sr = self._rep_sr_sum / max(1, self._rep_sr_count)
-                    rep_info = self._finalize_rep(frame_idx, avg_rep_sr)
-                    self.last_rep_frame = frame_idx
-                self.state = self.STANDING
-
-        self.prev_composite = composite
-        return composite, rt_feedback, rep_info
-
-    def _reset_rep_tracking(self):
-        self.rep_max_composite = 0.0
-        self.rep_back_rounding_frames = 0
-        self.rep_leg_back_mismatch_frames = 0
-        self.rep_down_frames = 0
-        self.rep_up_frames = 0
-        self.rep_top_hold_frames = 0
-        self.prev_knee_angle = None
-        self.prev_torso_raw = None
-        self._rep_sr_sum = 0.0
-        self._rep_sr_count = 0
-
-    def _track_rep_quality(self, composite, back_rounded, knee_angle, torso_angle):
-        if back_rounded:
-            self.rep_back_rounding_frames += 1
-        if composite > self.prev_composite + 0.005:
-            self.rep_down_frames += 1
-        elif composite < self.prev_composite - 0.005:
-            self.rep_up_frames += 1
-        if composite < 0.10:
-            self.rep_top_hold_frames += 1
-        if (knee_angle is not None and self.prev_knee_angle is not None
-                and self.prev_torso_raw is not None):
-            dk  = knee_angle - self.prev_knee_angle
-            dta = torso_angle - self.prev_torso_raw
-            if (abs(dk) > 4.0 and abs(dta) < 1.0) or (abs(dta) > 4.0 and abs(dk) < 1.0):
-                self.rep_leg_back_mismatch_frames += 1
-        self.prev_knee_angle = knee_angle
-        self.prev_torso_raw  = torso_angle
-
-    def _check_back_rounding(self, shoulder, hip, head, max_angle=32.0):
-        tv   = shoulder - hip
-        hv   = head - shoulder
-        tn   = np.linalg.norm(tv) + 1e-9
-        hn   = np.linalg.norm(hv) + 1e-9
-        if hn < 0.3 * tn:
-            return False
-        return math.degrees(math.acos(float(np.clip(np.dot(tv, hv) / (tn * hn), -1.0, 1.0)))) > max_angle
-
-    def _finalize_rep(self, frame_idx, side_ratio=1.0):
-        self.reps += 1
-        dt = 1.0 / max(1, self.fps)
-        penalty = 0.0
-        fb = []
-        # Back rounding & mismatch: ONLY from clear side view (>=0.70)
-        # From diagonal/front, head and joint landmarks are too noisy
-        # for reliable form assessment — only depth is checked.
-        if side_ratio >= 0.70:
-            if self.rep_back_rounding_frames >= max(6, int(0.5 / dt)):
-                fb.append("Try to keep your back a bit straighter")
-                penalty += 1.5
-            if self.rep_leg_back_mismatch_frames >= max(6, int(0.5 / dt)):
-                fb.append("Drive the back up with the legs evenly")
-                penalty += 1.0
-        # Depth: only from side view where depth is reliably measured,
-        # and only if significantly shallow (< 35% of calibrated deep)
-        if side_ratio >= 0.70 and self.rep_max_composite < self.COMPOSITE_HINGE_DEEP * 0.35:
-            fb.append("Try to hinge a bit deeper")
-            penalty += 0.5
-        score = round(max(4, 10 - penalty) * 2) / 2.0
-        if score >= 10.0: self.good_reps += 1
-        else:             self.bad_reps  += 1
-        down_s = self.rep_down_frames * dt
-        top_s  = self.rep_top_hold_frames * dt
-        tip = _choose_tip(down_s, top_s, self.rep_max_composite)
-        info = {"rep_index": self.reps, "score": float(score),
-                "score_display": display_half_str(score),
-                "feedback": fb if score < 10.0 else [], "tip": tip}
-        self.all_scores.append(score)
-        self.reps_report.append(info)
-        return info
-
-
-def _choose_tip(down_s, top_s, rom):
-    if down_s is not None and down_s < 0.35:
-        return "Slow the lowering to ~2–3s for more hypertrophy"
-    if top_s is not None and top_s < 0.15:
-        return "Squeeze the glutes for a brief hold at the top"
-    if rom is not None and 0.3 <= rom <= 0.5:
-        return "Hinge a bit deeper within comfort"
-    return "Keep the bar close and move smoothly"
-
+def _half_floor10(x):
+    return max(0.0, min(10.0, math.floor(x * 2.0) / 2.0))
 
 def _dyn_thickness(h):
     return max(2, int(round(h * 0.003))), max(3, int(round(h * 0.005)))
 
+# ============ Body-only skeleton ============
+_FACE_LMS = set()
+_BODY_CONNECTIONS = tuple()
+_BODY_POINTS = tuple()
+if mp_pose:
+    _FACE_LMS = {
+        mp_pose.PoseLandmark.NOSE.value,
+        mp_pose.PoseLandmark.LEFT_EYE_INNER.value, mp_pose.PoseLandmark.LEFT_EYE.value,
+        mp_pose.PoseLandmark.LEFT_EYE_OUTER.value,
+        mp_pose.PoseLandmark.RIGHT_EYE_INNER.value, mp_pose.PoseLandmark.RIGHT_EYE.value,
+        mp_pose.PoseLandmark.RIGHT_EYE_OUTER.value,
+        mp_pose.PoseLandmark.LEFT_EAR.value, mp_pose.PoseLandmark.RIGHT_EAR.value,
+        mp_pose.PoseLandmark.MOUTH_LEFT.value, mp_pose.PoseLandmark.MOUTH_RIGHT.value,
+    }
+    _BODY_CONNECTIONS = tuple(
+        (a, b) for (a, b) in mp_pose.POSE_CONNECTIONS
+        if a not in _FACE_LMS and b not in _FACE_LMS
+    )
+    _BODY_POINTS = tuple(sorted({i for conn in _BODY_CONNECTIONS for i in conn}))
+
+
+def _snapshot_smoothed(lms):
+    """Convert mediapipe landmarks to dict {idx: (x,y)} like deadlift."""
+    snap = {}
+    for i in _BODY_POINTS:
+        snap[i] = (float(lms[i].x), float(lms[i].y))
+    return snap
+
 
 def draw_skeleton(frame, smoothed_pts, color=(255, 255, 255)):
+    """Draw skeleton from snapshot dict — identical to deadlift draw_skeleton."""
     h, w = frame.shape[:2]
     line_t, dot_r = _dyn_thickness(h)
-    for a, b in _BODY_CONNS:
+    for a, b in _BODY_CONNECTIONS:
         if a in smoothed_pts and b in smoothed_pts:
             cv2.line(frame,
                      (int(smoothed_pts[a][0] * w), int(smoothed_pts[a][1] * h)),
@@ -635,6 +138,7 @@ def draw_skeleton(frame, smoothed_pts, color=(255, 255, 255)):
     return frame
 
 
+# ============ Overlay — IDENTICAL to deadlift (work-resolution) ============
 def _wrap2(draw, text, font, maxw):
     words = text.split()
     if not words:
@@ -653,33 +157,34 @@ def _wrap2(draw, text, font, maxw):
     if cur and len(lines) < 2:
         lines.append(cur)
     if len(lines) >= 2 and draw.textlength(lines[-1], font=font) > maxw:
-        last = lines[-1] + "…"
+        last = lines[-1] + "\u2026"
         while draw.textlength(last, font=font) > maxw and len(last) > 1:
-            last = last[:-2] + "…"
+            last = last[:-2] + "\u2026"
         lines[-1] = last
     return lines
 
 
-def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
+def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
+    """Overlay at frame resolution — same code as deadlift draw_overlay."""
     h, w, _ = frame.shape
-    _REPS_F  = _get_font(FONT_PATH, _scaled_font_size(_REF_REPS_FONT_SIZE,       h))
-    _FB_F    = _get_font(FONT_PATH, _scaled_font_size(_REF_FEEDBACK_FONT_SIZE,    h))
-    _DL_F    = _get_font(FONT_PATH, _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, h))
-    _DP_F    = _get_font(FONT_PATH, _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE,   h))
+    _REPS_F = _get_font(FONT_PATH, _scaled_font_size(_REF_REPS_FONT_SIZE, h))
+    _FB_F = _get_font(FONT_PATH, _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, h))
+    _DL_F = _get_font(FONT_PATH, _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, h))
+    _DP_F = _get_font(FONT_PATH, _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, h))
 
-    pct       = float(np.clip(progress_pct, 0, 1))
-    bg_alpha  = int(round(255 * BAR_BG_ALPHA))
-    ref_h     = max(int(h * 0.06), int(_REPS_F.size * 1.6))
-    radius    = int(ref_h * DONUT_RADIUS_SCALE)
-    thick     = max(3, int(radius * DONUT_THICKNESS_FRAC))
-    cx        = w - 12 - radius
-    cy        = max(ref_h + radius // 8, radius + thick // 2 + 2)
+    pct = float(np.clip(depth_pct, 0, 1))
+    bg_alpha = int(round(255 * BAR_BG_ALPHA))
+    ref_h = max(int(h * 0.06), int(_REPS_F.size * 1.6))
+    radius = int(ref_h * DONUT_RADIUS_SCALE)
+    thick = max(3, int(radius * DONUT_THICKNESS_FRAC))
+    cx = w - 12 - radius
+    cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
 
-    ov        = np.zeros((h, w, 4), dtype=np.uint8)
-    _tmp_img  = Image.new("RGBA", (1, 1))
-    tmp_draw  = ImageDraw.Draw(_tmp_img)
-    txt       = f"Reps: {int(reps)}"
-    tw        = tmp_draw.textlength(txt, font=_REPS_F)
+    ov = np.zeros((h, w, 4), dtype=np.uint8)
+    _tmp_img = Image.new("RGBA", (1, 1))
+    tmp_draw = ImageDraw.Draw(_tmp_img)
+    txt = f"Reps: {int(reps)}"
+    tw = tmp_draw.textlength(txt, font=_REPS_F)
     cv2.rectangle(ov, (0, 0), (int(tw + 20), int(_REPS_F.size + 12)), (0, 0, 0, bg_alpha), -1)
 
     cv2.circle(ov, (cx, cy), radius, (*DEPTH_RING_BG, 255), thick, cv2.LINE_AA)
@@ -691,26 +196,28 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
     fb_y0 = fb_pad_x = fb_pad_y = line_gap = line_h = 0
     fb_lines = []
     if feedback:
-        safe     = max(6, int(h * 0.02))
-        fb_pad_x = 12; fb_pad_y = 8; line_gap = 4
+        safe = max(6, int(h * 0.02))
+        fb_pad_x = 12
+        fb_pad_y = 8
+        line_gap = 4
         fb_lines = _wrap2(tmp_draw, feedback, _FB_F, int(w - 2 * fb_pad_x - 20))
-        line_h   = _FB_F.size + 6
-        block_h  = 2 * fb_pad_y + len(fb_lines) * line_h + (len(fb_lines) - 1) * line_gap
-        fb_y0    = max(0, h - safe - block_h)
+        line_h = _FB_F.size + 6
+        block_h = 2 * fb_pad_y + len(fb_lines) * line_h + (len(fb_lines) - 1) * line_gap
+        fb_y0 = max(0, h - safe - block_h)
         cv2.rectangle(ov, (0, fb_y0), (w, h - safe), (0, 0, 0, bg_alpha), -1)
 
-    pil  = Image.fromarray(ov, mode="RGBA")
+    pil = Image.fromarray(ov, mode="RGBA")
     draw = ImageDraw.Draw(pil)
     draw.text((10, 5), txt, font=_REPS_F, fill=(255, 255, 255, 255))
 
     gap = max(2, int(radius * 0.10))
-    by  = cy - (_DL_F.size + gap + _DP_F.size) // 2
-    lbl = "HEIGHT"
-    pt  = f"{int(pct * 100)}%"
+    by = cy - (_DL_F.size + gap + _DP_F.size) // 2
+    lbl = "DEPTH"
+    pt = f"{int(pct * 100)}%"
     draw.text((cx - int(draw.textlength(lbl, font=_DL_F) // 2), by),
               lbl, font=_DL_F, fill=(255, 255, 255, 255))
     draw.text((cx - int(draw.textlength(pt, font=_DP_F) // 2), by + _DL_F.size + gap),
-              pt,  font=_DP_F, fill=(255, 255, 255, 255))
+              pt, font=_DP_F, fill=(255, 255, 255, 255))
 
     if feedback and fb_lines:
         ty = fb_y0 + fb_pad_y
@@ -720,77 +227,436 @@ def draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0):
             ty += line_h + line_gap
 
     ov_arr = np.array(pil)
-    alpha  = ov_arr[:, :, 3:4].astype(np.float32) / 255.0
-    out_f  = frame.astype(np.float32) * (1 - alpha) + ov_arr[:, :, [2, 1, 0]].astype(np.float32) * alpha
+    alpha = ov_arr[:, :, 3:4].astype(np.float32) / 255.0
+    out_f = frame.astype(np.float32) * (1 - alpha) + ov_arr[:, :, [2, 1, 0]].astype(np.float32) * alpha
     return out_f.astype(np.uint8)
 
 
-class PoseEstimator:
-    def __init__(self, model_path=None):
-        self._impl    = None
-        self._is_tasks = False
-        if _SOLUTIONS_AVAILABLE:
-            self._impl = _mp_pose.Pose(
-                model_complexity=0,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5)
-        elif _USE_TASKS_API:
-            if model_path and os.path.exists(model_path):
-                opts = _tasks_vision.PoseLandmarkerOptions(
-                    base_options=_tasks_base(model_asset_path=model_path),
-                    running_mode=_tasks_vision.RunningMode.VIDEO,
-                    num_poses=1,
-                    min_pose_detection_confidence=0.5,
-                    min_tracking_confidence=0.5)
-                self._impl     = _tasks_vision.PoseLandmarker.create_from_options(opts)
-                self._is_tasks = True
-            else:
-                raise FileNotFoundError("Tasks API requires a pose_landmarker.task model file.")
+# ============ Motion Detection (unchanged from original) ============
+BASE_FRAME_SKIP = 2
+ACTIVE_FRAME_SKIP = 1          # was 2 — process every frame when active for fast reps
+MOTION_DETECTION_WINDOW = 10   # was 8 — wider window catches fast patterns
+MOTION_VEL_THRESHOLD = 0.0008  # was 0.0010 — more sensitive to fast movement
+MOTION_ACCEL_THRESHOLD = 0.0005  # was 0.0006
+ELBOW_CHANGE_THRESHOLD = 4.0    # was 5.0 — catch smaller fast-rep elbow changes
+COOLDOWN_FRAMES = 18             # was 15 — stay active longer after motion
+MIN_VEL_FOR_MOTION = 0.0003      # was 0.0004
 
-    def process(self, frame_bgr, timestamp_ms=0):
-        if not self._is_tasks:
-            res = self._impl.process(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-            return res.pose_landmarks.landmark if res.pose_landmarks else None
+
+class MotionDetector:
+    def __init__(self):
+        self.shoulder_history = deque(maxlen=MOTION_DETECTION_WINDOW)
+        self.elbow_history = deque(maxlen=MOTION_DETECTION_WINDOW)
+        self.velocity_history = deque(maxlen=MOTION_DETECTION_WINDOW)
+        self.raw_elbow_history = deque(maxlen=MOTION_DETECTION_WINDOW)
+        self.is_active = False
+        self.cooldown_counter = 0
+        self.last_process_frame = -999
+        self.activation_count = 0
+        self.last_activation_reason = ""
+
+    def add_sample(self, shoulder_y, elbow_angle, raw_elbow_min, frame_idx):
+        self.shoulder_history.append(shoulder_y)
+        self.elbow_history.append(elbow_angle)
+        self.raw_elbow_history.append(raw_elbow_min)
+
+        motion_detected = False
+        reason = ""
+
+        if len(self.shoulder_history) >= 2:
+            vel = abs(self.shoulder_history[-1] - self.shoulder_history[-2])
+            self.velocity_history.append(vel)
+
+            if len(self.velocity_history) >= 3:
+                max_vel = max(self.velocity_history)
+                recent_avg = sum(list(self.velocity_history)[-3:]) / 3
+                accel = abs(self.velocity_history[-1] - self.velocity_history[-2])
+
+                if max_vel > MOTION_VEL_THRESHOLD:
+                    motion_detected = True
+                    reason = f"high_vel({max_vel:.4f})"
+                elif accel > MOTION_ACCEL_THRESHOLD:
+                    motion_detected = True
+                    reason = f"accel({accel:.4f})"
+                elif recent_avg > MOTION_VEL_THRESHOLD * 0.55:
+                    motion_detected = True
+                    reason = f"sustained({recent_avg:.4f})"
+
+        if len(self.elbow_history) >= 3:
+            elbow_change = abs(self.elbow_history[-1] - self.elbow_history[-3])
+            elbow_vel = abs(self.elbow_history[-1] - self.elbow_history[-2])
+            if elbow_change > ELBOW_CHANGE_THRESHOLD:
+                motion_detected = True
+                reason = f"elbow_change({elbow_change:.1f})"
+            elif elbow_vel > ELBOW_CHANGE_THRESHOLD * 0.45:
+                motion_detected = True
+                reason = f"elbow_vel({elbow_vel:.1f})"
+
+        if len(self.raw_elbow_history) >= 3:
+            raw_change = abs(self.raw_elbow_history[-1] - self.raw_elbow_history[-3])
+            raw_vel = abs(self.raw_elbow_history[-1] - self.raw_elbow_history[-2])
+            if raw_change > 8.0:
+                motion_detected = True
+                reason = f"raw_spike({raw_change:.1f})"
+            elif raw_vel > 5.0:
+                motion_detected = True
+                reason = f"raw_vel({raw_vel:.1f})"
+
+        if len(self.raw_elbow_history) >= 5:
+            elbows = list(self.raw_elbow_history)
+            went_down = elbows[-5] - elbows[-3] > 10   # was 13
+            went_up = elbows[-1] - elbows[-3] > 10     # was 13
+            if went_down and went_up:
+                motion_detected = True
+                reason = "V_pattern"
+
+        # Short V-pattern (3-sample) for very fast reps
+        if len(self.raw_elbow_history) >= 3:
+            elbows = list(self.raw_elbow_history)
+            d1 = elbows[-3] - elbows[-2]  # drop
+            d2 = elbows[-1] - elbows[-2]  # rise
+            if d1 > 6 and d2 > 6:
+                motion_detected = True
+                reason = "fast_V"
+
+        # Wide elbow range in recent history = active motion
+        if len(self.raw_elbow_history) >= 4:
+            rng = max(self.raw_elbow_history) - min(self.raw_elbow_history)
+            if rng > 20:
+                motion_detected = True
+                reason = f"elbow_range({rng:.0f})"
+
+        if len(self.shoulder_history) >= 5:
+            diffs = [self.shoulder_history[i + 1] - self.shoulder_history[i]
+                     for i in range(len(self.shoulder_history) - 1)]
+            if len(diffs) >= 4:
+                sign_changes = sum(1 for i in range(len(diffs) - 1) if diffs[i] * diffs[i + 1] < 0)
+                max_diff = max(abs(d) for d in diffs)
+                if sign_changes >= 1 and max_diff > MIN_VEL_FOR_MOTION:
+                    motion_detected = True
+                    reason = "direction_change"
+
+        if motion_detected:
+            self.activate(reason)
+        if self.cooldown_counter > 0:
+            self.cooldown_counter -= 1
+            if self.cooldown_counter == 0:
+                self.is_active = False
+
+    def activate(self, reason=""):
+        if not self.is_active:
+            self.is_active = True
+            self.activation_count += 1
+            self.last_activation_reason = reason
+        self.cooldown_counter = COOLDOWN_FRAMES
+
+    def should_process(self, frame_idx):
+        skip = ACTIVE_FRAME_SKIP if (self.is_active or self.cooldown_counter > 0) else BASE_FRAME_SKIP
+        should = (frame_idx - self.last_process_frame) >= skip
+        if should:
+            self.last_process_frame = frame_idx
+        return should
+
+    def get_stats(self):
+        return {
+            "is_active": self.is_active,
+            "cooldown": self.cooldown_counter,
+            "activations": self.activation_count,
+            "last_reason": self.last_activation_reason
+        }
+
+
+# ============ Parameters (unchanged from original) ============
+ELBOW_BENT_ANGLE = 102.0
+SHOULDER_MIN_DESCENT = 0.036
+RESET_ASCENT = 0.024
+RESET_ELBOW = 153.0
+REFRACTORY_FRAMES = 1
+ELBOW_EMA_ALPHA = 0.72
+SHOULDER_EMA_ALPHA = 0.67
+VIS_THR_STRICT = 0.29
+PLANK_BODY_ANGLE_MAX = 26.0
+HANDS_BELOW_SHOULDERS = 0.035
+ONPUSHUP_MIN_FRAMES = 2
+OFFPUSHUP_MIN_FRAMES = 5
+AUTO_STOP_AFTER_EXIT_SEC = 1.5
+TAIL_NOPOSE_STOP_SEC = 1.0
+
+# Feedback
+FB_ERROR_DEPTH = "Go deeper (chest to floor)"
+FB_ERROR_HIPS = "Keep hips level (don't sag or pike)"
+FB_ERROR_LOCKOUT = "Fully lockout arms at top"
+FB_ERROR_ELBOWS = "Keep elbows at 45\u00b0 (not flared)"
+PERF_TIP_SLOW_DOWN = "Lower slowly for better control"
+PERF_TIP_TEMPO = "Try 2-1-2 tempo (down-pause-up)"
+PERF_TIP_BREATHING = "Breathe: inhale down, exhale up"
+PERF_TIP_CORE = "Engage core throughout movement"
+
+FB_W_DEPTH = 1.2
+FB_W_HIPS = 1.0
+FB_W_LOCKOUT = 0.9
+FB_W_ELBOWS = 0.7
+FB_WEIGHTS = {
+    FB_ERROR_DEPTH: FB_W_DEPTH,
+    FB_ERROR_HIPS: FB_W_HIPS,
+    FB_ERROR_LOCKOUT: FB_W_LOCKOUT,
+    FB_ERROR_ELBOWS: FB_W_ELBOWS,
+}
+FB_DEFAULT_WEIGHT = 0.5
+PENALTY_MIN_IF_ANY = 0.5
+
+FORM_ERROR_PRIORITY = [FB_ERROR_DEPTH, FB_ERROR_LOCKOUT, FB_ERROR_HIPS, FB_ERROR_ELBOWS]
+PERF_TIP_PRIORITY = [PERF_TIP_SLOW_DOWN, PERF_TIP_TEMPO, PERF_TIP_BREATHING, PERF_TIP_CORE]
+
+DEPTH_EXCELLENT_ANGLE = 85.0
+DEPTH_GOOD_ANGLE = 95.0
+DEPTH_FAIR_ANGLE = 105.0
+DEPTH_POOR_ANGLE = 115.0
+HIP_EXCELLENT = 8.0
+HIP_GOOD = 15.0
+HIP_FAIR = 22.0
+HIP_POOR = 30.0
+LOCKOUT_EXCELLENT = 175.0
+LOCKOUT_GOOD = 170.0
+LOCKOUT_FAIR = 165.0
+LOCKOUT_POOR = 160.0
+FLARE_EXCELLENT = 45.0
+FLARE_GOOD = 55.0
+FLARE_FAIR = 65.0
+FLARE_POOR = 75.0
+DESCENT_SPEED_IDEAL = 0.0010
+DESCENT_SPEED_FAST = 0.0012
+
+DEPTH_FAIL_MIN_REPS = 2
+HIPS_FAIL_MIN_REPS = 2
+LOCKOUT_FAIL_MIN_REPS = 2
+FLARE_FAIL_MIN_REPS = 2
+TEMPO_CHECK_MIN_REPS = 1
+DEPTH_ERROR_ANGLE = 110.0
+LOCKOUT_ERROR_ANGLE = 165.0
+
+BURST_FRAMES = 5   # was 4 — more burst frames near inflection for fast reps
+INFLECT_VEL_THR = 0.0027
+
+DEBUG_ONPUSHUP = bool(int(os.getenv("DEBUG_ONPUSHUP", "0")))
+DEBUG_MOTION = bool(int(os.getenv("DEBUG_MOTION", "0")))
+DEBUG_GRADING = bool(int(os.getenv("DEBUG_GRADING", "1")))
+
+MIN_CYCLE_ELBOW_SAMPLES = 4
+ROBUST_BOTTOM_PERCENTILE = 25
+ROBUST_TOP_PERCENTILE = 75
+ROBUST_CONFIRMED_PERCENTILE = 10
+
+
+# ============ Geometry helpers (unchanged) ============
+def _calculate_body_angle(lms, LSH, RSH, LH, RH, LA, RA):
+    mid_sh = ((lms[LSH].x + lms[RSH].x) / 2.0, (lms[LSH].y + lms[RSH].y) / 2.0)
+    mid_ank = ((lms[LA].x + lms[RA].x) / 2.0, (lms[LA].y + lms[RA].y) / 2.0)
+    dx = mid_sh[0] - mid_ank[0]
+    dy = mid_sh[1] - mid_ank[1]
+    return abs(math.degrees(math.atan2(abs(dy), abs(dx) + 1e-9)))
+
+
+def _calculate_hip_misalignment(lms, LSH, RSH, LH, RH, LA, RA):
+    mid_sh = ((lms[LSH].x + lms[RSH].x) / 2.0, (lms[LSH].y + lms[RSH].y) / 2.0)
+    mid_hp = ((lms[LH].x + lms[RH].x) / 2.0, (lms[LH].y + lms[RH].y) / 2.0)
+    mid_ank = ((lms[LA].x + lms[RA].x) / 2.0, (lms[LA].y + lms[RA].y) / 2.0)
+    return abs(180.0 - _ang(mid_sh, mid_hp, mid_ank))
+
+
+def _calculate_elbow_flare(lms, LSH, RSH, LE, RE, LW, RW):
+    mid_sh = ((lms[LSH].x + lms[RSH].x) / 2.0, (lms[LSH].y + lms[RSH].y) / 2.0)
+
+    left_vec_sh = (mid_sh[0] - lms[LSH].x, mid_sh[1] - lms[LSH].y)
+    left_vec_elb = (lms[LE].x - lms[LSH].x, lms[LE].y - lms[LSH].y)
+    left_angle = abs(math.degrees(math.atan2(
+        left_vec_sh[0] * left_vec_elb[1] - left_vec_sh[1] * left_vec_elb[0],
+        left_vec_sh[0] * left_vec_elb[0] + left_vec_sh[1] * left_vec_elb[1])))
+
+    right_vec_sh = (mid_sh[0] - lms[RSH].x, mid_sh[1] - lms[RSH].y)
+    right_vec_elb = (lms[RE].x - lms[RSH].x, lms[RE].y - lms[RSH].y)
+    right_angle = abs(math.degrees(math.atan2(
+        right_vec_sh[0] * right_vec_elb[1] - right_vec_sh[1] * right_vec_elb[0],
+        right_vec_sh[0] * right_vec_elb[0] + right_vec_sh[1] * right_vec_elb[1])))
+
+    return max(left_angle, right_angle)
+
+
+def _robust_cycle_elbows(bottom_samples, top_samples, fallback_bottom=None, fallback_top=None, confirmed_bottom=None):
+    robust_bottom = fallback_bottom
+    robust_top = fallback_top
+
+    if confirmed_bottom and len(confirmed_bottom) >= 1:
+        arr = np.array(confirmed_bottom, dtype=np.float32)
+        robust_bottom = float(np.percentile(arr, ROBUST_CONFIRMED_PERCENTILE))
+    elif bottom_samples:
+        arr = np.array(bottom_samples, dtype=np.float32)
+        robust_bottom = float(np.percentile(arr, ROBUST_BOTTOM_PERCENTILE))
+
+    if fallback_bottom is not None and robust_bottom is not None:
+        robust_bottom = min(robust_bottom, fallback_bottom)
+
+    if top_samples:
+        arr = np.array(top_samples, dtype=np.float32)
+        robust_top = float(np.percentile(arr, ROBUST_TOP_PERCENTILE))
+
+    return robust_bottom, robust_top
+
+
+def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
+                         cycle_max_hip_misalign, cycle_max_flare, cycle_max_descent_vel,
+                         depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
+                         fast_descent_count, depth_already_reported, hips_already_reported,
+                         lockout_already_reported, flare_already_reported, tempo_already_reported,
+                         session_form_errors, session_perf_tips, rep_count, local_vars):
+
+    has_depth_issue = has_lockout_issue = has_hips_issue = has_flare_issue = False
+
+    if bottom_phase_min_elbow is not None and local_vars.get("cycle_bottom_samples") and len(local_vars["cycle_bottom_samples"]) >= MIN_CYCLE_ELBOW_SAMPLES:
+        if bottom_phase_min_elbow > DEPTH_ERROR_ANGLE:
+            has_depth_issue = True
+            local_vars['cycle_tip_deeper'] = True
+            local_vars['depth_fail_count'] += 1
+            if local_vars['depth_fail_count'] >= DEPTH_FAIL_MIN_REPS and not depth_already_reported:
+                session_form_errors.add(FB_ERROR_DEPTH)
+                local_vars['depth_already_reported'] = True
+
+    if top_phase_max_elbow is not None and local_vars.get("cycle_top_samples") and len(local_vars["cycle_top_samples"]) >= MIN_CYCLE_ELBOW_SAMPLES:
+        if top_phase_max_elbow < LOCKOUT_ERROR_ANGLE:
+            has_lockout_issue = True
+            local_vars['cycle_tip_lockout'] = True
+            local_vars['lockout_fail_count'] += 1
+            if local_vars['lockout_fail_count'] >= LOCKOUT_FAIL_MIN_REPS and not lockout_already_reported:
+                session_form_errors.add(FB_ERROR_LOCKOUT)
+                local_vars['lockout_already_reported'] = True
+
+    if cycle_max_hip_misalign is not None:
+        if cycle_max_hip_misalign > HIP_FAIR:
+            has_hips_issue = True
+            local_vars['cycle_tip_hips'] = True
+            local_vars['hips_fail_count'] += 1
+            if local_vars['hips_fail_count'] >= HIPS_FAIL_MIN_REPS and not hips_already_reported:
+                session_form_errors.add(FB_ERROR_HIPS)
+                local_vars['hips_already_reported'] = True
+
+    if cycle_max_flare is not None:
+        if cycle_max_flare > FLARE_FAIR:
+            has_flare_issue = True
+            local_vars['cycle_tip_elbows'] = True
+            local_vars['flare_fail_count'] += 1
+            if local_vars['flare_fail_count'] >= FLARE_FAIL_MIN_REPS and not flare_already_reported:
+                session_form_errors.add(FB_ERROR_ELBOWS)
+                local_vars['flare_already_reported'] = True
+
+    if rep_count >= TEMPO_CHECK_MIN_REPS and not tempo_already_reported:
+        if cycle_max_descent_vel > DESCENT_SPEED_FAST:
+            local_vars['fast_descent_count'] += 1
+            if local_vars['fast_descent_count'] >= 1:
+                session_perf_tips.add(PERF_TIP_SLOW_DOWN)
+                session_perf_tips.add(PERF_TIP_TEMPO)
+                local_vars['tempo_already_reported'] = True
+
+    return has_depth_issue or has_lockout_issue or has_hips_issue or has_flare_issue
+
+
+def _count_rep(rep_reports, rep_count, bottom_elbow, descent_from, bottom_shoulder_y,
+               all_scores, rep_has_tip,
+               bottom_phase_min_elbow, top_phase_max_elbow,
+               cycle_max_hip_misalign, cycle_max_flare):
+
+    depth_score = lockout_score = hips_score = flare_score = 10.0
+
+    if bottom_phase_min_elbow:
+        if bottom_phase_min_elbow <= DEPTH_EXCELLENT_ANGLE:
+            depth_score = 10.0
+        elif bottom_phase_min_elbow <= DEPTH_GOOD_ANGLE:
+            depth_score = 9.0
+        elif bottom_phase_min_elbow <= DEPTH_FAIR_ANGLE:
+            depth_score = 7.5
+        elif bottom_phase_min_elbow <= DEPTH_POOR_ANGLE:
+            depth_score = 5.0
         else:
-            mp_img = mp.Image(image_format=mp.ImageFormat.SRGB,
-                              data=cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-            res = self._impl.detect_for_video(mp_img, int(timestamp_ms))
-            if res.pose_landmarks and len(res.pose_landmarks) > 0:
-                return res.pose_landmarks[0]
-            return None
+            depth_score = 3.0
 
-    def close(self):
-        if hasattr(self._impl, 'close'):
-            self._impl.close()
-        elif hasattr(self._impl, '__exit__'):
-            self._impl.__exit__(None, None, None)
+    if top_phase_max_elbow:
+        if top_phase_max_elbow >= LOCKOUT_EXCELLENT:
+            lockout_score = 10.0
+        elif top_phase_max_elbow >= LOCKOUT_GOOD:
+            lockout_score = 9.0
+        elif top_phase_max_elbow >= LOCKOUT_FAIR:
+            lockout_score = 7.5
+        elif top_phase_max_elbow >= LOCKOUT_POOR:
+            lockout_score = 5.0
+        else:
+            lockout_score = 3.0
+
+    if cycle_max_hip_misalign is not None:
+        if cycle_max_hip_misalign <= HIP_EXCELLENT:
+            hips_score = 10.0
+        elif cycle_max_hip_misalign <= HIP_GOOD:
+            hips_score = 9.0
+        elif cycle_max_hip_misalign <= HIP_FAIR:
+            hips_score = 7.5
+        elif cycle_max_hip_misalign <= HIP_POOR:
+            hips_score = 5.0
+        else:
+            hips_score = 3.0
+
+    if cycle_max_flare is not None:
+        if cycle_max_flare <= FLARE_EXCELLENT:
+            flare_score = 10.0
+        elif cycle_max_flare <= FLARE_GOOD:
+            flare_score = 9.0
+        elif cycle_max_flare <= FLARE_FAIR:
+            flare_score = 7.5
+        elif cycle_max_flare <= FLARE_POOR:
+            flare_score = 5.0
+        else:
+            flare_score = 3.0
+
+    rep_score = (depth_score * 0.35 + lockout_score * 0.25 + hips_score * 0.25 + flare_score * 0.15)
+    rep_score = round(rep_score * 2) / 2
+    all_scores.append(rep_score)
+
+    rep_reports.append({
+        "rep_index": int(rep_count + 1),
+        "score": float(rep_score),
+        "good": bool(rep_score >= 9.0),
+        "bottom_elbow": float(bottom_elbow),
+        "descent_from": float(descent_from),
+        "bottom_shoulder_y": float(bottom_shoulder_y),
+        "detailed_scores": {
+            "depth": float(depth_score),
+            "lockout": float(lockout_score),
+            "hips": float(hips_score),
+            "flare": float(flare_score),
+        },
+        "measurements": {
+            "bottom_elbow_angle": float(bottom_phase_min_elbow) if bottom_phase_min_elbow else None,
+            "top_elbow_angle": float(top_phase_max_elbow) if top_phase_max_elbow else None,
+            "hip_misalignment": float(cycle_max_hip_misalign) if cycle_max_hip_misalign else None,
+            "elbow_flare": float(cycle_max_flare) if cycle_max_flare else None,
+        }
+    })
 
 
-def get_video_rotation(video_path):
+# ============ Video rotation (like deadlift) ============
+def _get_video_rotation(video_path):
     try:
         result = subprocess.run(
             ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', video_path],
             capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
             data = json.loads(result.stdout)
-            for stream in data.get('streams', []):
-                if stream.get('codec_type') != 'video':
+            for s in data.get('streams', []):
+                if s.get('codec_type') != 'video':
                     continue
-                tags = stream.get('tags', {})
+                tags = s.get('tags', {})
                 if 'rotate' in tags:
                     return int(tags['rotate'])
-                for sd in stream.get('side_data_list', []):
+                for sd in s.get('side_data_list', []):
                     if 'rotation' in sd:
                         return (-int(sd['rotation'])) % 360
-    except Exception as e:
-        print(f"ROTATION: ffprobe failed: {e}", flush=True)
-    try:
-        result = subprocess.run(
-            ['ffprobe', '-v', 'quiet', '-select_streams', 'v:0',
-             '-show_entries', 'stream_tags=rotate', '-of', 'csv=p=0', video_path],
-            capture_output=True, text=True, timeout=10)
-        if result.returncode == 0 and result.stdout.strip():
-            return int(result.stdout.strip())
     except Exception:
         pass
     return 0
@@ -798,269 +664,681 @@ def get_video_rotation(video_path):
 
 def _apply_rotation(frame, angle):
     angle = angle % 360
-    if angle == 90:  return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    if angle == 180: return cv2.rotate(frame, cv2.ROTATE_180)
-    if angle == 270: return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if angle == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if angle == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if angle == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
     return frame
 
 
-def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
+# ============ PASS 1: Analysis (no video writing) — logic UNCHANGED ============
+def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
     import sys
-    effective_fps  = max(1.0, fps_in / max(1, frame_skip))
-    dt             = 1.0 / float(effective_fps)
+    t0 = time.time()
 
-    rep_detector      = DeadliftRepDetector(fps=effective_fps)
-    landmark_smoother = LandmarkSmoother(alpha=0.5, vis_threshold=0.35)
-    progress_ema      = EMA(0.35)
-    progress_ema.value = 0.0
+    model_complexity = 0 if fast_mode else 1
+    if fast_mode:
+        scale = min(scale, 0.35)
 
-    frame_idx        = 0
-    current_feedback = None
-    fb_hold          = 0
-    fb_hold_frames   = max(1, int(0.8 / dt))
-    frame_data       = {}
-    last_valid_snap  = None
-    last_composite   = 0.0
+    effective_fps = max(1.0, fps_in / max(1, BASE_FRAME_SKIP))
+    sec_to_frames = lambda s: max(1, int(s * effective_fps))
 
     cap = cv2.VideoCapture(video_path)
-    t0  = time.time()
+    if not cap.isOpened():
+        return None, {}, effective_fps
 
-    try:
-        pose_est = PoseEstimator()
-    except Exception as e:
-        cap.release()
-        return ({"squat_count": 0, "technique_score": 0.0,
-                 "technique_score_display": display_half_str(0.0),
-                 "technique_label": score_label(0.0),
-                 "good_reps": 0, "bad_reps": 0,
-                 "feedback": [f"Pose model error: {e}"],
-                 "reps": []},
-                {}, effective_fps)
+    frame_idx = 0
+    frame_data = {}
 
-    try:
-        while cap.isOpened():
+    rep_count = 0
+    good_reps = 0
+    bad_reps = 0
+    rep_reports = []
+    all_scores = []
+
+    motion_detector = MotionDetector()
+    frames_processed = 0
+    frames_skipped = 0
+
+    LSH = mp_pose.PoseLandmark.LEFT_SHOULDER.value
+    RSH = mp_pose.PoseLandmark.RIGHT_SHOULDER.value
+    LE = mp_pose.PoseLandmark.LEFT_ELBOW.value
+    RE = mp_pose.PoseLandmark.RIGHT_ELBOW.value
+    LW = mp_pose.PoseLandmark.LEFT_WRIST.value
+    RW = mp_pose.PoseLandmark.RIGHT_WRIST.value
+    LH = mp_pose.PoseLandmark.LEFT_HIP.value
+    RH = mp_pose.PoseLandmark.RIGHT_HIP.value
+    LA = mp_pose.PoseLandmark.LEFT_ANKLE.value
+    RA = mp_pose.PoseLandmark.RIGHT_ANKLE.value
+
+    def _pick_side_dyn(lms):
+        vL = lms[LSH].visibility + lms[LE].visibility + lms[LW].visibility
+        vR = lms[RSH].visibility + lms[RE].visibility + lms[RW].visibility
+        return ("LEFT", LSH, LE, LW) if vL >= vR else ("RIGHT", RSH, RE, RW)
+
+    elbow_ema = None
+    shoulder_ema = None
+    shoulder_prev = None
+    shoulder_vel_prev = None
+    baseline_shoulder_y = None
+    desc_base_shoulder = None
+    allow_new_bottom = True
+    last_bottom_frame = -10**9
+    cycle_max_descent = 0.0
+    cycle_min_elbow = 999.0
+    counted_this_cycle = False
+
+    onpushup = False
+    onpushup_streak = 0
+    offpushup_streak = 0
+    offpushup_frames_since_any_rep = 0
+    nopose_frames_since_any_rep = 0
+
+    session_form_errors = set()
+    session_perf_tips = set()
+    rt_fb_msg = None
+    rt_fb_hold = 0
+
+    cycle_tip_deeper = False
+    cycle_tip_hips = False
+    cycle_tip_lockout = False
+    cycle_tip_elbows = False
+    cycle_bottom_samples = []
+    cycle_top_samples = []
+    confirmed_bottom_samples = []
+    depth_fail_count = 0
+    hips_fail_count = 0
+    lockout_fail_count = 0
+    flare_fail_count = 0
+    depth_already_reported = False
+    hips_already_reported = False
+    lockout_already_reported = False
+    flare_already_reported = False
+
+    fast_descent_count = 0
+    tempo_already_reported = False
+
+    bottom_phase_min_elbow = None
+    top_phase_max_elbow = None
+    cycle_max_hip_misalign = None
+    cycle_max_flare = None
+    cycle_max_descent_vel = 0.0
+    in_descent_phase = False
+
+    OFFPUSHUP_STOP_FRAMES = sec_to_frames(AUTO_STOP_AFTER_EXIT_SEC)
+    NOPOSE_STOP_FRAMES = sec_to_frames(TAIL_NOPOSE_STOP_SEC)
+    RT_FB_HOLD_FRAMES = sec_to_frames(0.8)
+    REARM_ASCENT_EFF = max(RESET_ASCENT * 0.58, 0.014)
+
+    burst_cntr = 0
+    last_valid_snap = None
+
+    with mp_pose.Pose(model_complexity=model_complexity,
+                      min_detection_confidence=0.5,
+                      min_tracking_confidence=0.5) as pose:
+        while True:
             ret, frame = cap.read()
             if not ret:
                 break
             if time.time() - t0 > 180:
-                print("[DL] Pass1 timeout 180s", file=sys.stderr, flush=True)
+                print("[PUSHUP] Pass1 timeout 180s", file=sys.stderr, flush=True)
                 break
 
             frame_idx += 1
-            if frame_idx % frame_skip != 0:
+
+            process_now = False
+            if burst_cntr > 0:
+                process_now = True
+                burst_cntr -= 1
+            elif motion_detector.should_process(frame_idx):
+                process_now = True
+
+            if not process_now:
+                frames_skipped += 1
                 continue
+
+            frames_processed += 1
 
             frame = _apply_rotation(frame, rotation)
-            work  = (cv2.resize(frame, (0, 0), fx=scale, fy=scale)
-                     if scale != 1.0 else frame)
 
-            timestamp_ms = (frame_idx / fps_in) * 1000.0
-            landmarks    = pose_est.process(work, timestamp_ms=timestamp_ms)
+            # Scale down for pose detection
+            if scale != 1.0:
+                work = cv2.resize(frame, (0, 0), fx=scale, fy=scale)
+            else:
+                work = frame
 
-            def _store(snap, composite):
+            res = pose.process(cv2.cvtColor(work, cv2.COLOR_BGR2RGB))
+            depth_live = 0.0
+
+            if not res.pose_landmarks:
+                nopose_frames_since_any_rep = (nopose_frames_since_any_rep + 1) if rep_count > 0 else 0
+                if rep_count > 0 and nopose_frames_since_any_rep >= NOPOSE_STOP_FRAMES:
+                    break
                 frame_data[frame_idx] = {
-                    "snap":      snap,
-                    "reps":      rep_detector.reps,
-                    "fb":        current_feedback if fb_hold > 0 else None,
-                    "composite": composite,
+                    "snap": last_valid_snap,
+                    "reps": rep_count,
+                    "fb": rt_fb_msg if rt_fb_hold > 0 else None,
+                    "depth_pct": 0.0,
                 }
-
-            if landmarks is None:
-                _store(last_valid_snap, last_composite)
-                if fb_hold > 0:
-                    fb_hold -= 1
+                if rt_fb_hold > 0:
+                    rt_fb_hold -= 1
                 continue
 
-            smoothed = landmark_smoother.update(landmarks)
-            snap     = _snapshot_smoothed(smoothed)
+            nopose_frames_since_any_rep = 0
+            lms = res.pose_landmarks.landmark
+
+            # Save lightweight snapshot for render pass
+            snap = _snapshot_smoothed(lms)
             last_valid_snap = snap
 
-            composite, rt_fb, rep_info = rep_detector.process_frame(smoothed, landmarks, frame_idx)
-            last_composite = composite
+            side, S, E, W = _pick_side_dyn(lms)
 
-            if rt_fb:
-                current_feedback = rt_fb
-                fb_hold          = fb_hold_frames
-            elif rep_info:
-                current_feedback = (rep_info["feedback"][0]
-                                    if rep_info.get("feedback") else None)
-                fb_hold = fb_hold_frames if current_feedback else 0
+            min_vis = min(lms[S].visibility, lms[E].visibility, lms[W].visibility,
+                          lms[LH].visibility, lms[RH].visibility)
+            vis_strict_ok = (min_vis >= VIS_THR_STRICT)
 
-            if fb_hold > 0:
-                fb_hold -= 1
+            shoulder_raw = float(lms[S].y)
+            raw_elbow_L = _ang((lms[LSH].x, lms[LSH].y), (lms[LE].x, lms[LE].y), (lms[LW].x, lms[LW].y))
+            raw_elbow_R = _ang((lms[RSH].x, lms[RSH].y), (lms[RE].x, lms[RE].y), (lms[RW].x, lms[RW].y))
+            raw_elbow = raw_elbow_L if side == "LEFT" else raw_elbow_R
+            raw_elbow_min = min(raw_elbow_L, raw_elbow_R)
 
-            _store(snap, composite)
+            elbow_ema = _ema(elbow_ema, raw_elbow, ELBOW_EMA_ALPHA)
+            shoulder_ema = _ema(shoulder_ema, shoulder_raw, SHOULDER_EMA_ALPHA)
+            shoulder_y = shoulder_ema
+            elbow_angle = elbow_ema
 
-            if frame_idx % (frame_skip * 50) == 0:
-                print(f"[DL] Pass1 fi={frame_idx} reps={rep_detector.reps} "
-                      f"comp={composite:.3f} state={rep_detector.state}",
-                      file=sys.stderr, flush=True)
+            motion_detector.add_sample(shoulder_y, elbow_angle, raw_elbow_min, frame_idx)
 
-    finally:
-        pose_est.close()
-        cap.release()
+            if baseline_shoulder_y is None:
+                baseline_shoulder_y = shoulder_y
+            depth_live = float(np.clip(
+                (shoulder_y - baseline_shoulder_y) / max(0.10, SHOULDER_MIN_DESCENT * 1.2),
+                0.0, 1.0))
 
-    print(f"[DL] Pass1 done reps={rep_detector.reps}", file=sys.stderr, flush=True)
+            body_angle = _calculate_body_angle(lms, LSH, RSH, LH, RH, LA, RA)
+            hands_position = ((lms[LW].y > lms[LSH].y - HANDS_BELOW_SHOULDERS) and
+                              (lms[RW].y > lms[RSH].y - HANDS_BELOW_SHOULDERS))
+            in_plank = (body_angle <= PLANK_BODY_ANGLE_MAX) and hands_position
 
-    # V4.5: Post-analysis putdown filter.
-    # After the last real rep, the lifter puts the bar down and stands up.
-    # This "stand up" can be falsely counted as a rep. Detect and remove it.
-    # Heuristic: if last rep's gap from previous rep is much larger than
-    # the average inter-rep gap, and it's near the end of the video.
-    total_processed = frame_idx  # last frame_idx from the loop
-    if len(rep_detector.reps_report) >= 3:
-        # Get frame indices from rep timing (approximate from rep_index and last_rep_frame)
-        # Use the frame_data to find when each rep was counted
-        rep_frames = []
-        for fi in sorted(frame_data.keys()):
-            fd = frame_data[fi]
-            if fd["reps"] > len(rep_frames):
-                rep_frames.append(fi)
-        if len(rep_frames) >= 3:
-            gaps = [rep_frames[i] - rep_frames[i-1] for i in range(1, len(rep_frames))]
-            last_gap = gaps[-1]
-            avg_gap = sum(gaps[:-1]) / len(gaps[:-1])  # average of gaps EXCLUDING last
-            last_rep_late = rep_frames[-1] > total_processed * 0.75  # in last 25% of video
-            if avg_gap > 0 and last_gap > avg_gap * 1.5 and last_rep_late:
-                print(f"[DL] PUTDOWN FILTER: removing last rep "
-                      f"(gaps={gaps}, avg={avg_gap:.0f}, last={last_gap}, "
-                      f"ratio={last_gap/avg_gap:.1f}x, late={last_rep_late})",
-                      file=sys.stderr, flush=True)
-                removed = rep_detector.reps_report.pop()
-                rep_detector.all_scores.pop()
-                rep_detector.reps -= 1
-                if float(removed.get("score") or 0) >= 10.0:
-                    rep_detector.good_reps = max(0, rep_detector.good_reps - 1)
+            if vis_strict_ok and in_plank:
+                onpushup_streak += 1
+                offpushup_streak = 0
+            else:
+                offpushup_streak += 1
+                onpushup_streak = 0
+
+            if (not onpushup) and onpushup_streak >= ONPUSHUP_MIN_FRAMES:
+                onpushup = True
+                desc_base_shoulder = None
+                allow_new_bottom = True
+                cycle_max_descent = 0.0
+                cycle_min_elbow = 999.0
+                counted_this_cycle = False
+                cycle_tip_deeper = False
+                cycle_tip_hips = False
+                cycle_tip_lockout = False
+                cycle_tip_elbows = False
+                cycle_bottom_samples = []
+                cycle_top_samples = []
+                confirmed_bottom_samples = []
+                bottom_phase_min_elbow = None
+                top_phase_max_elbow = None
+                cycle_max_hip_misalign = None
+                cycle_max_flare = None
+                cycle_max_descent_vel = 0.0
+                in_descent_phase = False
+                motion_detector.activate("enter_plank")
+
+            if onpushup and offpushup_streak >= OFFPUSHUP_MIN_FRAMES:
+                robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(
+                    cycle_bottom_samples, cycle_top_samples,
+                    bottom_phase_min_elbow, top_phase_max_elbow,
+                    confirmed_bottom=confirmed_bottom_samples)
+                cycle_has_issues = _evaluate_cycle_form(
+                    lms, robust_bottom_elbow, robust_top_elbow,
+                    cycle_max_hip_misalign, cycle_max_flare, cycle_max_descent_vel,
+                    depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
+                    fast_descent_count, depth_already_reported, hips_already_reported,
+                    lockout_already_reported, flare_already_reported, tempo_already_reported,
+                    session_form_errors, session_perf_tips, rep_count, locals())
+
+                if ((not counted_this_cycle) and
+                        (cycle_max_descent >= SHOULDER_MIN_DESCENT) and
+                        (cycle_min_elbow <= ELBOW_BENT_ANGLE)):
+                    _count_rep(rep_reports, rep_count, cycle_min_elbow,
+                               desc_base_shoulder if desc_base_shoulder is not None else shoulder_y,
+                               baseline_shoulder_y + cycle_max_descent if baseline_shoulder_y is not None else shoulder_y,
+                               all_scores, cycle_has_issues,
+                               robust_bottom_elbow, robust_top_elbow,
+                               cycle_max_hip_misalign, cycle_max_flare)
+                    rep_count += 1
+                    if cycle_has_issues:
+                        bad_reps += 1
+                    else:
+                        good_reps += 1
+
+                onpushup = False
+                offpushup_frames_since_any_rep = 0
+                desc_base_shoulder = None
+                cycle_max_descent = 0.0
+                cycle_min_elbow = 999.0
+                counted_this_cycle = False
+                cycle_tip_deeper = False
+                cycle_tip_hips = False
+                cycle_tip_lockout = False
+                cycle_tip_elbows = False
+                cycle_bottom_samples = []
+                cycle_top_samples = []
+                confirmed_bottom_samples = []
+                bottom_phase_min_elbow = None
+                top_phase_max_elbow = None
+                cycle_max_hip_misalign = None
+                cycle_max_flare = None
+                cycle_max_descent_vel = 0.0
+
+            if (not onpushup) and rep_count > 0:
+                offpushup_frames_since_any_rep += 1
+                if offpushup_frames_since_any_rep >= OFFPUSHUP_STOP_FRAMES:
+                    break
+
+            shoulder_vel = 0.0 if shoulder_prev is None else (shoulder_y - shoulder_prev)
+            cur_rt = None
+
+            if onpushup and (desc_base_shoulder is not None):
+                near_inflect = (abs(shoulder_vel) <= INFLECT_VEL_THR)
+                sign_flip = (shoulder_vel_prev is not None) and (
+                    (shoulder_vel_prev < 0 and shoulder_vel >= 0) or
+                    (shoulder_vel_prev > 0 and shoulder_vel <= 0))
+                if near_inflect or sign_flip:
+                    burst_cntr = max(burst_cntr, BURST_FRAMES)
+                    motion_detector.activate("inflection")
+            shoulder_vel_prev = shoulder_vel
+
+            if onpushup and vis_strict_ok:
+                if desc_base_shoulder is None:
+                    if shoulder_vel > abs(INFLECT_VEL_THR):
+                        desc_base_shoulder = shoulder_y
+                        cycle_max_descent = 0.0
+                        cycle_min_elbow = elbow_angle
+                        counted_this_cycle = False
+                        cycle_bottom_samples = []
+                        cycle_top_samples = []
+                        confirmed_bottom_samples = []
+                        bottom_phase_min_elbow = None
+                        top_phase_max_elbow = None
+                        cycle_max_hip_misalign = None
+                        cycle_max_flare = None
+                        cycle_max_descent_vel = 0.0
+                        in_descent_phase = True
+                        motion_detector.activate("start_descent")
                 else:
-                    rep_detector.bad_reps = max(0, rep_detector.bad_reps - 1)
+                    cycle_max_descent = max(cycle_max_descent, (shoulder_y - desc_base_shoulder))
+                    cycle_min_elbow = min(cycle_min_elbow, elbow_angle)
 
-    avg = float(np.mean(rep_detector.all_scores)) if rep_detector.all_scores else 0.0
-    if not np.isfinite(avg):
-        avg = 0.0
-    technique_score = round(round(avg * 2) / 2, 2)
+                    vel_abs = abs(shoulder_vel)
+                    if shoulder_vel > 0 and in_descent_phase:
+                        cycle_max_descent_vel = max(cycle_max_descent_vel, vel_abs)
+                    if vel_abs > 0.0005:
+                        cycle_max_descent_vel = max(cycle_max_descent_vel, vel_abs)
 
-    # V4.5: If ANY rep had feedback (not perfect), cap overall score at 9.5
-    any_imperfect = any(float(r.get("score") or 0) < 10.0 for r in rep_detector.reps_report)
-    if any_imperfect and technique_score >= 10.0:
-        technique_score = 9.5
+                    min_elb_now = min(raw_elbow_L, raw_elbow_R)
+                    cycle_bottom_samples.append(min_elb_now)
+                    if len(cycle_bottom_samples) > 40:
+                        cycle_bottom_samples.pop(0)
+                    if bottom_phase_min_elbow is None:
+                        bottom_phase_min_elbow = min_elb_now
+                    else:
+                        bottom_phase_min_elbow = min(bottom_phase_min_elbow, min_elb_now)
 
-    seen, feedback_list = set(), []
-    for r in rep_detector.reps_report:
-        if float(r.get("score") or 0.0) >= 10.0:
-            continue
-        for msg in (r.get("feedback") or []):
-            if msg and msg not in seen:
-                seen.add(msg)
-                feedback_list.append(msg)
-    if not feedback_list:
-        feedback_list = ["Great form! Keep it up 💪"]
+                    max_elb_now = max(raw_elbow_L, raw_elbow_R)
+                    cycle_top_samples.append(max_elb_now)
+                    if len(cycle_top_samples) > 40:
+                        cycle_top_samples.pop(0)
+                    if top_phase_max_elbow is None:
+                        top_phase_max_elbow = max_elb_now
+                    else:
+                        top_phase_max_elbow = max(top_phase_max_elbow, max_elb_now)
 
-    analysis = {
-        "squat_count":             int(rep_detector.reps),
-        "technique_score":         float(technique_score),
+                    hip_misalign = _calculate_hip_misalignment(lms, LSH, RSH, LH, RH, LA, RA)
+                    if cycle_max_hip_misalign is None:
+                        cycle_max_hip_misalign = hip_misalign
+                    else:
+                        cycle_max_hip_misalign = max(cycle_max_hip_misalign, hip_misalign)
+
+                    elbow_flare = _calculate_elbow_flare(lms, LSH, RSH, LE, RE, LW, RW)
+                    if cycle_max_flare is None:
+                        cycle_max_flare = elbow_flare
+                    else:
+                        cycle_max_flare = max(cycle_max_flare, elbow_flare)
+
+                    reset_by_asc = (desc_base_shoulder is not None) and ((desc_base_shoulder - shoulder_y) >= RESET_ASCENT)
+                    reset_by_elb = (elbow_angle >= RESET_ELBOW)
+
+                    if shoulder_vel < 0 and in_descent_phase:
+                        in_descent_phase = False
+
+                    if reset_by_asc or reset_by_elb:
+                        robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(
+                            cycle_bottom_samples, cycle_top_samples,
+                            bottom_phase_min_elbow, top_phase_max_elbow,
+                            confirmed_bottom=confirmed_bottom_samples)
+                        cycle_has_issues = _evaluate_cycle_form(
+                            lms, robust_bottom_elbow, robust_top_elbow,
+                            cycle_max_hip_misalign, cycle_max_flare, cycle_max_descent_vel,
+                            depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
+                            fast_descent_count, depth_already_reported, hips_already_reported,
+                            lockout_already_reported, flare_already_reported, tempo_already_reported,
+                            session_form_errors, session_perf_tips, rep_count, locals())
+
+                        if ((not counted_this_cycle) and
+                                (cycle_max_descent >= SHOULDER_MIN_DESCENT) and
+                                (cycle_min_elbow <= ELBOW_BENT_ANGLE)):
+                            _count_rep(rep_reports, rep_count, elbow_angle,
+                                       desc_base_shoulder,
+                                       baseline_shoulder_y + cycle_max_descent if baseline_shoulder_y is not None else shoulder_y,
+                                       all_scores, cycle_has_issues,
+                                       robust_bottom_elbow, robust_top_elbow,
+                                       cycle_max_hip_misalign, cycle_max_flare)
+                            rep_count += 1
+                            if cycle_has_issues:
+                                bad_reps += 1
+                            else:
+                                good_reps += 1
+
+                        desc_base_shoulder = shoulder_y
+                        cycle_max_descent = 0.0
+                        cycle_min_elbow = elbow_angle
+                        counted_this_cycle = False
+                        allow_new_bottom = True
+                        cycle_bottom_samples = []
+                        cycle_top_samples = []
+                        confirmed_bottom_samples = []
+                        bottom_phase_min_elbow = None
+                        top_phase_max_elbow = None
+                        cycle_max_hip_misalign = None
+                        cycle_max_flare = None
+                        cycle_max_descent_vel = 0.0
+                        cycle_tip_deeper = False
+                        cycle_tip_hips = False
+                        cycle_tip_lockout = False
+                        cycle_tip_elbows = False
+                        in_descent_phase = True
+                        motion_detector.activate("reset")
+
+                    descent_amt = 0.0 if desc_base_shoulder is None else (shoulder_y - desc_base_shoulder)
+
+                    at_bottom = (elbow_angle <= ELBOW_BENT_ANGLE) and (descent_amt >= SHOULDER_MIN_DESCENT)
+                    raw_bottom = (raw_elbow_min <= (ELBOW_BENT_ANGLE + 9.0)) and (descent_amt >= SHOULDER_MIN_DESCENT * 0.87)
+                    at_bottom = at_bottom or raw_bottom
+                    can_cnt = (frame_idx - last_bottom_frame) >= REFRACTORY_FRAMES
+
+                    if at_bottom:
+                        confirmed_bottom_samples.append(raw_elbow_min)
+                        if len(confirmed_bottom_samples) > 15:
+                            confirmed_bottom_samples.pop(0)
+
+                    if at_bottom and allow_new_bottom and can_cnt and (not counted_this_cycle):
+                        rep_has_issues = False
+                        robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(
+                            cycle_bottom_samples, cycle_top_samples,
+                            bottom_phase_min_elbow, top_phase_max_elbow,
+                            confirmed_bottom=confirmed_bottom_samples)
+                        if robust_bottom_elbow and robust_bottom_elbow > DEPTH_ERROR_ANGLE:
+                            rep_has_issues = True
+                        if robust_top_elbow and robust_top_elbow < LOCKOUT_ERROR_ANGLE:
+                            rep_has_issues = True
+                        if cycle_max_hip_misalign and cycle_max_hip_misalign > HIP_FAIR:
+                            rep_has_issues = True
+                        if cycle_max_flare and cycle_max_flare > FLARE_FAIR:
+                            rep_has_issues = True
+
+                        _count_rep(rep_reports, rep_count, elbow_angle,
+                                   desc_base_shoulder if desc_base_shoulder is not None else shoulder_y,
+                                   shoulder_y,
+                                   all_scores, rep_has_issues,
+                                   robust_bottom_elbow if robust_bottom_elbow else raw_elbow_min,
+                                   robust_top_elbow if robust_top_elbow else max(raw_elbow_L, raw_elbow_R),
+                                   cycle_max_hip_misalign if cycle_max_hip_misalign else 0.0,
+                                   cycle_max_flare if cycle_max_flare else 0.0)
+                        rep_count += 1
+                        if rep_has_issues:
+                            bad_reps += 1
+                        else:
+                            good_reps += 1
+                        last_bottom_frame = frame_idx
+                        allow_new_bottom = False
+                        counted_this_cycle = True
+                        top_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
+                        in_descent_phase = False
+                        motion_detector.activate("count_rep")
+
+                    if (allow_new_bottom is False) and (last_bottom_frame > 0):
+                        if (shoulder_prev is not None and (shoulder_prev - shoulder_y) > 0
+                                and (desc_base_shoulder is not None)):
+                            if ((desc_base_shoulder + cycle_max_descent) - shoulder_y) >= REARM_ASCENT_EFF:
+                                allow_new_bottom = True
+
+                    if at_bottom and not cycle_tip_deeper:
+                        robust_bottom_elbow, _ = _robust_cycle_elbows(
+                            cycle_bottom_samples, cycle_top_samples,
+                            bottom_phase_min_elbow, top_phase_max_elbow,
+                            confirmed_bottom=confirmed_bottom_samples)
+                        if robust_bottom_elbow and robust_bottom_elbow > DEPTH_ERROR_ANGLE:
+                            cycle_tip_deeper = True
+                            depth_fail_count += 1
+                            if depth_fail_count >= DEPTH_FAIL_MIN_REPS and not depth_already_reported:
+                                session_form_errors.add(FB_ERROR_DEPTH)
+                                depth_already_reported = True
+                                cur_rt = FB_ERROR_DEPTH
+
+            else:
+                desc_base_shoulder = None
+                allow_new_bottom = True
+
+            if cur_rt:
+                if cur_rt != rt_fb_msg:
+                    rt_fb_msg = cur_rt
+                    rt_fb_hold = RT_FB_HOLD_FRAMES
+                else:
+                    rt_fb_hold = max(rt_fb_hold, RT_FB_HOLD_FRAMES)
+            else:
+                if rt_fb_hold > 0:
+                    rt_fb_hold -= 1
+
+            # Store frame data for render pass
+            frame_data[frame_idx] = {
+                "snap": snap,
+                "reps": rep_count,
+                "fb": rt_fb_msg if rt_fb_hold > 0 else None,
+                "depth_pct": depth_live,
+            }
+
+            if shoulder_y is not None:
+                shoulder_prev = shoulder_y
+
+    # Final uncounted cycle
+    if (onpushup and (not counted_this_cycle)
+            and (cycle_max_descent >= SHOULDER_MIN_DESCENT)
+            and (cycle_min_elbow <= ELBOW_BENT_ANGLE)):
+        robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(
+            cycle_bottom_samples, cycle_top_samples,
+            bottom_phase_min_elbow, top_phase_max_elbow,
+            confirmed_bottom=confirmed_bottom_samples)
+        cycle_has_issues = _evaluate_cycle_form(
+            lms, robust_bottom_elbow, robust_top_elbow,
+            cycle_max_hip_misalign, cycle_max_flare, cycle_max_descent_vel,
+            depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
+            fast_descent_count, depth_already_reported, hips_already_reported,
+            lockout_already_reported, flare_already_reported, tempo_already_reported,
+            session_form_errors, session_perf_tips, rep_count, locals())
+        _count_rep(rep_reports, rep_count, cycle_min_elbow,
+                   desc_base_shoulder if desc_base_shoulder is not None else (baseline_shoulder_y or 0.0),
+                   (baseline_shoulder_y + cycle_max_descent) if baseline_shoulder_y is not None else (baseline_shoulder_y or 0.0),
+                   all_scores, cycle_has_issues,
+                   robust_bottom_elbow, robust_top_elbow,
+                   cycle_max_hip_misalign, cycle_max_flare)
+        rep_count += 1
+        if cycle_has_issues:
+            bad_reps += 1
+        else:
+            good_reps += 1
+
+    cap.release()
+
+    # Compute technique score
+    if rep_count == 0:
+        technique_score = 0.0
+    else:
+        if session_form_errors:
+            penalty = sum(FB_WEIGHTS.get(m, FB_DEFAULT_WEIGHT) for m in set(session_form_errors))
+            penalty = max(PENALTY_MIN_IF_ANY, penalty)
+        else:
+            penalty = 0.0
+        technique_score = _half_floor10(max(0.0, 10.0 - penalty))
+
+    if technique_score == 10.0 and rep_count > 0:
+        good_reps = rep_count
+        bad_reps = 0
+
+    form_errors_list = [err for err in FORM_ERROR_PRIORITY if err in session_form_errors]
+    perf_tips_list = [tip for tip in PERF_TIP_PRIORITY if tip in session_perf_tips]
+    primary_form_error = form_errors_list[0] if form_errors_list else None
+    primary_perf_tip = perf_tips_list[0] if perf_tips_list else None
+
+    total_frames = frames_processed + frames_skipped
+    efficiency = (frames_skipped / total_frames * 100) if total_frames > 0 else 0
+
+    print(f"[PUSHUP] Pass1 done: {rep_count} reps, {frames_processed} proc, "
+          f"{frames_skipped} skip ({efficiency:.0f}%), {time.time()-t0:.1f}s",
+          file=sys.stderr, flush=True)
+
+    result = {
+        "squat_count": int(rep_count),
+        "technique_score": float(technique_score),
         "technique_score_display": display_half_str(technique_score),
-        "technique_label":         score_label(technique_score),
-        "good_reps":               int(rep_detector.good_reps),
-        "bad_reps":                int(rep_detector.bad_reps),
-        "feedback":                feedback_list,
-        "reps":                    rep_detector.reps_report,
+        "technique_label": score_label(technique_score),
+        "good_reps": int(good_reps),
+        "bad_reps": int(bad_reps),
+        "feedback": form_errors_list if form_errors_list else (
+            ["Great form! Keep it up \U0001f4aa"] if technique_score == 10.0 and rep_count > 0 else []),
+        "tips": perf_tips_list,
+        "reps": rep_reports,
+        "processing_stats": {
+            "frames_processed": frames_processed,
+            "frames_skipped": frames_skipped,
+            "efficiency_percent": round(efficiency, 1),
+            "motion_activations": motion_detector.activation_count,
+        }
     }
-    return analysis, frame_data, effective_fps
+
+    if primary_perf_tip:
+        result["form_tip"] = primary_perf_tip
+    if primary_form_error:
+        result["primary_form_error"] = primary_form_error
+    if primary_perf_tip:
+        result["primary_perf_tip"] = primary_perf_tip
+
+    return result, frame_data, effective_fps
 
 
-def _render_pass(video_path, rotation, frame_skip, output_path,
+# ============ PASS 2: Render at OUTPUT resolution (sharp overlay) ============
+def _render_pass(video_path, rotation, output_path,
                  out_w, out_h, work_w, work_h, fps_in, frame_data):
+    """
+    Render pass: reads video, draws skeleton + overlay at OUTPUT resolution
+    (out_w x out_h) so fonts and donut are sharp. ffmpeg then just encodes
+    without upscaling.
+    """
     import sys
-    effective_fps = max(1.0, fps_in / max(1, frame_skip))
+    effective_fps = max(1.0, fps_in / max(1, BASE_FRAME_SKIP))
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out    = cv2.VideoWriter(output_path, fourcc, effective_fps, (work_w, work_h))
+    out = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
 
     if not out.isOpened():
-        print(f"[DL] ERROR: VideoWriter failed", file=sys.stderr, flush=True)
+        print(f"[PUSHUP] ERROR: VideoWriter failed", file=sys.stderr, flush=True)
         return
 
-    cap       = cv2.VideoCapture(video_path)
-    frame_idx = written = 0
+    cap = cv2.VideoCapture(video_path)
+    frame_idx = 0
+    written = 0
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
         frame_idx += 1
-        if frame_idx % frame_skip != 0:
+
+        # Only write frames that exist in frame_data (processed by analysis)
+        if frame_idx not in frame_data:
             continue
 
         frame = _apply_rotation(frame, rotation)
-        if frame.shape[1] != work_w or frame.shape[0] != work_h:
-            frame = cv2.resize(frame, (work_w, work_h))
 
-        fd = frame_data.get(frame_idx)
-        if fd is None:
-            out.write(draw_overlay(frame, reps=0, feedback=None, progress_pct=0.0))
-        else:
-            f = frame.copy()
-            if fd["snap"] is not None:
-                f = draw_skeleton(f, fd["snap"])
-            donut_pct = 1.0 - float(np.clip(fd["composite"], 0, 1))
-            out.write(draw_overlay(f, reps=fd["reps"],
-                                   feedback=fd["fb"],
-                                   progress_pct=donut_pct))
+        # Resize to OUTPUT resolution (full size, not work size)
+        if frame.shape[1] != out_w or frame.shape[0] != out_h:
+            frame = cv2.resize(frame, (out_w, out_h))
+
+        fd = frame_data[frame_idx]
+        f = frame.copy()
+        if fd["snap"] is not None:
+            f = draw_skeleton(f, fd["snap"])
+
+        out.write(draw_overlay(f, reps=fd["reps"],
+                               feedback=fd["fb"],
+                               depth_pct=fd["depth_pct"]))
         written += 1
 
     cap.release()
     out.release()
-    print(f"[DL] Pass2 done frames_written={written}", file=sys.stderr, flush=True)
+    print(f"[PUSHUP] Pass2 done frames_written={written} at {out_w}x{out_h}",
+          file=sys.stderr, flush=True)
 
 
-def run_deadlift_analysis(video_path,
-                          frame_skip=3,
-                          scale=0.4,
-                          output_path="deadlift_analyzed.mp4",
-                          feedback_path="deadlift_feedback.txt",
-                          detector_onnx_path="barbell_plates_yolov8n.onnx",
-                          detector_input_size=640,
-                          detector_conf_thres=0.25,
-                          detector_iou_thres=0.45,
-                          detector_class_ids=None,
-                          return_video=True,
-                          fast_mode=None,
-                          pose_model_path=None):
+# ============ Main entry — identical structure to deadlift run_deadlift_analysis ============
+def run_pushup_analysis(video_path,
+                        frame_skip=None,
+                        scale=0.4,
+                        output_path="pushup_analyzed.mp4",
+                        feedback_path="pushup_feedback.txt",
+                        preserve_quality=False,
+                        encode_crf=None,
+                        return_video=True,
+                        fast_mode=None):
     import sys
+    if mp_pose is None:
+        return _ret_err("Mediapipe not available", feedback_path)
+
     t_start = time.time()
 
     if fast_mode is True:
         return_video = False
+    if fast_mode:
+        scale = min(scale, 0.35)
+
+    if preserve_quality:
+        scale = 1.0
+        encode_crf = 18 if encode_crf is None else encode_crf
+    else:
+        encode_crf = 28 if encode_crf is None else encode_crf
+
     create_video = bool(return_video) and bool(output_path)
 
-    print(f"[DL] Start fast_mode={fast_mode} create_video={create_video}",
+    rotation = _get_video_rotation(video_path)
+    print(f"[PUSHUP] Start fast_mode={fast_mode} create_video={create_video} rotation={rotation}deg",
           file=sys.stderr, flush=True)
-
-    rotation = get_video_rotation(video_path)
-    print(f"[DL] rotation={rotation}deg", file=sys.stderr, flush=True)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return {"squat_count": 0, "technique_score": 0.0,
-                "technique_score_display": display_half_str(0.0),
-                "technique_label": score_label(0.0),
-                "good_reps": 0, "bad_reps": 0,
-                "feedback": ["Could not open video"],
-                "reps": [], "video_path": "", "feedback_path": feedback_path}
+        return _ret_err("Could not open video", feedback_path)
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    fps_in       = cap.get(cv2.CAP_PROP_FPS) or 25
-    orig_w       = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    orig_h       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps_in = cap.get(cv2.CAP_PROP_FPS) or 25
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
-
-    if total_frames < 10:
-        return {"squat_count": 0, "technique_score": 0.0,
-                "technique_score_display": display_half_str(0.0),
-                "technique_label": score_label(0.0),
-                "good_reps": 0, "bad_reps": 0,
-                "feedback": [f"Invalid video — only {total_frames} frames"],
-                "reps": [], "video_path": "", "feedback_path": feedback_path}
 
     if rotation % 360 in (90, 270):
         out_w, out_h = orig_h, orig_w
@@ -1072,64 +1350,103 @@ def run_deadlift_analysis(video_path,
     work_w = work_w if work_w % 2 == 0 else work_w + 1
     work_h = work_h if work_h % 2 == 0 else work_h + 1
 
-    print(f"[DL] {total_frames}fr @ {fps_in:.1f}fps  out={out_w}x{out_h}  work={work_w}x{work_h}",
+    print(f"[PUSHUP] out={out_w}x{out_h} work={work_w}x{work_h}",
           file=sys.stderr, flush=True)
 
+    # PASS 1: Analysis
     analysis, frame_data, effective_fps = _analysis_pass(
-        video_path, rotation, frame_skip, scale, fps_in)
+        video_path, rotation, scale, fps_in,
+        fast_mode=bool(fast_mode) if fast_mode else False)
 
+    if analysis is None:
+        return _ret_err("Analysis failed", feedback_path)
+
+    # Write feedback file
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
-            f.write(f"Total Reps: {analysis['squat_count']}\n"
-                    f"Technique Score: {analysis['technique_score']}/10\n")
-            for fb in analysis["feedback"]:
-                f.write(f"- {fb}\n")
-    except Exception as e:
-        print(f"[DL] Warning feedback file: {e}")
+            f.write(f"Total Reps: {analysis['squat_count']}\n")
+            f.write(f"Good Reps: {analysis['good_reps']} | Bad Reps: {analysis['bad_reps']}\n")
+            f.write(f"Technique Score: {analysis['technique_score_display']} / 10  "
+                    f"({analysis['technique_label']})\n")
+            form_errors = [x for x in analysis.get('feedback', [])
+                           if x != "Great form! Keep it up \U0001f4aa"]
+            if form_errors:
+                f.write("\nForm Corrections (affecting score):\n")
+                for ln in form_errors:
+                    f.write(f"- {ln}\n")
+            if analysis.get('tips'):
+                f.write("\nPerformance Tips (not affecting score):\n")
+                for ln in analysis['tips']:
+                    f.write(f"- {ln}\n")
+    except Exception:
+        pass
 
+    # PASS 2: Render video (like deadlift)
     final_video_path = ""
     if create_video:
-        print("[DL] Pass2 rendering video...", file=sys.stderr, flush=True)
-        _render_pass(video_path, rotation, frame_skip, output_path,
+        print("[PUSHUP] Pass2 rendering video...", file=sys.stderr, flush=True)
+        _render_pass(video_path, rotation, output_path,
                      out_w, out_h, work_w, work_h, fps_in, frame_data)
 
         encoded = output_path.replace(".mp4", "_encoded.mp4")
         try:
             proc = subprocess.run(
                 ["ffmpeg", "-y", "-i", output_path,
-                 "-vf", f"scale={out_w}:{out_h}:flags=bilinear",
-                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", str(encode_crf),
                  "-threads", "2",
                  "-movflags", "+faststart", "-pix_fmt", "yuv420p", encoded],
                 capture_output=True, timeout=120)
-            print(f"[DL] ffmpeg rc={proc.returncode}", file=sys.stderr, flush=True)
+            print(f"[PUSHUP] ffmpeg rc={proc.returncode}", file=sys.stderr, flush=True)
             if proc.returncode != 0:
-                print(f"[DL] ffmpeg stderr: {proc.stderr.decode(errors='replace')[-500:]}",
+                print(f"[PUSHUP] ffmpeg stderr: {proc.stderr.decode(errors='replace')[-500:]}",
                       file=sys.stderr, flush=True)
         except Exception as e:
-            print(f"[DL] ffmpeg exception: {e}", file=sys.stderr, flush=True)
+            print(f"[PUSHUP] ffmpeg exception: {e}", file=sys.stderr, flush=True)
 
         encoded_ok = os.path.exists(encoded) and os.path.getsize(encoded) > 1000
         if encoded_ok:
-            try: os.remove(output_path)
-            except Exception: pass
+            try:
+                os.remove(output_path)
+            except Exception:
+                pass
             final_video_path = encoded
         elif os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
             final_video_path = output_path
         else:
             final_video_path = ""
 
-        print(f"[DL] video='{final_video_path}' "
+        print(f"[PUSHUP] video='{final_video_path}' "
               f"exists={bool(final_video_path and os.path.exists(final_video_path))}",
               file=sys.stderr, flush=True)
 
     total_time = time.time() - t_start
-    print(f"[DL] Total time: {total_time:.1f}s", file=sys.stderr, flush=True)
+    print(f"[PUSHUP] Total time: {total_time:.1f}s", file=sys.stderr, flush=True)
 
-    analysis["video_path"]    = str(final_video_path)
+    analysis["video_path"] = str(final_video_path) if create_video else ""
     analysis["feedback_path"] = str(feedback_path)
     return analysis
 
 
+def _ret_err(msg, feedback_path):
+    try:
+        with open(feedback_path, "w", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+    return {
+        "squat_count": 0,
+        "technique_score": 0.0,
+        "technique_score_display": display_half_str(0.0),
+        "technique_label": score_label(0.0),
+        "good_reps": 0,
+        "bad_reps": 0,
+        "feedback": [],
+        "tips": [],
+        "reps": [],
+        "video_path": "",
+        "feedback_path": feedback_path,
+    }
+
+
 def run_analysis(*args, **kwargs):
-    return run_deadlift_analysis(*args, **kwargs)
+    return run_pushup_analysis(*args, **kwargs)
