@@ -678,10 +678,10 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
     import sys
     t0 = time.time()
 
-    # fast_mode only controls return_video, NOT analysis quality
-    # This ensures fast and slow modes produce identical rep counts
-    model_complexity = 1
-    # Scale is the same regardless of fast_mode — consistent analysis
+    # Use model_complexity=0 always (like deadlift) for consistent + fast results
+    model_complexity = 0
+    # Force scale=0.4 regardless of what app.py sends
+    scale = 0.4
 
     effective_fps = max(1.0, fps_in / max(1, BASE_FRAME_SKIP))
     sec_to_frames = lambda s: max(1, int(s * effective_fps))
