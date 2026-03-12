@@ -678,9 +678,10 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
     import sys
     t0 = time.time()
 
-    model_complexity = 0 if fast_mode else 1
-    if fast_mode:
-        scale = min(scale, 0.35)
+    # fast_mode only controls return_video, NOT analysis quality
+    # This ensures fast and slow modes produce identical rep counts
+    model_complexity = 1
+    # Scale is the same regardless of fast_mode — consistent analysis
 
     effective_fps = max(1.0, fps_in / max(1, BASE_FRAME_SKIP))
     sec_to_frames = lambda s: max(1, int(s * effective_fps))
@@ -1350,8 +1351,7 @@ def run_pushup_analysis(video_path,
 
     if fast_mode is True:
         return_video = False
-    if fast_mode:
-        scale = min(scale, 0.35)
+    # fast_mode does NOT change scale — analysis must be identical
 
     if preserve_quality:
         scale = 1.0
