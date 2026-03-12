@@ -1279,19 +1279,19 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
     return result, frame_data, effective_fps
 
 
-# ============ PASS 2: Render at OUTPUT resolution (sharp overlay) ============
+# ============ PASS 2: Render at WORK resolution, ffmpeg upscales (like deadlift) ============
 def _render_pass(video_path, rotation, output_path,
                  out_w, out_h, work_w, work_h, fps_in, frame_data):
     """
-    Render pass: reads video, draws skeleton + overlay at OUTPUT resolution
-    (out_w x out_h) so fonts and donut are sharp. ffmpeg then just encodes
-    without upscaling.
+    Render pass: reads video, draws skeleton + overlay at WORK resolution
+    (work_w x work_h). ffmpeg then upscales to out_w x out_h with bilinear.
+    This matches deadlift exactly.
     """
     import sys
     effective_fps = max(1.0, fps_in / max(1, BASE_FRAME_SKIP))
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
+    out = cv2.VideoWriter(output_path, fourcc, effective_fps, (work_w, work_h))
 
     if not out.isOpened():
         print(f"[PUSHUP] ERROR: VideoWriter failed", file=sys.stderr, flush=True)
@@ -1313,9 +1313,9 @@ def _render_pass(video_path, rotation, output_path,
 
         frame = _apply_rotation(frame, rotation)
 
-        # Resize to OUTPUT resolution (full size, not work size)
-        if frame.shape[1] != out_w or frame.shape[0] != out_h:
-            frame = cv2.resize(frame, (out_w, out_h))
+        # Resize to WORK resolution (like deadlift)
+        if frame.shape[1] != work_w or frame.shape[0] != work_h:
+            frame = cv2.resize(frame, (work_w, work_h))
 
         fd = frame_data[frame_idx]
         f = frame.copy()
@@ -1329,7 +1329,7 @@ def _render_pass(video_path, rotation, output_path,
 
     cap.release()
     out.release()
-    print(f"[PUSHUP] Pass2 done frames_written={written} at {out_w}x{out_h}",
+    print(f"[PUSHUP] Pass2 done frames_written={written} at {work_w}x{work_h}",
           file=sys.stderr, flush=True)
 
 
@@ -1351,7 +1351,9 @@ def run_pushup_analysis(video_path,
 
     if fast_mode is True:
         return_video = False
-    # fast_mode does NOT change scale — analysis must be identical
+    # IMPORTANT: Override scale to ensure fast and slow produce identical results
+    # app.py may send scale=0.35 for fast_mode, but analysis must use same scale
+    scale = 0.4
 
     if preserve_quality:
         scale = 1.0
@@ -1426,6 +1428,7 @@ def run_pushup_analysis(video_path,
         try:
             proc = subprocess.run(
                 ["ffmpeg", "-y", "-i", output_path,
+                 "-vf", f"scale={out_w}:{out_h}:flags=bilinear",
                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", str(encode_crf),
                  "-threads", "2",
                  "-movflags", "+faststart", "-pix_fmt", "yuv420p", encoded],
