@@ -232,15 +232,15 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     return out_f.astype(np.uint8)
 
 
-# ============ Motion Detection (unchanged from original) ============
+# ============ Motion Detection ============
 BASE_FRAME_SKIP = 2
-ACTIVE_FRAME_SKIP = 1          # was 2 — process every frame when active for fast reps
-MOTION_DETECTION_WINDOW = 10   # was 8 — wider window catches fast patterns
-MOTION_VEL_THRESHOLD = 0.0008  # was 0.0010 — more sensitive to fast movement
-MOTION_ACCEL_THRESHOLD = 0.0005  # was 0.0006
-ELBOW_CHANGE_THRESHOLD = 4.0    # was 5.0 — catch smaller fast-rep elbow changes
-COOLDOWN_FRAMES = 18             # was 15 — stay active longer after motion
-MIN_VEL_FOR_MOTION = 0.0003      # was 0.0004
+ACTIVE_FRAME_SKIP = 2
+MOTION_DETECTION_WINDOW = 8
+MOTION_VEL_THRESHOLD = 0.0010
+MOTION_ACCEL_THRESHOLD = 0.0006
+ELBOW_CHANGE_THRESHOLD = 5.0
+COOLDOWN_FRAMES = 15
+MIN_VEL_FOR_MOTION = 0.0004
 
 
 class MotionDetector:
@@ -278,7 +278,7 @@ class MotionDetector:
                 elif accel > MOTION_ACCEL_THRESHOLD:
                     motion_detected = True
                     reason = f"accel({accel:.4f})"
-                elif recent_avg > MOTION_VEL_THRESHOLD * 0.55:
+                elif recent_avg > MOTION_VEL_THRESHOLD * 0.65:
                     motion_detected = True
                     reason = f"sustained({recent_avg:.4f})"
 
@@ -288,24 +288,24 @@ class MotionDetector:
             if elbow_change > ELBOW_CHANGE_THRESHOLD:
                 motion_detected = True
                 reason = f"elbow_change({elbow_change:.1f})"
-            elif elbow_vel > ELBOW_CHANGE_THRESHOLD * 0.45:
+            elif elbow_vel > ELBOW_CHANGE_THRESHOLD * 0.55:
                 motion_detected = True
                 reason = f"elbow_vel({elbow_vel:.1f})"
 
         if len(self.raw_elbow_history) >= 3:
             raw_change = abs(self.raw_elbow_history[-1] - self.raw_elbow_history[-3])
             raw_vel = abs(self.raw_elbow_history[-1] - self.raw_elbow_history[-2])
-            if raw_change > 8.0:
+            if raw_change > 11.0:
                 motion_detected = True
                 reason = f"raw_spike({raw_change:.1f})"
-            elif raw_vel > 5.0:
+            elif raw_vel > 7.0:
                 motion_detected = True
                 reason = f"raw_vel({raw_vel:.1f})"
 
         if len(self.raw_elbow_history) >= 5:
             elbows = list(self.raw_elbow_history)
-            went_down = elbows[-5] - elbows[-3] > 10   # was 13
-            went_up = elbows[-1] - elbows[-3] > 10     # was 13
+            went_down = elbows[-5] - elbows[-3] > 13
+            went_up = elbows[-1] - elbows[-3] > 13
             if went_down and went_up:
                 motion_detected = True
                 reason = "V_pattern"
@@ -435,7 +435,7 @@ TEMPO_CHECK_MIN_REPS = 1
 DEPTH_ERROR_ANGLE = 110.0
 LOCKOUT_ERROR_ANGLE = 165.0
 
-BURST_FRAMES = 5   # was 4 — more burst frames near inflection for fast reps
+BURST_FRAMES = 4
 INFLECT_VEL_THR = 0.0027
 
 DEBUG_ONPUSHUP = bool(int(os.getenv("DEBUG_ONPUSHUP", "0")))
@@ -961,6 +961,8 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                 if desc_base_shoulder is None:
                     if shoulder_vel > abs(INFLECT_VEL_THR):
                         desc_base_shoulder = shoulder_y
+                        print(f"[PU] vvv DESCENT START F{frame_idx} sy={shoulder_y:.4f} sv={shoulder_vel:.5f} ea={elbow_angle:.1f}",
+                              file=sys.stderr, flush=True)
                         cycle_max_descent = 0.0
                         cycle_min_elbow = elbow_angle
                         counted_this_cycle = False
@@ -1021,6 +1023,9 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                         in_descent_phase = False
 
                     if reset_by_asc or reset_by_elb:
+                        print(f"[PU] ~~~ CYCLE RESET F{frame_idx} by_asc={reset_by_asc} by_elb={reset_by_elb} "
+                              f"cmd={cycle_max_descent:.4f} cme={cycle_min_elbow:.1f} ctc={counted_this_cycle}",
+                              file=sys.stderr, flush=True)
                         robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(
                             cycle_bottom_samples, cycle_top_samples,
                             bottom_phase_min_elbow, top_phase_max_elbow,
@@ -1075,12 +1080,26 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                     at_bottom = at_bottom or raw_bottom
                     can_cnt = (frame_idx - last_bottom_frame) >= REFRACTORY_FRAMES
 
+                    # === DETAILED LOGGING ===
+                    if frame_idx % 3 == 0 or at_bottom:
+                        print(f"[PU] F{frame_idx} ea={elbow_angle:.1f} rem={raw_elbow_min:.1f} "
+                              f"sy={shoulder_y:.4f} desc={descent_amt:.4f} "
+                              f"sv={shoulder_vel:.5f} "
+                              f"at_bot={at_bottom} anb={allow_new_bottom} can={can_cnt} "
+                              f"ctc={counted_this_cycle} reps={rep_count} "
+                              f"dsb={'Y' if desc_base_shoulder is not None else 'N'} "
+                              f"cmd={cycle_max_descent:.4f} cme={cycle_min_elbow:.1f}",
+                              file=sys.stderr, flush=True)
+
                     if at_bottom:
                         confirmed_bottom_samples.append(raw_elbow_min)
                         if len(confirmed_bottom_samples) > 15:
                             confirmed_bottom_samples.pop(0)
 
                     if at_bottom and allow_new_bottom and can_cnt and (not counted_this_cycle):
+                        print(f"[PU] >>> REP COUNTED #{rep_count+1} F{frame_idx} "
+                              f"ea={elbow_angle:.1f} rem={raw_elbow_min:.1f} desc={descent_amt:.4f}",
+                              file=sys.stderr, flush=True)
                         rep_has_issues = False
                         robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(
                             cycle_bottom_samples, cycle_top_samples,
@@ -1114,12 +1133,27 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                         top_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
                         in_descent_phase = False
                         motion_detector.activate("count_rep")
+                    elif at_bottom and (not allow_new_bottom or not can_cnt or counted_this_cycle):
+                        # Log WHY we didn't count even though at_bottom
+                        reasons = []
+                        if not allow_new_bottom:
+                            reasons.append("anb=F")
+                        if not can_cnt:
+                            reasons.append(f"refractory(gap={frame_idx-last_bottom_frame}<{REFRACTORY_FRAMES})")
+                        if counted_this_cycle:
+                            reasons.append("already_counted")
+                        print(f"[PU] --- AT_BOTTOM but NOT counted F{frame_idx}: {', '.join(reasons)} "
+                              f"ea={elbow_angle:.1f} rem={raw_elbow_min:.1f}",
+                              file=sys.stderr, flush=True)
 
                     if (allow_new_bottom is False) and (last_bottom_frame > 0):
                         if (shoulder_prev is not None and (shoulder_prev - shoulder_y) > 0
                                 and (desc_base_shoulder is not None)):
-                            if ((desc_base_shoulder + cycle_max_descent) - shoulder_y) >= REARM_ASCENT_EFF:
+                            ascent_from_bottom = ((desc_base_shoulder + cycle_max_descent) - shoulder_y)
+                            if ascent_from_bottom >= REARM_ASCENT_EFF:
                                 allow_new_bottom = True
+                                print(f"[PU] +++ REARM F{frame_idx} ascent={ascent_from_bottom:.4f} >= {REARM_ASCENT_EFF:.4f}",
+                                      file=sys.stderr, flush=True)
 
                     if at_bottom and not cycle_tip_deeper:
                         robust_bottom_elbow, _ = _robust_cycle_elbows(
