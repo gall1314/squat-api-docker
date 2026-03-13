@@ -447,7 +447,7 @@ DEBUG_ONPUSHUP = bool(int(os.getenv("DEBUG_ONPUSHUP", "0")))
 DEBUG_MOTION = bool(int(os.getenv("DEBUG_MOTION", "0")))
 DEBUG_GRADING = bool(int(os.getenv("DEBUG_GRADING", "1")))
 
-MIN_CYCLE_ELBOW_SAMPLES = 4
+MIN_CYCLE_ELBOW_SAMPLES = 2   # was 4 — lowered for fast reps with shorter cycles
 ROBUST_BOTTOM_PERCENTILE = 25
 ROBUST_TOP_PERCENTILE = 75
 ROBUST_CONFIRMED_PERCENTILE = 10
@@ -515,9 +515,13 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                          lockout_already_reported, flare_already_reported, tempo_already_reported,
                          session_form_errors, session_perf_tips, rep_count, local_vars):
 
+    import sys
     has_depth_issue = has_lockout_issue = has_hips_issue = has_flare_issue = False
 
-    if bottom_phase_min_elbow is not None and local_vars.get("cycle_bottom_samples") and len(local_vars["cycle_bottom_samples"]) >= MIN_CYCLE_ELBOW_SAMPLES:
+    n_bottom = len(local_vars.get("cycle_bottom_samples", []))
+    n_top = len(local_vars.get("cycle_top_samples", []))
+
+    if bottom_phase_min_elbow is not None and n_bottom >= MIN_CYCLE_ELBOW_SAMPLES:
         if bottom_phase_min_elbow > DEPTH_ERROR_ANGLE:
             has_depth_issue = True
             local_vars['cycle_tip_deeper'] = True
@@ -526,7 +530,7 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                 session_form_errors.add(FB_ERROR_DEPTH)
                 local_vars['depth_already_reported'] = True
 
-    if top_phase_max_elbow is not None and local_vars.get("cycle_top_samples") and len(local_vars["cycle_top_samples"]) >= MIN_CYCLE_ELBOW_SAMPLES:
+    if top_phase_max_elbow is not None and n_top >= MIN_CYCLE_ELBOW_SAMPLES:
         if top_phase_max_elbow < LOCKOUT_ERROR_ANGLE:
             has_lockout_issue = True
             local_vars['cycle_tip_lockout'] = True
@@ -622,6 +626,13 @@ def _count_rep(rep_reports, rep_count, bottom_elbow, descent_from, bottom_should
     rep_score = (depth_score * 0.35 + lockout_score * 0.25 + hips_score * 0.25 + flare_score * 0.15)
     rep_score = round(rep_score * 2) / 2
     all_scores.append(rep_score)
+
+    import sys
+    print(f"[PU] SCORE rep#{rep_count+1}: {rep_score} "
+          f"depth={depth_score}(bpme={bottom_phase_min_elbow}) "
+          f"lock={lockout_score}(tpme={top_phase_max_elbow}) "
+          f"hips={hips_score} flare={flare_score}",
+          file=sys.stderr, flush=True)
 
     rep_reports.append({
         "rep_index": int(rep_count + 1),
