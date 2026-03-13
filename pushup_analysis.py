@@ -235,7 +235,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
 # ============ Motion Detection ============
 BASE_FRAME_SKIP = 2
-ACTIVE_FRAME_SKIP = 2
+ACTIVE_FRAME_SKIP = 1   # process every frame during motion for fast reps
 MOTION_DETECTION_WINDOW = 8
 MOTION_VEL_THRESHOLD = 0.0010
 MOTION_ACCEL_THRESHOLD = 0.0006
@@ -367,14 +367,14 @@ class MotionDetector:
         }
 
 
-# ============ Parameters (unchanged from original) ============
-ELBOW_BENT_ANGLE = 102.0
-SHOULDER_MIN_DESCENT = 0.036
-RESET_ASCENT = 0.024
-RESET_ELBOW = 153.0
+# ============ Parameters ============
+ELBOW_BENT_ANGLE = 105.0       # was 102 — slightly more lenient for fast shallow reps
+SHOULDER_MIN_DESCENT = 0.028   # was 0.036 — fast reps have less shoulder drop
+RESET_ASCENT = 0.018           # was 0.024 — faster reset between reps
+RESET_ELBOW = 148.0            # was 153 — don't need full lockout to reset cycle
 REFRACTORY_FRAMES = 1
-ELBOW_EMA_ALPHA = 0.72
-SHOULDER_EMA_ALPHA = 0.67
+ELBOW_EMA_ALPHA = 0.80         # was 0.72 — faster response to elbow changes
+SHOULDER_EMA_ALPHA = 0.75      # was 0.67 — faster response to shoulder changes
 VIS_THR_STRICT = 0.29
 PLANK_BODY_ANGLE_MAX = 26.0
 HANDS_BELOW_SHOULDERS = 0.035
@@ -382,6 +382,10 @@ ONPUSHUP_MIN_FRAMES = 2
 OFFPUSHUP_MIN_FRAMES = 5
 AUTO_STOP_AFTER_EXIT_SEC = 1.5
 TAIL_NOPOSE_STOP_SEC = 1.0
+
+# Fast rep detection: when raw elbow rises this much above the bottom,
+# rearm for a new rep even if shoulder hasn't risen enough
+RAW_ELBOW_REARM_RISE = 18.0   # was 25 — faster rearm for fast reps
 
 # Feedback
 FB_ERROR_DEPTH = "Go deeper (chest to floor)"
@@ -773,7 +777,7 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
     OFFPUSHUP_STOP_FRAMES = sec_to_frames(AUTO_STOP_AFTER_EXIT_SEC)
     NOPOSE_STOP_FRAMES = sec_to_frames(TAIL_NOPOSE_STOP_SEC)
     RT_FB_HOLD_FRAMES = sec_to_frames(0.8)
-    REARM_ASCENT_EFF = max(RESET_ASCENT * 0.58, 0.014)
+    REARM_ASCENT_EFF = max(RESET_ASCENT * 0.50, 0.009)  # was 0.58/0.014 — faster rearm
 
     burst_cntr = 0
     last_valid_snap = None
@@ -1021,12 +1025,19 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
 
                     reset_by_asc = (desc_base_shoulder is not None) and ((desc_base_shoulder - shoulder_y) >= RESET_ASCENT)
                     reset_by_elb = (elbow_angle >= RESET_ELBOW)
+                    # NEW: Reset if raw elbow has risen significantly AND we already counted
+                    # This helps fast reps where person doesn't fully lock out
+                    reset_by_raw_elb = False
+                    if counted_this_cycle and bottom_phase_min_elbow is not None:
+                        raw_rise = raw_elbow_min - bottom_phase_min_elbow
+                        if raw_rise >= 35.0:  # significant elbow extension
+                            reset_by_raw_elb = True
 
                     if shoulder_vel < 0 and in_descent_phase:
                         in_descent_phase = False
 
-                    if reset_by_asc or reset_by_elb:
-                        print(f"[PU] ~~~ CYCLE RESET F{frame_idx} by_asc={reset_by_asc} by_elb={reset_by_elb} "
+                    if reset_by_asc or reset_by_elb or reset_by_raw_elb:
+                        print(f"[PU] ~~~ CYCLE RESET F{frame_idx} asc={reset_by_asc} elb={reset_by_elb} raw={reset_by_raw_elb} "
                               f"cmd={cycle_max_descent:.4f} cme={cycle_min_elbow:.1f} ctc={counted_this_cycle}",
                               file=sys.stderr, flush=True)
                         robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(
@@ -1080,7 +1091,16 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
 
                     at_bottom = (elbow_angle <= ELBOW_BENT_ANGLE) and (descent_amt >= SHOULDER_MIN_DESCENT)
                     raw_bottom = (raw_elbow_min <= (ELBOW_BENT_ANGLE + 9.0)) and (descent_amt >= SHOULDER_MIN_DESCENT * 0.87)
-                    at_bottom = at_bottom or raw_bottom
+                    # NEW: Pure elbow bottom — for very fast reps where shoulder barely drops
+                    # If raw elbow is deeply bent AND has dropped significantly from cycle start,
+                    # count as bottom even without much shoulder descent
+                    elbow_bottom = False
+                    if (not at_bottom) and (not raw_bottom) and (raw_elbow_min <= ELBOW_BENT_ANGLE + 5.0):
+                        if top_phase_max_elbow is not None and (top_phase_max_elbow - raw_elbow_min) > 30.0:
+                            elbow_bottom = True
+                        elif cycle_min_elbow < ELBOW_BENT_ANGLE + 5.0 and descent_amt >= SHOULDER_MIN_DESCENT * 0.5:
+                            elbow_bottom = True
+                    at_bottom = at_bottom or raw_bottom or elbow_bottom
                     can_cnt = (frame_idx - last_bottom_frame) >= REFRACTORY_FRAMES
 
                     # === DETAILED LOGGING (only at_bottom events) ===
@@ -1141,13 +1161,26 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                               file=sys.stderr, flush=True)
 
                     if (allow_new_bottom is False) and (last_bottom_frame > 0):
+                        rearmed = False
+                        # Original shoulder-based rearm
                         if (shoulder_prev is not None and (shoulder_prev - shoulder_y) > 0
                                 and (desc_base_shoulder is not None)):
                             ascent_from_bottom = ((desc_base_shoulder + cycle_max_descent) - shoulder_y)
                             if ascent_from_bottom >= REARM_ASCENT_EFF:
-                                allow_new_bottom = True
-                                print(f"[PU] +++ REARM F{frame_idx} ascent={ascent_from_bottom:.4f} >= {REARM_ASCENT_EFF:.4f}",
+                                rearmed = True
+                                print(f"[PU] +++ REARM(shoulder) F{frame_idx} ascent={ascent_from_bottom:.4f}",
                                       file=sys.stderr, flush=True)
+                        # NEW: Raw elbow rearm — if elbow straightens significantly above
+                        # the cycle minimum, the person is pushing back up → allow new rep
+                        if (not rearmed) and bottom_phase_min_elbow is not None:
+                            elbow_rise = raw_elbow_min - bottom_phase_min_elbow
+                            if elbow_rise >= RAW_ELBOW_REARM_RISE:
+                                rearmed = True
+                                print(f"[PU] +++ REARM(elbow) F{frame_idx} rise={elbow_rise:.1f} "
+                                      f"rem={raw_elbow_min:.1f} bpme={bottom_phase_min_elbow:.1f}",
+                                      file=sys.stderr, flush=True)
+                        if rearmed:
+                            allow_new_bottom = True
 
                     if at_bottom and not cycle_tip_deeper:
                         robust_bottom_elbow, _ = _robust_cycle_elbows(
@@ -1290,6 +1323,10 @@ def _render_pass(video_path, rotation, output_path,
         print(f"[PUSHUP] ERROR: VideoWriter failed", file=sys.stderr, flush=True)
         return
 
+    # Pre-compute which frames to process
+    frame_indices = set(frame_data.keys())
+    max_frame = max(frame_indices) if frame_indices else 0
+
     cap = cv2.VideoCapture(video_path)
     frame_idx = 0
     written = 0
@@ -1300,8 +1337,12 @@ def _render_pass(video_path, rotation, output_path,
             break
         frame_idx += 1
 
+        # Stop early if past all needed frames
+        if frame_idx > max_frame:
+            break
+
         # Only write frames that exist in frame_data (processed by analysis)
-        if frame_idx not in frame_data:
+        if frame_idx not in frame_indices:
             continue
 
         frame = _apply_rotation(frame, rotation)
@@ -1311,11 +1352,10 @@ def _render_pass(video_path, rotation, output_path,
             frame = cv2.resize(frame, (work_w, work_h))
 
         fd = frame_data[frame_idx]
-        f = frame.copy()
         if fd["snap"] is not None:
-            f = draw_skeleton(f, fd["snap"])
+            frame = draw_skeleton(frame, fd["snap"])
 
-        out.write(draw_overlay(f, reps=fd["reps"],
+        out.write(draw_overlay(frame, reps=fd["reps"],
                                feedback=fd["fb"],
                                depth_pct=fd["depth_pct"]))
         written += 1
