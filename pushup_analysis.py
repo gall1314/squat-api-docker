@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-# pushup_analysis.py — V5: Deadlift-matching overlay + 2-pass + fast ffmpeg
+# pushup_analysis.py — V6: model_complexity=0 + forced scale=0.4 + deadlift overlay
+_PUSHUP_VERSION = "V6-2026-03-13"
 # Analysis logic: UNCHANGED from original HD OVERLAY VERSION 2026-02-27
 # Architecture: 2-pass like deadlift (analysis stores data, render draws)
 # Overlay: work-resolution like deadlift (not 1080p upscale)
@@ -232,7 +233,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
     return out_f.astype(np.uint8)
 
 
-# ============ Motion Detection (unchanged from original) ============
+# ============ Motion Detection ============
 BASE_FRAME_SKIP = 2
 ACTIVE_FRAME_SKIP = 2
 MOTION_DETECTION_WINDOW = 8
@@ -309,6 +310,22 @@ class MotionDetector:
             if went_down and went_up:
                 motion_detected = True
                 reason = "V_pattern"
+
+        # Short V-pattern (3-sample) for very fast reps
+        if len(self.raw_elbow_history) >= 3:
+            elbows = list(self.raw_elbow_history)
+            d1 = elbows[-3] - elbows[-2]  # drop
+            d2 = elbows[-1] - elbows[-2]  # rise
+            if d1 > 6 and d2 > 6:
+                motion_detected = True
+                reason = "fast_V"
+
+        # Wide elbow range in recent history = active motion
+        if len(self.raw_elbow_history) >= 4:
+            rng = max(self.raw_elbow_history) - min(self.raw_elbow_history)
+            if rng > 20:
+                motion_detected = True
+                reason = f"elbow_range({rng:.0f})"
 
         if len(self.shoulder_history) >= 5:
             diffs = [self.shoulder_history[i + 1] - self.shoulder_history[i]
@@ -662,9 +679,11 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
     import sys
     t0 = time.time()
 
-    model_complexity = 0 if fast_mode else 1
-    if fast_mode:
-        scale = min(scale, 0.35)
+    # Use model_complexity=0 always (like deadlift) for consistent + fast results
+    model_complexity = 0
+    # Force scale=0.4 regardless of what app.py sends
+    scale = 0.4
+    print(f"[PUSHUP] _analysis_pass: mc={model_complexity} scale={scale}", file=sys.stderr, flush=True)
 
     effective_fps = max(1.0, fps_in / max(1, BASE_FRAME_SKIP))
     sec_to_frames = lambda s: max(1, int(s * effective_fps))
@@ -945,6 +964,8 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                 if desc_base_shoulder is None:
                     if shoulder_vel > abs(INFLECT_VEL_THR):
                         desc_base_shoulder = shoulder_y
+                        print(f"[PU] vvv DESCENT START F{frame_idx} sy={shoulder_y:.4f} sv={shoulder_vel:.5f} ea={elbow_angle:.1f}",
+                              file=sys.stderr, flush=True)
                         cycle_max_descent = 0.0
                         cycle_min_elbow = elbow_angle
                         counted_this_cycle = False
@@ -1005,6 +1026,9 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                         in_descent_phase = False
 
                     if reset_by_asc or reset_by_elb:
+                        print(f"[PU] ~~~ CYCLE RESET F{frame_idx} by_asc={reset_by_asc} by_elb={reset_by_elb} "
+                              f"cmd={cycle_max_descent:.4f} cme={cycle_min_elbow:.1f} ctc={counted_this_cycle}",
+                              file=sys.stderr, flush=True)
                         robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(
                             cycle_bottom_samples, cycle_top_samples,
                             bottom_phase_min_elbow, top_phase_max_elbow,
@@ -1059,12 +1083,17 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                     at_bottom = at_bottom or raw_bottom
                     can_cnt = (frame_idx - last_bottom_frame) >= REFRACTORY_FRAMES
 
+                    # === DETAILED LOGGING (only at_bottom events) ===
+
                     if at_bottom:
                         confirmed_bottom_samples.append(raw_elbow_min)
                         if len(confirmed_bottom_samples) > 15:
                             confirmed_bottom_samples.pop(0)
 
                     if at_bottom and allow_new_bottom and can_cnt and (not counted_this_cycle):
+                        print(f"[PU] >>> REP COUNTED #{rep_count+1} F{frame_idx} "
+                              f"ea={elbow_angle:.1f} rem={raw_elbow_min:.1f} desc={descent_amt:.4f}",
+                              file=sys.stderr, flush=True)
                         rep_has_issues = False
                         robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(
                             cycle_bottom_samples, cycle_top_samples,
@@ -1098,12 +1127,27 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                         top_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
                         in_descent_phase = False
                         motion_detector.activate("count_rep")
+                    elif at_bottom and (not allow_new_bottom or not can_cnt or counted_this_cycle):
+                        # Log WHY we didn't count even though at_bottom
+                        reasons = []
+                        if not allow_new_bottom:
+                            reasons.append("anb=F")
+                        if not can_cnt:
+                            reasons.append(f"refractory(gap={frame_idx-last_bottom_frame}<{REFRACTORY_FRAMES})")
+                        if counted_this_cycle:
+                            reasons.append("already_counted")
+                        print(f"[PU] --- AT_BOTTOM but NOT counted F{frame_idx}: {', '.join(reasons)} "
+                              f"ea={elbow_angle:.1f} rem={raw_elbow_min:.1f}",
+                              file=sys.stderr, flush=True)
 
                     if (allow_new_bottom is False) and (last_bottom_frame > 0):
                         if (shoulder_prev is not None and (shoulder_prev - shoulder_y) > 0
                                 and (desc_base_shoulder is not None)):
-                            if ((desc_base_shoulder + cycle_max_descent) - shoulder_y) >= REARM_ASCENT_EFF:
+                            ascent_from_bottom = ((desc_base_shoulder + cycle_max_descent) - shoulder_y)
+                            if ascent_from_bottom >= REARM_ASCENT_EFF:
                                 allow_new_bottom = True
+                                print(f"[PU] +++ REARM F{frame_idx} ascent={ascent_from_bottom:.4f} >= {REARM_ASCENT_EFF:.4f}",
+                                      file=sys.stderr, flush=True)
 
                     if at_bottom and not cycle_tip_deeper:
                         robust_bottom_elbow, _ = _robust_cycle_elbows(
@@ -1228,9 +1272,14 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
     return result, frame_data, effective_fps
 
 
-# ============ PASS 2: Render — identical structure to deadlift _render_pass ============
+# ============ PASS 2: Render at WORK resolution, ffmpeg upscales (like deadlift) ============
 def _render_pass(video_path, rotation, output_path,
                  out_w, out_h, work_w, work_h, fps_in, frame_data):
+    """
+    Render pass: reads video, draws skeleton + overlay at WORK resolution
+    (work_w x work_h). ffmpeg then upscales to out_w x out_h with bilinear.
+    This matches deadlift exactly.
+    """
     import sys
     effective_fps = max(1.0, fps_in / max(1, BASE_FRAME_SKIP))
 
@@ -1256,6 +1305,8 @@ def _render_pass(video_path, rotation, output_path,
             continue
 
         frame = _apply_rotation(frame, rotation)
+
+        # Resize to WORK resolution (like deadlift)
         if frame.shape[1] != work_w or frame.shape[0] != work_h:
             frame = cv2.resize(frame, (work_w, work_h))
 
@@ -1271,7 +1322,8 @@ def _render_pass(video_path, rotation, output_path,
 
     cap.release()
     out.release()
-    print(f"[PUSHUP] Pass2 done frames_written={written}", file=sys.stderr, flush=True)
+    print(f"[PUSHUP] Pass2 done frames_written={written} at {work_w}x{work_h}",
+          file=sys.stderr, flush=True)
 
 
 # ============ Main entry — identical structure to deadlift run_deadlift_analysis ============
@@ -1292,8 +1344,9 @@ def run_pushup_analysis(video_path,
 
     if fast_mode is True:
         return_video = False
-    if fast_mode:
-        scale = min(scale, 0.35)
+    # IMPORTANT: Override scale to ensure fast and slow produce identical results
+    # app.py may send scale=0.35 for fast_mode, but analysis must use same scale
+    scale = 0.4
 
     if preserve_quality:
         scale = 1.0
@@ -1304,7 +1357,7 @@ def run_pushup_analysis(video_path,
     create_video = bool(return_video) and bool(output_path)
 
     rotation = _get_video_rotation(video_path)
-    print(f"[PUSHUP] Start fast_mode={fast_mode} create_video={create_video} rotation={rotation}deg",
+    print(f"[PUSHUP] {_PUSHUP_VERSION} | fast_mode={fast_mode} create_video={create_video} rotation={rotation}deg scale={scale}",
           file=sys.stderr, flush=True)
 
     cap = cv2.VideoCapture(video_path)
