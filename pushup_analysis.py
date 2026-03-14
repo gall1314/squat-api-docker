@@ -437,8 +437,8 @@ HIPS_FAIL_MIN_REPS = 2
 LOCKOUT_FAIL_MIN_REPS = 2
 FLARE_FAIL_MIN_REPS = 2
 TEMPO_CHECK_MIN_REPS = 1
-DEPTH_ERROR_ANGLE = 110.0
-LOCKOUT_ERROR_ANGLE = 165.0
+DEPTH_ERROR_ANGLE = 115.0    # was 110 — more tolerant for fast partial reps
+LOCKOUT_ERROR_ANGLE = 160.0  # was 165 — still catches clear lockout issues
 
 BURST_FRAMES = 4
 INFLECT_VEL_THR = 0.0027
@@ -521,7 +521,11 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
     n_bottom = len(local_vars.get("cycle_bottom_samples", []))
     n_top = len(local_vars.get("cycle_top_samples", []))
 
-    if bottom_phase_min_elbow is not None and n_bottom >= MIN_CYCLE_ELBOW_SAMPLES:
+    # Use MIN_CYCLE_ELBOW_SAMPLES=4 for normal reps, but 1 for fast reps
+    # (fast reps have fewer samples per cycle due to quick resets)
+    min_samples = min(MIN_CYCLE_ELBOW_SAMPLES, max(1, n_bottom, n_top))
+
+    if bottom_phase_min_elbow is not None and n_bottom >= 1:
         if bottom_phase_min_elbow > DEPTH_ERROR_ANGLE:
             has_depth_issue = True
             local_vars['cycle_tip_deeper'] = True
@@ -530,7 +534,7 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                 session_form_errors.add(FB_ERROR_DEPTH)
                 local_vars['depth_already_reported'] = True
 
-    if top_phase_max_elbow is not None and n_top >= MIN_CYCLE_ELBOW_SAMPLES:
+    if top_phase_max_elbow is not None and n_top >= 1:
         if top_phase_max_elbow < LOCKOUT_ERROR_ANGLE:
             has_lockout_issue = True
             local_vars['cycle_tip_lockout'] = True
