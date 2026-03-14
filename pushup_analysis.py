@@ -501,9 +501,15 @@ def _robust_cycle_elbows(bottom_samples, top_samples, fallback_bottom=None, fall
     if fallback_bottom is not None and robust_bottom is not None:
         robust_bottom = min(robust_bottom, fallback_bottom)
 
-    if top_samples:
+    if top_samples and len(top_samples) >= 2:
         arr = np.array(top_samples, dtype=np.float32)
-        robust_top = float(np.percentile(arr, ROBUST_TOP_PERCENTILE))
+        # P85: representative of top position, filters single noisy spikes
+        robust_top = float(np.percentile(arr, 85))
+    elif top_samples:
+        robust_top = float(top_samples[0])
+    # Cap robust_top to not exceed fallback (raw max) — shouldn't happen but safety
+    if fallback_top is not None and robust_top is not None:
+        robust_top = min(robust_top, fallback_top)
 
     return robust_bottom, robust_top
 
@@ -1275,12 +1281,53 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
             penalty = 0.0
         technique_score = _half_floor10(max(0.0, 10.0 - penalty))
 
+        # Also check per-rep average — if reps scored poorly, cap technique score
+        if all_scores:
+            avg_rep_score = float(np.mean(all_scores))
+            if avg_rep_score < 9.5 and technique_score >= 10.0:
+                technique_score = _half_floor10(avg_rep_score)
+            # Blend: technique score shouldn't be much higher than average rep score
+            technique_score = min(technique_score, _half_floor10(avg_rep_score + 0.5))
+
     if technique_score == 10.0 and rep_count > 0:
         good_reps = rep_count
         bad_reps = 0
 
     form_errors_list = [err for err in FORM_ERROR_PRIORITY if err in session_form_errors]
     perf_tips_list = [tip for tip in PERF_TIP_PRIORITY if tip in session_perf_tips]
+
+    # Post-analysis: infer feedback from per-rep detailed scores
+    # This catches issues that _evaluate_cycle_form missed due to fast cycles
+    if rep_reports and len(rep_reports) >= 2:
+        lockout_scores = [r["detailed_scores"]["lockout"] for r in rep_reports if "detailed_scores" in r]
+        depth_scores = [r["detailed_scores"]["depth"] for r in rep_reports if "detailed_scores" in r]
+
+        if lockout_scores:
+            avg_lock = sum(lockout_scores) / len(lockout_scores)
+            bad_lock_pct = sum(1 for s in lockout_scores if s < 9.0) / len(lockout_scores)
+            if bad_lock_pct >= 0.4 and FB_ERROR_LOCKOUT not in session_form_errors:
+                session_form_errors.add(FB_ERROR_LOCKOUT)
+                form_errors_list = [err for err in FORM_ERROR_PRIORITY if err in session_form_errors]
+                print(f"[PUSHUP] POST-ANALYSIS: added lockout feedback (avg={avg_lock:.1f}, bad%={bad_lock_pct:.0%})",
+                      file=sys.stderr, flush=True)
+
+        if depth_scores:
+            avg_depth = sum(depth_scores) / len(depth_scores)
+            bad_depth_pct = sum(1 for s in depth_scores if s < 9.0) / len(depth_scores)
+            if bad_depth_pct >= 0.4 and FB_ERROR_DEPTH not in session_form_errors:
+                session_form_errors.add(FB_ERROR_DEPTH)
+                form_errors_list = [err for err in FORM_ERROR_PRIORITY if err in session_form_errors]
+                print(f"[PUSHUP] POST-ANALYSIS: added depth feedback (avg={avg_depth:.1f}, bad%={bad_depth_pct:.0%})",
+                      file=sys.stderr, flush=True)
+
+        # Recompute technique score after adding post-analysis errors
+        if session_form_errors:
+            penalty = sum(FB_WEIGHTS.get(m, FB_DEFAULT_WEIGHT) for m in set(session_form_errors))
+            penalty = max(PENALTY_MIN_IF_ANY, penalty)
+            technique_score = _half_floor10(max(0.0, 10.0 - penalty))
+            if all_scores:
+                avg_rep_score = float(np.mean(all_scores))
+                technique_score = min(technique_score, _half_floor10(avg_rep_score + 0.5))
     primary_form_error = form_errors_list[0] if form_errors_list else None
     primary_perf_tip = perf_tips_list[0] if perf_tips_list else None
 
