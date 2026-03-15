@@ -235,7 +235,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
 # ============ Motion Detection ============
 BASE_FRAME_SKIP = 2
-ACTIVE_FRAME_SKIP = 1   # process every frame during motion for fast reps
+ACTIVE_FRAME_SKIP = 2   # must be 2, not 1 — with 1, fast reps cause 0% skip = too slow
 MOTION_DETECTION_WINDOW = 8
 MOTION_VEL_THRESHOLD = 0.0010
 MOTION_ACCEL_THRESHOLD = 0.0006
@@ -575,7 +575,18 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                 session_perf_tips.add(PERF_TIP_TEMPO)
                 local_vars['tempo_already_reported'] = True
 
-    return has_depth_issue or has_lockout_issue or has_hips_issue or has_flare_issue
+    # Determine most important real-time feedback message (priority order)
+    rt_msg = None
+    if has_depth_issue and FB_ERROR_DEPTH in session_form_errors:
+        rt_msg = FB_ERROR_DEPTH
+    elif has_lockout_issue and FB_ERROR_LOCKOUT in session_form_errors:
+        rt_msg = FB_ERROR_LOCKOUT
+    elif has_hips_issue and FB_ERROR_HIPS in session_form_errors:
+        rt_msg = FB_ERROR_HIPS
+    elif has_flare_issue and FB_ERROR_ELBOWS in session_form_errors:
+        rt_msg = FB_ERROR_ELBOWS
+
+    return has_depth_issue or has_lockout_issue or has_hips_issue or has_flare_issue, rt_msg
 
 
 def _count_rep(rep_reports, rep_count, bottom_elbow, descent_from, bottom_shoulder_y,
@@ -925,13 +936,15 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                     cycle_bottom_samples, cycle_top_samples,
                     bottom_phase_min_elbow, top_phase_max_elbow,
                     confirmed_bottom=confirmed_bottom_samples)
-                cycle_has_issues = _evaluate_cycle_form(
+                cycle_has_issues, cycle_rt_msg = _evaluate_cycle_form(
                     lms, robust_bottom_elbow, robust_top_elbow,
                     cycle_max_hip_misalign, cycle_max_flare, cycle_max_descent_vel,
                     depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
                     fast_descent_count, depth_already_reported, hips_already_reported,
                     lockout_already_reported, flare_already_reported, tempo_already_reported,
                     session_form_errors, session_perf_tips, rep_count, locals())
+                if cycle_rt_msg and cur_rt is None:
+                    cur_rt = cycle_rt_msg
 
                 if ((not counted_this_cycle) and
                         (cycle_max_descent >= SHOULDER_MIN_DESCENT) and
@@ -1065,13 +1078,15 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                             cycle_bottom_samples, cycle_top_samples,
                             bottom_phase_min_elbow, top_phase_max_elbow,
                             confirmed_bottom=confirmed_bottom_samples)
-                        cycle_has_issues = _evaluate_cycle_form(
+                        cycle_has_issues, cycle_rt_msg = _evaluate_cycle_form(
                             lms, robust_bottom_elbow, robust_top_elbow,
                             cycle_max_hip_misalign, cycle_max_flare, cycle_max_descent_vel,
                             depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
                             fast_descent_count, depth_already_reported, hips_already_reported,
                             lockout_already_reported, flare_already_reported, tempo_already_reported,
                             session_form_errors, session_perf_tips, rep_count, locals())
+                        if cycle_rt_msg and cur_rt is None:
+                            cur_rt = cycle_rt_msg
 
                         if ((not counted_this_cycle) and
                                 (cycle_max_descent >= SHOULDER_MIN_DESCENT) and
@@ -1142,12 +1157,20 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                             confirmed_bottom=confirmed_bottom_samples)
                         if robust_bottom_elbow and robust_bottom_elbow > DEPTH_ERROR_ANGLE:
                             rep_has_issues = True
+                            if FB_ERROR_DEPTH in session_form_errors and cur_rt is None:
+                                cur_rt = FB_ERROR_DEPTH
                         if robust_top_elbow and robust_top_elbow < LOCKOUT_ERROR_ANGLE:
                             rep_has_issues = True
+                            if FB_ERROR_LOCKOUT in session_form_errors and cur_rt is None:
+                                cur_rt = FB_ERROR_LOCKOUT
                         if cycle_max_hip_misalign and cycle_max_hip_misalign > HIP_FAIR:
                             rep_has_issues = True
+                            if FB_ERROR_HIPS in session_form_errors and cur_rt is None:
+                                cur_rt = FB_ERROR_HIPS
                         if cycle_max_flare and cycle_max_flare > FLARE_FAIR:
                             rep_has_issues = True
+                            if FB_ERROR_ELBOWS in session_form_errors and cur_rt is None:
+                                cur_rt = FB_ERROR_ELBOWS
 
                         _count_rep(rep_reports, rep_count, elbow_angle,
                                    desc_base_shoulder if desc_base_shoulder is not None else shoulder_y,
@@ -1224,6 +1247,8 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                 if cur_rt != rt_fb_msg:
                     rt_fb_msg = cur_rt
                     rt_fb_hold = RT_FB_HOLD_FRAMES
+                    print(f"[PU] FB SET F{frame_idx}: '{cur_rt}' hold={RT_FB_HOLD_FRAMES}",
+                          file=sys.stderr, flush=True)
                 else:
                     rt_fb_hold = max(rt_fb_hold, RT_FB_HOLD_FRAMES)
             else:
@@ -1231,10 +1256,11 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                     rt_fb_hold -= 1
 
             # Store frame data for render pass
+            fb_val = rt_fb_msg if rt_fb_hold > 0 else None
             frame_data[frame_idx] = {
                 "snap": snap,
                 "reps": rep_count,
-                "fb": rt_fb_msg if rt_fb_hold > 0 else None,
+                "fb": fb_val,
                 "depth_pct": depth_live,
             }
 
@@ -1249,7 +1275,7 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
             cycle_bottom_samples, cycle_top_samples,
             bottom_phase_min_elbow, top_phase_max_elbow,
             confirmed_bottom=confirmed_bottom_samples)
-        cycle_has_issues = _evaluate_cycle_form(
+        cycle_has_issues, _ = _evaluate_cycle_form(
             lms, robust_bottom_elbow, robust_top_elbow,
             cycle_max_hip_misalign, cycle_max_flare, cycle_max_descent_vel,
             depth_fail_count, hips_fail_count, lockout_fail_count, flare_fail_count,
@@ -1334,8 +1360,10 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
     total_frames = frames_processed + frames_skipped
     efficiency = (frames_skipped / total_frames * 100) if total_frames > 0 else 0
 
+    fb_frames = sum(1 for fd in frame_data.values() if fd.get("fb") is not None)
     print(f"[PUSHUP] Pass1 done: {rep_count} reps, {frames_processed} proc, "
-          f"{frames_skipped} skip ({efficiency:.0f}%), {time.time()-t0:.1f}s",
+          f"{frames_skipped} skip ({efficiency:.0f}%), {time.time()-t0:.1f}s, "
+          f"fb_frames={fb_frames}, errors={list(session_form_errors)}",
           file=sys.stderr, flush=True)
 
     result = {
