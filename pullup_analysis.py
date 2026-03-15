@@ -235,7 +235,7 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
 # ============ Motion Detection ============
 BASE_FRAME_SKIP = 2
-ACTIVE_FRAME_SKIP = 1   # process every frame during motion for fast reps
+ACTIVE_FRAME_SKIP = 2   # must be 2, not 1 — with 1, fast reps cause 0% skip = too slow
 MOTION_DETECTION_WINDOW = 8
 MOTION_VEL_THRESHOLD = 0.0010
 MOTION_ACCEL_THRESHOLD = 0.0006
