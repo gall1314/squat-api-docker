@@ -426,9 +426,9 @@ LOCKOUT_GOOD = 165.0          # good extension
 LOCKOUT_FAIR = 155.0          # acceptable
 LOCKOUT_POOR = 145.0          # poor
 FLARE_EXCELLENT = 50.0
-FLARE_GOOD = 65.0             # was 55 — many pushup styles have wider elbows
-FLARE_FAIR = 75.0             # was 65
-FLARE_POOR = 85.0             # was 75
+FLARE_GOOD = 65.0             # many pushup styles have wider elbows
+FLARE_FAIR = 80.0             # was 75 — wider tolerance
+FLARE_POOR = 90.0             # was 85
 DESCENT_SPEED_IDEAL = 0.0010
 DESCENT_SPEED_FAST = 0.0015   # was 0.0012 — fast reps naturally have faster descent
 
@@ -437,8 +437,8 @@ HIPS_FAIL_MIN_REPS = 3        # was 2
 LOCKOUT_FAIL_MIN_REPS = 3     # was 2
 FLARE_FAIL_MIN_REPS = 3       # was 2
 TEMPO_CHECK_MIN_REPS = 3      # was 1
-DEPTH_ERROR_ANGLE = 118.0     # was 115 — triggers "go deeper" if bottom elbow > 118
-LOCKOUT_ERROR_ANGLE = 158.0   # was 165 — triggers "lockout" if raw max top elbow < 158
+DEPTH_ERROR_ANGLE = 120.0     # triggers "go deeper" if bottom elbow > 120
+LOCKOUT_ERROR_ANGLE = 160.0   # triggers "lockout" if raw max top elbow < 160 (measurement now correct)
 
 BURST_FRAMES = 4
 INFLECT_VEL_THR = 0.0027
@@ -1007,7 +1007,7 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                         cycle_top_samples = []
                         confirmed_bottom_samples = []
                         bottom_phase_min_elbow = None
-                        top_phase_max_elbow = None
+                        # Keep top_phase_max_elbow — it was set during ascent
                         cycle_max_hip_misalign = None
                         cycle_max_flare = None
                         cycle_max_descent_vel = 0.0
@@ -1108,7 +1108,11 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                         cycle_top_samples = []
                         confirmed_bottom_samples = []
                         bottom_phase_min_elbow = None
-                        top_phase_max_elbow = None
+                        # DON'T reset top_phase_max_elbow — carry forward the max
+                        # from the ascent phase so the next rep's scoring uses it.
+                        # It gets properly updated each frame anyway (line ~1030).
+                        # Resetting it here was the bug — rapid cycle resets during
+                        # ascent would clear it before the next rep could use it.
                         cycle_max_hip_misalign = None
                         cycle_max_flare = None
                         cycle_max_descent_vel = 0.0
@@ -1200,7 +1204,8 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                         last_bottom_frame = frame_idx
                         allow_new_bottom = False
                         counted_this_cycle = True
-                        top_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
+                        # Reset top_phase_max_elbow ONLY after counting — not on cycle reset
+                        top_phase_max_elbow = None
                         in_descent_phase = False
                         motion_detector.activate("count_rep")
                     elif at_bottom and (not allow_new_bottom or not can_cnt or counted_this_cycle):
@@ -1407,19 +1412,18 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
     return result, frame_data, effective_fps
 
 
-# ============ PASS 2: Render at WORK resolution, ffmpeg upscales (like deadlift) ============
+# ============ PASS 2: Render at OUTPUT resolution for sharp overlay ============
 def _render_pass(video_path, rotation, output_path,
                  out_w, out_h, work_w, work_h, fps_in, frame_data):
     """
-    Render pass: reads video, draws skeleton + overlay at WORK resolution
-    (work_w x work_h). ffmpeg then upscales to out_w x out_h with bilinear.
-    This matches deadlift exactly.
+    Render pass: reads video, draws skeleton + overlay at OUTPUT resolution
+    (out_w x out_h) for sharp text. ffmpeg encodes without upscaling.
     """
     import sys
     effective_fps = max(1.0, fps_in / max(1, BASE_FRAME_SKIP))
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, effective_fps, (work_w, work_h))
+    out = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
 
     if not out.isOpened():
         print(f"[PUSHUP] ERROR: VideoWriter failed", file=sys.stderr, flush=True)
@@ -1449,9 +1453,9 @@ def _render_pass(video_path, rotation, output_path,
 
         frame = _apply_rotation(frame, rotation)
 
-        # Resize to WORK resolution (like deadlift)
-        if frame.shape[1] != work_w or frame.shape[0] != work_h:
-            frame = cv2.resize(frame, (work_w, work_h))
+        # Resize to OUTPUT resolution for sharp overlay
+        if frame.shape[1] != out_w or frame.shape[0] != out_h:
+            frame = cv2.resize(frame, (out_w, out_h))
 
         fd = frame_data[frame_idx]
         if fd["snap"] is not None:
@@ -1464,7 +1468,7 @@ def _render_pass(video_path, rotation, output_path,
 
     cap.release()
     out.release()
-    print(f"[PUSHUP] Pass2 done frames_written={written} at {work_w}x{work_h}",
+    print(f"[PUSHUP] Pass2 done frames_written={written} at {out_w}x{out_h}",
           file=sys.stderr, flush=True)
 
 
@@ -1563,7 +1567,6 @@ def run_pushup_analysis(video_path,
         try:
             proc = subprocess.run(
                 ["ffmpeg", "-y", "-i", output_path,
-                 "-vf", f"scale={out_w}:{out_h}:flags=bilinear",
                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", str(encode_crf),
                  "-threads", "2",
                  "-movflags", "+faststart", "-pix_fmt", "yuv420p", encoded],
