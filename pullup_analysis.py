@@ -1157,12 +1157,20 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                             confirmed_bottom=confirmed_bottom_samples)
                         if robust_bottom_elbow and robust_bottom_elbow > DEPTH_ERROR_ANGLE:
                             rep_has_issues = True
+                            if FB_ERROR_DEPTH in session_form_errors and cur_rt is None:
+                                cur_rt = FB_ERROR_DEPTH
                         if robust_top_elbow and robust_top_elbow < LOCKOUT_ERROR_ANGLE:
                             rep_has_issues = True
+                            if FB_ERROR_LOCKOUT in session_form_errors and cur_rt is None:
+                                cur_rt = FB_ERROR_LOCKOUT
                         if cycle_max_hip_misalign and cycle_max_hip_misalign > HIP_FAIR:
                             rep_has_issues = True
+                            if FB_ERROR_HIPS in session_form_errors and cur_rt is None:
+                                cur_rt = FB_ERROR_HIPS
                         if cycle_max_flare and cycle_max_flare > FLARE_FAIR:
                             rep_has_issues = True
+                            if FB_ERROR_ELBOWS in session_form_errors and cur_rt is None:
+                                cur_rt = FB_ERROR_ELBOWS
 
                         _count_rep(rep_reports, rep_count, elbow_angle,
                                    desc_base_shoulder if desc_base_shoulder is not None else shoulder_y,
