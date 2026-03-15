@@ -1157,18 +1157,34 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                             confirmed_bottom=confirmed_bottom_samples)
                         if robust_bottom_elbow and robust_bottom_elbow > DEPTH_ERROR_ANGLE:
                             rep_has_issues = True
+                            depth_fail_count += 1
+                            if depth_fail_count >= DEPTH_FAIL_MIN_REPS and not depth_already_reported:
+                                session_form_errors.add(FB_ERROR_DEPTH)
+                                depth_already_reported = True
                             if FB_ERROR_DEPTH in session_form_errors and cur_rt is None:
                                 cur_rt = FB_ERROR_DEPTH
                         if robust_top_elbow and robust_top_elbow < LOCKOUT_ERROR_ANGLE:
                             rep_has_issues = True
+                            lockout_fail_count += 1
+                            if lockout_fail_count >= LOCKOUT_FAIL_MIN_REPS and not lockout_already_reported:
+                                session_form_errors.add(FB_ERROR_LOCKOUT)
+                                lockout_already_reported = True
                             if FB_ERROR_LOCKOUT in session_form_errors and cur_rt is None:
                                 cur_rt = FB_ERROR_LOCKOUT
                         if cycle_max_hip_misalign and cycle_max_hip_misalign > HIP_FAIR:
                             rep_has_issues = True
+                            hips_fail_count += 1
+                            if hips_fail_count >= HIPS_FAIL_MIN_REPS and not hips_already_reported:
+                                session_form_errors.add(FB_ERROR_HIPS)
+                                hips_already_reported = True
                             if FB_ERROR_HIPS in session_form_errors and cur_rt is None:
                                 cur_rt = FB_ERROR_HIPS
                         if cycle_max_flare and cycle_max_flare > FLARE_FAIR:
                             rep_has_issues = True
+                            flare_fail_count += 1
+                            if flare_fail_count >= FLARE_FAIL_MIN_REPS and not flare_already_reported:
+                                session_form_errors.add(FB_ERROR_ELBOWS)
+                                flare_already_reported = True
                             if FB_ERROR_ELBOWS in session_form_errors and cur_rt is None:
                                 cur_rt = FB_ERROR_ELBOWS
 
