@@ -1127,12 +1127,13 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
 
                     at_bottom = (elbow_angle <= ELBOW_BENT_ANGLE) and (descent_amt >= SHOULDER_MIN_DESCENT)
                     raw_bottom = (raw_elbow_min <= (ELBOW_BENT_ANGLE + 9.0)) and (descent_amt >= SHOULDER_MIN_DESCENT * 0.87)
-                    # NEW: Pure elbow bottom — for very fast reps where shoulder barely drops
-                    # If raw elbow is deeply bent AND has dropped significantly from cycle start,
-                    # count as bottom even without much shoulder descent
+                    # Pure elbow bottom — for very fast reps where shoulder barely drops
+                    # Uses current cycle's top samples, NOT carried-forward top_phase_max_elbow
                     elbow_bottom = False
                     if (not at_bottom) and (not raw_bottom) and (raw_elbow_min <= ELBOW_BENT_ANGLE + 5.0):
-                        if top_phase_max_elbow is not None and (top_phase_max_elbow - raw_elbow_min) > 30.0:
+                        # Only use cycle-local max for this check
+                        cycle_local_top = max(cycle_top_samples) if cycle_top_samples else None
+                        if cycle_local_top is not None and (cycle_local_top - raw_elbow_min) > 30.0:
                             elbow_bottom = True
                         elif cycle_min_elbow < ELBOW_BENT_ANGLE + 5.0 and descent_amt >= SHOULDER_MIN_DESCENT * 0.5:
                             elbow_bottom = True
