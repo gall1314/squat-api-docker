@@ -413,32 +413,32 @@ PENALTY_MIN_IF_ANY = 0.5
 FORM_ERROR_PRIORITY = [FB_ERROR_DEPTH, FB_ERROR_LOCKOUT, FB_ERROR_HIPS, FB_ERROR_ELBOWS]
 PERF_TIP_PRIORITY = [PERF_TIP_SLOW_DOWN, PERF_TIP_TEMPO, PERF_TIP_BREATHING, PERF_TIP_CORE]
 
-DEPTH_EXCELLENT_ANGLE = 90.0   # was 85 — very deep pushup
-DEPTH_GOOD_ANGLE = 100.0      # was 95 — good depth
-DEPTH_FAIR_ANGLE = 110.0      # was 105 — acceptable
-DEPTH_POOR_ANGLE = 120.0      # was 115 — shallow
-HIP_EXCELLENT = 8.0
-HIP_GOOD = 15.0
-HIP_FAIR = 22.0
-HIP_POOR = 30.0
-LOCKOUT_EXCELLENT = 175.0     # was 178 — nearly straight
-LOCKOUT_GOOD = 168.0          # was 173 — good extension
-LOCKOUT_FAIR = 160.0          # was 168 — acceptable
-LOCKOUT_POOR = 150.0          # was 160 — poor
-FLARE_EXCELLENT = 45.0
-FLARE_GOOD = 55.0
-FLARE_FAIR = 65.0
-FLARE_POOR = 75.0
+DEPTH_EXCELLENT_ANGLE = 90.0   # very deep pushup
+DEPTH_GOOD_ANGLE = 100.0      # good depth
+DEPTH_FAIR_ANGLE = 110.0      # acceptable
+DEPTH_POOR_ANGLE = 120.0      # shallow
+HIP_EXCELLENT = 10.0
+HIP_GOOD = 18.0
+HIP_FAIR = 25.0
+HIP_POOR = 35.0
+LOCKOUT_EXCELLENT = 172.0     # nearly straight
+LOCKOUT_GOOD = 165.0          # good extension
+LOCKOUT_FAIR = 155.0          # acceptable
+LOCKOUT_POOR = 145.0          # poor
+FLARE_EXCELLENT = 50.0
+FLARE_GOOD = 65.0             # was 55 — many pushup styles have wider elbows
+FLARE_FAIR = 75.0             # was 65
+FLARE_POOR = 85.0             # was 75
 DESCENT_SPEED_IDEAL = 0.0010
-DESCENT_SPEED_FAST = 0.0012
+DESCENT_SPEED_FAST = 0.0015   # was 0.0012 — fast reps naturally have faster descent
 
-DEPTH_FAIL_MIN_REPS = 2
-HIPS_FAIL_MIN_REPS = 2
-LOCKOUT_FAIL_MIN_REPS = 2
-FLARE_FAIL_MIN_REPS = 2
-TEMPO_CHECK_MIN_REPS = 1
-DEPTH_ERROR_ANGLE = 115.0    # triggers "go deeper" if bottom elbow > 115
-LOCKOUT_ERROR_ANGLE = 165.0  # triggers "lockout" if raw max top elbow < 165
+DEPTH_FAIL_MIN_REPS = 3       # was 2 — need more consistent fails before reporting
+HIPS_FAIL_MIN_REPS = 3        # was 2
+LOCKOUT_FAIL_MIN_REPS = 3     # was 2
+FLARE_FAIL_MIN_REPS = 3       # was 2
+TEMPO_CHECK_MIN_REPS = 3      # was 1
+DEPTH_ERROR_ANGLE = 118.0     # was 115 — triggers "go deeper" if bottom elbow > 118
+LOCKOUT_ERROR_ANGLE = 158.0   # was 165 — triggers "lockout" if raw max top elbow < 158
 
 BURST_FRAMES = 4
 INFLECT_VEL_THR = 0.0027
@@ -1343,7 +1343,7 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
         if lockout_scores:
             avg_lock = sum(lockout_scores) / len(lockout_scores)
             bad_lock_pct = sum(1 for s in lockout_scores if s < 9.0) / len(lockout_scores)
-            if bad_lock_pct >= 0.5 and FB_ERROR_LOCKOUT not in session_form_errors:
+            if bad_lock_pct >= 0.6 and FB_ERROR_LOCKOUT not in session_form_errors:
                 session_form_errors.add(FB_ERROR_LOCKOUT)
                 form_errors_list = [err for err in FORM_ERROR_PRIORITY if err in session_form_errors]
                 print(f"[PUSHUP] POST-ANALYSIS: added lockout feedback (avg={avg_lock:.1f}, bad%={bad_lock_pct:.0%})",
@@ -1352,7 +1352,7 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
         if depth_scores:
             avg_depth = sum(depth_scores) / len(depth_scores)
             bad_depth_pct = sum(1 for s in depth_scores if s < 9.0) / len(depth_scores)
-            if bad_depth_pct >= 0.5 and FB_ERROR_DEPTH not in session_form_errors:
+            if bad_depth_pct >= 0.6 and FB_ERROR_DEPTH not in session_form_errors:
                 session_form_errors.add(FB_ERROR_DEPTH)
                 form_errors_list = [err for err in FORM_ERROR_PRIORITY if err in session_form_errors]
                 print(f"[PUSHUP] POST-ANALYSIS: added depth feedback (avg={avg_depth:.1f}, bad%={bad_depth_pct:.0%})",
