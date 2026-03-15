@@ -413,18 +413,18 @@ PENALTY_MIN_IF_ANY = 0.5
 FORM_ERROR_PRIORITY = [FB_ERROR_DEPTH, FB_ERROR_LOCKOUT, FB_ERROR_HIPS, FB_ERROR_ELBOWS]
 PERF_TIP_PRIORITY = [PERF_TIP_SLOW_DOWN, PERF_TIP_TEMPO, PERF_TIP_BREATHING, PERF_TIP_CORE]
 
-DEPTH_EXCELLENT_ANGLE = 85.0
-DEPTH_GOOD_ANGLE = 95.0
-DEPTH_FAIR_ANGLE = 105.0
-DEPTH_POOR_ANGLE = 115.0
+DEPTH_EXCELLENT_ANGLE = 90.0   # was 85 — very deep pushup
+DEPTH_GOOD_ANGLE = 100.0      # was 95 — good depth
+DEPTH_FAIR_ANGLE = 110.0      # was 105 — acceptable
+DEPTH_POOR_ANGLE = 120.0      # was 115 — shallow
 HIP_EXCELLENT = 8.0
 HIP_GOOD = 15.0
 HIP_FAIR = 22.0
 HIP_POOR = 30.0
-LOCKOUT_EXCELLENT = 178.0
-LOCKOUT_GOOD = 173.0
-LOCKOUT_FAIR = 168.0
-LOCKOUT_POOR = 160.0
+LOCKOUT_EXCELLENT = 175.0     # was 178 — nearly straight
+LOCKOUT_GOOD = 168.0          # was 173 — good extension
+LOCKOUT_FAIR = 160.0          # was 168 — acceptable
+LOCKOUT_POOR = 150.0          # was 160 — poor
 FLARE_EXCELLENT = 45.0
 FLARE_GOOD = 55.0
 FLARE_FAIR = 65.0
@@ -438,7 +438,7 @@ LOCKOUT_FAIL_MIN_REPS = 2
 FLARE_FAIL_MIN_REPS = 2
 TEMPO_CHECK_MIN_REPS = 1
 DEPTH_ERROR_ANGLE = 115.0    # triggers "go deeper" if bottom elbow > 115
-LOCKOUT_ERROR_ANGLE = 170.0  # triggers "lockout" if top elbow < 170 — catches partial extension
+LOCKOUT_ERROR_ANGLE = 165.0  # triggers "lockout" if raw max top elbow < 165
 
 BURST_FRAMES = 4
 INFLECT_VEL_THR = 0.0027
@@ -489,6 +489,9 @@ def _calculate_elbow_flare(lms, LSH, RSH, LE, RE, LW, RW):
 
 def _robust_cycle_elbows(bottom_samples, top_samples, fallback_bottom=None, fallback_top=None, confirmed_bottom=None):
     robust_bottom = fallback_bottom
+    # For top: use the raw max (top_phase_max_elbow) — one good lockout frame
+    # is enough to confirm the person locked out. Using percentile of ALL cycle
+    # samples (which includes bottom frames) was giving falsely low values.
     robust_top = fallback_top
 
     if confirmed_bottom and len(confirmed_bottom) >= 1:
@@ -501,15 +504,8 @@ def _robust_cycle_elbows(bottom_samples, top_samples, fallback_bottom=None, fall
     if fallback_bottom is not None and robust_bottom is not None:
         robust_bottom = min(robust_bottom, fallback_bottom)
 
-    if top_samples and len(top_samples) >= 2:
-        arr = np.array(top_samples, dtype=np.float32)
-        # P85: representative of top position, filters single noisy spikes
-        robust_top = float(np.percentile(arr, 85))
-    elif top_samples:
-        robust_top = float(top_samples[0])
-    # Cap robust_top to not exceed fallback (raw max) — shouldn't happen but safety
-    if fallback_top is not None and robust_top is not None:
-        robust_top = min(robust_top, fallback_top)
+    # For top: keep using fallback_top (= top_phase_max_elbow = raw max)
+    # This is the highest elbow angle seen in the cycle — representative of lockout
 
     return robust_bottom, robust_top
 
@@ -1347,7 +1343,7 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
         if lockout_scores:
             avg_lock = sum(lockout_scores) / len(lockout_scores)
             bad_lock_pct = sum(1 for s in lockout_scores if s < 9.0) / len(lockout_scores)
-            if bad_lock_pct >= 0.4 and FB_ERROR_LOCKOUT not in session_form_errors:
+            if bad_lock_pct >= 0.5 and FB_ERROR_LOCKOUT not in session_form_errors:
                 session_form_errors.add(FB_ERROR_LOCKOUT)
                 form_errors_list = [err for err in FORM_ERROR_PRIORITY if err in session_form_errors]
                 print(f"[PUSHUP] POST-ANALYSIS: added lockout feedback (avg={avg_lock:.1f}, bad%={bad_lock_pct:.0%})",
@@ -1356,7 +1352,7 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
         if depth_scores:
             avg_depth = sum(depth_scores) / len(depth_scores)
             bad_depth_pct = sum(1 for s in depth_scores if s < 9.0) / len(depth_scores)
-            if bad_depth_pct >= 0.4 and FB_ERROR_DEPTH not in session_form_errors:
+            if bad_depth_pct >= 0.5 and FB_ERROR_DEPTH not in session_form_errors:
                 session_form_errors.add(FB_ERROR_DEPTH)
                 form_errors_list = [err for err in FORM_ERROR_PRIORITY if err in session_form_errors]
                 print(f"[PUSHUP] POST-ANALYSIS: added depth feedback (avg={avg_depth:.1f}, bad%={bad_depth_pct:.0%})",
