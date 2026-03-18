@@ -234,8 +234,8 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
 
 # ============ Motion Detection ============
-BASE_FRAME_SKIP = 3   # was 2 — skip more idle frames for speed
-ACTIVE_FRAME_SKIP = 2 # process every 2nd frame during motion
+BASE_FRAME_SKIP = 2   # must be 2 for accurate fast rep counting
+ACTIVE_FRAME_SKIP = 2 # same during motion
 MOTION_DETECTION_WINDOW = 8
 MOTION_VEL_THRESHOLD = 0.0010
 MOTION_ACCEL_THRESHOLD = 0.0006
@@ -421,10 +421,10 @@ HIP_EXCELLENT = 10.0
 HIP_GOOD = 18.0
 HIP_FAIR = 25.0
 HIP_POOR = 35.0
-LOCKOUT_EXCELLENT = 172.0     # nearly straight
-LOCKOUT_GOOD = 165.0          # good extension
-LOCKOUT_FAIR = 155.0          # acceptable
-LOCKOUT_POOR = 145.0          # poor
+LOCKOUT_EXCELLENT = 155.0     # was 172 — adjusted for tpme measurement offset
+LOCKOUT_GOOD = 140.0          # was 165
+LOCKOUT_FAIR = 125.0          # was 155
+LOCKOUT_POOR = 110.0          # was 145
 FLARE_EXCELLENT = 50.0
 FLARE_GOOD = 65.0             # many pushup styles have wider elbows
 FLARE_FAIR = 80.0             # was 75 — wider tolerance
@@ -432,13 +432,13 @@ FLARE_POOR = 90.0             # was 85
 DESCENT_SPEED_IDEAL = 0.0010
 DESCENT_SPEED_FAST = 0.0015   # was 0.0012 — fast reps naturally have faster descent
 
-DEPTH_FAIL_MIN_REPS = 3       # was 2 — need more consistent fails before reporting
-HIPS_FAIL_MIN_REPS = 3        # was 2
-LOCKOUT_FAIL_MIN_REPS = 3     # was 2
-FLARE_FAIL_MIN_REPS = 3       # was 2
-TEMPO_CHECK_MIN_REPS = 3      # was 1
-DEPTH_ERROR_ANGLE = 120.0     # triggers "go deeper" if bottom elbow > 120
-LOCKOUT_ERROR_ANGLE = 160.0   # triggers "lockout" if raw max top elbow < 160 (measurement now correct)
+DEPTH_FAIL_MIN_REPS = 3
+HIPS_FAIL_MIN_REPS = 3
+LOCKOUT_FAIL_MIN_REPS = 5     # was 3 — need very consistent fails
+FLARE_FAIL_MIN_REPS = 5       # was 3
+TEMPO_CHECK_MIN_REPS = 3
+DEPTH_ERROR_ANGLE = 125.0     # triggers "go deeper" only for clearly shallow
+LOCKOUT_ERROR_ANGLE = 130.0   # was 160 — lowered because tpme measurement reads low
 
 BURST_FRAMES = 4
 INFLECT_VEL_THR = 0.0027
@@ -1333,7 +1333,7 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
         if lockout_scores:
             avg_lock = sum(lockout_scores) / len(lockout_scores)
             bad_lock_pct = sum(1 for s in lockout_scores if s < 9.0) / len(lockout_scores)
-            if bad_lock_pct >= 0.6 and FB_ERROR_LOCKOUT not in session_form_errors:
+            if bad_lock_pct >= 0.75 and FB_ERROR_LOCKOUT not in session_form_errors:
                 session_form_errors.add(FB_ERROR_LOCKOUT)
                 form_errors_list = [err for err in FORM_ERROR_PRIORITY if err in session_form_errors]
                 print(f"[PUSHUP] POST-ANALYSIS: added lockout feedback (avg={avg_lock:.1f}, bad%={bad_lock_pct:.0%})",
@@ -1342,7 +1342,7 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
         if depth_scores:
             avg_depth = sum(depth_scores) / len(depth_scores)
             bad_depth_pct = sum(1 for s in depth_scores if s < 9.0) / len(depth_scores)
-            if bad_depth_pct >= 0.6 and FB_ERROR_DEPTH not in session_form_errors:
+            if bad_depth_pct >= 0.75 and FB_ERROR_DEPTH not in session_form_errors:
                 session_form_errors.add(FB_ERROR_DEPTH)
                 form_errors_list = [err for err in FORM_ERROR_PRIORITY if err in session_form_errors]
                 print(f"[PUSHUP] POST-ANALYSIS: added depth feedback (avg={avg_depth:.1f}, bad%={bad_depth_pct:.0%})",
