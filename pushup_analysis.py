@@ -234,8 +234,8 @@ def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
 
 
 # ============ Motion Detection ============
-BASE_FRAME_SKIP = 2
-ACTIVE_FRAME_SKIP = 2   # must be 2, not 1 — with 1, fast reps cause 0% skip = too slow
+BASE_FRAME_SKIP = 3   # was 2 — skip more idle frames for speed
+ACTIVE_FRAME_SKIP = 2 # process every 2nd frame during motion
 MOTION_DETECTION_WINDOW = 8
 MOTION_VEL_THRESHOLD = 0.0010
 MOTION_ACCEL_THRESHOLD = 0.0006
@@ -998,8 +998,6 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                 if desc_base_shoulder is None:
                     if shoulder_vel > abs(INFLECT_VEL_THR):
                         desc_base_shoulder = shoulder_y
-                        print(f"[PU] vvv DESCENT START F{frame_idx} sy={shoulder_y:.4f} sv={shoulder_vel:.5f} ea={elbow_angle:.1f}",
-                              file=sys.stderr, flush=True)
                         cycle_max_descent = 0.0
                         cycle_min_elbow = elbow_angle
                         counted_this_cycle = False
@@ -1067,9 +1065,6 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                         in_descent_phase = False
 
                     if reset_by_asc or reset_by_elb or reset_by_raw_elb:
-                        print(f"[PU] ~~~ CYCLE RESET F{frame_idx} asc={reset_by_asc} elb={reset_by_elb} raw={reset_by_raw_elb} "
-                              f"cmd={cycle_max_descent:.4f} cme={cycle_min_elbow:.1f} ctc={counted_this_cycle}",
-                              file=sys.stderr, flush=True)
                         robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(
                             cycle_bottom_samples, cycle_top_samples,
                             bottom_phase_min_elbow, top_phase_max_elbow,
@@ -1148,8 +1143,9 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                             confirmed_bottom_samples.pop(0)
 
                     if at_bottom and allow_new_bottom and can_cnt and (not counted_this_cycle):
-                        print(f"[PU] >>> REP COUNTED #{rep_count+1} F{frame_idx} "
-                              f"ea={elbow_angle:.1f} rem={raw_elbow_min:.1f} desc={descent_amt:.4f}",
+                        print(f"[PU] >>> REP #{rep_count+1} F{frame_idx} "
+                              f"ea={elbow_angle:.1f} rem={raw_elbow_min:.1f} desc={descent_amt:.4f} "
+                              f"tpme={top_phase_max_elbow}",
                               file=sys.stderr, flush=True)
                         rep_has_issues = False
                         robust_bottom_elbow, robust_top_elbow = _robust_cycle_elbows(
@@ -1210,17 +1206,7 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                         in_descent_phase = False
                         motion_detector.activate("count_rep")
                     elif at_bottom and (not allow_new_bottom or not can_cnt or counted_this_cycle):
-                        # Log WHY we didn't count even though at_bottom
-                        reasons = []
-                        if not allow_new_bottom:
-                            reasons.append("anb=F")
-                        if not can_cnt:
-                            reasons.append(f"refractory(gap={frame_idx-last_bottom_frame}<{REFRACTORY_FRAMES})")
-                        if counted_this_cycle:
-                            reasons.append("already_counted")
-                        print(f"[PU] --- AT_BOTTOM but NOT counted F{frame_idx}: {', '.join(reasons)} "
-                              f"ea={elbow_angle:.1f} rem={raw_elbow_min:.1f}",
-                              file=sys.stderr, flush=True)
+                        pass  # Skip verbose logging for speed
 
                     if (allow_new_bottom is False) and (last_bottom_frame > 0):
                         rearmed = False
@@ -1265,8 +1251,6 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                 if cur_rt != rt_fb_msg:
                     rt_fb_msg = cur_rt
                     rt_fb_hold = RT_FB_HOLD_FRAMES
-                    print(f"[PU] FB SET F{frame_idx}: '{cur_rt}' hold={RT_FB_HOLD_FRAMES}",
-                          file=sys.stderr, flush=True)
                 else:
                     rt_fb_hold = max(rt_fb_hold, RT_FB_HOLD_FRAMES)
             else:
