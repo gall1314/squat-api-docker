@@ -368,11 +368,11 @@ class MotionDetector:
 
 
 # ============ Parameters ============
-ELBOW_BENT_ANGLE = 105.0       # was 102 — slightly more lenient for fast shallow reps
-SHOULDER_MIN_DESCENT = 0.028   # was 0.036 — fast reps have less shoulder drop
-RESET_ASCENT = 0.018           # was 0.024 — faster reset between reps
-RESET_ELBOW = 148.0            # was 153 — don't need full lockout to reset cycle
-REFRACTORY_FRAMES = 4          # was 1 — minimum 4 processed frames between reps to prevent double counting
+ELBOW_BENT_ANGLE = 105.0
+SHOULDER_MIN_DESCENT = 0.032   # was 0.028 — slightly stricter to avoid false triggers
+RESET_ASCENT = 0.018
+RESET_ELBOW = 148.0
+REFRACTORY_FRAMES = 5          # was 4 — a bit more gap between reps
 ELBOW_EMA_ALPHA = 0.80         # was 0.72 — faster response to elbow changes
 SHOULDER_EMA_ALPHA = 0.75      # was 0.67 — faster response to shoulder changes
 VIS_THR_STRICT = 0.29
@@ -1121,18 +1121,8 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                     descent_amt = 0.0 if desc_base_shoulder is None else (shoulder_y - desc_base_shoulder)
 
                     at_bottom = (elbow_angle <= ELBOW_BENT_ANGLE) and (descent_amt >= SHOULDER_MIN_DESCENT)
-                    raw_bottom = (raw_elbow_min <= (ELBOW_BENT_ANGLE + 9.0)) and (descent_amt >= SHOULDER_MIN_DESCENT * 0.87)
-                    # Pure elbow bottom — for very fast reps where shoulder barely drops
-                    # Uses current cycle's top samples, NOT carried-forward top_phase_max_elbow
-                    elbow_bottom = False
-                    if (not at_bottom) and (not raw_bottom) and (raw_elbow_min <= ELBOW_BENT_ANGLE + 5.0):
-                        # Only use cycle-local max for this check
-                        cycle_local_top = max(cycle_top_samples) if cycle_top_samples else None
-                        if cycle_local_top is not None and (cycle_local_top - raw_elbow_min) > 30.0:
-                            elbow_bottom = True
-                        elif cycle_min_elbow < ELBOW_BENT_ANGLE + 5.0 and descent_amt >= SHOULDER_MIN_DESCENT * 0.5:
-                            elbow_bottom = True
-                    at_bottom = at_bottom or raw_bottom or elbow_bottom
+                    raw_bottom = (raw_elbow_min <= (ELBOW_BENT_ANGLE + 7.0)) and (descent_amt >= SHOULDER_MIN_DESCENT * 0.9)
+                    at_bottom = at_bottom or raw_bottom
                     can_cnt = (frame_idx - last_bottom_frame) >= REFRACTORY_FRAMES
 
                     # === DETAILED LOGGING (only at_bottom events) ===
