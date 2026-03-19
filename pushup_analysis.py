@@ -425,10 +425,10 @@ LOCKOUT_EXCELLENT = 155.0     # was 172 — adjusted for tpme measurement offset
 LOCKOUT_GOOD = 140.0          # was 165
 LOCKOUT_FAIR = 125.0          # was 155
 LOCKOUT_POOR = 110.0          # was 145
-FLARE_EXCELLENT = 50.0
-FLARE_GOOD = 65.0             # many pushup styles have wider elbows
-FLARE_FAIR = 80.0             # was 75 — wider tolerance
-FLARE_POOR = 90.0             # was 85
+FLARE_EXCELLENT = 55.0
+FLARE_GOOD = 70.0             # wide range of normal pushup styles
+FLARE_FAIR = 85.0             # still acceptable
+FLARE_POOR = 95.0             # only extreme flare
 DESCENT_SPEED_IDEAL = 0.0010
 DESCENT_SPEED_FAST = 0.0015   # was 0.0012 — fast reps naturally have faster descent
 
