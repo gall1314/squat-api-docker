@@ -1387,24 +1387,19 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
     return result, frame_data, effective_fps
 
 
-# ============ PASS 2: Render at OUTPUT resolution for sharp overlay ============
+# ============ PASS 2: Render at WORK resolution, ffmpeg upscales ============
 def _render_pass(video_path, rotation, output_path,
                  out_w, out_h, work_w, work_h, fps_in, frame_data):
-    """
-    Render pass: reads video, draws skeleton + overlay at OUTPUT resolution
-    (out_w x out_h) for sharp text. ffmpeg encodes without upscaling.
-    """
     import sys
     effective_fps = max(1.0, fps_in / max(1, BASE_FRAME_SKIP))
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
+    out = cv2.VideoWriter(output_path, fourcc, effective_fps, (work_w, work_h))
 
     if not out.isOpened():
         print(f"[PUSHUP] ERROR: VideoWriter failed", file=sys.stderr, flush=True)
         return
 
-    # Pre-compute which frames to process
     frame_indices = set(frame_data.keys())
     max_frame = max(frame_indices) if frame_indices else 0
 
@@ -1417,20 +1412,14 @@ def _render_pass(video_path, rotation, output_path,
         if not ret:
             break
         frame_idx += 1
-
-        # Stop early if past all needed frames
         if frame_idx > max_frame:
             break
-
-        # Only write frames that exist in frame_data (processed by analysis)
         if frame_idx not in frame_indices:
             continue
 
         frame = _apply_rotation(frame, rotation)
-
-        # Resize to OUTPUT resolution for sharp overlay
-        if frame.shape[1] != out_w or frame.shape[0] != out_h:
-            frame = cv2.resize(frame, (out_w, out_h))
+        if frame.shape[1] != work_w or frame.shape[0] != work_h:
+            frame = cv2.resize(frame, (work_w, work_h))
 
         fd = frame_data[frame_idx]
         if fd["snap"] is not None:
@@ -1443,7 +1432,7 @@ def _render_pass(video_path, rotation, output_path,
 
     cap.release()
     out.release()
-    print(f"[PUSHUP] Pass2 done frames_written={written} at {out_w}x{out_h}",
+    print(f"[PUSHUP] Pass2 done frames_written={written} at {work_w}x{work_h}",
           file=sys.stderr, flush=True)
 
 
@@ -1542,6 +1531,7 @@ def run_pushup_analysis(video_path,
         try:
             proc = subprocess.run(
                 ["ffmpeg", "-y", "-i", output_path,
+                 "-vf", f"scale={out_w}:{out_h}:flags=bilinear",
                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", str(encode_crf),
                  "-threads", "2",
                  "-movflags", "+faststart", "-pix_fmt", "yuv420p", encoded],
