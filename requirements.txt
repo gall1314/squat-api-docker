@@ -7,3 +7,4 @@ Pillow
 requests
 onnxruntime==1.18.1
 ffmpeg-python
+gunicorn
