@@ -39,4 +39,4 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY . .
 # ה-API מאזין על 8080
 EXPOSE 8080
-CMD ["gunicorn", "-c", "gunicorn_config.py", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "2", "--timeout", "300", "app:app"]
