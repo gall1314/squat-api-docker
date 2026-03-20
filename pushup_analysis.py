@@ -713,11 +713,13 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
 
     # Use model_complexity=0 always (like deadlift) for consistent + fast results
     model_complexity = 0
-    # Force scale=0.4 regardless of what app.py sends
-    scale = 0.4
-    print(f"[PUSHUP] _analysis_pass: mc={model_complexity} scale={scale}", file=sys.stderr, flush=True)
+    # Scale: 0.4 for fast mode (accuracy), 0.35 for slow mode (speed — has render overhead)
+    scale = 0.35 if not fast_mode else 0.4
+    # Frame skip: 2 for fast mode (accurate counting), 3 for slow mode (speed)
+    analysis_frame_skip = 2 if fast_mode else 3
+    print(f"[PUSHUP] _analysis_pass: mc={model_complexity} scale={scale} skip={analysis_frame_skip} fast={fast_mode}", file=sys.stderr, flush=True)
 
-    effective_fps = max(1.0, fps_in / max(1, BASE_FRAME_SKIP))
+    effective_fps = max(1.0, fps_in / max(1, analysis_frame_skip))
     sec_to_frames = lambda s: max(1, int(s * effective_fps))
 
     cap = cv2.VideoCapture(video_path)
@@ -822,6 +824,12 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                 break
 
             frame_idx += 1
+
+            # Basic frame skip — in slow mode (skip=3), only consider every 3rd frame
+            if frame_idx % analysis_frame_skip != 0:
+                if burst_cntr <= 0:  # burst overrides skip
+                    frames_skipped += 1
+                    continue
 
             process_now = False
             if burst_cntr > 0:
