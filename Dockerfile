@@ -1,7 +1,6 @@
 # syntax=docker/dockerfile:1.5
 # Python בסיסי, ללא CUDA/GPU
 FROM python:3.10-slim
-
 # ספריות מערכת ש-OpenCV/MediaPipe צריכים + ffmpeg
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -13,13 +12,10 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     libgomp1 \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
-
 # רצוי לשדרג pip וכלי build
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --upgrade pip setuptools wheel
-
 # הגדרות להתמודדות עם בעיות רשת PyPI
 ENV PIP_DEFAULT_TIMEOUT=30
 ENV PIP_RETRIES=5
@@ -28,7 +24,6 @@ ENV PIP_PROGRESS_BAR=off
 ENV PIP_INDEX_URL=https://pypi.org/simple
 ENV PIP_EXTRA_INDEX_URL="https://pypi.python.org/simple https://pypi.tuna.tsinghua.edu.cn/simple"
 ENV PIP_TRUSTED_HOST="pypi.org files.pythonhosted.org pypi.tuna.tsinghua.edu.cn"
-
 # התקנת דרישות
 COPY requirements.txt requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -40,11 +35,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     --trusted-host files.pythonhosted.org \
     --trusted-host pypi.tuna.tsinghua.edu.cn \
     -r requirements.txt
-
 # קוד האפליקציה
 COPY . .
-
 # ה-API מאזין על 8080
 EXPOSE 8080
-
-CMD ["python", "app.py"]
+CMD ["gunicorn", "-c", "gunicorn_config.py", "app:app"]
