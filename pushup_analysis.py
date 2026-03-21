@@ -413,10 +413,10 @@ PENALTY_MIN_IF_ANY = 0.5
 FORM_ERROR_PRIORITY = [FB_ERROR_DEPTH, FB_ERROR_LOCKOUT, FB_ERROR_HIPS, FB_ERROR_ELBOWS]
 PERF_TIP_PRIORITY = [PERF_TIP_SLOW_DOWN, PERF_TIP_TEMPO, PERF_TIP_BREATHING, PERF_TIP_CORE]
 
-DEPTH_EXCELLENT_ANGLE = 90.0   # very deep pushup
-DEPTH_GOOD_ANGLE = 100.0      # good depth
-DEPTH_FAIR_ANGLE = 110.0      # acceptable
-DEPTH_POOR_ANGLE = 120.0      # shallow
+DEPTH_EXCELLENT_ANGLE = 95.0   # was 90 — very deep pushup
+DEPTH_GOOD_ANGLE = 108.0      # was 100 — good depth
+DEPTH_FAIR_ANGLE = 118.0      # was 110 — acceptable
+DEPTH_POOR_ANGLE = 128.0      # was 120 — shallow
 HIP_EXCELLENT = 12.0
 HIP_GOOD = 22.0           # was 18 — more tolerance
 HIP_FAIR = 32.0            # was 25
@@ -425,20 +425,20 @@ LOCKOUT_EXCELLENT = 155.0
 LOCKOUT_GOOD = 140.0
 LOCKOUT_FAIR = 125.0
 LOCKOUT_POOR = 110.0
-FLARE_EXCELLENT = 60.0     # was 55
-FLARE_GOOD = 75.0          # was 70
-FLARE_FAIR = 90.0          # was 85 — very wide tolerance
-FLARE_POOR = 100.0         # was 95 — only extreme flare
+FLARE_EXCELLENT = 70.0     # tight elbows
+FLARE_GOOD = 90.0          # was 80 — most normal pushups
+FLARE_FAIR = 105.0         # was 95 — wide but acceptable
+FLARE_POOR = 120.0         # was 110 — only extreme flare
 DESCENT_SPEED_IDEAL = 0.0010
-DESCENT_SPEED_FAST = 0.0015   # was 0.0012 — fast reps naturally have faster descent
+DESCENT_SPEED_FAST = 0.0015
 
-DEPTH_FAIL_MIN_REPS = 3
-HIPS_FAIL_MIN_REPS = 3
-LOCKOUT_FAIL_MIN_REPS = 5     # was 3 — need very consistent fails
-FLARE_FAIL_MIN_REPS = 5       # was 3
+DEPTH_FAIL_MIN_REPS = 4    # was 3 — need more consistent fails
+HIPS_FAIL_MIN_REPS = 4     # was 3
+LOCKOUT_FAIL_MIN_REPS = 5
+FLARE_FAIL_MIN_REPS = 6    # was 5 — very hard to trigger flare feedback
 TEMPO_CHECK_MIN_REPS = 3
-DEPTH_ERROR_ANGLE = 125.0     # triggers "go deeper" only for clearly shallow
-LOCKOUT_ERROR_ANGLE = 130.0   # was 160 — lowered because tpme measurement reads low
+DEPTH_ERROR_ANGLE = 130.0   # was 125 — only very clearly shallow reps
+LOCKOUT_ERROR_ANGLE = 130.0
 
 BURST_FRAMES = 4
 INFLECT_VEL_THR = 0.0027
@@ -1497,7 +1497,14 @@ def run_pushup_analysis(video_path,
     work_w = work_w if work_w % 2 == 0 else work_w + 1
     work_h = work_h if work_h % 2 == 0 else work_h + 1
 
-    print(f"[PUSHUP] out={out_w}x{out_h} work={work_w}x{work_h}",
+    # Render resolution: higher than work for readable overlay, but not full output
+    render_scale = min(0.65, max(scale, 420.0 / max(out_h, 1)))
+    render_w = int(out_w * render_scale) if render_scale != 1.0 else out_w
+    render_h = int(out_h * render_scale) if render_scale != 1.0 else out_h
+    render_w = render_w if render_w % 2 == 0 else render_w + 1
+    render_h = render_h if render_h % 2 == 0 else render_h + 1
+
+    print(f"[PUSHUP] out={out_w}x{out_h} work={work_w}x{work_h} render={render_w}x{render_h}",
           file=sys.stderr, flush=True)
 
     # PASS 1: Analysis
@@ -1533,7 +1540,7 @@ def run_pushup_analysis(video_path,
     if create_video:
         print("[PUSHUP] Pass2 rendering video...", file=sys.stderr, flush=True)
         _render_pass(video_path, rotation, output_path,
-                     out_w, out_h, work_w, work_h, fps_in, frame_data)
+                     out_w, out_h, render_w, render_h, fps_in, frame_data)
 
         encoded = output_path.replace(".mp4", "_encoded.mp4")
         try:
