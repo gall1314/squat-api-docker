@@ -1489,10 +1489,13 @@ def run_pushup_analysis(video_path,
     work_w = work_w if work_w % 2 == 0 else work_w + 1
     work_h = work_h if work_h % 2 == 0 else work_h + 1
 
-    # Render resolution: higher than work for readable overlay, but not full output
-    render_scale = min(0.65, max(scale, 420.0 / max(out_h, 1)))
-    render_w = int(out_w * render_scale) if render_scale != 1.0 else out_w
-    render_h = int(out_h * render_scale) if render_scale != 1.0 else out_h
+    # Render resolution: high enough for sharp overlay text
+    # Minimum 480px height, up to 0.8 of output, but cap at 720px to stay fast
+    render_scale = max(scale, 480.0 / max(out_h, 1))
+    render_scale = min(render_scale, 720.0 / max(out_h, 1))  # cap at 720p
+    render_scale = min(render_scale, 1.0)  # never exceed original
+    render_w = int(out_w * render_scale) if render_scale < 1.0 else out_w
+    render_h = int(out_h * render_scale) if render_scale < 1.0 else out_h
     render_w = render_w if render_w % 2 == 0 else render_w + 1
     render_h = render_h if render_h % 2 == 0 else render_h + 1
 
