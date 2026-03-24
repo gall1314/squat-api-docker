@@ -640,7 +640,8 @@ def _count_rep(rep_reports, rep_count, bottom_elbow, descent_from, bottom_should
         else:
             flare_score = 3.0
 
-    rep_score = (depth_score * 0.35 + lockout_score * 0.25 + hips_score * 0.25 + flare_score * 0.15)
+    # Flare disabled from scoring — mediapipe measurement unreliable
+    rep_score = (depth_score * 0.40 + lockout_score * 0.30 + hips_score * 0.30)
     rep_score = round(rep_score * 2) / 2
     all_scores.append(rep_score)
 
