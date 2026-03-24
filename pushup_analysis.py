@@ -425,10 +425,10 @@ LOCKOUT_EXCELLENT = 155.0
 LOCKOUT_GOOD = 140.0
 LOCKOUT_FAIR = 125.0
 LOCKOUT_POOR = 110.0
-FLARE_EXCELLENT = 80.0
-FLARE_GOOD = 100.0
-FLARE_FAIR = 120.0         # very high — effectively disables flare feedback
-FLARE_POOR = 140.0
+FLARE_EXCELLENT = 90.0
+FLARE_GOOD = 120.0
+FLARE_FAIR = 150.0         # effectively disabled — mediapipe flare measurement unreliable
+FLARE_POOR = 180.0
 DESCENT_SPEED_IDEAL = 0.0010
 DESCENT_SPEED_FAST = 0.0015
 
