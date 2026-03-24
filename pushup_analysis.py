@@ -1300,10 +1300,12 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
         # Also check per-rep average — if reps scored poorly, cap technique score
         if all_scores:
             avg_rep_score = float(np.mean(all_scores))
-            if avg_rep_score < 9.5 and technique_score >= 10.0:
-                technique_score = _half_floor10(avg_rep_score)
-            # Blend: technique score shouldn't be much higher than average rep score
-            technique_score = min(technique_score, _half_floor10(avg_rep_score + 0.5))
+            if avg_rep_score < 9.0 and technique_score >= 10.0:
+                technique_score = _half_floor10(avg_rep_score + 0.5)
+
+    # If no form errors at all, score should be 10
+    if not session_form_errors and rep_count > 0:
+        technique_score = 10.0
 
     if technique_score == 10.0 and rep_count > 0:
         good_reps = rep_count
@@ -1364,7 +1366,7 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
         "good_reps": int(good_reps),
         "bad_reps": int(bad_reps),
         "feedback": form_errors_list if form_errors_list else (
-            ["Great form! Keep it up \U0001f4aa"] if technique_score == 10.0 and rep_count > 0 else []),
+            ["Great form! Keep it up \U0001f4aa"] if rep_count > 0 else []),
         "tips": perf_tips_list,
         "reps": rep_reports,
         "processing_stats": {
