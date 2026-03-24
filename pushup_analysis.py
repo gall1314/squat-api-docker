@@ -410,7 +410,7 @@ FB_WEIGHTS = {
 FB_DEFAULT_WEIGHT = 0.5
 PENALTY_MIN_IF_ANY = 0.5
 
-FORM_ERROR_PRIORITY = [FB_ERROR_DEPTH, FB_ERROR_LOCKOUT, FB_ERROR_HIPS, FB_ERROR_ELBOWS]
+FORM_ERROR_PRIORITY = [FB_ERROR_DEPTH, FB_ERROR_LOCKOUT, FB_ERROR_HIPS]
 PERF_TIP_PRIORITY = [PERF_TIP_SLOW_DOWN, PERF_TIP_TEMPO, PERF_TIP_BREATHING, PERF_TIP_CORE]
 
 DEPTH_EXCELLENT_ANGLE = 95.0   # was 90 — very deep pushup
@@ -554,14 +554,10 @@ def _evaluate_cycle_form(lms, bottom_phase_min_elbow, top_phase_max_elbow,
                 session_form_errors.add(FB_ERROR_HIPS)
                 local_vars['hips_already_reported'] = True
 
-    if cycle_max_flare is not None:
-        if cycle_max_flare > FLARE_FAIR:
-            has_flare_issue = True
-            local_vars['cycle_tip_elbows'] = True
-            local_vars['flare_fail_count'] += 1
-            if local_vars['flare_fail_count'] >= FLARE_FAIL_MIN_REPS and not flare_already_reported:
-                session_form_errors.add(FB_ERROR_ELBOWS)
-                local_vars['flare_already_reported'] = True
+    # Flare check DISABLED — mediapipe measurement unreliable
+    # if cycle_max_flare is not None:
+    #     if cycle_max_flare > FLARE_FAIR:
+    #         has_flare_issue = True
 
     if rep_count >= TEMPO_CHECK_MIN_REPS and not tempo_already_reported:
         if cycle_max_descent_vel > DESCENT_SPEED_FAST:
@@ -1175,14 +1171,7 @@ def _analysis_pass(video_path, rotation, scale, fps_in, fast_mode=False):
                                 hips_already_reported = True
                             if FB_ERROR_HIPS in session_form_errors and cur_rt is None:
                                 cur_rt = FB_ERROR_HIPS
-                        if cycle_max_flare and cycle_max_flare > FLARE_FAIR:
-                            rep_has_issues = True
-                            flare_fail_count += 1
-                            if flare_fail_count >= FLARE_FAIL_MIN_REPS and not flare_already_reported:
-                                session_form_errors.add(FB_ERROR_ELBOWS)
-                                flare_already_reported = True
-                            if FB_ERROR_ELBOWS in session_form_errors and cur_rt is None:
-                                cur_rt = FB_ERROR_ELBOWS
+                        # Flare check DISABLED — mediapipe measurement unreliable
 
                         _count_rep(rep_reports, rep_count, elbow_angle,
                                    desc_base_shoulder if desc_base_shoulder is not None else shoulder_y,
