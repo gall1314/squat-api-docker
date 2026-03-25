@@ -346,6 +346,14 @@ def run_squat_analysis(video_path,
             "technique_label": score_label(0.0)
         }
     
+    # Save original dimensions for ffmpeg upscale
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if rotation % 360 in (90, 270):
+        out_w, out_h = orig_h, orig_w
+    else:
+        out_w, out_h = orig_w, orig_h
+    
     if fast_mode is True:
         return_video = False
     create_video = bool(return_video) and (output_path is not None) and (output_path != "")
@@ -698,6 +706,7 @@ def run_squat_analysis(video_path,
         encoded_path = output_path.replace(".mp4", "_encoded.mp4")
         try:
             cmd = ["ffmpeg", "-y", "-i", output_path,
+                   "-vf", f"scale={out_w}:{out_h}:flags=bilinear",
                    "-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart",
                    "-pix_fmt", "yuv420p", "-metadata:s:v:0", "rotate=0", encoded_path]
             result = subprocess.run(cmd, check=False, capture_output=True)
