@@ -423,7 +423,10 @@ def run_squat_analysis(video_path,
 
             h, w = frame.shape[:2]
             if create_video and out is None:
-                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
+                # VideoWriter with rotated dimensions
+                rot_frame = _apply_rotation(frame, rotation)
+                rh, rw = rot_frame.shape[:2]
+                out = cv2.VideoWriter(output_path, fourcc, effective_fps, (rw, rh))
 
             image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = pose.process(image)
@@ -431,6 +434,7 @@ def run_squat_analysis(video_path,
                 if create_video:
                     depth_live = 0.0
                     if rt_fb_hold > 0: rt_fb_hold -= 1
+                    frame = _apply_rotation(frame, rotation)
                     frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
                     if out: out.write(frame)
                 continue
@@ -640,6 +644,7 @@ def run_squat_analysis(video_path,
 
                 if create_video:
                     frame = draw_body_only(frame, lm)
+                    frame = _apply_rotation(frame, rotation)
                     frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
                     if out: out.write(frame)
 
@@ -647,6 +652,7 @@ def run_squat_analysis(video_path,
                 if create_video:
                     if rt_fb_hold > 0: rt_fb_hold -= 1
                     depth_live = 0.0
+                    frame = _apply_rotation(frame, rotation)
                     frame = draw_overlay(frame, reps=counter, feedback=(rt_fb_msg if rt_fb_hold>0 else None), depth_pct=depth_live)
                     if out: out.write(frame)
                 continue
@@ -691,21 +697,9 @@ def run_squat_analysis(video_path,
     if create_video and output_path:
         encoded_path = output_path.replace(".mp4", "_encoded.mp4")
         try:
-            # Build ffmpeg filter for rotation + encoding
-            vf_filters = []
-            if rotation == 90:
-                vf_filters.append("transpose=1")  # 90° clockwise
-            elif rotation == 180:
-                vf_filters.append("transpose=1,transpose=1")  # 180°
-            elif rotation == 270:
-                vf_filters.append("transpose=2")  # 90° counter-clockwise
-            
-            cmd = ["ffmpeg", "-y", "-i", output_path]
-            if vf_filters:
-                cmd += ["-vf", ",".join(vf_filters)]
-            cmd += ["-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart", 
-                    "-pix_fmt", "yuv420p", "-metadata:s:v:0", "rotate=0", encoded_path]
-            
+            cmd = ["ffmpeg", "-y", "-i", output_path,
+                   "-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart",
+                   "-pix_fmt", "yuv420p", "-metadata:s:v:0", "rotate=0", encoded_path]
             result = subprocess.run(cmd, check=False, capture_output=True)
             
             if os.path.exists(output_path) and os.path.exists(encoded_path):
