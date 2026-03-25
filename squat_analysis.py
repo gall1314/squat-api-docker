@@ -365,8 +365,18 @@ def run_squat_analysis(video_path,
         print(f"[FAST MODE] frame_skip={effective_frame_skip} (2x), scale={effective_scale:.2f}, model=lite", flush=True)
     else:
         effective_frame_skip = frame_skip
-        effective_scale = scale
+        if create_video:
+            # Ensure overlay is sharp: post-rotation smallest dimension >= 480px
+            # Pre-rotation frame: orig_w * scale × orig_h * scale
+            # Post-rotation (90/270): orig_h * scale × orig_w * scale  
+            # Smallest dimension = min(orig_w, orig_h) * scale >= 480
+            min_dim = min(orig_w, orig_h)
+            min_scale_for_overlay = 480.0 / max(min_dim, 1)
+            effective_scale = min(0.7, max(scale, min_scale_for_overlay))
+        else:
+            effective_scale = scale
         model_complexity = 1
+        print(f"[SLOW MODE] scale={effective_scale:.2f}, rotation={rotation}deg", flush=True)
 
     counter = 0
     good_reps = 0
