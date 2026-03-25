@@ -419,7 +419,6 @@ def run_squat_analysis(video_path,
             if not ret: break
             frame_idx += 1
             if frame_idx % effective_frame_skip != 0: continue
-            frame = _apply_rotation(frame, rotation)
             if effective_scale != 1.0: frame = cv2.resize(frame, (0,0), fx=effective_scale, fy=effective_scale)
 
             h, w = frame.shape[:2]
@@ -692,11 +691,22 @@ def run_squat_analysis(video_path,
     if create_video and output_path:
         encoded_path = output_path.replace(".mp4", "_encoded.mp4")
         try:
-            result = subprocess.run([
-                "ffmpeg", "-y", "-i", output_path,
-                "-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart", "-pix_fmt", "yuv420p",
-                encoded_path
-            ], check=False, capture_output=True)
+            # Build ffmpeg filter for rotation + encoding
+            vf_filters = []
+            if rotation == 90:
+                vf_filters.append("transpose=1")  # 90° clockwise
+            elif rotation == 180:
+                vf_filters.append("transpose=1,transpose=1")  # 180°
+            elif rotation == 270:
+                vf_filters.append("transpose=2")  # 90° counter-clockwise
+            
+            cmd = ["ffmpeg", "-y", "-i", output_path]
+            if vf_filters:
+                cmd += ["-vf", ",".join(vf_filters)]
+            cmd += ["-c:v", "libx264", "-preset", "fast", "-movflags", "+faststart", 
+                    "-pix_fmt", "yuv420p", "-metadata:s:v:0", "rotate=0", encoded_path]
+            
+            result = subprocess.run(cmd, check=False, capture_output=True)
             
             if os.path.exists(output_path) and os.path.exists(encoded_path):
                 os.remove(output_path)
