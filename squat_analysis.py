@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # squat_analysis.py — מהיר ואיטי עם לוגיקה זהה מובטחת
+# OVERLAY FIX: renders at frame resolution instead of 1080p canvas (3-5x faster)
 import os
 import cv2
 import math
@@ -21,22 +22,40 @@ DEPTH_RING_BG        = (70, 70, 70)
 
 FONT_PATH = "Roboto-VariableFont_wdth,wght.ttf"
 
-# Reference: at 480px frame height, these sizes looked correct.
-# On the HD canvas (1080p) we scale them proportionally.
 _REF_H = 480.0
 _REF_REPS_FONT_SIZE = 28
 _REF_FEEDBACK_FONT_SIZE = 22
 _REF_DEPTH_LABEL_FONT_SIZE = 14
 _REF_DEPTH_PCT_FONT_SIZE = 18
 
+_FONT_CACHE = {}
+
+def _get_font(path, size):
+    key = (path, size)
+    if key not in _FONT_CACHE:
+        _FONT_CACHE[key] = _load_font(path, size)
+    return _FONT_CACHE[key]
+
 def _load_font(path, size):
     try:
         return ImageFont.truetype(path, size)
     except Exception:
+        pass
+    for fb in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ]:
+        try:
+            return ImageFont.truetype(fb, size)
+        except Exception:
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
         return ImageFont.load_default()
 
 def _scaled_font_size(ref_size, canvas_h):
-    """Scale font size proportionally to canvas height."""
     return max(10, int(round(ref_size * (canvas_h / _REF_H))))
 
 mp_pose = mp.solutions.pose
@@ -79,7 +98,6 @@ def merge_feedback(global_best, new_list):
     if not global_best: return cand
     return cand if FB_SEVERITY.get(cand,1) >= FB_SEVERITY.get(global_best,1) else global_best
 
-# ===================== תצוגה מילולית/מספרית לציון =====================
 def score_label(s):
     s = float(s)
     if s >= 9.5: return "Excellent"
@@ -94,7 +112,7 @@ def display_half_str(x):
         return str(int(round(q)))
     return f"{q:.1f}"
 
-# ===================== OVERLAY (HD rendering) =====================
+# ===================== OVERLAY — efficient frame-resolution rendering =====================
 def _wrap_two_lines(draw, text, font, max_width):
     words = (text or "").split()
     if not words:
@@ -114,122 +132,79 @@ def _wrap_two_lines(draw, text, font, max_width):
     if cur and len(lines) < 2:
         lines.append(cur)
     if len(lines) >= 2 and draw.textlength(lines[-1], font=font) > max_width:
-        last = lines[-1] + "…"
+        last = lines[-1] + "\u2026"
         while draw.textlength(last, font=font) > max_width and len(last) > 1:
-            last = last[:-2] + "…"
+            last = last[:-2] + "\u2026"
         lines[-1] = last
     return lines
 
 
 def draw_overlay(frame, reps=0, feedback=None, depth_pct=0.0):
-    """Reps top-left; donut top-right; feedback bottom.
-    Rendered on a 1080p RGBA canvas, then composited onto the frame."""
+    """Overlay at frame resolution — no 1080p canvas, much faster."""
     h, w, _ = frame.shape
-
-    # HD canvas dimensions
-    HD_H = 1080
-    hd_scale = HD_H / float(h)
-    HD_W = max(1, int(round(w * hd_scale)))
-
-    # Scale font sizes for HD canvas
-    reps_font_size = _scaled_font_size(_REF_REPS_FONT_SIZE, HD_H)
-    feedback_font_size = _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, HD_H)
-    depth_label_font_size = _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, HD_H)
-    depth_pct_font_size = _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, HD_H)
-
-    _REPS_FONT = _load_font(FONT_PATH, reps_font_size)
-    _FEEDBACK_FONT = _load_font(FONT_PATH, feedback_font_size)
-    _DEPTH_LABEL_FONT = _load_font(FONT_PATH, depth_label_font_size)
-    _DEPTH_PCT_FONT = _load_font(FONT_PATH, depth_pct_font_size)
+    _REPS_F = _get_font(FONT_PATH, _scaled_font_size(_REF_REPS_FONT_SIZE, h))
+    _FB_F = _get_font(FONT_PATH, _scaled_font_size(_REF_FEEDBACK_FONT_SIZE, h))
+    _DL_F = _get_font(FONT_PATH, _scaled_font_size(_REF_DEPTH_LABEL_FONT_SIZE, h))
+    _DP_F = _get_font(FONT_PATH, _scaled_font_size(_REF_DEPTH_PCT_FONT_SIZE, h))
 
     pct = float(np.clip(depth_pct, 0, 1))
-    bg_alpha_val = int(round(255 * BAR_BG_ALPHA))
-
-    # Layout calculations on HD canvas
-    ref_h = max(int(HD_H * 0.06), int(reps_font_size * 1.6))
+    bg_alpha = int(round(255 * BAR_BG_ALPHA))
+    ref_h = max(int(h * 0.06), int(_REPS_F.size * 1.6))
     radius = int(ref_h * DONUT_RADIUS_SCALE)
     thick = max(3, int(radius * DONUT_THICKNESS_FRAC))
-    margin = int(12 * hd_scale)
-    cx = HD_W - margin - radius
+    cx = w - 12 - radius
     cy = max(ref_h + radius // 8, radius + thick // 2 + 2)
 
-    # Create RGBA PIL image (fully transparent)
-    overlay_pil = Image.new("RGBA", (HD_W, HD_H), (0, 0, 0, 0))
+    ov = np.zeros((h, w, 4), dtype=np.uint8)
+    _tmp_img = Image.new("RGBA", (1, 1))
+    tmp_draw = ImageDraw.Draw(_tmp_img)
+    txt = f"Reps: {int(reps)}"
+    tw = tmp_draw.textlength(txt, font=_REPS_F)
+    cv2.rectangle(ov, (0, 0), (int(tw + 20), int(_REPS_F.size + 12)), (0, 0, 0, bg_alpha), -1)
 
-    # We need a numpy array for cv2 drawing (donut ring)
-    overlay_np = np.zeros((HD_H, HD_W, 4), dtype=np.uint8)
-
-    # --- Reps box background ---
-    pad_x, pad_y = int(10 * hd_scale), int(6 * hd_scale)
-    draw_tmp = ImageDraw.Draw(overlay_pil)
-    reps_text = f"Reps: {int(reps)}"
-    tw = draw_tmp.textlength(reps_text, font=_REPS_FONT)
-    thh = _REPS_FONT.size
-    box_w = int(tw + 2 * pad_x)
-    box_h = int(thh + 2 * pad_y)
-    # Draw semi-transparent black box
-    cv2.rectangle(overlay_np, (0, 0), (box_w, box_h), (0, 0, 0, bg_alpha_val), -1)
-
-    # --- Donut ring ---
-    # Background ring
-    cv2.circle(overlay_np, (cx, cy), radius, (*DEPTH_RING_BG, 255), thick, cv2.LINE_AA)
-    # Progress arc
-    start_ang = -90
-    end_ang = start_ang + int(360 * pct)
-    if end_ang != start_ang:
-        cv2.ellipse(overlay_np, (cx, cy), (radius, radius), 0, start_ang, end_ang,
+    cv2.circle(ov, (cx, cy), radius, (*DEPTH_RING_BG, 255), thick, cv2.LINE_AA)
+    sa, ea = -90, -90 + int(360 * pct)
+    if ea != sa:
+        cv2.ellipse(ov, (cx, cy), (radius, radius), 0, sa, ea,
                     (*DEPTH_COLOR, 255), thick, cv2.LINE_AA)
 
-    # --- Feedback bar background ---
+    fb_y0 = fb_pad_x = fb_pad_y = line_gap = line_h = 0
+    fb_lines = []
     if feedback:
-        safe_margin = max(int(6 * hd_scale), int(HD_H * 0.02))
-        fb_pad_x, fb_pad_y, line_gap = int(12 * hd_scale), int(8 * hd_scale), int(4 * hd_scale)
-        max_text_w = int(HD_W - 2 * fb_pad_x - int(20 * hd_scale))
-        lines = _wrap_two_lines(draw_tmp, feedback, _FEEDBACK_FONT, max_text_w)
-        line_h = _FEEDBACK_FONT.size + int(6 * hd_scale)
-        block_h = 2 * fb_pad_y + len(lines) * line_h + (len(lines) - 1) * line_gap
-        y0 = max(0, HD_H - safe_margin - block_h)
-        y1 = HD_H - safe_margin
-        cv2.rectangle(overlay_np, (0, y0), (HD_W, y1), (0, 0, 0, bg_alpha_val), -1)
+        safe = max(6, int(h * 0.02))
+        fb_pad_x = 12
+        fb_pad_y = 8
+        line_gap = 4
+        fb_lines = _wrap_two_lines(tmp_draw, feedback, _FB_F, int(w - 2 * fb_pad_x - 20))
+        line_h = _FB_F.size + 6
+        block_h = 2 * fb_pad_y + len(fb_lines) * line_h + (len(fb_lines) - 1) * line_gap
+        fb_y0 = max(0, h - safe - block_h)
+        cv2.rectangle(ov, (0, fb_y0), (w, h - safe), (0, 0, 0, bg_alpha), -1)
 
-    # Merge cv2-drawn elements into PIL image
-    overlay_pil = Image.fromarray(overlay_np, mode="RGBA")
-    draw = ImageDraw.Draw(overlay_pil)
+    pil = Image.fromarray(ov, mode="RGBA")
+    draw = ImageDraw.Draw(pil)
+    draw.text((10, 5), txt, font=_REPS_F, fill=(255, 255, 255, 255))
 
-    # --- Reps text ---
-    draw.text((pad_x, pad_y - 1), reps_text, font=_REPS_FONT, fill=(255, 255, 255, 255))
-
-    # --- Donut labels ---
     gap = max(2, int(radius * 0.10))
-    by = cy - (_DEPTH_LABEL_FONT.size + gap + _DEPTH_PCT_FONT.size) // 2
-    label_txt = "DEPTH"
-    pct_txt = f"{int(pct * 100)}%"
-    lw = draw.textlength(label_txt, font=_DEPTH_LABEL_FONT)
-    pw = draw.textlength(pct_txt, font=_DEPTH_PCT_FONT)
-    draw.text((cx - int(lw // 2), by), label_txt, font=_DEPTH_LABEL_FONT, fill=(255, 255, 255, 255))
-    draw.text((cx - int(pw // 2), by + _DEPTH_LABEL_FONT.size + gap), pct_txt, font=_DEPTH_PCT_FONT, fill=(255, 255, 255, 255))
+    by = cy - (_DL_F.size + gap + _DP_F.size) // 2
+    lbl = "DEPTH"
+    pt = f"{int(pct * 100)}%"
+    draw.text((cx - int(draw.textlength(lbl, font=_DL_F) // 2), by),
+              lbl, font=_DL_F, fill=(255, 255, 255, 255))
+    draw.text((cx - int(draw.textlength(pt, font=_DP_F) // 2), by + _DL_F.size + gap),
+              pt, font=_DP_F, fill=(255, 255, 255, 255))
 
-    # --- Feedback text ---
-    if feedback:
-        ty = y0 + fb_pad_y
-        for ln in lines:
-            tw2 = draw.textlength(ln, font=_FEEDBACK_FONT)
-            tx = max(fb_pad_x, (HD_W - int(tw2)) // 2)
-            draw.text((tx, ty), ln, font=_FEEDBACK_FONT, fill=(255, 255, 255, 255))
+    if feedback and fb_lines:
+        ty = fb_y0 + fb_pad_y
+        for ln in fb_lines:
+            tx = max(fb_pad_x, (w - int(draw.textlength(ln, font=_FB_F))) // 2)
+            draw.text((tx, ty), ln, font=_FB_F, fill=(255, 255, 255, 255))
             ty += line_h + line_gap
 
-    # --- Composite onto frame ---
-    overlay_rgba = np.array(overlay_pil)
-    # Resize HD overlay down to frame size
-    overlay_small = cv2.resize(overlay_rgba, (w, h), interpolation=cv2.INTER_AREA)
-
-    # Alpha composite: overlay onto BGR frame
-    alpha = overlay_small[:, :, 3:4].astype(np.float32) / 255.0
-    # overlay_small is RGBA (PIL order), convert RGB channels to BGR for OpenCV
-    overlay_bgr = overlay_small[:, :, [2, 1, 0]].astype(np.float32)
-    frame_f = frame.astype(np.float32)
-    result = frame_f * (1.0 - alpha) + overlay_bgr * alpha
-    return result.astype(np.uint8)
+    ov_arr = np.array(pil)
+    alpha = ov_arr[:, :, 3:4].astype(np.float32) / 255.0
+    out_f = frame.astype(np.float32) * (1 - alpha) + ov_arr[:, :, [2, 1, 0]].astype(np.float32) * alpha
+    return out_f.astype(np.uint8)
 
 # ===================== BODY-ONLY SKELETON =====================
 _FACE_LMS = {
@@ -284,13 +259,11 @@ REP_FINISH_KNEE_MARGIN = 6.0
 REP_FINISH_DEPTH_MAX = 0.20
 REP_FINISH_ALLOW_MOVING_DEPTH_MAX = 0.10
 
-# --------- תנועה גלובלית ---------
 HIP_VEL_THRESH_PCT    = 0.014
 ANKLE_VEL_THRESH_PCT  = 0.017
 EMA_ALPHA             = 0.65
 MOVEMENT_CLEAR_FRAMES = 2
 
-# ===================== זיהוי עומק - hip below knee =====================
 def calculate_depth_robust(mid_hip, mid_knee, mid_ankle, knee_angle, mid_shoulder):
     hip_below_knee = mid_hip[1] - mid_knee[1]
     thigh_length = max(1e-6, _euclid(mid_hip, mid_knee))
@@ -478,15 +451,12 @@ def run_squat_analysis(video_path,
                     rep_had_back_feedback = False
                     rep_start_frame = frame_idx
                     rep_down_start_idx = frame_idx
-                    
                     rep_start_hip_x = mid_hip[0]
                     rep_start_ankle_x = mid_ankle[0]
                     rep_max_horizontal_movement = 0.0
-                    
                     rep_start_left_knee = calculate_angle(l_hip, l_knee, l_ankle)
                     rep_start_right_knee = knee_angle
                     rep_max_asymmetry = 0.0
-                    
                     stage = "down"
 
                 current_depth = calculate_depth_robust(mid_hip, mid_knee, mid_ankle, knee_angle, mid_shoulder)
@@ -536,13 +506,10 @@ def run_squat_analysis(video_path,
 
                 max_horizontal_allowed = 0.25
                 has_excessive_horizontal = rep_max_horizontal_movement > max_horizontal_allowed
-                
                 max_asymmetry_allowed = 35
                 has_excessive_asymmetry = rep_max_asymmetry > max_asymmetry_allowed
-                
                 min_depth_for_rep = 0.12
                 has_minimal_depth = rep_max_depth >= min_depth_for_rep
-                
                 is_pickup_motion = has_excessive_horizontal and has_excessive_asymmetry
                 is_valid_rep = (not is_pickup_motion) and has_minimal_depth
                 
@@ -550,7 +517,6 @@ def run_squat_analysis(video_path,
                     knee_angle > STAND_KNEE_ANGLE
                     or (knee_angle > (STAND_KNEE_ANGLE - REP_FINISH_KNEE_MARGIN) and current_depth <= REP_FINISH_DEPTH_MAX)
                 )
-
                 rep_finish_gate_ok = (
                     movement_free_streak >= MOVEMENT_CLEAR_FRAMES
                     or current_depth <= REP_FINISH_ALLOW_MOVING_DEPTH_MAX
@@ -569,7 +535,6 @@ def run_squat_analysis(video_path,
                     
                     feedbacks = []
                     penalty = 0.0
-
                     depth_pct = rep_max_depth
                     
                     if   depth_pct < 0.55: feedbacks.append("Try to squat deeper");            penalty += 3
@@ -590,24 +555,15 @@ def run_squat_analysis(video_path,
                     rep_feedbacks, rep_feedback_by_cat = pick_strongest_per_category(feedbacks)
                 
                     safe_start_knee = float(start_knee_angle or knee_angle)
-                    if np.isnan(safe_start_knee) or np.isinf(safe_start_knee):
-                        safe_start_knee = 160.0
-                    
+                    if np.isnan(safe_start_knee) or np.isinf(safe_start_knee): safe_start_knee = 160.0
                     safe_min_knee = float(rep_min_knee_angle)
-                    if np.isnan(safe_min_knee) or np.isinf(safe_min_knee):
-                        safe_min_knee = 160.0
-                        
+                    if np.isnan(safe_min_knee) or np.isinf(safe_min_knee): safe_min_knee = 160.0
                     safe_max_knee = float(rep_max_knee_angle)
-                    if np.isnan(safe_max_knee) or np.isinf(safe_max_knee):
-                        safe_max_knee = 160.0
-                        
+                    if np.isnan(safe_max_knee) or np.isinf(safe_max_knee): safe_max_knee = 160.0
                     safe_back_angle_top = float(rep_max_back_angle_top)
-                    if np.isnan(safe_back_angle_top) or np.isinf(safe_back_angle_top):
-                        safe_back_angle_top = 0.0
-                        
+                    if np.isnan(safe_back_angle_top) or np.isinf(safe_back_angle_top): safe_back_angle_top = 0.0
                     safe_back_angle_bottom = float(rep_max_back_angle_bottom)
-                    if np.isnan(safe_back_angle_bottom) or np.isinf(safe_back_angle_bottom):
-                        safe_back_angle_bottom = 0.0
+                    if np.isnan(safe_back_angle_bottom) or np.isinf(safe_back_angle_bottom): safe_back_angle_bottom = 0.0
                     
                     rep_reports.append({
                         "rep_index": counter + 1,
@@ -673,7 +629,7 @@ def run_squat_analysis(video_path,
     if session_feedbacks and len(session_feedbacks) > 0:
         technique_score = min(technique_score, 9.5)
     
-    feedback_list = session_feedbacks if session_feedbacks else ["Great form! Keep it up 💪"]
+    feedback_list = session_feedbacks if session_feedbacks else ["Great form! Keep it up \U0001f4aa"]
     
     session_tip = None
     if session_feedback_by_cat:
@@ -730,7 +686,6 @@ def run_squat_analysis(video_path,
     
     return result
 
-# תאימות
 def run_analysis(video_path,
                  frame_skip=3,
                  scale=0.4,
