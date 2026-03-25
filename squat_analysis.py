@@ -252,6 +252,39 @@ def angle_between_vectors(v1, v2):
 def _euclid(a, b):
     return math.hypot(a[0]-b[0], a[1]-b[1])
 
+# ===================== Video rotation (like pushup/deadlift) =====================
+import json
+
+def _get_video_rotation(video_path):
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', video_path],
+            capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            for s in data.get('streams', []):
+                if s.get('codec_type') != 'video':
+                    continue
+                tags = s.get('tags', {})
+                if 'rotate' in tags:
+                    return int(tags['rotate'])
+                for sd in s.get('side_data_list', []):
+                    if 'rotation' in sd:
+                        return (-int(sd['rotation'])) % 360
+    except Exception:
+        pass
+    return 0
+
+def _apply_rotation(frame, angle):
+    angle = angle % 360
+    if angle == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if angle == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if angle == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
+
 # ===================== SQUAT CORE PARAMS =====================
 STAND_KNEE_ANGLE    = 155.0
 MIN_FRAMES_BETWEEN_REPS_SQ = 6
@@ -303,6 +336,7 @@ def run_squat_analysis(video_path,
                        fast_mode=False,
                        return_video=True):
     mp_pose_mod = mp.solutions.pose
+    rotation = _get_video_rotation(video_path)
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {
@@ -385,6 +419,7 @@ def run_squat_analysis(video_path,
             if not ret: break
             frame_idx += 1
             if frame_idx % effective_frame_skip != 0: continue
+            frame = _apply_rotation(frame, rotation)
             if effective_scale != 1.0: frame = cv2.resize(frame, (0,0), fx=effective_scale, fy=effective_scale)
 
             h, w = frame.shape[:2]
