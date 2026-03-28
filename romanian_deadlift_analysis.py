@@ -606,13 +606,17 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
 # PASS 2 — video rendering
 # =====================================================================
 def _render_pass(video_path, rotation, frame_skip, output_path, out_w, out_h, fps_in, frame_data):
-    import sys
+    import sys, time
     effective_fps = max(1.0, fps_in / max(1, frame_skip))
     cap = cv2.VideoCapture(video_path)
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, effective_fps, (out_w, out_h))
     frame_idx = written = 0
+    t0 = time.time()
     while cap.isOpened():
+        if time.time() - t0 > 300:
+            print("[RDL] Pass2 timeout", file=sys.stderr, flush=True)
+            break
         ret, frame = cap.read()
         if not ret: break
         frame_idx += 1
@@ -676,7 +680,10 @@ def run_romanian_deadlift_analysis(video_path, frame_skip=3, scale=0.4,
     final_video_path = ""
     if create_video:
         print("[RDL] Pass2 rendering...", file=sys.stderr, flush=True)
-        _render_pass(video_path, rotation, frame_skip, output_path, out_w, out_h, fps_in, frame_data)
+        try:
+            _render_pass(video_path, rotation, frame_skip, output_path, out_w, out_h, fps_in, frame_data)
+        except Exception as e:
+            print(f"[RDL] Pass2 exception: {e}", file=sys.stderr, flush=True)
         encoded = output_path.replace(".mp4", "_encoded.mp4")
         try:
             proc = subprocess.run(

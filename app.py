@@ -372,7 +372,7 @@ def analyze():
                 "detail": "Upload interrupted before the multipart payload was fully received (client/proxy timeout or connection drop)",
                 "content_length": content_length,
                 "size_mb": size_mb,
-                "hint": "Client/proxy timed out during upload. Retry on better network, send smaller/compressed video, or use raw video upload (Content-Type: video/mp4 with ?exercise_type=...&fast=true).",
+                "hint": "Client/proxy timed out during upload. Retry on better network, send smaller/compressed video, or use raw video upload (Content-Type: video/mp4 with ?exercise_type=...&fast=false for analyzed video).",
                 "video_path": ""
             }, 408)
 
