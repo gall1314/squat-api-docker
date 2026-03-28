@@ -2,7 +2,6 @@
 # romanian_deadlift_analysis_fixed.py  v5.3 — TWO-PASS + FAST OVERLAY
 #
 # v5.3: use scale param (not hardcoded 0.35) for better landmark detection -> fewer false reps
-#        ffmpeg: remove redundant -vf scale, preset fast for better quality
 # v5.2: draw_overlay at frame resolution (not 1080p), font cache, positive_feedback bool
 
 import os
@@ -690,7 +689,8 @@ def run_romanian_deadlift_analysis(video_path, frame_skip=3, scale=0.4,
         try:
             proc = subprocess.run(
                 ["ffmpeg", "-y", "-i", output_path,
-                 "-c:v", "libx264", "-preset", "fast",
+                 "-vf", f"scale={out_w}:{out_h}:flags=bilinear",
+                 "-c:v", "libx264", "-preset", "ultrafast",
                  "-movflags", "+faststart", "-pix_fmt", "yuv420p", encoded],
                 capture_output=True, timeout=300)
             print(f"[RDL] ffmpeg rc={proc.returncode}", file=sys.stderr, flush=True)
