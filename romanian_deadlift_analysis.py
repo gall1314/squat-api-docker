@@ -67,13 +67,13 @@ FB_SEVERITY = {
     "Go deeper - hinge more at the hips": 3,
     "Bend your knees a bit more":         3,
     "Too much knee bend":                 3,
-    "Try to keep your back neutral":      2,
+    "Your torso is going too far forward": 2,
 }
 FEEDBACK_CATEGORY = {
     "Go deeper - hinge more at the hips": "depth",
     "Bend your knees a bit more":         "knees",
     "Too much knee bend":                 "knees",
-    "Try to keep your back neutral":      "back",
+    "Your torso is going too far forward": "back",
 }
 
 def pick_strongest_feedback(feedback_list):
@@ -258,16 +258,12 @@ def torso_angle_to_vertical(hip, shoulder):
     return float(math.degrees(math.acos(
         float(np.clip(np.dot(vec, np.array([0.0, -1.0])) / nrm, -1.0, 1.0)))))
 
-def analyze_back_curvature(shoulder, hip, head_like,
-                            max_angle_deg=45.0, min_head_dist_ratio=0.35):
-    tv = shoulder - hip
-    hv = head_like - shoulder
-    tn = np.linalg.norm(tv) + 1e-9
-    hn = np.linalg.norm(hv) + 1e-9
-    if hn < min_head_dist_ratio * tn:
-        return 0.0, False
-    ang = math.degrees(math.acos(float(np.clip(np.dot(tv, hv) / (tn * hn), -1.0, 1.0))))
-    return ang, ang > max_angle_deg
+def check_torso_angle_rdl(hip, shoulder, max_torso_angle=85.0):
+    """Check if torso angle is excessive for RDL.
+    In a proper RDL the torso hinges forward but shouldn't go
+    near-horizontal (>85 deg from vertical). Returns (angle, is_too_far)."""
+    torso_ang = torso_angle_to_vertical(hip, shoulder)
+    return torso_ang, torso_ang > max_torso_angle
 
 # ===================== LANDMARK EXTRACTION =====================
 def _get_all_landmarks(lm):
@@ -566,12 +562,12 @@ class RepCounter:
         return None
 
 # ===================== REP EVALUATION =====================
-HINGE_BOTTOM_ANGLE = 55.0
-KNEE_MIN_ANGLE     = 172.0
-KNEE_MAX_ANGLE     = 125.0
-BACK_MAX_ANGLE     = 60.0
-MIN_SCORE          = 4.0
-MAX_SCORE          = 10.0
+HINGE_BOTTOM_ANGLE    = 55.0
+KNEE_MIN_ANGLE        = 172.0
+KNEE_MAX_ANGLE        = 125.0
+TORSO_MAX_ANGLE       = 85.0   # torso shouldn't go near-horizontal
+MIN_SCORE             = 4.0
+MAX_SCORE             = 10.0
 
 def _evaluate_rep(rep_result):
     feedback = []
@@ -587,8 +583,8 @@ def _evaluate_rep(rep_result):
     elif rep_result["min_knee"] < KNEE_MAX_ANGLE:
         feedback.append("Too much knee bend")
         score -= 2.0
-    if rep_result["back_issue"] and rep_result["back_angle"] > (BACK_MAX_ANGLE + 5.0):
-        feedback.append("Try to keep your back neutral")
+    if rep_result["back_issue"] and rep_result["back_angle"] > TORSO_MAX_ANGLE:
+        feedback.append("Your torso is going too far forward")
         score -= 1.0
 
     return float(max(MIN_SCORE, min(MAX_SCORE, score))), feedback
@@ -713,8 +709,8 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
             depth_pct = depth_norm.update(signal_data["composite"])
 
             pts = _get_side_landmarks(lm)
-            back_angle, back_bad = analyze_back_curvature(
-                pts["shoulder"], pts["hip"], pts["ear"], BACK_MAX_ANGLE)
+            back_angle, back_bad = check_torso_angle_rdl(
+                pts["hip"], pts["shoulder"], TORSO_MAX_ANGLE)
             if rep_counter.state in ("descending", "ascending") and back_bad:
                 rep_counter.rep_back_issue = True
                 rep_counter.rep_back_angle = max(rep_counter.rep_back_angle, back_angle)
