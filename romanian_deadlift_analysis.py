@@ -565,7 +565,7 @@ class RepCounter:
 HINGE_BOTTOM_ANGLE    = 55.0
 KNEE_MIN_ANGLE        = 172.0
 KNEE_MAX_ANGLE        = 125.0
-TORSO_MAX_ANGLE       = 85.0   # torso shouldn't go near-horizontal
+TORSO_MAX_ANGLE       = 95.0   # only flag if torso goes past horizontal
 MIN_SCORE             = 4.0
 MAX_SCORE             = 10.0
 
