@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
-# romanian_deadlift_analysis_fixed.py  v5.2 — TWO-PASS + FAST OVERLAY
+# romanian_deadlift_analysis_fixed.py  v5.3 — TWO-PASS + FAST OVERLAY
 #
+# v5.3: use scale param (not hardcoded 0.35) for better landmark detection -> fewer false reps
+#        ffmpeg: remove redundant -vf scale, preset fast for better quality
 # v5.2: draw_overlay at frame resolution (not 1080p), font cache, positive_feedback bool
 
 import os
@@ -668,7 +670,7 @@ def run_romanian_deadlift_analysis(video_path, frame_skip=3, scale=0.4,
     out_w, out_h = (orig_h, orig_w) if rotation in (90, 270) else (orig_w, orig_h)
     print(f"[RDL] {total_frames}fr @ {fps_in:.1f}fps  out={out_w}x{out_h}", file=sys.stderr, flush=True)
 
-    analysis, frame_data, _ = _analysis_pass(video_path, rotation, frame_skip, 0.35, fps_in)
+    analysis, frame_data, _ = _analysis_pass(video_path, rotation, frame_skip, scale, fps_in)
 
     try:
         with open(feedback_path, "w", encoding="utf-8") as f:
@@ -688,8 +690,7 @@ def run_romanian_deadlift_analysis(video_path, frame_skip=3, scale=0.4,
         try:
             proc = subprocess.run(
                 ["ffmpeg", "-y", "-i", output_path,
-                 "-vf", f"scale={out_w}:{out_h}:flags=bilinear",
-                 "-c:v", "libx264", "-preset", "ultrafast",
+                 "-c:v", "libx264", "-preset", "fast",
                  "-movflags", "+faststart", "-pix_fmt", "yuv420p", encoded],
                 capture_output=True, timeout=300)
             print(f"[RDL] ffmpeg rc={proc.returncode}", file=sys.stderr, flush=True)
