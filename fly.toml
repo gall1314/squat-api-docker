@@ -9,13 +9,16 @@ primary_region = "fra"
   force_https = true
   auto_start_machines = true
   auto_stop_machines = "stop"
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ["app"]
+
+  [http_service.http_options]
+    idle_timeout = 600
 
 [vm]
   cpu_kind = "shared"
   cpus = 2
-  memory_mb = 1024
+  memory_mb = 2048
 
 [env]
   PORT = "8080"
