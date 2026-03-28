@@ -3,7 +3,7 @@
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-import os, uuid, shutil, inspect, importlib, importlib.util, sys, traceback, time
+import os, uuid, shutil, inspect, importlib, importlib.util, sys, traceback, time, base64
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import BadRequest, ClientDisconnected
 
@@ -97,6 +97,20 @@ def _supports_arg(func, name: str) -> bool:
         return name in inspect.signature(func).parameters
     except Exception:
         return False
+
+def _encode_video_base64(video_path):
+    """Read video file and return base64-encoded string, or None on failure."""
+    try:
+        if video_path and os.path.exists(video_path) and os.path.getsize(video_path) > 0:
+            with open(video_path, "rb") as f:
+                encoded = base64.b64encode(f.read()).decode("ascii")
+            size_mb = os.path.getsize(video_path) / (1024 * 1024)
+            print(f"[video_b64] Encoded {size_mb:.1f}MB -> {len(encoded)} chars",
+                  file=sys.stderr, flush=True)
+            return encoded
+    except Exception as e:
+        print(f"[video_b64] Failed: {e}", file=sys.stderr, flush=True)
+    return None
 
 def _run_analyzer(func, src_path, out_video_path, fast_mode: bool, *, frame_skip=3, scale=0.4, extra=None):
     """
@@ -280,7 +294,8 @@ def analyze():
 
     Returns:
     - result: object - תוצאות הניתוח (reps, scores, feedback)
-    - video_url: string|null - URL לוידאו מנותח (רק אם fast=false)
+    - video_url: string|null - URL לוידאו מנותח (רק אם fast=false) [LEGACY, kept for compatibility]
+    - video_base64: string|null - Base64-encoded MP4 video (רק אם fast=false)
     """
     t0 = time.time()
 
@@ -295,10 +310,28 @@ def analyze():
         safe_result = result_dict if isinstance(result_dict, dict) else _invalid_result_payload()
         safe_result = _standardize_video_path(safe_result)
         output_path = safe_result.get("video_path") or ""
+
+        # Build video_url (legacy, kept for backward compat)
         video_url = None
         if output_path and os.path.exists(output_path):
             video_url = request.host_url.rstrip('/') + '/media/' + os.path.basename(output_path)
-        return jsonify({"result": safe_result, "video_url": video_url}), status
+
+        # Encode video as base64 so the client gets it in one response
+        # No need for a separate GET that can fail if Fly autostops
+        video_b64 = _encode_video_base64(output_path)
+
+        # Clean up video file after encoding — no longer needed on disk
+        if video_b64 and output_path and os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except Exception:
+                pass
+
+        return jsonify({
+            "result": safe_result,
+            "video_url": video_url,        # legacy — may be unreachable after autostop
+            "video_base64": video_b64,      # new — always works
+        }), status
 
     try:
         print("==== POST RECEIVED ====", file=sys.stderr, flush=True)
@@ -346,7 +379,9 @@ def analyze():
                 return _json_response(unavailable_resp.get_json(silent=True) or result, status)
 
             response, status = _json_response(result)
-            print(f"[RAW] OK -> {response.get_json(silent=True).get('video_url')}", file=sys.stderr, flush=True)
+            resp_json = response.get_json(silent=True) or {}
+            has_b64 = bool(resp_json.get("video_base64"))
+            print(f"[RAW] OK -> url={resp_json.get('video_url')} b64={has_b64}", file=sys.stderr, flush=True)
             print(f"[RAW] TOTAL TIME: {(time.time() - t0):.3f}s", file=sys.stderr, flush=True)
             return response, status
 
@@ -437,7 +472,9 @@ def analyze():
             return _json_response(unavailable_resp.get_json(silent=True) or result, status)
 
         response, status = _json_response(result)
-        print(f"[MP] OK -> {response.get_json(silent=True).get('video_url')}", file=sys.stderr, flush=True)
+        resp_json = response.get_json(silent=True) or {}
+        has_b64 = bool(resp_json.get("video_base64"))
+        print(f"[MP] OK -> url={resp_json.get('video_url')} b64={has_b64}", file=sys.stderr, flush=True)
         print(f"[MP] TOTAL TIME: {(time.time() - t0):.3f}s", file=sys.stderr, flush=True)
         return response, status
 
