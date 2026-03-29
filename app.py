@@ -3,14 +3,13 @@
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-import os, uuid, shutil, inspect, importlib, importlib.util, sys, traceback, time, base64
+import os, uuid, shutil, inspect, importlib, importlib.util, sys, traceback, time
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import BadRequest, ClientDisconnected
 
 app = Flask(__name__)
 CORS(app)
 
-# ✅ הגדלת גבולות לסרטונים גדולים
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
@@ -32,7 +31,7 @@ _EXERCISE_MAP_RAW = {
     "barbell bent over row": "bent_row", "bent over row": "bent_row",
     "barbell row": "bent_row", "row": "bent_row",
     "good morning": "good_morning", "good mornings": "good_morning", "good morningg": "good_morning",
-    "dips": "dips", "dip": "dips", 
+    "dips": "dips", "dip": "dips",
     "bench dips": "dips", "bench dip": "dips",
     "chest dips": "dips", "chest dip": "dips",
     "tricep dips": "dips", "triceps dips": "dips",
@@ -44,7 +43,6 @@ _EXERCISE_MAP_RAW = {
     "push-ups": "pushup", "regular push-up": "pushup", "standard push-up": "pushup",
 }
 
-# Create case-insensitive lookup by normalizing all keys to lowercase
 EXERCISE_MAP = {k.lower(): v for k, v in _EXERCISE_MAP_RAW.items()}
 
 # -------- Error handling & logging --------
@@ -60,7 +58,6 @@ def log_entry():
 
 # -------- Utilities --------
 def _standardize_video_path(result_dict):
-    """Normalize result to always contain result['video_path'] if analyzer returned 'analyzed_video_path'."""
     if isinstance(result_dict, dict):
         if "video_path" not in result_dict and "analyzed_video_path" in result_dict:
             result_dict["video_path"] = result_dict["analyzed_video_path"]
@@ -80,7 +77,6 @@ def _unavailable_response(result_dict):
     return jsonify(payload), 501
 
 def _normalize_analysis_fields(result_dict):
-    """Ensure analyzer responses contain stable numeric fields for downstream UI."""
     if not isinstance(result_dict, dict):
         return result_dict
     if result_dict.get("proper_reps") is None:
@@ -98,55 +94,30 @@ def _supports_arg(func, name: str) -> bool:
     except Exception:
         return False
 
-def _encode_video_base64(video_path):
-    """Read video file and return base64-encoded string, or None on failure."""
-    try:
-        if video_path and os.path.exists(video_path) and os.path.getsize(video_path) > 0:
-            with open(video_path, "rb") as f:
-                encoded = base64.b64encode(f.read()).decode("ascii")
-            size_mb = os.path.getsize(video_path) / (1024 * 1024)
-            print(f"[video_b64] Encoded {size_mb:.1f}MB -> {len(encoded)} chars",
-                  file=sys.stderr, flush=True)
-            return encoded
-    except Exception as e:
-        print(f"[video_b64] Failed: {e}", file=sys.stderr, flush=True)
-    return None
-
 def _run_analyzer(func, src_path, out_video_path, fast_mode: bool, *, frame_skip=3, scale=0.4, extra=None):
-    """
-    מריץ אנלייזר עם תמיכה בשני מסלולים:
-      fast_mode=True  → רק JSON, ללא וידאו (10-15 שניות)
-      fast_mode=False → JSON + וידאו מנותח (60 שניות)
-    
-    ** חשוב: התוצאות (reps, scores, feedback) זהות בשני המצבים! **
-    """
     extra = extra or {}
     kwargs = {}
-    
-    # פרמטרים בסיסיים
-    if _supports_arg(func, "frame_skip"): 
+
+    if _supports_arg(func, "frame_skip"):
         kwargs["frame_skip"] = frame_skip
-    if _supports_arg(func, "scale"): 
+    if _supports_arg(func, "scale"):
         kwargs["scale"] = scale
-    
-    # מסלול מהיר vs איטי
+
     if _supports_arg(func, "fast_mode"):
         kwargs["fast_mode"] = fast_mode
         print(f"[_run_analyzer] fast_mode={fast_mode}", file=sys.stderr, flush=True)
-    
+
     if _supports_arg(func, "return_video"):
         kwargs["return_video"] = (not fast_mode)
         print(f"[_run_analyzer] return_video={not fast_mode}", file=sys.stderr, flush=True)
-    
-    # output_path - רק במצב איטי (עם וידאו) - FIX: תמיד העבר גם אם None
+
     if not fast_mode and _supports_arg(func, "output_path"):
         kwargs["output_path"] = out_video_path or ""
         print(f"[_run_analyzer] output_path={out_video_path or ''}", file=sys.stderr, flush=True)
-    
+
     if _supports_arg(func, "output_dir"):
         kwargs["output_dir"] = os.path.dirname(out_video_path) if out_video_path else MEDIA_DIR
 
-    # פרמטרים נוספים
     for k, v in extra.items():
         if _supports_arg(func, k):
             kwargs[k] = v
@@ -166,110 +137,78 @@ def _missing_stub(mod_name, fn_names):
     return _stub
 
 def load_func_soft(module_name, *func_names):
-    """
-    Import module and return the first existing attribute from func_names.
-    If module/function missing — returns a stub that yields a clear JSON error instead of crashing.
-    """
-    # Avoid noisy import traceback for analyzers that are not shipped in this build.
     if importlib.util.find_spec(module_name) is None:
         print(f"[loader] SKIP missing optional module {module_name}", file=sys.stderr, flush=True)
         return _missing_stub(module_name, func_names)
-
     try:
         mod = importlib.import_module(module_name)
     except Exception as e:
         print(f"[loader] FAILED import {module_name}: {e}", file=sys.stderr, flush=True)
         return _missing_stub(module_name, func_names)
-
     for fn in func_names:
         if hasattr(mod, fn):
             f = getattr(mod, fn)
             print(f"[loader] {module_name}.{fn} resolved", file=sys.stderr, flush=True)
             return f
-
     print(f"[loader] {module_name}: none of {func_names} found", file=sys.stderr, flush=True)
     return _missing_stub(module_name, func_names)
 
 # ---- Resolve analyzers ----
-run_squat       = load_func_soft('squat_analysis', 'run_analysis', 'run_squat_analysis')
-run_deadlift    = load_func_soft('deadlift_analysis', 'run_deadlift_analysis', 'run_analysis')
-run_rdl         = load_func_soft('romanian_deadlift_analysis', 'run_romanian_deadlift_analysis', 'run_analysis')
-run_stiff_leg   = load_func_soft('stiff_leg_deadlift_analysis', 'run_stiff_leg_deadlift_analysis', 'run_analysis')
-run_bulgarian   = load_func_soft('bulgarian_split_squat_analysis', 'run_bulgarian_analysis', 'run_analysis')
-run_pullup      = load_func_soft('pullup_analysis', 'run_pullup_analysis', 'run_analysis')
-run_bicep_curl  = load_func_soft('barbell_bicep_curl', 'run_barbell_bicep_curl_analysis', 'run_analysis')
-run_bent_row    = load_func_soft('bent_over_row_analysis', 'run_row_analysis', 'run_analysis')
-run_good_morning = load_func_soft('good_morning_analysis', 'run_good_morning_analysis', 'run_analysis')
-run_dips        = load_func_soft('dips_analysis', 'run_dips_analysis', 'run_analysis')
+run_squat          = load_func_soft('squat_analysis', 'run_analysis', 'run_squat_analysis')
+run_deadlift       = load_func_soft('deadlift_analysis', 'run_deadlift_analysis', 'run_analysis')
+run_rdl            = load_func_soft('romanian_deadlift_analysis', 'run_romanian_deadlift_analysis', 'run_analysis')
+run_stiff_leg      = load_func_soft('stiff_leg_deadlift_analysis', 'run_stiff_leg_deadlift_analysis', 'run_analysis')
+run_bulgarian      = load_func_soft('bulgarian_split_squat_analysis', 'run_bulgarian_analysis', 'run_analysis')
+run_pullup         = load_func_soft('pullup_analysis', 'run_pullup_analysis', 'run_analysis')
+run_bicep_curl     = load_func_soft('barbell_bicep_curl', 'run_barbell_bicep_curl_analysis', 'run_analysis')
+run_bent_row       = load_func_soft('bent_over_row_analysis', 'run_row_analysis', 'run_analysis')
+run_good_morning   = load_func_soft('good_morning_analysis', 'run_good_morning_analysis', 'run_analysis')
+run_dips           = load_func_soft('dips_analysis', 'run_dips_analysis', 'run_analysis')
 run_overhead_press = load_func_soft('overhead_press_analysis', 'run_overhead_press_analysis', 'run_analysis')
-run_pushup      = load_func_soft('pushup_analysis', 'run_pushup_analysis', 'run_analysis')
+run_pushup         = load_func_soft('pushup_analysis', 'run_pushup_analysis', 'run_analysis')
 
 # -------- Streaming saves --------
 def _save_upload_streaming(file_storage, dest_path, chunk_size=16*1024*1024):
-    """שמירה ישירה עם chunks גדולים"""
     with open(dest_path, "wb") as f:
         shutil.copyfileobj(file_storage.stream, f, length=chunk_size)
 
 def _save_raw_stream(raw_stream, dest_path, chunk_size=16*1024*1024):
-    """שמירה ישירה עם chunks גדולים"""
     with open(dest_path, "wb") as f:
         shutil.copyfileobj(raw_stream, f, length=chunk_size)
 
 # -------- Core analyze logic --------
 def _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_mode: bool):
-    """
-    מריץ ניתוח על הוידאו
-    
-    fast_mode=True:  רק JSON (10-15 שניות)
-    fast_mode=False: JSON + וידאו (60 שניות)
-    
-    ** התוצאות זהות בשני המצבים! **
-    """
-    print(f"[_do_analyze] type={resolved_type}, raw={raw_video_path}, analyzed={analyzed_path}, fast_mode={fast_mode}", 
+    print(f"[_do_analyze] type={resolved_type}, raw={raw_video_path}, analyzed={analyzed_path}, fast_mode={fast_mode}",
           file=sys.stderr, flush=True)
-    
-    # פרמטרים אופטימליים
+
     frame_skip = 3
     scale = 0.4
-    
+
     if resolved_type == 'squat':
-        result = _run_analyzer(run_squat, raw_video_path, analyzed_path, fast_mode,
-                             frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_squat, raw_video_path, analyzed_path, fast_mode, frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'deadlift':
-        result = _run_analyzer(run_deadlift, raw_video_path, analyzed_path, fast_mode,
-                             frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_deadlift, raw_video_path, analyzed_path, fast_mode, frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'romanian_deadlift':
-        result = _run_analyzer(run_rdl, raw_video_path, analyzed_path, fast_mode,
-                             frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_rdl, raw_video_path, analyzed_path, fast_mode, frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'stiff_leg_deadlift':
-        result = _run_analyzer(run_stiff_leg, raw_video_path, analyzed_path, fast_mode,
-                             frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_stiff_leg, raw_video_path, analyzed_path, fast_mode, frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'bulgarian':
-        result = _run_analyzer(run_bulgarian, raw_video_path, analyzed_path, fast_mode,
-                             frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_bulgarian, raw_video_path, analyzed_path, fast_mode, frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'pullup':
-        result = _run_analyzer(run_pullup, raw_video_path, analyzed_path, fast_mode,
-                             frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_pullup, raw_video_path, analyzed_path, fast_mode, frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'bicep_curl':
-        result = _run_analyzer(run_bicep_curl, raw_video_path, analyzed_path, fast_mode,
-                             frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_bicep_curl, raw_video_path, analyzed_path, fast_mode, frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'bent_row':
-        result = _run_analyzer(run_bent_row, raw_video_path, analyzed_path, fast_mode,
-                               frame_skip=frame_skip, scale=scale,
-                               extra={"output_dir": MEDIA_DIR})
+        result = _run_analyzer(run_bent_row, raw_video_path, analyzed_path, fast_mode, frame_skip=frame_skip, scale=scale, extra={"output_dir": MEDIA_DIR})
         result = _standardize_video_path(result)
     elif resolved_type == 'good_morning':
-        result = _run_analyzer(run_good_morning, raw_video_path, analyzed_path, fast_mode,
-                             frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_good_morning, raw_video_path, analyzed_path, fast_mode, frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'dips':
-        result = _run_analyzer(run_dips, raw_video_path, analyzed_path, fast_mode,
-                             frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_dips, raw_video_path, analyzed_path, fast_mode, frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'overhead_press':
-        result = _run_analyzer(run_overhead_press, raw_video_path, analyzed_path, fast_mode,
-                             frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_overhead_press, raw_video_path, analyzed_path, fast_mode, frame_skip=frame_skip, scale=scale)
     elif resolved_type == 'pushup':
-        result = _run_analyzer(run_pushup, raw_video_path, analyzed_path, fast_mode,
-                             frame_skip=frame_skip, scale=scale)
+        result = _run_analyzer(run_pushup, raw_video_path, analyzed_path, fast_mode, frame_skip=frame_skip, scale=scale)
     else:
         result = {"error": f"Unhandled exercise type: {resolved_type}", "video_path": ""}
 
@@ -278,84 +217,36 @@ def _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_mode: bool):
 # -------- API --------
 @app.route('/analyze', methods=['POST'])
 def analyze():
-    """
-    POST /analyze
-
-    Parameters:
-    - exercise_type: string (required) - סוג התרגיל
-    - fast: boolean (optional, default=true) - מצב מהיר או מלא
-      * fast=true:  רק JSON, ללא וידאו (10-15 שניות)
-      * fast=false: JSON + וידאו מנותח (60 שניות)
-
-    Supported exercise types:
-    - squat, deadlift, romanian deadlift (rdl), stiff leg deadlift (sldl)
-    - bulgarian split squat, pull-up, bicep curl, bent-over row
-    - good morning, dips, overhead press, push-up
-
-    Returns:
-    - result: object - תוצאות הניתוח (reps, scores, feedback)
-    - video_url: string|null - URL לוידאו מנותח (רק אם fast=false) [LEGACY, kept for compatibility]
-    - video_base64: string|null - Base64-encoded MP4 video (רק אם fast=false)
-    """
     t0 = time.time()
 
     def _invalid_result_payload():
-        return {
-            "error": "invalid_result",
-            "detail": "Analyzer did not return a dict",
-            "video_path": ""
-        }
+        return {"error": "invalid_result", "detail": "Analyzer did not return a dict", "video_path": ""}
 
     def _json_response(result_dict, status=200):
         safe_result = result_dict if isinstance(result_dict, dict) else _invalid_result_payload()
         safe_result = _standardize_video_path(safe_result)
         output_path = safe_result.get("video_path") or ""
 
-        # Build video_url (legacy, kept for backward compat)
         video_url = None
         if output_path and os.path.exists(output_path):
             video_url = request.host_url.rstrip('/') + '/media/' + os.path.basename(output_path)
 
-        # Encode video as base64 so the client gets it in one response
-        # No need for a separate GET that can fail if Fly autostops
-        video_b64 = _encode_video_base64(output_path)
-
-        # Clean up video file after encoding — no longer needed on disk
-        if video_b64 and output_path and os.path.exists(output_path):
-            try:
-                os.remove(output_path)
-            except Exception:
-                pass
-
-        return jsonify({
-            "result": safe_result,
-            "video_url": video_url,        # legacy — may be unreachable after autostop
-            "video_base64": video_b64,      # new — always works
-        }), status
+        return jsonify({"result": safe_result, "video_url": video_url}), status
 
     try:
         print("==== POST RECEIVED ====", file=sys.stderr, flush=True)
         ctype = (request.content_type or "").lower()
         print(f"Content-Type: {ctype}", file=sys.stderr, flush=True)
 
-        # ---------- RAW upload path (video/* or application/octet-stream in body) ----------
+        # ---------- RAW upload path ----------
         if ctype.startswith("video/") or ctype == "application/octet-stream":
             exercise_type = (request.args.get('exercise_type') or "").strip().lower()
-
             if not exercise_type or exercise_type == 'null':
-                return _json_response({
-                    "error": "Missing exercise_type",
-                    "detail": "Query parameter 'exercise_type' is required. Supported types: squat, deadlift, rdl, sldl, bulgarian, pullup, bicep_curl, bent_row, good_morning, dips, overhead_press, pushup",
-                    "video_path": ""
-                }, 400)
+                return _json_response({"error": "Missing exercise_type", "detail": "Query parameter 'exercise_type' is required.", "video_path": ""}, 400)
 
             resolved_type = EXERCISE_MAP.get(exercise_type)
             if not resolved_type:
-                return _json_response({
-                    "error": f"Unsupported exercise type: {exercise_type}",
-                    "detail": f"Supported types: {', '.join(sorted(set(EXERCISE_MAP.values())))}",
-                    "video_path": ""
-                }, 400)
+                return _json_response({"error": f"Unsupported exercise type: {exercise_type}", "detail": f"Supported: {', '.join(sorted(set(EXERCISE_MAP.values())))}", "video_path": ""}, 400)
 
             fast_str = request.args.get('fast', 'true').lower()
             fast_mode = (fast_str == 'true')
@@ -368,8 +259,7 @@ def analyze():
 
             t_save0 = time.time()
             _save_raw_stream(request.stream, raw_video_path)
-            t_save1 = time.time()
-            print(f"[RAW] Saved in {(t_save1 - t_save0):.3f}s", file=sys.stderr, flush=True)
+            print(f"[RAW] Saved in {(time.time() - t_save0):.3f}s", file=sys.stderr, flush=True)
 
             result = _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_mode)
             if not isinstance(result, dict):
@@ -379,72 +269,40 @@ def analyze():
                 return _json_response(unavailable_resp.get_json(silent=True) or result, status)
 
             response, status = _json_response(result)
-            resp_json = response.get_json(silent=True) or {}
-            has_b64 = bool(resp_json.get("video_base64"))
-            print(f"[RAW] OK -> url={resp_json.get('video_url')} b64={has_b64}", file=sys.stderr, flush=True)
+            print(f"[RAW] OK -> {response.get_json(silent=True).get('video_url')}", file=sys.stderr, flush=True)
             print(f"[RAW] TOTAL TIME: {(time.time() - t0):.3f}s", file=sys.stderr, flush=True)
             return response, status
 
         # ---------- multipart/form-data path ----------
         if "multipart/form-data" not in ctype:
-            return _json_response({
-                "error": "Bad request",
-                "detail": "Send video as multipart/form-data (field 'video') or raw video body (Content-Type: video/* or application/octet-stream) with query params",
-                "video_path": ""
-            }, 400)
+            return _json_response({"error": "Bad request", "detail": "Send video as multipart/form-data or raw video body", "video_path": ""}, 400)
 
         try:
             form = request.form
             files = request.files
         except (ClientDisconnected, BadRequest) as e:
             content_length = request.content_length
-            size_mb = round((content_length or 0) / (1024 * 1024), 2)
             print(f"[MP] request parsing failed: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-            print(f"[MP] client likely disconnected while upload was in-flight (content_length={content_length})",
-                  file=sys.stderr, flush=True)
-            return _json_response({
-                "error": "client_disconnected",
-                "detail": "Upload interrupted before the multipart payload was fully received (client/proxy timeout or connection drop)",
-                "content_length": content_length,
-                "size_mb": size_mb,
-                "hint": "Client/proxy timed out during upload. Retry on better network, send smaller/compressed video, or use raw video upload (Content-Type: video/mp4 with ?exercise_type=...&fast=false for analyzed video).",
-                "video_path": ""
-            }, 408)
+            return _json_response({"error": "client_disconnected", "detail": "Upload interrupted", "video_path": ""}, 408)
 
         video_file = files.get('video')
         if not video_file:
-            print("NO 'video' FILE FIELD", file=sys.stderr, flush=True)
-            return _json_response({
-                "error": "No video uploaded",
-                "detail": "form-data field name must be 'video'",
-                "video_path": ""
-            }, 400)
+            return _json_response({"error": "No video uploaded", "detail": "form-data field name must be 'video'", "video_path": ""}, 400)
 
         print(f"FORM KEYS: {list(form.keys())}", file=sys.stderr, flush=True)
         print(f"FILES KEYS: {list(files.keys())}", file=sys.stderr, flush=True)
 
         exercise_type = form.get('exercise_type')
         print(f"[MP] exercise_type from form: '{exercise_type}'", file=sys.stderr, flush=True)
-
         if not exercise_type or exercise_type == 'null':
-            print(f"[MP] ERROR: Missing or invalid exercise_type (got: '{exercise_type}')", file=sys.stderr, flush=True)
-            return _json_response({
-                "error": "Missing exercise_type",
-                "detail": "The 'exercise_type' field is required and cannot be null. Supported types: squat, deadlift, rdl, sldl, bulgarian, pullup, bicep_curl, bent_row, good_morning, dips, overhead_press, pushup",
-                "video_path": ""
-            }, 400)
+            return _json_response({"error": "Missing exercise_type", "detail": "The 'exercise_type' field is required.", "video_path": ""}, 400)
 
         exercise_type = exercise_type.lower().strip()
         print(f"[MP] normalized exercise_type: '{exercise_type}'", file=sys.stderr, flush=True)
         resolved_type = EXERCISE_MAP.get(exercise_type)
         print(f"[MP] resolved_type: '{resolved_type}'", file=sys.stderr, flush=True)
         if not resolved_type:
-            print(f"[MP] ERROR: Unsupported exercise type: {exercise_type}", file=sys.stderr, flush=True)
-            return _json_response({
-                "error": f"Unsupported exercise type: {exercise_type}",
-                "detail": f"Supported types: {', '.join(sorted(set(EXERCISE_MAP.values())))}",
-                "video_path": ""
-            }, 400)
+            return _json_response({"error": f"Unsupported exercise type: {exercise_type}", "detail": f"Supported: {', '.join(sorted(set(EXERCISE_MAP.values())))}", "video_path": ""}, 400)
 
         fast_str = form.get('fast', 'true').lower()
         fast_mode = (fast_str == 'true')
@@ -456,13 +314,11 @@ def analyze():
         raw_video_path = os.path.join(MEDIA_DIR, base_filename + ".mp4")
         analyzed_path = os.path.join(MEDIA_DIR, base_filename + "_analyzed.mp4")
 
-        print(f"[MP] raw_video_path={raw_video_path}, analyzed_path={analyzed_path}",
-              file=sys.stderr, flush=True)
+        print(f"[MP] raw_video_path={raw_video_path}, analyzed_path={analyzed_path}", file=sys.stderr, flush=True)
 
         t_save0 = time.time()
         _save_upload_streaming(video_file, raw_video_path)
-        t_save1 = time.time()
-        print(f"[MP] Saved in {(t_save1 - t_save0):.3f}s", file=sys.stderr, flush=True)
+        print(f"[MP] Saved in {(time.time() - t_save0):.3f}s", file=sys.stderr, flush=True)
 
         result = _do_analyze(resolved_type, raw_video_path, analyzed_path, fast_mode)
         if not isinstance(result, dict):
@@ -472,20 +328,14 @@ def analyze():
             return _json_response(unavailable_resp.get_json(silent=True) or result, status)
 
         response, status = _json_response(result)
-        resp_json = response.get_json(silent=True) or {}
-        has_b64 = bool(resp_json.get("video_base64"))
-        print(f"[MP] OK -> url={resp_json.get('video_url')} b64={has_b64}", file=sys.stderr, flush=True)
+        print(f"[MP] OK -> {response.get_json(silent=True).get('video_url')}", file=sys.stderr, flush=True)
         print(f"[MP] TOTAL TIME: {(time.time() - t0):.3f}s", file=sys.stderr, flush=True)
         return response, status
 
     except Exception as e:
         tb = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         print("\n*** analyze() EXCEPTION ***\n", tb, file=sys.stderr, flush=True)
-        return _json_response({
-            "error": "internal_error_in_analyze",
-            "detail": str(e),
-            "video_path": ""
-        }, 500)
+        return _json_response({"error": "internal_error_in_analyze", "detail": str(e), "video_path": ""}, 500)
 
 @app.route('/media/<filename>')
 def media(filename):
@@ -496,5 +346,4 @@ def healthz():
     return "ok", 200
 
 if __name__ == "__main__":
-    # Development server - for production use: gunicorn -c gunicorn_config.py app:app
     app.run(host="0.0.0.0", port=8080, threaded=True)
