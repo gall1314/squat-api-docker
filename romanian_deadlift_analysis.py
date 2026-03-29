@@ -66,13 +66,11 @@ mp_pose = mp.solutions.pose
 FB_SEVERITY = {
     "Go deeper - hinge more at the hips": 3,
     "Bend your knees a bit more":         3,
-    "Too much knee bend":                 3,
     "Your torso is going too far forward": 2,
 }
 FEEDBACK_CATEGORY = {
     "Go deeper - hinge more at the hips": "depth",
     "Bend your knees a bit more":         "knees",
-    "Too much knee bend":                 "knees",
     "Your torso is going too far forward": "back",
 }
 
@@ -371,17 +369,17 @@ class DepthNormalizer:
 class RepCounter:
     ENTER_THRESHOLD           = 0.30
     EXIT_THRESHOLD            = 0.18
-    MIN_PEAK_FOR_REP          = 0.45
-    GOOD_DEPTH_PEAK           = 0.58
+    MIN_PEAK_FOR_REP          = 0.38
+    GOOD_DEPTH_PEAK           = 0.52
     MIN_FRAMES_BETWEEN        = 8
     MAX_REP_FRAMES            = 120
     REBOUND_DELTA             = 0.06
-    MIN_RETURN_FROM_PEAK      = 0.10
-    NORMALIZED_PEAK_THRESHOLD = 0.62
+    MIN_RETURN_FROM_PEAK      = 0.08
+    NORMALIZED_PEAK_THRESHOLD = 0.55
     NORMALIZED_DROP_THRESHOLD = 0.18
     MIN_REP_DURATION_FRAMES   = 10
-    MIN_PEAK_DELTA            = 0.12
-    MIN_NORMALIZED_PEAK_DELTA = 0.25
+    MIN_PEAK_DELTA            = 0.10
+    MIN_NORMALIZED_PEAK_DELTA = 0.22
 
     def __init__(self):
         self.state             = "standing"
@@ -564,7 +562,6 @@ class RepCounter:
 # ===================== REP EVALUATION =====================
 HINGE_BOTTOM_ANGLE    = 55.0
 KNEE_MIN_ANGLE        = 172.0
-KNEE_MAX_ANGLE        = 125.0
 TORSO_MAX_ANGLE       = 95.0   # only flag if torso goes past horizontal
 MIN_SCORE             = 4.0
 MAX_SCORE             = 10.0
@@ -580,9 +577,6 @@ def _evaluate_rep(rep_result):
     if rep_result["max_knee"] > KNEE_MIN_ANGLE:
         feedback.append("Bend your knees a bit more")
         score -= 1.5
-    elif rep_result["min_knee"] < KNEE_MAX_ANGLE:
-        feedback.append("Too much knee bend")
-        score -= 2.0
     if rep_result["back_issue"] and rep_result["back_angle"] > TORSO_MAX_ANGLE:
         feedback.append("Your torso is going too far forward")
         score -= 1.0
