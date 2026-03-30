@@ -491,7 +491,10 @@ class RepCounter:
             self.rep_max_knee = max(self.rep_max_knee, ka)
 
         if self.state == "standing":
-            if sm >= self.ENTER_THRESHOLD or nm >= 0.28:
+            # Require torso to be near-upright before starting a new rep
+            # This prevents counting bar put-down as a rep
+            torso_upright = sd.get("torso_2d_angle", 0) < 30.0
+            if (sm >= self.ENTER_THRESHOLD or nm >= 0.28) and torso_upright:
                 self._start_rep(sd, fi, sm)
 
         elif self.state == "descending":
