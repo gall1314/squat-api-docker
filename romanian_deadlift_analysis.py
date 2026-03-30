@@ -369,13 +369,13 @@ class DepthNormalizer:
 class RepCounter:
     ENTER_THRESHOLD           = 0.30
     EXIT_THRESHOLD            = 0.18
-    MIN_PEAK_FOR_REP          = 0.42
-    GOOD_DEPTH_PEAK           = 0.55
+    MIN_PEAK_FOR_REP          = 0.45
+    GOOD_DEPTH_PEAK           = 0.58
     MIN_FRAMES_BETWEEN        = 8
     MAX_REP_FRAMES            = 120
     REBOUND_DELTA             = 0.06
     MIN_RETURN_FROM_PEAK      = 0.10
-    NORMALIZED_PEAK_THRESHOLD = 0.58
+    NORMALIZED_PEAK_THRESHOLD = 0.62
     NORMALIZED_DROP_THRESHOLD = 0.18
     MIN_REP_DURATION_FRAMES   = 10
     MIN_PEAK_DELTA            = 0.12
