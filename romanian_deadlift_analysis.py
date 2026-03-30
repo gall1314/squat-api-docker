@@ -711,6 +711,17 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
 
             rep_result = rep_counter.update(signal_data, frame_idx)
 
+            # Debug: log signal every frame to diagnose missed reps
+            if frame_idx % (effective_skip * 3) == 0:  # log every ~9th raw frame
+                print(f"[RDL-DBG] f={frame_idx} state={rep_counter.state} "
+                      f"composite={signal_data['composite']:.3f} "
+                      f"smoothed={rep_counter.smoothed:.3f} "
+                      f"peak={rep_counter.current_peak:.3f} "
+                      f"floor={rep_counter.dynamic_floor:.3f} "
+                      f"ceil={rep_counter.dynamic_ceil:.3f} "
+                      f"torso2d={signal_data['torso_2d_angle']:.1f} "
+                      f"vis={signal_data['vis_ratio']:.2f}",
+                      file=sys.stderr, flush=True)
             if rep_result is not None:
                 score, feedback = _evaluate_rep(rep_result)
                 all_scores.append(score)
