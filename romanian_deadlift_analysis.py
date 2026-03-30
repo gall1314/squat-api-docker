@@ -421,8 +421,10 @@ class RepCounter:
         if len(self.calibration_signals) >= 25:
             self.standing_baseline = float(np.percentile(self.calibration_signals, 40))
             self.dynamic_floor     = self.standing_baseline
-            self.dynamic_ceil      = max(self.standing_baseline + 0.40,
-                                         float(np.percentile(self.calibration_signals, 95)))
+            p95 = float(np.percentile(self.calibration_signals, 95))
+            # Cap ceil to avoid inflated range from a single early rep
+            self.dynamic_ceil      = min(max(self.standing_baseline + 0.40, p95),
+                                         self.standing_baseline + 0.65)
             self.ENTER_THRESHOLD   = max(0.20, self.standing_baseline + 0.20)
             self.EXIT_THRESHOLD    = max(0.14, self.standing_baseline + 0.10)
             self.calibrated        = True
@@ -503,7 +505,7 @@ class RepCounter:
             self.rep_max_knee = max(self.rep_max_knee, ka)
 
         if self.state == "standing":
-            if sm >= self.ENTER_THRESHOLD or nm >= 0.34:
+            if sm >= self.ENTER_THRESHOLD or nm >= 0.28:
                 self._start_rep(sd, fi, sm)
 
         elif self.state == "descending":
