@@ -793,7 +793,7 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in):
     feedback_list = (
         dedupe_feedback(list(session_feedback_by_cat.values()))
         if session_feedback_by_cat
-        else (["Great form! Keep it up \U0001f4aa"] if not session_feedbacks
+        else (["Perfect form! \U0001f525"] if not session_feedbacks
               else dedupe_feedback(session_feedbacks))
     )
 
