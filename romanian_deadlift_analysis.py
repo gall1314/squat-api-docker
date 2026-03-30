@@ -472,22 +472,8 @@ class RepCounter:
         self.rep_start_signal = 0.0
 
     def finalize_pending_rep(self, fi):
-        if self.state != "ascending":
-            return None
-        vd  = self.current_peak - self.ascent_valley
-        nvd = vd / max(0.20, self.dynamic_ceil - self.dynamic_floor)
-        ok_p = (self.current_peak >= self.MIN_PEAK_FOR_REP
-                or self._norm_peak() >= self.NORMALIZED_PEAK_THRESHOLD)
-        ok_r = (vd >= self.MIN_RETURN_FROM_PEAK * 0.7
-                or nvd >= self.NORMALIZED_DROP_THRESHOLD * 0.8)
-        if (ok_p and ok_r and self._meaningful()
-                and (fi - self.last_rep_frame) >= self.MIN_FRAMES_BETWEEN
-                and (fi - self.rep_start_frame) >= self.MIN_REP_DURATION_FRAMES):
-            self.count += 1
-            self.last_rep_frame = fi
-            info = self._rep_info()
-            self._reset()
-            return info
+        # Disabled: end-of-clip motion (putting bar down, standing up)
+        # was being falsely counted as a rep
         return None
 
     def update(self, sd, fi):
