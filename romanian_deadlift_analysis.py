@@ -402,6 +402,7 @@ class RepCounter:
         self.standing_baseline = 0.0
         self.dynamic_floor     = 0.0
         self.dynamic_ceil      = 0.6
+        self._last_rep_smoothed = 0.0
 
     def _smooth(self, raw):
         self.smoothed += 0.35 * (raw - self.smoothed)
@@ -463,13 +464,15 @@ class RepCounter:
                 "back_issue":   self.rep_back_issue,
                 "back_angle":   self.rep_back_angle}
 
-    def _reset(self):
+    def _reset(self, smoothed_at_reset=None):
         self.state            = "standing"
         self.frames_in_state  = 0
         self.current_peak     = 0.0
         self.rep_start_frame  = -1
         self.ascent_valley    = 1.0
         self.rep_start_signal = 0.0
+        if smoothed_at_reset is not None:
+            self._last_rep_smoothed = smoothed_at_reset
 
     def finalize_pending_rep(self, fi):
         # Disabled: end-of-clip motion (putting bar down, standing up)
@@ -491,10 +494,11 @@ class RepCounter:
             self.rep_max_knee = max(self.rep_max_knee, ka)
 
         if self.state == "standing":
-            # Require torso to be near-upright before starting a new rep
-            # This prevents counting bar put-down as a rep
-            torso_upright = sd.get("torso_2d_angle", 0) < 30.0
-            if (sm >= self.ENTER_THRESHOLD or nm >= 0.28) and torso_upright:
+            # Prevent immediate re-entry: smoothed must drop enough since last rep
+            settled = (self._last_rep_smoothed < 0.01
+                       or sm <= self._last_rep_smoothed * 0.55
+                       or sm <= self.EXIT_THRESHOLD + 0.05)
+            if settled and (sm >= self.ENTER_THRESHOLD or nm >= 0.28):
                 self._start_rep(sd, fi, sm)
 
         elif self.state == "descending":
@@ -520,9 +524,9 @@ class RepCounter:
                     self.count += 1
                     self.last_rep_frame = fi
                     info = self._rep_info()
-                    self._reset()
+                    self._reset(smoothed_at_reset=sm)
                     return info
-                self._reset()
+                self._reset(smoothed_at_reset=sm)
 
             vd  = self.current_peak - self.ascent_valley
             nvd = vd / max(0.20, self.dynamic_ceil - self.dynamic_floor)
