@@ -661,6 +661,7 @@ def run_dips_analysis(video_path,
 
             if ondips and vis_strict_ok:
                 # REP COUNTING
+                at_bottom = False  # initialize before any branch
                 if desc_base_shoulder is None:
                     # Start descent detection: either velocity-based OR elbow starting to bend
                     descent_starting = (shoulder_vel > abs(INFLECT_VEL_THR)) or \
