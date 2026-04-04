@@ -334,6 +334,12 @@ OFFDIPS_MIN_FRAMES = 8            # was 6 — stay in dips state longer
 AUTO_STOP_AFTER_EXIT_SEC = 2.0    # was 1.2 — wait longer before stopping
 TAIL_NOPOSE_STOP_SEC = 1.5        # was 1.0 — wait longer for no-pose
 
+# Stabilization: prevent counting mount/dismount as reps
+STABLE_BASELINE_FRAMES = 6        # must be stable for N frames before counting starts
+STABLE_SHOULDER_VARIANCE = 0.015  # max shoulder Y variance during stabilization
+MAX_SINGLE_DESCENT = 0.12         # reject descents larger than this (mount/dismount)
+                                  # real dips: ~0.04-0.06, mounting: ~0.20
+
 # Alternative position detection: elbow angle range indicating dips motion
 # Even if wrists aren't perfectly below shoulders, if elbows are bending
 # in the right range, we're probably doing dips
@@ -458,6 +464,11 @@ def run_dips_analysis(video_path,
 
     ondips=False; ondips_streak=0; offdips_streak=0; prev_torso_cx=None
     offdips_frames_since_any_rep=0; nopose_frames_since_any_rep=0
+
+    # Stabilization: prevent counting mount/dismount
+    stabilized = False              # True once baseline is established
+    stable_shoulder_buf = deque(maxlen=STABLE_BASELINE_FRAMES)
+    ondips_frames_count = 0         # how many frames in current ondips session
 
     # Adaptive baseline: track shoulder Y over time to handle drift
     shoulder_y_history = deque(maxlen=30)
@@ -637,8 +648,10 @@ def run_dips_analysis(video_path,
                 top_phase_max_elbow=None
                 cycle_max_lean=None
                 cycle_max_flare=None
-                # Reset baseline to current shoulder position (top of movement)
-                baseline_shoulder_y = shoulder_y
+                # Stabilization: don't set baseline yet — wait for stable frames
+                stabilized = False
+                stable_shoulder_buf.clear()
+                ondips_frames_count = 0
                 print(f"[DIPS] Entered dips position at frame {frame_idx}")
 
             # Exit dips position
@@ -678,9 +691,28 @@ def run_dips_analysis(video_path,
             shoulder_vel_prev = shoulder_vel
 
             if ondips and vis_strict_ok:
+                ondips_frames_count += 1
+
+                # STABILIZATION PHASE: wait for stable position before counting
+                stable_shoulder_buf.append(shoulder_y)
+                if not stabilized:
+                    if len(stable_shoulder_buf) >= STABLE_BASELINE_FRAMES:
+                        sh_var = max(stable_shoulder_buf) - min(stable_shoulder_buf)
+                        if sh_var <= STABLE_SHOULDER_VARIANCE:
+                            stabilized = True
+                            baseline_shoulder_y = sum(stable_shoulder_buf) / len(stable_shoulder_buf)
+                            print(f"[DIPS] Stabilized at frame {frame_idx}, baseline_sh={baseline_shoulder_y:.4f}")
+                        else:
+                            # Not stable yet — keep waiting, don't count anything
+                            pass
+
                 # REP COUNTING — count on ASCENT only (after descent+bottom+rise)
                 at_bottom = False  # initialize before any branch
-                if desc_base_shoulder is None:
+
+                if not stabilized:
+                    # Not stabilized yet — skip counting entirely
+                    pass
+                elif desc_base_shoulder is None:
                     # Start descent detection: either velocity-based OR elbow starting to bend
                     descent_starting = (shoulder_vel > abs(INFLECT_VEL_THR)) or \
                                       (raw_elbow_min < 150 and shoulder_y > baseline_shoulder_y)
@@ -772,9 +804,10 @@ def run_dips_analysis(video_path,
                             cycle_tip_lockout = result_fb.get('tip_lockout', False)
                             cycle_tip_elbows = result_fb.get('tip_elbows', False)
 
-                        # Verify rep quality
+                        # Verify rep quality + reject mount/dismount
                         _elbow_ok2 = (cycle_min_elbow <= ELBOW_BENT_ANGLE) or (cycle_min_elbow_raw <= ELBOW_BENT_ANGLE + ELBOW_BENT_ANGLE_RAW_MARGIN)
-                        if (cycle_max_descent >= SHOULDER_MIN_DESCENT) and _elbow_ok2 and (desc_frame_count >= MIN_DESC_FRAMES):
+                        _descent_ok = (cycle_max_descent >= SHOULDER_MIN_DESCENT) and (cycle_max_descent <= MAX_SINGLE_DESCENT)
+                        if _descent_ok and _elbow_ok2 and (desc_frame_count >= MIN_DESC_FRAMES):
                             rep_has_tip = cycle_tip_deeper or cycle_tip_lean or cycle_tip_lockout or cycle_tip_elbows
                             _count_rep(rep_reports,rep_count,cycle_min_elbow,
                                        desc_base_shoulder,
