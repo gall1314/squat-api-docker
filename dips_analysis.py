@@ -135,16 +135,22 @@ def _pre_rotate_video(video_path):
     rotation = _get_video_rotation(video_path)
     print(f"[ROTATION] Detected rotation metadata: {rotation}°")
 
+    # Only pre-rotate if there's actual rotation metadata
     if rotation == 0:
-        # Even if rotation is 0, some videos use display matrix.
-        # Use ffmpeg -autorotate (default behavior) to be safe.
-        pass
+        return video_path
 
-    # Always run through ffmpeg to normalize rotation — this handles
-    # both explicit rotate tags and display matrix side data.
-    # ffmpeg applies rotation by default when transcoding.
-    base, ext = os.path.splitext(video_path)
-    rotated_path = base + "_rotated" + ext
+    # Write rotated file next to the original or in /tmp
+    base, ext = os.path.splitext(os.path.basename(video_path))
+    # Try same directory first, fall back to /tmp
+    parent_dir = os.path.dirname(video_path)
+    rotated_path = os.path.join(parent_dir, base + "_rotated" + ext)
+    try:
+        # Test if we can write to parent dir
+        test_file = os.path.join(parent_dir, ".write_test")
+        with open(test_file, "w") as f: f.write("t")
+        os.remove(test_file)
+    except (OSError, PermissionError):
+        rotated_path = os.path.join("/tmp", base + "_rotated" + ext)
 
     try:
         cmd = [
@@ -301,7 +307,7 @@ ELBOW_BENT_ANGLE = 110.0          # was 90° — too strict; 110° catches more 
 ELBOW_BENT_ANGLE_RAW_MARGIN = 15.0  # raw elbow can be up to this much above threshold
 SHOULDER_MIN_DESCENT = 0.025      # was 0.045 — reduced for various camera angles
 RESET_ASCENT = 0.015              # was 0.025 — reduced for smoother detection
-RESET_ELBOW = 140.0               # was 150° — relaxed
+RESET_ELBOW = 110.0               # was 150° → 140° → 110°; real data shows top elbow is 108-124°
 REFRACTORY_FRAMES = 3             # was 4
 
 # EMA smoothing — faster response
@@ -313,7 +319,7 @@ MIN_DESC_FRAMES = 2
 
 # Rearm requirements
 REARM_ASCENT_RATIO = 0.30         # was 0.40 — more lenient
-REARM_ELBOW_ABOVE = 120.0         # was 130° — more lenient
+REARM_ELBOW_ABOVE = 105.0         # was 130° → 120° → 105°; real data shows top elbow is 108-124°
 
 # Velocity smoothing window (frames)
 VEL_WINDOW = 3
@@ -360,7 +366,7 @@ DEPTH_MIN_ANGLE = 100.0           # was 95 — relaxed
 DEPTH_NEAR_DEG = 12.0             # was 8 — wider near zone
 TORSO_MAX_LEAN = 30.0             # was 25 — allow more lean
 LEAN_NEAR_DEG = 8.0               # was 5
-LOCKOUT_MIN_ANGLE = 160.0         # was 165 — relaxed
+LOCKOUT_MIN_ANGLE = 140.0         # was 165° → 160° → 140°; camera angle makes full lockout look less
 LOCKOUT_NEAR_DEG = 12.0           # was 8
 ELBOW_FLARE_MAX = 50.0            # was 45 — more lenient
 FLARE_NEAR_DEG = 10.0             # was 8
@@ -526,12 +532,40 @@ def run_dips_analysis(video_path,
             vis_strict_ok=(min_vis>=VIS_THR_LOOSE)
             vis_good=(min_vis>=VIS_THR_STRICT)
 
-            shoulder_raw=float(lms[S].y)
+            # Use average of both shoulders for more stable Y tracking
+            shoulder_raw=float((lms[LSH].y + lms[RSH].y) / 2.0)
             raw_elbow_L=_ang((lms[LSH].x,lms[LSH].y),(lms[LE].x,lms[LE].y),(lms[LW].x,lms[LW].y))
             raw_elbow_R=_ang((lms[RSH].x,lms[RSH].y),(lms[RE].x,lms[RE].y),(lms[RW].x,lms[RW].y))
             raw_elbow=raw_elbow_L if side=="LEFT" else raw_elbow_R
-            raw_elbow_min=min(raw_elbow_L,raw_elbow_R)
-            raw_elbow_max=max(raw_elbow_L,raw_elbow_R)
+
+            # Visibility-weighted elbow: avoid noise from low-visibility side
+            vis_L_arm = min(lms[LSH].visibility, lms[LE].visibility, lms[LW].visibility)
+            vis_R_arm = min(lms[RSH].visibility, lms[RE].visibility, lms[RW].visibility)
+
+            # If one side has much better visibility, trust that side more
+            VIS_RATIO_THR = 1.5  # if one side is 1.5x more visible, prefer it
+            if vis_L_arm > vis_R_arm * VIS_RATIO_THR:
+                # Trust left side
+                raw_elbow_primary = raw_elbow_L
+                raw_elbow_min = raw_elbow_L
+                raw_elbow_max = raw_elbow_L
+            elif vis_R_arm > vis_L_arm * VIS_RATIO_THR:
+                # Trust right side
+                raw_elbow_primary = raw_elbow_R
+                raw_elbow_min = raw_elbow_R
+                raw_elbow_max = raw_elbow_R
+            else:
+                # Both sides roughly equal visibility — use both
+                raw_elbow_primary = raw_elbow
+                raw_elbow_min = min(raw_elbow_L, raw_elbow_R)
+                raw_elbow_max = max(raw_elbow_L, raw_elbow_R)
+
+            # Sanity check: elbow angle below 30° is almost certainly noise
+            if raw_elbow_min < 30.0:
+                # Use the other side or primary
+                raw_elbow_min = raw_elbow_primary
+            if raw_elbow_max < 30.0:
+                raw_elbow_max = raw_elbow_primary
 
             elbow_ema=_ema(elbow_ema,raw_elbow,ELBOW_EMA_ALPHA)
             shoulder_ema=_ema(shoulder_ema,shoulder_raw,SHOULDER_EMA_ALPHA)
