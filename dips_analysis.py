@@ -453,6 +453,7 @@ def run_dips_analysis(video_path,
     cycle_min_elbow_raw=999.0
     desc_frame_count=0
     cycle_bottom_shoulder=None
+    reached_bottom=False
     vel_buf=deque(maxlen=VEL_WINDOW)
 
     ondips=False; ondips_streak=0; offdips_streak=0; prev_torso_cx=None
@@ -629,6 +630,7 @@ def run_dips_analysis(video_path,
                 desc_base_shoulder=None; allow_new_bottom=True
                 cycle_max_descent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
                 cycle_min_elbow_raw=999.0; desc_frame_count=0; cycle_bottom_shoulder=None
+                reached_bottom=False
                 vel_buf.clear()
                 cycle_tip_deeper=False; cycle_tip_lean=False; cycle_tip_lockout=False; cycle_tip_elbows=False
                 bottom_phase_min_elbow=None
@@ -641,30 +643,12 @@ def run_dips_analysis(video_path,
 
             # Exit dips position
             if ondips and offdips_streak>=OFFDIPS_MIN_FRAMES:
-                # Evaluate form at cycle end
-                _evaluate_cycle_form(bottom_phase_min_elbow, top_phase_max_elbow,
-                                   cycle_max_lean, cycle_max_flare,
-                                   session_feedback,
-                                   depth_fail_count, lean_fail_count, lockout_fail_count, flare_fail_count,
-                                   depth_already_reported, lean_already_reported,
-                                   lockout_already_reported, flare_already_reported)
-
-                # Count rep if valid
-                _elbow_ok = (cycle_min_elbow <= ELBOW_BENT_ANGLE) or (cycle_min_elbow_raw <= ELBOW_BENT_ANGLE + ELBOW_BENT_ANGLE_RAW_MARGIN)
-                if (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and _elbow_ok and (desc_frame_count >= MIN_DESC_FRAMES):
-                    rep_has_tip = cycle_tip_deeper or cycle_tip_lean or cycle_tip_lockout or cycle_tip_elbows
-                    _count_rep(rep_reports,rep_count,cycle_min_elbow,
-                               desc_base_shoulder if desc_base_shoulder is not None else shoulder_y,
-                               baseline_shoulder_y+cycle_max_descent if baseline_shoulder_y is not None else shoulder_y,
-                               all_scores, rep_has_tip)
-                    rep_count+=1
-                    if rep_has_tip: bad_reps+=1
-                    else: good_reps+=1
-                    print(f"[DIPS] Rep {rep_count} counted at exit (elbow={cycle_min_elbow:.1f}, descent={cycle_max_descent:.4f})")
+                # Don't count incomplete reps on exit — only fully ascended reps count
 
                 ondips=False; offdips_frames_since_any_rep=0
                 desc_base_shoulder=None; cycle_max_descent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
                 cycle_min_elbow_raw=999.0; desc_frame_count=0; cycle_bottom_shoulder=None
+                reached_bottom=False
                 vel_buf.clear()
                 cycle_tip_deeper=False; cycle_tip_lean=False; cycle_tip_lockout=False; cycle_tip_elbows=False
                 bottom_phase_min_elbow=None
@@ -694,7 +678,7 @@ def run_dips_analysis(video_path,
             shoulder_vel_prev = shoulder_vel
 
             if ondips and vis_strict_ok:
-                # REP COUNTING
+                # REP COUNTING — count on ASCENT only (after descent+bottom+rise)
                 at_bottom = False  # initialize before any branch
                 if desc_base_shoulder is None:
                     # Start descent detection: either velocity-based OR elbow starting to bend
@@ -708,6 +692,7 @@ def run_dips_analysis(video_path,
                         top_phase_max_elbow=None
                         cycle_max_lean=None
                         cycle_max_flare=None
+                        reached_bottom=False  # NEW: track if we've been at bottom
                 else:
                     desc_frame_count+=1
                     cycle_max_descent=max(cycle_max_descent,(shoulder_y-desc_base_shoulder))
@@ -715,14 +700,12 @@ def run_dips_analysis(video_path,
                     cycle_min_elbow_raw=min(cycle_min_elbow_raw,raw_elbow_min)
 
                     # Track bottom phase
-                    min_elb_now = min(raw_elbow_L, raw_elbow_R)
-                    if bottom_phase_min_elbow is None: bottom_phase_min_elbow = min_elb_now
-                    else: bottom_phase_min_elbow = min(bottom_phase_min_elbow, min_elb_now)
+                    if bottom_phase_min_elbow is None: bottom_phase_min_elbow = raw_elbow_min
+                    else: bottom_phase_min_elbow = min(bottom_phase_min_elbow, raw_elbow_min)
 
                     # Track top phase
-                    max_elb_now = max(raw_elbow_L, raw_elbow_R)
-                    if top_phase_max_elbow is None: top_phase_max_elbow = max_elb_now
-                    else: top_phase_max_elbow = max(top_phase_max_elbow, max_elb_now)
+                    if top_phase_max_elbow is None: top_phase_max_elbow = raw_elbow_max
+                    else: top_phase_max_elbow = max(top_phase_max_elbow, raw_elbow_max)
 
                     # Track lean
                     torso_angle = _calculate_torso_lean(lms, LSH, RSH, LH, RH)
@@ -734,17 +717,42 @@ def run_dips_analysis(video_path,
                     if cycle_max_flare is None: cycle_max_flare = elbow_flare
                     else: cycle_max_flare = max(cycle_max_flare, elbow_flare)
 
-                    # Reset detection — shoulder going back up + elbow extending
-                    reset_by_asc=(desc_base_shoulder is not None) and ((desc_base_shoulder-shoulder_y)>=RESET_ASCENT)
-                    reset_by_elb=(elbow_angle>=RESET_ELBOW)
-                    # Also detect reset by raw elbow extending significantly
-                    reset_by_raw_elb=(raw_elbow_max >= RESET_ELBOW - 5)
+                    descent_amt=0.0 if desc_base_shoulder is None else (shoulder_y-desc_base_shoulder)
 
-                    do_reset = (reset_by_asc and (reset_by_elb or reset_by_raw_elb)) or \
-                               (reset_by_asc and desc_frame_count >= MIN_DESC_FRAMES * 3) or \
-                               (reset_by_elb and desc_frame_count >= MIN_DESC_FRAMES * 2 and cycle_max_descent >= SHOULDER_MIN_DESCENT * 0.5)
+                    # Bottom detection — mark that we've been at bottom (but DON'T count yet!)
+                    at_bottom_ema=(elbow_angle<=ELBOW_BENT_ANGLE) and (descent_amt>=SHOULDER_MIN_DESCENT)
+                    at_bottom_raw=(raw_elbow_min<=(ELBOW_BENT_ANGLE+ELBOW_BENT_ANGLE_RAW_MARGIN)) and (descent_amt>=SHOULDER_MIN_DESCENT*0.7)
+                    at_bottom_descent=(descent_amt >= SHOULDER_MIN_DESCENT * 1.5) and (raw_elbow_min <= ELBOW_BENT_ANGLE + 20)
+                    at_bottom = at_bottom_ema or at_bottom_raw or at_bottom_descent
 
-                    if do_reset:
+                    if at_bottom and not reached_bottom:
+                        reached_bottom = True
+                        cycle_bottom_shoulder = shoulder_y
+                        if DEBUG_REPS:
+                            print(f"[BOTTOM] frame={frame_idx} elbow={elbow_angle:.1f} raw={raw_elbow_min:.1f} "
+                                  f"descent={descent_amt:.4f}")
+
+                    # Track deepest point for bottom shoulder
+                    if reached_bottom and shoulder_y > (cycle_bottom_shoulder or 0):
+                        cycle_bottom_shoulder = shoulder_y
+
+                    # Ascent detection — shoulder going back up + elbow extending
+                    # This is where we COUNT the rep (on the way UP)
+                    ascending = False
+                    if reached_bottom and not counted_this_cycle:
+                        ascent_from_bottom = 0.0
+                        if cycle_bottom_shoulder is not None:
+                            ascent_from_bottom = cycle_bottom_shoulder - shoulder_y
+                        
+                        elbow_extending = (elbow_angle >= RESET_ELBOW) or (raw_elbow_max >= RESET_ELBOW - 5)
+                        shoulder_rising = (ascent_from_bottom >= RESET_ASCENT)
+                        
+                        # Count rep when ascending: shoulder is rising AND elbow is extending
+                        ascending = (shoulder_rising and elbow_extending) or \
+                                   (shoulder_rising and desc_frame_count >= MIN_DESC_FRAMES * 3) or \
+                                   (elbow_extending and ascent_from_bottom >= RESET_ASCENT * 0.5 and desc_frame_count >= MIN_DESC_FRAMES * 2)
+
+                    if ascending and not counted_this_cycle:
                         # Evaluate form
                         result_fb = _evaluate_cycle_form(bottom_phase_min_elbow, top_phase_max_elbow,
                                            cycle_max_lean, cycle_max_flare,
@@ -764,70 +772,34 @@ def run_dips_analysis(video_path,
                             cycle_tip_lockout = result_fb.get('tip_lockout', False)
                             cycle_tip_elbows = result_fb.get('tip_elbows', False)
 
-                        # Count rep
+                        # Verify rep quality
                         _elbow_ok2 = (cycle_min_elbow <= ELBOW_BENT_ANGLE) or (cycle_min_elbow_raw <= ELBOW_BENT_ANGLE + ELBOW_BENT_ANGLE_RAW_MARGIN)
-                        if (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and _elbow_ok2 and (desc_frame_count >= MIN_DESC_FRAMES):
+                        if (cycle_max_descent >= SHOULDER_MIN_DESCENT) and _elbow_ok2 and (desc_frame_count >= MIN_DESC_FRAMES):
                             rep_has_tip = cycle_tip_deeper or cycle_tip_lean or cycle_tip_lockout or cycle_tip_elbows
                             _count_rep(rep_reports,rep_count,cycle_min_elbow,
                                        desc_base_shoulder,
                                        baseline_shoulder_y+cycle_max_descent if baseline_shoulder_y is not None else shoulder_y,
                                        all_scores, rep_has_tip)
                             rep_count+=1
+                            counted_this_cycle=True
                             if rep_has_tip: bad_reps+=1
                             else: good_reps+=1
                             if DEBUG_REPS:
-                                print(f"[REP] #{rep_count} at reset: elbow_ema={cycle_min_elbow:.1f} "
+                                print(f"[REP] #{rep_count} on ASCENT: elbow_ema={cycle_min_elbow:.1f} "
                                       f"elbow_raw={cycle_min_elbow_raw:.1f} descent={cycle_max_descent:.4f} "
                                       f"frames={desc_frame_count}")
 
                         # Reset for next cycle
                         desc_base_shoulder=shoulder_y
-                        cycle_max_descent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
+                        cycle_max_descent=0.0; cycle_min_elbow=elbow_angle
                         cycle_min_elbow_raw=raw_elbow_min; desc_frame_count=0; cycle_bottom_shoulder=None
-                        allow_new_bottom=True
                         bottom_phase_min_elbow=None
                         top_phase_max_elbow=None
                         cycle_max_lean=None
                         cycle_max_flare=None
                         cycle_tip_deeper=False; cycle_tip_lean=False; cycle_tip_lockout=False; cycle_tip_elbows=False
-
-                    descent_amt=0.0 if desc_base_shoulder is None else (shoulder_y-desc_base_shoulder)
-
-                    # Bottom detection — relaxed
-                    at_bottom_ema=(elbow_angle<=ELBOW_BENT_ANGLE) and (descent_amt>=SHOULDER_MIN_DESCENT)
-                    at_bottom_raw=(raw_elbow_min<=(ELBOW_BENT_ANGLE+ELBOW_BENT_ANGLE_RAW_MARGIN)) and (descent_amt>=SHOULDER_MIN_DESCENT*0.7)
-                    # Also accept: significant descent with moderate elbow bend
-                    at_bottom_descent=(descent_amt >= SHOULDER_MIN_DESCENT * 1.5) and (raw_elbow_min <= ELBOW_BENT_ANGLE + 20)
-                    at_bottom = at_bottom_ema or at_bottom_raw or at_bottom_descent
-
-                    enough_frames=(desc_frame_count >= MIN_DESC_FRAMES)
-                    can_cnt=(frame_idx - last_bottom_frame) >= REFRACTORY_FRAMES
-
-                    if at_bottom and allow_new_bottom and can_cnt and enough_frames and (not counted_this_cycle):
-                        rep_has_tip = cycle_tip_deeper or cycle_tip_lean or cycle_tip_lockout or cycle_tip_elbows
-                        _count_rep(rep_reports,rep_count,elbow_angle,
-                                   desc_base_shoulder if desc_base_shoulder is not None else shoulder_y, shoulder_y,
-                                   all_scores, rep_has_tip)
-                        rep_count+=1
-                        if rep_has_tip: bad_reps+=1
-                        else: good_reps+=1
-                        last_bottom_frame=frame_idx; allow_new_bottom=False; counted_this_cycle=True
-                        cycle_bottom_shoulder=shoulder_y
-                        top_phase_max_elbow = max(raw_elbow_L, raw_elbow_R)
-                        if DEBUG_REPS:
-                            print(f"[REP] #{rep_count} at bottom: elbow={elbow_angle:.1f} raw={raw_elbow_min:.1f} "
-                                  f"descent={descent_amt:.4f} frames={desc_frame_count}")
-
-                    # Rearm — more lenient
-                    if (allow_new_bottom is False) and (last_bottom_frame>0):
-                        if shoulder_prev is not None and (shoulder_prev - shoulder_y) > 0 and (desc_base_shoulder is not None):
-                            ascent_from_bottom = (cycle_bottom_shoulder - shoulder_y) if cycle_bottom_shoulder is not None else ((desc_base_shoulder + cycle_max_descent) - shoulder_y)
-                            ascent_ratio = ascent_from_bottom / max(cycle_max_descent, 0.001)
-                            elbow_open = (elbow_angle >= REARM_ELBOW_ABOVE) or (raw_elbow_max >= REARM_ELBOW_ABOVE - 5)
-                            if (ascent_ratio >= REARM_ASCENT_RATIO and elbow_open) or \
-                               (ascent_from_bottom >= REARM_ASCENT_EFF and ascent_ratio >= REARM_ASCENT_RATIO * 0.5) or \
-                               (elbow_open and desc_frame_count >= MIN_DESC_FRAMES * 4):
-                                allow_new_bottom=True
+                        reached_bottom=False
+                        counted_this_cycle=False
 
                 # Real-time feedback at bottom (only if at_bottom was computed)
                 if desc_base_shoulder is not None and at_bottom and not cycle_tip_deeper:
@@ -860,17 +832,8 @@ def run_dips_analysis(video_path,
 
             if shoulder_y is not None: shoulder_prev=shoulder_y
 
-    # EOF post-hoc
-    _eof_elbow_ok = (cycle_min_elbow <= ELBOW_BENT_ANGLE) or (cycle_min_elbow_raw <= ELBOW_BENT_ANGLE + ELBOW_BENT_ANGLE_RAW_MARGIN)
-    if ondips and (not counted_this_cycle) and (cycle_max_descent>=SHOULDER_MIN_DESCENT) and _eof_elbow_ok and (desc_frame_count >= MIN_DESC_FRAMES):
-        rep_has_tip = cycle_tip_deeper or cycle_tip_lean or cycle_tip_lockout or cycle_tip_elbows
-        _count_rep(rep_reports,rep_count,cycle_min_elbow,
-                   desc_base_shoulder if desc_base_shoulder is not None else (baseline_shoulder_y or 0.0),
-                   (baseline_shoulder_y + cycle_max_descent) if baseline_shoulder_y is not None else (baseline_shoulder_y or 0.0),
-                   all_scores, rep_has_tip)
-        rep_count+=1
-        if rep_has_tip: bad_reps+=1
-        else: good_reps+=1
+    # EOF post-hoc — do NOT count incomplete reps (only count if reached bottom AND was ascending)
+    # If someone stops mid-rep at the bottom, that's an incomplete rep
 
     cap.release()
     if return_video and out: out.release()
