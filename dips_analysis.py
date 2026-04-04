@@ -794,8 +794,8 @@ def run_dips_analysis(video_path,
                                (elbow_open and desc_frame_count >= MIN_DESC_FRAMES * 4):
                                 allow_new_bottom=True
 
-                # Real-time feedback at bottom
-                if at_bottom and not cycle_tip_deeper:
+                # Real-time feedback at bottom (only if at_bottom was computed)
+                if desc_base_shoulder is not None and at_bottom and not cycle_tip_deeper:
                     if bottom_phase_min_elbow and bottom_phase_min_elbow > DEPTH_MIN_ANGLE:
                         cycle_tip_deeper = True
                         depth_fail_count += 1
