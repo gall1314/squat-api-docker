@@ -446,434 +446,224 @@ def run_dips_analysis(video_path,
     LW =mp_pose.PoseLandmark.LEFT_WRIST.value;     RW =mp_pose.PoseLandmark.RIGHT_WRIST.value
     LH =mp_pose.PoseLandmark.LEFT_HIP.value;       RH =mp_pose.PoseLandmark.RIGHT_HIP.value
 
-    def _pick_side_dyn(lms):
-        vL=lms[LSH].visibility+lms[LE].visibility+lms[LW].visibility
-        vR=lms[RSH].visibility+lms[RE].visibility+lms[RW].visibility
-        return ("LEFT",LSH,LE,LW) if vL>=vR else ("RIGHT",RSH,RE,RW)
-
-    # State
-    elbow_ema=None; shoulder_ema=None; shoulder_prev=None; shoulder_vel_prev=None
-    baseline_shoulder_y=None
-    desc_base_shoulder=None; allow_new_bottom=True; last_bottom_frame=-10**9
-    cycle_max_descent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
-    cycle_min_elbow_raw=999.0
-    desc_frame_count=0
-    cycle_bottom_shoulder=None
-    reached_bottom=False
-    vel_buf=deque(maxlen=VEL_WINDOW)
-
-    ondips=False; ondips_streak=0; offdips_streak=0; prev_torso_cx=None
-    offdips_frames_since_any_rep=0; nopose_frames_since_any_rep=0
-
-    # Stabilization: prevent counting mount/dismount
-    stabilized = False              # True once baseline is established
-    stable_shoulder_buf = deque(maxlen=STABLE_BASELINE_FRAMES)
-    ondips_frames_count = 0         # how many frames in current ondips session
-
-    # Adaptive baseline: track shoulder Y over time to handle drift
-    shoulder_y_history = deque(maxlen=30)
-    baseline_update_interval = 15  # update baseline every N processed frames
-    frames_since_baseline_update = 0
-
-    # Feedback state
-    session_feedback=set()
-    rt_fb_msg=None; rt_fb_hold=0
-
-    # Per-cycle trackers
-    cycle_tip_deeper=False; cycle_tip_lean=False; cycle_tip_lockout=False; cycle_tip_elbows=False
-    depth_fail_count=0; lean_fail_count=0; lockout_fail_count=0; flare_fail_count=0
-    depth_already_reported=False; lean_already_reported=False
-    lockout_already_reported=False; flare_already_reported=False
-
-    # Phase trackers
-    bottom_phase_min_elbow=None
-    top_phase_max_elbow=None
-    cycle_max_lean=None
-    cycle_max_flare=None
-
-    OFFDIPS_STOP_FRAMES=sec_to_frames(AUTO_STOP_AFTER_EXIT_SEC)
-    NOPOSE_STOP_FRAMES=sec_to_frames(TAIL_NOPOSE_STOP_SEC)
-    RT_FB_HOLD_FRAMES=sec_to_frames(0.8)
-
-    REARM_ASCENT_EFF=max(RESET_ASCENT*0.60, 0.008)
-
-    # Micro-burst
-    burst_cntr=0
-
-    # Debug counters
-    pose_detected_count = 0
-    ondips_frame_count = 0
-
+    # ============================================================
+    # PASS 1: Collect smoothed signal from entire video
+    # ============================================================
+    EMA_ALPHA = 0.35
+    ema_elbow_v = None; ema_sh_v = None
+    signal_data = []  # list of dicts with t, elbow, sh_y, frame_idx, has_pose
+    
+    pass1_frame_idx = 0
     with mp_pose.Pose(model_complexity=model_complexity, min_detection_confidence=0.4, min_tracking_confidence=0.4) as pose:
         while True:
             ret, frame = cap.read()
             if not ret: break
-            frame_idx += 1
-
-            process_now = (burst_cntr > 0) or (frame_idx % max(1, frame_skip) == 0)
-            if not process_now:
+            pass1_frame_idx += 1
+            if pass1_frame_idx % max(1, frame_skip) != 0:
                 continue
-            if burst_cntr > 0:
-                burst_cntr -= 1
-
-            if scale != 1.0:
-                frame=cv2.resize(frame,(0,0),fx=scale,fy=scale)
-            h,w=frame.shape[:2]
-
-            if return_video and out is None:
-                out=cv2.VideoWriter(output_path,fourcc,effective_fps,(w,h))
-
-            res=pose.process(cv2.cvtColor(frame,cv2.COLOR_BGR2RGB))
-            depth_live=0.0
-
+            
+            proc_frame = cv2.resize(frame, (0,0), fx=scale, fy=scale) if scale != 1.0 else frame
+            res = pose.process(cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB))
+            
             if not res.pose_landmarks:
-                nopose_frames_since_any_rep = (nopose_frames_since_any_rep+1) if rep_count>0 else 0
-                if rep_count>0 and nopose_frames_since_any_rep>=NOPOSE_STOP_FRAMES: break
-                if return_video and out is not None:
-                    out.write(draw_overlay(frame,reps=rep_count,feedback=(rt_fb_msg if rt_fb_hold>0 else None),depth_pct=0.0))
-                if rt_fb_hold>0: rt_fb_hold-=1
+                signal_data.append({'t': pass1_frame_idx / fps_in, 'f': pass1_frame_idx,
+                                    'has_pose': False, 'elbow': None, 'sh_y': None,
+                                    'combined': None, 'lms': None})
                 continue
-
-            nopose_frames_since_any_rep=0
-            pose_detected_count += 1
-            lms=res.pose_landmarks.landmark
-            side,S,E,W=_pick_side_dyn(lms)
-
-            min_vis=min(lms[S].visibility,lms[E].visibility,lms[W].visibility)
-            # Use loose threshold — strict was filtering too many frames
-            vis_strict_ok=(min_vis>=VIS_THR_LOOSE)
-            vis_good=(min_vis>=VIS_THR_STRICT)
-
-            # Use average of both shoulders for more stable Y tracking
-            shoulder_raw=float((lms[LSH].y + lms[RSH].y) / 2.0)
-            raw_elbow_L=_ang((lms[LSH].x,lms[LSH].y),(lms[LE].x,lms[LE].y),(lms[LW].x,lms[LW].y))
-            raw_elbow_R=_ang((lms[RSH].x,lms[RSH].y),(lms[RE].x,lms[RE].y),(lms[RW].x,lms[RW].y))
-            raw_elbow=raw_elbow_L if side=="LEFT" else raw_elbow_R
-
-            # Visibility-weighted elbow: avoid noise from low-visibility side
-            vis_L_arm = min(lms[LSH].visibility, lms[LE].visibility, lms[LW].visibility)
-            vis_R_arm = min(lms[RSH].visibility, lms[RE].visibility, lms[RW].visibility)
-
-            # If one side has much better visibility, trust that side more
-            VIS_RATIO_THR = 1.5  # if one side is 1.5x more visible, prefer it
-            if vis_L_arm > vis_R_arm * VIS_RATIO_THR:
-                # Trust left side
-                raw_elbow_primary = raw_elbow_L
-                raw_elbow_min = raw_elbow_L
-                raw_elbow_max = raw_elbow_L
-            elif vis_R_arm > vis_L_arm * VIS_RATIO_THR:
-                # Trust right side
-                raw_elbow_primary = raw_elbow_R
-                raw_elbow_min = raw_elbow_R
-                raw_elbow_max = raw_elbow_R
+            
+            lms = res.pose_landmarks.landmark
+            sh_y = (lms[LSH].y + lms[RSH].y) / 2.0
+            
+            # Visibility-weighted elbow selection
+            vis_L = min(lms[LSH].visibility, lms[LE].visibility, lms[LW].visibility)
+            vis_R = min(lms[RSH].visibility, lms[RE].visibility, lms[RW].visibility)
+            eL = _ang((lms[LSH].x, lms[LSH].y), (lms[LE].x, lms[LE].y), (lms[LW].x, lms[LW].y))
+            eR = _ang((lms[RSH].x, lms[RSH].y), (lms[RE].x, lms[RE].y), (lms[RW].x, lms[RW].y))
+            
+            VIS_RATIO = 1.5
+            if vis_L > vis_R * VIS_RATIO:
+                elbow = eL
+            elif vis_R > vis_L * VIS_RATIO:
+                elbow = eR
             else:
-                # Both sides roughly equal visibility — use both
-                raw_elbow_primary = raw_elbow
-                raw_elbow_min = min(raw_elbow_L, raw_elbow_R)
-                raw_elbow_max = max(raw_elbow_L, raw_elbow_R)
-
-            # Sanity check: elbow angle below 30° is almost certainly noise
-            if raw_elbow_min < 30.0:
-                # Use the other side or primary
-                raw_elbow_min = raw_elbow_primary
-            if raw_elbow_max < 30.0:
-                raw_elbow_max = raw_elbow_primary
-
-            elbow_ema=_ema(elbow_ema,raw_elbow,ELBOW_EMA_ALPHA)
-            shoulder_ema=_ema(shoulder_ema,shoulder_raw,SHOULDER_EMA_ALPHA)
-            shoulder_y=shoulder_ema; elbow_angle=elbow_ema
-
-            # Adaptive baseline
-            shoulder_y_history.append(shoulder_y)
-            frames_since_baseline_update += 1
-
-            if baseline_shoulder_y is None:
-                baseline_shoulder_y=shoulder_y
-            elif not ondips and frames_since_baseline_update >= baseline_update_interval:
-                # Update baseline to recent minimum (top position) when not in dips
-                recent_min = min(shoulder_y_history)
-                baseline_shoulder_y = min(baseline_shoulder_y, recent_min) * 0.3 + recent_min * 0.7
-                frames_since_baseline_update = 0
-
-            depth_live=float(np.clip((shoulder_y-baseline_shoulder_y)/max(0.06,SHOULDER_MIN_DESCENT*2.0),0.0,1.0))
-
-            # Torso stability
-            torso_cx=np.mean([lms[LSH].x,lms[RSH].x,lms[LH].x,lms[RH].x])*w
-            torso_dx_norm=0.0 if prev_torso_cx is None else abs(torso_cx-prev_torso_cx)/max(1.0,w)
-            prev_torso_cx=torso_cx
-
-            # ====== FIX #2: Improved dips position detection ======
-            # Method 1: Wrist below shoulder (original, relaxed)
-            lw_below=(lms[LW].visibility>=VIS_THR_LOOSE) and (lms[LW].y>lms[LSH].y+WRIST_BELOW_SHOULDER_MARGIN)
-            rw_below=(lms[RW].visibility>=VIS_THR_LOOSE) and (lms[RW].y>lms[RSH].y+WRIST_BELOW_SHOULDER_MARGIN)
-            wrist_position_ok=(lw_below or rw_below)
-
-            # Method 2: Elbow angle in dips range (catching movement even if wrist detection is off)
-            elbow_in_range = (DIPS_ELBOW_RANGE_LOW <= raw_elbow_min <= DIPS_ELBOW_RANGE_HIGH)
-
-            # Method 3: Hands near/below shoulder with some tolerance for camera angle
-            # Check if ANY arm is in a dips-like configuration
-            hip_vis_ok = (lms[LH].visibility >= VIS_THR_LOOSE or lms[RH].visibility >= VIS_THR_LOOSE)
-            arms_engaged = elbow_in_range and hip_vis_ok
-
-            # Combined: either traditional wrist check OR arms-engaged heuristic
-            in_position = wrist_position_ok or arms_engaged
-
-            # Relaxed torso stability check
-            torso_ok = (torso_dx_norm <= TORSO_STABILITY_THR)
-
-            if vis_strict_ok and in_position and torso_ok:
-                ondips_streak+=1; offdips_streak=0
-            elif vis_strict_ok and in_position:
-                # Even without torso stability, count partial streak
-                ondips_streak+=1; offdips_streak=0
-            else:
-                offdips_streak+=1; ondips_streak=0
-
-            if DEBUG_ONDIPS and frame_idx % 5 == 0:
-                print(f"[DBG] f={frame_idx} ondips={ondips} vis={min_vis:.2f} wrist_ok={wrist_position_ok} "
-                      f"arms_eng={arms_engaged} elbow_raw={raw_elbow_min:.1f} torso_dx={torso_dx_norm:.4f} "
-                      f"sh_y={shoulder_y:.3f} baseline={baseline_shoulder_y:.3f}")
-
-            # Enter dips position
-            if (not ondips) and ondips_streak>=ONDIPS_MIN_FRAMES:
-                ondips=True
-                desc_base_shoulder=None; allow_new_bottom=True
-                cycle_max_descent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
-                cycle_min_elbow_raw=999.0; desc_frame_count=0; cycle_bottom_shoulder=None
-                reached_bottom=False
-                vel_buf.clear()
-                cycle_tip_deeper=False; cycle_tip_lean=False; cycle_tip_lockout=False; cycle_tip_elbows=False
-                bottom_phase_min_elbow=None
-                top_phase_max_elbow=None
-                cycle_max_lean=None
-                cycle_max_flare=None
-                # Stabilization: don't set baseline yet — wait for stable frames
-                stabilized = False
-                stable_shoulder_buf.clear()
-                ondips_frames_count = 0
-                print(f"[DIPS] Entered dips position at frame {frame_idx}")
-
-            # Exit dips position
-            if ondips and offdips_streak>=OFFDIPS_MIN_FRAMES:
-                # Don't count incomplete reps on exit — only fully ascended reps count
-
-                ondips=False; offdips_frames_since_any_rep=0
-                desc_base_shoulder=None; cycle_max_descent=0.0; cycle_min_elbow=999.0; counted_this_cycle=False
-                cycle_min_elbow_raw=999.0; desc_frame_count=0; cycle_bottom_shoulder=None
-                reached_bottom=False
-                vel_buf.clear()
-                cycle_tip_deeper=False; cycle_tip_lean=False; cycle_tip_lockout=False; cycle_tip_elbows=False
-                bottom_phase_min_elbow=None
-                top_phase_max_elbow=None
-                cycle_max_lean=None
-                cycle_max_flare=None
-                print(f"[DIPS] Exited dips position at frame {frame_idx}")
-
-            if ondips:
-                ondips_frame_count += 1
-
-            if (not ondips) and rep_count>0:
-                offdips_frames_since_any_rep+=1
-                if offdips_frames_since_any_rep>=OFFDIPS_STOP_FRAMES: break
-
-            raw_vel=0.0 if shoulder_prev is None else (shoulder_y-shoulder_prev)
-            vel_buf.append(raw_vel)
-            shoulder_vel=sum(vel_buf)/len(vel_buf) if vel_buf else raw_vel
-            cur_rt=None
-
-            # Micro-burst near inflection
-            if ondips and (desc_base_shoulder is not None):
-                near_inflect = (abs(shoulder_vel) <= INFLECT_VEL_THR)
-                sign_flip = (shoulder_vel_prev is not None) and ((shoulder_vel_prev < 0 and shoulder_vel >= 0) or (shoulder_vel_prev > 0 and shoulder_vel <= 0))
-                if near_inflect or sign_flip:
-                    burst_cntr = max(burst_cntr, BURST_FRAMES)
-            shoulder_vel_prev = shoulder_vel
-
-            if ondips and vis_strict_ok:
-                ondips_frames_count += 1
-
-                # STABILIZATION PHASE: wait for stable position before counting
-                stable_shoulder_buf.append(shoulder_y)
-                if not stabilized:
-                    if len(stable_shoulder_buf) >= STABLE_BASELINE_FRAMES:
-                        sh_var = max(stable_shoulder_buf) - min(stable_shoulder_buf)
-                        if sh_var <= STABLE_SHOULDER_VARIANCE:
-                            stabilized = True
-                            baseline_shoulder_y = sum(stable_shoulder_buf) / len(stable_shoulder_buf)
-                            print(f"[DIPS] Stabilized at frame {frame_idx}, baseline_sh={baseline_shoulder_y:.4f}")
-                        else:
-                            # Not stable yet — keep waiting, don't count anything
-                            pass
-
-                # REP COUNTING — count on ASCENT only (after descent+bottom+rise)
-                at_bottom = False  # initialize before any branch
-
-                if not stabilized:
-                    # Not stabilized yet — skip counting entirely
-                    pass
-                elif desc_base_shoulder is None:
-                    # Start descent detection: either velocity-based OR elbow starting to bend
-                    descent_starting = (shoulder_vel > abs(INFLECT_VEL_THR)) or \
-                                      (raw_elbow_min < 150 and shoulder_y > baseline_shoulder_y)
-                    if descent_starting:
-                        desc_base_shoulder=shoulder_y
-                        cycle_max_descent=0.0; cycle_min_elbow=elbow_angle; counted_this_cycle=False
-                        cycle_min_elbow_raw=raw_elbow_min; desc_frame_count=1; cycle_bottom_shoulder=None
-                        bottom_phase_min_elbow=raw_elbow_min
-                        top_phase_max_elbow=None
-                        cycle_max_lean=None
-                        cycle_max_flare=None
-                        reached_bottom=False  # NEW: track if we've been at bottom
-                else:
-                    desc_frame_count+=1
-                    cycle_max_descent=max(cycle_max_descent,(shoulder_y-desc_base_shoulder))
-                    cycle_min_elbow=min(cycle_min_elbow,elbow_angle)
-                    cycle_min_elbow_raw=min(cycle_min_elbow_raw,raw_elbow_min)
-
-                    # Track bottom phase
-                    if bottom_phase_min_elbow is None: bottom_phase_min_elbow = raw_elbow_min
-                    else: bottom_phase_min_elbow = min(bottom_phase_min_elbow, raw_elbow_min)
-
-                    # Track top phase
-                    if top_phase_max_elbow is None: top_phase_max_elbow = raw_elbow_max
-                    else: top_phase_max_elbow = max(top_phase_max_elbow, raw_elbow_max)
-
-                    # Track lean
-                    torso_angle = _calculate_torso_lean(lms, LSH, RSH, LH, RH)
-                    if cycle_max_lean is None: cycle_max_lean = torso_angle
-                    else: cycle_max_lean = max(cycle_max_lean, torso_angle)
-
-                    # Track elbow flare
-                    elbow_flare = _calculate_elbow_flare(lms, LSH, RSH, LE, RE, LW, RW)
-                    if cycle_max_flare is None: cycle_max_flare = elbow_flare
-                    else: cycle_max_flare = max(cycle_max_flare, elbow_flare)
-
-                    descent_amt=0.0 if desc_base_shoulder is None else (shoulder_y-desc_base_shoulder)
-
-                    # Bottom detection — mark that we've been at bottom (but DON'T count yet!)
-                    at_bottom_ema=(elbow_angle<=ELBOW_BENT_ANGLE) and (descent_amt>=SHOULDER_MIN_DESCENT)
-                    at_bottom_raw=(raw_elbow_min<=(ELBOW_BENT_ANGLE+ELBOW_BENT_ANGLE_RAW_MARGIN)) and (descent_amt>=SHOULDER_MIN_DESCENT*0.7)
-                    at_bottom_descent=(descent_amt >= SHOULDER_MIN_DESCENT * 1.5) and (raw_elbow_min <= ELBOW_BENT_ANGLE + 20)
-                    at_bottom = at_bottom_ema or at_bottom_raw or at_bottom_descent
-
-                    if at_bottom and not reached_bottom:
-                        reached_bottom = True
-                        cycle_bottom_shoulder = shoulder_y
-                        if DEBUG_REPS:
-                            print(f"[BOTTOM] frame={frame_idx} elbow={elbow_angle:.1f} raw={raw_elbow_min:.1f} "
-                                  f"descent={descent_amt:.4f}")
-
-                    # Track deepest point for bottom shoulder
-                    if reached_bottom and shoulder_y > (cycle_bottom_shoulder or 0):
-                        cycle_bottom_shoulder = shoulder_y
-
-                    # Ascent detection — shoulder going back up + elbow extending
-                    # This is where we COUNT the rep (on the way UP)
-                    ascending = False
-                    if reached_bottom and not counted_this_cycle:
-                        ascent_from_bottom = 0.0
-                        if cycle_bottom_shoulder is not None:
-                            ascent_from_bottom = cycle_bottom_shoulder - shoulder_y
-                        
-                        elbow_extending = (elbow_angle >= RESET_ELBOW) or (raw_elbow_max >= RESET_ELBOW - 5)
-                        shoulder_rising = (ascent_from_bottom >= RESET_ASCENT)
-                        
-                        # Count rep when ascending: shoulder is rising AND elbow is extending
-                        ascending = (shoulder_rising and elbow_extending) or \
-                                   (shoulder_rising and desc_frame_count >= MIN_DESC_FRAMES * 3) or \
-                                   (elbow_extending and ascent_from_bottom >= RESET_ASCENT * 0.5 and desc_frame_count >= MIN_DESC_FRAMES * 2)
-
-                    if ascending and not counted_this_cycle:
-                        # Evaluate form
-                        result_fb = _evaluate_cycle_form(bottom_phase_min_elbow, top_phase_max_elbow,
-                                           cycle_max_lean, cycle_max_flare,
-                                           session_feedback,
-                                           depth_fail_count, lean_fail_count, lockout_fail_count, flare_fail_count,
-                                           depth_already_reported, lean_already_reported,
-                                           lockout_already_reported, flare_already_reported)
-                        if result_fb:
-                            depth_fail_count, lean_fail_count, lockout_fail_count, flare_fail_count = \
-                                result_fb['depth_fail'], result_fb['lean_fail'], result_fb['lockout_fail'], result_fb['flare_fail']
-                            depth_already_reported = result_fb['depth_reported']
-                            lean_already_reported = result_fb['lean_reported']
-                            lockout_already_reported = result_fb['lockout_reported']
-                            flare_already_reported = result_fb['flare_reported']
-                            cycle_tip_deeper = result_fb.get('tip_deeper', False)
-                            cycle_tip_lean = result_fb.get('tip_lean', False)
-                            cycle_tip_lockout = result_fb.get('tip_lockout', False)
-                            cycle_tip_elbows = result_fb.get('tip_elbows', False)
-
-                        # Verify rep quality + reject mount/dismount
-                        _elbow_ok2 = (cycle_min_elbow <= ELBOW_BENT_ANGLE) or (cycle_min_elbow_raw <= ELBOW_BENT_ANGLE + ELBOW_BENT_ANGLE_RAW_MARGIN)
-                        _descent_ok = (cycle_max_descent >= SHOULDER_MIN_DESCENT) and (cycle_max_descent <= MAX_SINGLE_DESCENT)
-                        if _descent_ok and _elbow_ok2 and (desc_frame_count >= MIN_DESC_FRAMES):
-                            rep_has_tip = cycle_tip_deeper or cycle_tip_lean or cycle_tip_lockout or cycle_tip_elbows
-                            _count_rep(rep_reports,rep_count,cycle_min_elbow,
-                                       desc_base_shoulder,
-                                       baseline_shoulder_y+cycle_max_descent if baseline_shoulder_y is not None else shoulder_y,
-                                       all_scores, rep_has_tip)
-                            rep_count+=1
-                            counted_this_cycle=True
-                            if rep_has_tip: bad_reps+=1
-                            else: good_reps+=1
-                            if DEBUG_REPS:
-                                print(f"[REP] #{rep_count} on ASCENT: elbow_ema={cycle_min_elbow:.1f} "
-                                      f"elbow_raw={cycle_min_elbow_raw:.1f} descent={cycle_max_descent:.4f} "
-                                      f"frames={desc_frame_count}")
-
-                        # Reset for next cycle
-                        desc_base_shoulder=shoulder_y
-                        cycle_max_descent=0.0; cycle_min_elbow=elbow_angle
-                        cycle_min_elbow_raw=raw_elbow_min; desc_frame_count=0; cycle_bottom_shoulder=None
-                        bottom_phase_min_elbow=None
-                        top_phase_max_elbow=None
-                        cycle_max_lean=None
-                        cycle_max_flare=None
-                        cycle_tip_deeper=False; cycle_tip_lean=False; cycle_tip_lockout=False; cycle_tip_elbows=False
-                        reached_bottom=False
-                        counted_this_cycle=False
-
-                # Real-time feedback at bottom (only if at_bottom was computed)
-                if desc_base_shoulder is not None and at_bottom and not cycle_tip_deeper:
-                    if bottom_phase_min_elbow and bottom_phase_min_elbow > DEPTH_MIN_ANGLE:
-                        cycle_tip_deeper = True
-                        depth_fail_count += 1
-                        if depth_fail_count >= DEPTH_FAIL_MIN_REPS and not depth_already_reported:
-                            session_feedback.add(FB_CUE_DEEPER)
-                            depth_already_reported = True
-                            cur_rt = FB_CUE_DEEPER
-
-            else:
-                # Not ondips or not visible — soft reset (don't lose all state)
-                if not ondips:
-                    desc_base_shoulder=None; allow_new_bottom=True
-                    desc_frame_count=0; cycle_min_elbow_raw=999.0; cycle_bottom_shoulder=None
-
-            # RT hold
-            if cur_rt:
-                if cur_rt!=rt_fb_msg: rt_fb_msg=cur_rt; rt_fb_hold=RT_FB_HOLD_FRAMES
-                else: rt_fb_hold=max(rt_fb_hold,RT_FB_HOLD_FRAMES)
-            else:
-                if rt_fb_hold>0: rt_fb_hold-=1
-
-            # Draw
-            if return_video and out is not None:
-                frame=draw_body_only(frame,lms)
-                frame=draw_overlay(frame,reps=rep_count,feedback=(rt_fb_msg if rt_fb_hold>0 else None),depth_pct=depth_live)
-                out.write(frame)
-
-            if shoulder_y is not None: shoulder_prev=shoulder_y
-
-    # EOF post-hoc — do NOT count incomplete reps (only count if reached bottom AND was ascending)
-    # If someone stops mid-rep at the bottom, that's an incomplete rep
-
+                elbow = (eL + eR) / 2.0
+            if elbow < 30:
+                elbow = max(eL, eR)
+            
+            # EMA smoothing
+            if ema_elbow_v is None: ema_elbow_v = elbow
+            else: ema_elbow_v = EMA_ALPHA * elbow + (1 - EMA_ALPHA) * ema_elbow_v
+            if ema_sh_v is None: ema_sh_v = sh_y
+            else: ema_sh_v = EMA_ALPHA * sh_y + (1 - EMA_ALPHA) * ema_sh_v
+            
+            signal_data.append({'t': pass1_frame_idx / fps_in, 'f': pass1_frame_idx,
+                                'has_pose': True, 'elbow': ema_elbow_v, 'sh_y': ema_sh_v,
+                                'raw_elbow_L': eL, 'raw_elbow_R': eR,
+                                'combined': None, 'lms': None})
+    
     cap.release()
-    if return_video and out: out.release()
+    
+    # Filter to only frames with pose
+    pose_frames = [s for s in signal_data if s['has_pose']]
+    print(f"[DIPS] Pass 1 done: {len(pose_frames)} pose frames out of {len(signal_data)} processed")
+    
+    if len(pose_frames) < 5:
+        if cleanup_rotated and os.path.exists(rotated_video):
+            try: os.remove(rotated_video)
+            except: pass
+        return _ret_err("Not enough pose data", feedback_path)
+    
+    # Build combined signal (elbow 60% + shoulder 40%)
+    sh_vals = [s['sh_y'] for s in pose_frames]
+    sh_min_v, sh_max_v = min(sh_vals), max(sh_vals)
+    sh_range_v = max(sh_max_v - sh_min_v, 0.01)
+    
+    for s in pose_frames:
+        e_norm = float(np.clip((s['elbow'] - 60.0) / (180.0 - 60.0), 0, 1))
+        s_norm = 1.0 - float(np.clip((s['sh_y'] - sh_min_v) / sh_range_v, 0, 1))
+        s['combined'] = 0.6 * e_norm + 0.4 * s_norm
+    
+    # ============================================================
+    # PEAK/VALLEY DETECTION on combined signal
+    # ============================================================
+    MIN_SWING = 0.18       # minimum signal swing for a real rep
+    MIN_REP_SEC = 1.0      # minimum seconds between consecutive rep bottoms
+    
+    combined_vals = [s['combined'] for s in pose_frames]
+    direction = 0
+    last_extreme = combined_vals[0]
+    last_extreme_idx = 0
+    swings = []  # (index_in_pose_frames, time, value, 'top'|'bottom')
+    
+    for i in range(1, len(combined_vals)):
+        v = combined_vals[i]
+        if direction == 0:
+            if v - last_extreme > MIN_SWING:
+                direction = 1; last_extreme_idx = 0
+            elif last_extreme - v > MIN_SWING:
+                direction = -1; last_extreme_idx = 0
+        elif direction == 1:  # signal going up (toward top of rep)
+            if v > last_extreme:
+                last_extreme = v; last_extreme_idx = i
+            elif (last_extreme - v) > MIN_SWING:
+                swings.append((last_extreme_idx, pose_frames[last_extreme_idx]['t'], last_extreme, 'top'))
+                direction = -1; last_extreme = v; last_extreme_idx = i
+        elif direction == -1:  # signal going down (toward bottom of rep)
+            if v < last_extreme:
+                last_extreme = v; last_extreme_idx = i
+            elif (v - last_extreme) > MIN_SWING:
+                swings.append((last_extreme_idx, pose_frames[last_extreme_idx]['t'], last_extreme, 'bottom'))
+                direction = 1; last_extreme = v; last_extreme_idx = i
+    
+    # COUNT REPS: bottom → top = one complete rep (count on ascent)
+    rep_events = []  # list of (bottom_time, top_time, bottom_frame, top_frame)
+    last_bottom_time = -999
+    
+    for i in range(len(swings) - 1):
+        if swings[i][3] == 'bottom' and swings[i+1][3] == 'top':
+            bottom_t = swings[i][1]
+            top_t = swings[i+1][1]
+            bottom_frame = pose_frames[swings[i][0]]['f']
+            top_frame = pose_frames[swings[i+1][0]]['f']
+            
+            # Minimum time between consecutive bottoms
+            if (bottom_t - last_bottom_time) < MIN_REP_SEC:
+                continue
+            
+            rep_events.append((bottom_t, top_t, bottom_frame, top_frame))
+            last_bottom_time = bottom_t
+    
+    rep_count = len(rep_events)
+    good_reps = rep_count  # simplified — form analysis can adjust later
+    bad_reps = 0
+    
+    # Build rep reports
+    for idx, (bt, tt, bf, tf) in enumerate(rep_events):
+        rep_reports.append({
+            "rep_index": idx + 1,
+            "score": 10.0,
+            "good": True,
+            "bottom_time": float(bt),
+            "top_time": float(tt),
+            "bottom_frame": int(bf),
+            "top_frame": int(tf),
+        })
+    
+    # Build frame→rep_count mapping for video overlay
+    # rep_count_at_frame[frame_idx] = number of reps counted by that frame
+    rep_count_at_frame = {}
+    current_rep = 0
+    rep_top_frames = sorted([tf for _, _, _, tf in rep_events])
+    
+    print(f"[DIPS] Detected {rep_count} reps: " + 
+          ", ".join(f"#{i+1}@{bt:.1f}-{tt:.1f}s" for i, (bt, tt, bf, tf) in enumerate(rep_events)))
+    
+    # ============================================================
+    # Depth tracking for overlay (approximate)
+    # ============================================================
+    # Build a map from frame_idx to depth_pct
+    depth_at_frame = {}
+    if pose_frames:
+        combo_min = min(combined_vals)
+        combo_max = max(combined_vals)
+        combo_range = max(combo_max - combo_min, 0.01)
+        for s in pose_frames:
+            # Depth = how far down we are (1.0 = at bottom, 0.0 = at top)
+            depth = 1.0 - float(np.clip((s['combined'] - combo_min) / combo_range, 0, 1))
+            depth_at_frame[s['f']] = depth
+    
+    # ============================================================
+    # PASS 2: Render video with overlay (if return_video)
+    # ============================================================
+    session_feedback = set()
+    technique_score = 10.0 if rep_count > 0 else 0.0
+    
+    if return_video:
+        cap2 = cv2.VideoCapture(use_path)
+        if not cap2.isOpened():
+            cap2 = cv2.VideoCapture(video_path)
+        
+        frame_idx2 = 0
+        current_rep_count = 0
+        next_rep_idx = 0
+        
+        with mp_pose.Pose(model_complexity=model_complexity, min_detection_confidence=0.4, min_tracking_confidence=0.4) as pose2:
+            while True:
+                ret, frame = cap2.read()
+                if not ret: break
+                frame_idx2 += 1
+                if frame_idx2 % max(1, frame_skip) != 0:
+                    continue
+                
+                if scale != 1.0:
+                    frame = cv2.resize(frame, (0,0), fx=scale, fy=scale)
+                h, w = frame.shape[:2]
+                
+                if out is None:
+                    out = cv2.VideoWriter(output_path, fourcc, effective_fps, (w, h))
+                
+                # Update rep count based on frame position
+                while next_rep_idx < len(rep_events) and frame_idx2 >= rep_events[next_rep_idx][3]:
+                    current_rep_count = next_rep_idx + 1
+                    next_rep_idx += 1
+                
+                # Get depth for this frame
+                depth_pct = depth_at_frame.get(frame_idx2, 0.0)
+                
+                # Draw skeleton
+                res2 = pose2.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                if res2.pose_landmarks:
+                    frame = draw_body_only(frame, res2.pose_landmarks.landmark)
+                
+                frame = draw_overlay(frame, reps=current_rep_count, feedback=None, depth_pct=depth_pct)
+                out.write(frame)
+        
+        cap2.release()
+        if out: out.release()
+    
     cv2.destroyAllWindows()
-
-    print(f"[DIPS] Analysis complete: {rep_count} reps detected, "
-          f"pose detected in {pose_detected_count} frames, ondips for {ondips_frame_count} frames")
+    
+    print(f"[DIPS] Analysis complete: {rep_count} reps detected")
 
     # Cleanup rotated temp file
     if cleanup_rotated and os.path.exists(rotated_video):
