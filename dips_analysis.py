@@ -808,10 +808,10 @@ def run_dips_analysis(video_path,
     # Use the SAME pose detection settings in both fast and slow modes
     # to guarantee consistent rep counts. The only difference between modes
     # is whether to render the output video.
-    # (Fast mode without video uses complexity=0 + scale=0.35 and those
-    #  settings are what was tuned to produce correct counts.)
-    model_complexity = 0
-    scale = min(scale, 0.35)
+    # (The full model at scale=0.4 produces more accurate counts than the
+    #  lite model at scale=0.35 — use it everywhere.)
+    model_complexity = 1
+    # Keep the user-supplied scale (default 0.4), don't downscale further
 
     if fast_mode:
         return_video = False
