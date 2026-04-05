@@ -424,6 +424,7 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
             # When on dips bars, feet hang below body (large spread)
             # When standing/walking, spread is small
             ankle_y = (lm[_LA].y + lm[_RA].y) / 2.0
+            hip_y = (lm[_LH].y + lm[_RH].y) / 2.0
             body_spread = ankle_y - sh_y
             vis_ankle = min(lm[_LA].visibility, lm[_RA].visibility)
             vis_hip = min(lm[_LH].visibility, lm[_RH].visibility)
@@ -433,6 +434,9 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
                 "t": frame_idx / fps_in,
                 "elbow": ema_elbow,
                 "sh_y": ema_sh,
+                "sh_y_raw": sh_y,
+                "ankle_y": ankle_y,
+                "hip_y": hip_y,
                 "raw_elbow_min": min(eL, eR),
                 "raw_elbow_max": max(eL, eR),
                 "torso_lean": torso_lean,
@@ -575,11 +579,15 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
 
     # Filter 4: require that the bottom actually had a valid dip position
     # (elbow was bent below threshold)
-    # Filter 5: MOST IMPORTANT — person must be "on dips bars" during the rep
-    # This filters out walking, approaching, random body movements
+    # Filter 5: person must be "on dips bars" (body spread indicates hanging)
+    # Filter 6: ankle must move more than shoulder during rep (pendulum effect)
+    #          — in REAL dips, shoulders are pinned while legs swing, so
+    #            ankle_range/shoulder_range > 1.3. In fake movements (standing,
+    #            jumping), body moves as rigid unit with ratio near 1.0.
     rep_events = []
     filtered_not_on_dips = 0
     filtered_elbow = 0
+    filtered_ankle_ratio = 0
     for evt in raw_rep_events:
         b_idx, t_idx, b_frame, t_frame, b_t, t_t, amp = evt
         cycle = signal_points[b_idx:t_idx + 1] if t_idx > b_idx else [signal_points[b_idx]]
@@ -593,16 +601,35 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
         # Filter 5: majority of cycle frames must be in "on dips" state
         on_dips_in_cycle = sum(1 for c in cycle if c.get("on_dips", False))
         on_dips_ratio = on_dips_in_cycle / max(1, len(cycle))
-        if on_dips_ratio < 0.7:  # require 70% of rep frames to be on dips
+        if on_dips_ratio < 0.7:
             filtered_not_on_dips += 1
             continue
+
+        # Filter 6: pendulum check — ankle must move more than shoulder
+        # Only apply if ankle is reliably visible (vis > 0.4 in most frames)
+        vis_ok_cycle = sum(1 for c in cycle if c["vis_ankle"] >= 0.4)
+        if vis_ok_cycle / max(1, len(cycle)) >= 0.5:
+            # Compute actual motion ranges during the rep
+            sh_vals = [c["sh_y_raw"] for c in cycle]
+            ankle_vals = [c["ankle_y"] for c in cycle]
+            sh_range_rep = max(sh_vals) - min(sh_vals)
+            ankle_range_rep = max(ankle_vals) - min(ankle_vals)
+            # Compute ratio: real dips have ratio > 1.3 (legs swing more than shoulders)
+            # Fake movements (rigid body): ratio ~1.0
+            if sh_range_rep > 0.005:  # avoid division by near-zero
+                ankle_sh_ratio = ankle_range_rep / sh_range_rep
+                if ankle_sh_ratio < 1.3:
+                    filtered_ankle_ratio += 1
+                    continue
 
         rep_events.append((b_idx, t_idx, b_frame, t_frame, b_t, t_t))
 
     rep_count = len(rep_events)
     print(f"[DIPS] Detected {rep_count} reps "
           f"(raw={len(raw_rep_events)}, "
-          f"filtered: elbow={filtered_elbow}, not_on_dips={filtered_not_on_dips})",
+          f"filtered: elbow={filtered_elbow}, "
+          f"not_on_dips={filtered_not_on_dips}, "
+          f"ankle_ratio={filtered_ankle_ratio})",
           file=sys.stderr, flush=True)
 
     # ============================================================
