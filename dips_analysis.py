@@ -280,6 +280,8 @@ if mp_pose is not None:
     _RW  = mp_pose.PoseLandmark.RIGHT_WRIST.value
     _LH  = mp_pose.PoseLandmark.LEFT_HIP.value
     _RH  = mp_pose.PoseLandmark.RIGHT_HIP.value
+    _LA  = mp_pose.PoseLandmark.LEFT_ANKLE.value
+    _RA  = mp_pose.PoseLandmark.RIGHT_ANKLE.value
 
 # Smoothing
 EMA_ALPHA = 0.35
@@ -290,6 +292,13 @@ MIN_REP_SEC     = 1.0    # minimum seconds between consecutive rep bottoms
 MIN_REP_AMP     = 0.22   # minimum bottom->top amplitude for a valid rep
 MAX_REP_SEC     = 5.0    # maximum seconds for a single rep (reject slow drift)
 VIS_RATIO       = 1.5    # prefer one side if it's this much more visible
+
+# "On dips bars" detection
+# When on dips bars: ankle hangs below shoulder (large body_spread)
+# When standing/walking: body_spread is small (ankles near body)
+# body_spread = ankle_y - shoulder_y (normalized image coords)
+ON_DIPS_SPREAD_THR = 0.08     # body_spread must exceed this to be "on bars"
+ON_DIPS_MIN_FRAMES = 5         # need this many consecutive "on dips" frames to enter state
 
 # Form feedback cues
 FB_CUE_DEEPER   = "Go deeper (elbows to 90\u00b0)"
@@ -411,6 +420,14 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
             torso_lean = _calc_torso_lean(lm)
             flare = _calc_elbow_flare(lm)
 
+            # "On dips" detection: body_spread = ankle_y - shoulder_y
+            # When on dips bars, feet hang below body (large spread)
+            # When standing/walking, spread is small
+            ankle_y = (lm[_LA].y + lm[_RA].y) / 2.0
+            body_spread = ankle_y - sh_y
+            vis_ankle = min(lm[_LA].visibility, lm[_RA].visibility)
+            vis_hip = min(lm[_LH].visibility, lm[_RH].visibility)
+
             signal_points.append({
                 "f": frame_idx,
                 "t": frame_idx / fps_in,
@@ -420,6 +437,9 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
                 "raw_elbow_max": max(eL, eR),
                 "torso_lean": torso_lean,
                 "flare": flare,
+                "body_spread": body_spread,
+                "vis_ankle": vis_ankle,
+                "vis_hip": vis_hip,
             })
 
             frame_data[frame_idx] = {
@@ -432,6 +452,39 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
 
     if len(signal_points) < 5:
         return None, None
+
+    # ============================================================
+    # Detect "on dips bars" state per frame using body_spread
+    # Requires a streak of high-spread frames to enter state
+    # (prevents single-frame spikes from triggering)
+    # ============================================================
+    # First pass: mark each frame as "above threshold" or not
+    for s in signal_points:
+        # Must have visible ankle AND high body spread
+        has_visible_ankle = s["vis_ankle"] >= 0.2
+        s["_spread_ok"] = has_visible_ankle and s["body_spread"] >= ON_DIPS_SPREAD_THR
+
+    # Second pass: compute streak-based on_dips state
+    streak = 0
+    off_streak = 0
+    on_dips_state = False
+    for s in signal_points:
+        if s["_spread_ok"]:
+            streak += 1
+            off_streak = 0
+            if streak >= ON_DIPS_MIN_FRAMES:
+                on_dips_state = True
+        else:
+            off_streak += 1
+            streak = 0
+            # Need sustained "off" to exit (hysteresis: 10 frames)
+            if off_streak >= 10:
+                on_dips_state = False
+        s["on_dips"] = on_dips_state
+
+    on_dips_frames = sum(1 for s in signal_points if s["on_dips"])
+    print(f"[DIPS] On-dips state: {on_dips_frames}/{len(signal_points)} frames",
+          file=sys.stderr, flush=True)
 
     # ============================================================
     # Build combined signal (60% elbow + 40% shoulder)
@@ -521,23 +574,35 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
             last_bottom_time = b_t
 
     # Filter 4: require that the bottom actually had a valid dip position
-    # (elbow was bent below threshold AND wrists below shoulders)
+    # (elbow was bent below threshold)
+    # Filter 5: MOST IMPORTANT — person must be "on dips bars" during the rep
+    # This filters out walking, approaching, random body movements
     rep_events = []
+    filtered_not_on_dips = 0
+    filtered_elbow = 0
     for evt in raw_rep_events:
         b_idx, t_idx, b_frame, t_frame, b_t, t_t, amp = evt
-        # Look at the cycle and check if elbow dipped low enough
         cycle = signal_points[b_idx:t_idx + 1] if t_idx > b_idx else [signal_points[b_idx]]
-        min_elbow_in_cycle = min(c["raw_elbow_min"] for c in cycle)
 
-        # Real dip: elbow should bend below 130° at some point
+        # Filter 4: elbow bent below 130° at some point
+        min_elbow_in_cycle = min(c["raw_elbow_min"] for c in cycle)
         if min_elbow_in_cycle > 130.0:
+            filtered_elbow += 1
+            continue
+
+        # Filter 5: majority of cycle frames must be in "on dips" state
+        on_dips_in_cycle = sum(1 for c in cycle if c.get("on_dips", False))
+        on_dips_ratio = on_dips_in_cycle / max(1, len(cycle))
+        if on_dips_ratio < 0.7:  # require 70% of rep frames to be on dips
+            filtered_not_on_dips += 1
             continue
 
         rep_events.append((b_idx, t_idx, b_frame, t_frame, b_t, t_t))
 
     rep_count = len(rep_events)
     print(f"[DIPS] Detected {rep_count} reps "
-          f"(raw={len(raw_rep_events)}, filtered by elbow check)",
+          f"(raw={len(raw_rep_events)}, "
+          f"filtered: elbow={filtered_elbow}, not_on_dips={filtered_not_on_dips})",
           file=sys.stderr, flush=True)
 
     # ============================================================
