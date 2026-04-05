@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-# -*- coding: utf-8 -*-
 # dips_analysis.py — Dips analysis with signal-based rep counting
 # Architecture: 2-pass (analysis → render) with landmark snapshots
 # Rep counting: combined elbow+shoulder signal with peak/valley detection
@@ -288,6 +287,8 @@ EMA_ALPHA = 0.35
 # Rep counting (signal-based)
 MIN_SWING       = 0.18   # minimum combined-signal swing for a real rep
 MIN_REP_SEC     = 1.0    # minimum seconds between consecutive rep bottoms
+MIN_REP_AMP     = 0.22   # minimum bottom->top amplitude for a valid rep
+MAX_REP_SEC     = 5.0    # maximum seconds for a single rep (reject slow drift)
 VIS_RATIO       = 1.5    # prefer one side if it's this much more visible
 
 # Form feedback cues
@@ -486,8 +487,9 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
 
     # ============================================================
     # Count reps: bottom -> top = one complete rep (count on ascent)
+    # With multiple filters to reject false positives
     # ============================================================
-    rep_events = []  # (b_idx, t_idx, b_frame, t_frame, b_t, t_t)
+    raw_rep_events = []  # (b_idx, t_idx, b_frame, t_frame, b_t, t_t, amp)
     last_bottom_time = -999
 
     for i in range(len(swings) - 1):
@@ -496,17 +498,47 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
             t_idx = swings[i + 1][0]
             b_t = swings[i][1]
             t_t = swings[i + 1][1]
+            b_val = swings[i][2]
+            t_val = swings[i + 1][2]
+            amp = t_val - b_val
+            duration = t_t - b_t
 
+            # Filter 1: minimum time since last rep bottom
             if (b_t - last_bottom_time) < MIN_REP_SEC:
+                continue
+
+            # Filter 2: minimum amplitude (bottom to top swing)
+            if amp < MIN_REP_AMP:
+                continue
+
+            # Filter 3: maximum duration (reject slow drift)
+            if duration > MAX_REP_SEC:
                 continue
 
             b_frame = signal_points[b_idx]["f"]
             t_frame = signal_points[t_idx]["f"]
-            rep_events.append((b_idx, t_idx, b_frame, t_frame, b_t, t_t))
+            raw_rep_events.append((b_idx, t_idx, b_frame, t_frame, b_t, t_t, amp))
             last_bottom_time = b_t
 
+    # Filter 4: require that the bottom actually had a valid dip position
+    # (elbow was bent below threshold AND wrists below shoulders)
+    rep_events = []
+    for evt in raw_rep_events:
+        b_idx, t_idx, b_frame, t_frame, b_t, t_t, amp = evt
+        # Look at the cycle and check if elbow dipped low enough
+        cycle = signal_points[b_idx:t_idx + 1] if t_idx > b_idx else [signal_points[b_idx]]
+        min_elbow_in_cycle = min(c["raw_elbow_min"] for c in cycle)
+
+        # Real dip: elbow should bend below 130° at some point
+        if min_elbow_in_cycle > 130.0:
+            continue
+
+        rep_events.append((b_idx, t_idx, b_frame, t_frame, b_t, t_t))
+
     rep_count = len(rep_events)
-    print(f"[DIPS] Detected {rep_count} reps", file=sys.stderr, flush=True)
+    print(f"[DIPS] Detected {rep_count} reps "
+          f"(raw={len(raw_rep_events)}, filtered by elbow check)",
+          file=sys.stderr, flush=True)
 
     # ============================================================
     # Evaluate form per rep + build feedback
@@ -655,6 +687,10 @@ def _render_pass(video_path, rotation, frame_skip, output_path,
             continue
 
         frame = _apply_rotation(frame, rotation)
+        # Resize to output dimensions (fast path if already correct)
+        if frame.shape[1] != out_w or frame.shape[0] != out_h:
+            frame = cv2.resize(frame, (out_w, out_h), interpolation=cv2.INTER_AREA)
+
         fd = frame_data.get(frame_idx)
 
         if fd is None:
@@ -737,6 +773,20 @@ def run_dips_analysis(video_path,
         return _ret_err(f"Invalid video - only {total_frames} frames", feedback_path)
 
     out_w, out_h = (orig_h, orig_w) if rotation in (90, 270) else (orig_w, orig_h)
+
+    # Cap output resolution for fast rendering + encoding
+    # Full-res output (e.g. 720x1280) creates huge intermediate mp4v files
+    # and makes the ffmpeg re-encode step extremely slow
+    MAX_OUTPUT_LONG_SIDE = 540
+    long_side = max(out_w, out_h)
+    if long_side > MAX_OUTPUT_LONG_SIDE:
+        output_scale = MAX_OUTPUT_LONG_SIDE / float(long_side)
+        out_w = int(round(out_w * output_scale))
+        out_h = int(round(out_h * output_scale))
+        # Ensure even dimensions (required by yuv420p)
+        out_w = out_w - (out_w % 2)
+        out_h = out_h - (out_h % 2)
+
     print(f"[DIPS] {total_frames}fr @ {fps_in:.1f}fps out={out_w}x{out_h}",
           file=sys.stderr, flush=True)
 
@@ -770,12 +820,12 @@ def run_dips_analysis(video_path,
         try:
             proc = subprocess.run(
                 ["ffmpeg", "-y", "-i", output_path,
-                 "-c:v", "libx264", "-preset", "fast",
+                 "-c:v", "libx264", "-preset", "ultrafast",
                  "-crf", str(int(encode_crf)),
                  "-movflags", "+faststart", "-pix_fmt", "yuv420p",
                  "-metadata:s:v:0", "rotate=0",
                  encoded],
-                capture_output=True, timeout=300)
+                capture_output=True, timeout=120)
             print(f"[DIPS] ffmpeg rc={proc.returncode}", file=sys.stderr, flush=True)
             if proc.returncode != 0:
                 print(f"[DIPS] ffmpeg stderr: {proc.stderr.decode(errors='replace')[-500:]}",
