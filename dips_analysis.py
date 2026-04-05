@@ -805,10 +805,16 @@ def run_dips_analysis(video_path,
     if mp_pose is None:
         return _ret_err("Mediapipe not available", feedback_path)
 
-    model_complexity = 0 if fast_mode else 1
+    # Use the SAME pose detection settings in both fast and slow modes
+    # to guarantee consistent rep counts. The only difference between modes
+    # is whether to render the output video.
+    # (Fast mode without video uses complexity=0 + scale=0.35 and those
+    #  settings are what was tuned to produce correct counts.)
+    model_complexity = 0
+    scale = min(scale, 0.35)
+
     if fast_mode:
         return_video = False
-        scale = min(scale, 0.35)
 
     if preserve_quality:
         scale = 1.0
@@ -816,6 +822,9 @@ def run_dips_analysis(video_path,
         encode_crf = 18 if encode_crf is None else encode_crf
     else:
         encode_crf = 23 if encode_crf is None else encode_crf
+
+    print(f"[DIPS] Settings: model_complexity={model_complexity} "
+          f"scale={scale} frame_skip={frame_skip}", file=sys.stderr, flush=True)
 
     create_video = bool(return_video) and bool(output_path)
 
