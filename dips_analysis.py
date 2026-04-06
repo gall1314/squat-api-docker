@@ -289,7 +289,7 @@ EMA_ALPHA = 0.35
 # Rep counting (signal-based)
 MIN_SWING       = 0.18   # minimum combined-signal swing for a real rep
 MIN_REP_SEC     = 1.0    # minimum seconds between consecutive rep bottoms
-MIN_REP_AMP     = 0.22   # minimum bottom->top amplitude for a valid rep
+MIN_REP_AMP     = 0.15   # minimum bottom->top amplitude for a valid rep
 MAX_REP_SEC     = 5.0    # maximum seconds for a single rep (reject slow drift)
 VIS_RATIO       = 1.5    # prefer one side if it's this much more visible
 
@@ -555,6 +555,22 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
         print(f"[DIPS] Skipping first swing (mount detected at t={swings[0][1]:.2f}s)",
               file=sys.stderr, flush=True)
         swings = swings[1:]
+
+    # Dismount detection: if the very last swing is "top" and the frames 
+    # shortly AFTER that top transition to off-dips, it's a dismount.
+    # Remove that last top so the last bottom→top won't count.
+    if len(swings) >= 2 and swings[-1][3] == "top":
+        last_top_idx = swings[-1][0]
+        # Check frames after this top: do they go off-dips?
+        lookahead = min(last_top_idx + 15, len(signal_points))
+        after_top = signal_points[last_top_idx:lookahead]
+        if after_top:
+            off_count = sum(1 for s in after_top if not s.get("on_dips", False))
+            off_ratio = off_count / len(after_top)
+            if off_ratio >= 0.3:  # 30%+ of frames after top are off-dips = dismount
+                print(f"[DIPS] Skipping last swing (dismount detected at t={swings[-1][1]:.2f}s)",
+                      file=sys.stderr, flush=True)
+                swings = swings[:-1]
 
     raw_rep_events = []  # (b_idx, t_idx, b_frame, t_frame, b_t, t_t, amp)
     last_bottom_time = -999
