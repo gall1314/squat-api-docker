@@ -556,19 +556,24 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
               file=sys.stderr, flush=True)
         swings = swings[1:]
 
-    # Dismount detection: if the very last swing is "top" and the frames 
-    # shortly AFTER that top transition to off-dips, it's a dismount.
-    # Remove that last top so the last bottom→top won't count.
+    # Dismount detection: if the very last swing is "top" and body_spread
+    # drops significantly within the next ~20 frames, it's a dismount.
+    # We check raw body_spread instead of on_dips state (which has hysteresis delay).
     if len(swings) >= 2 and swings[-1][3] == "top":
         last_top_idx = swings[-1][0]
-        # Check frames after this top: do they go off-dips?
-        lookahead = min(last_top_idx + 15, len(signal_points))
-        after_top = signal_points[last_top_idx:lookahead]
-        if after_top:
-            off_count = sum(1 for s in after_top if not s.get("on_dips", False))
-            off_ratio = off_count / len(after_top)
-            if off_ratio >= 0.3:  # 30%+ of frames after top are off-dips = dismount
-                print(f"[DIPS] Skipping last swing (dismount detected at t={swings[-1][1]:.2f}s)",
+        top_spread = signal_points[last_top_idx]["body_spread"]
+        # Look ahead: does body_spread drop below threshold?
+        lookahead_end = min(last_top_idx + 20, len(signal_points))
+        after_frames = signal_points[last_top_idx + 1:lookahead_end]
+        if after_frames:
+            min_spread_after = min(s["body_spread"] for s in after_frames)
+            # Also check: are there fewer than 10 frames left? (near end of video)
+            frames_left = len(signal_points) - last_top_idx
+            spread_dropped = min_spread_after < ON_DIPS_SPREAD_THR
+            near_end = frames_left < 25
+            if spread_dropped or near_end:
+                print(f"[DIPS] Skipping last swing (dismount: spread_drop={spread_dropped}, "
+                      f"near_end={near_end}, t={swings[-1][1]:.2f}s)",
                       file=sys.stderr, flush=True)
                 swings = swings[:-1]
 
