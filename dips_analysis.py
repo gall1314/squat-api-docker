@@ -547,12 +547,7 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
     # With multiple filters to reject false positives
     # ============================================================
 
-    # ============================================================
-    # Count reps: bottom -> top = one complete rep (count on ascent)
-    # With multiple filters to reject false positives
-    # ============================================================
-
-    # Mount detection (PROVEN FIX): if the very first swing is "bottom",
+    # Mount detection: if the very first swing is "bottom",
     # the signal started mid-descent (mount/jump). Remove it.
     if swings and swings[0][3] == "bottom":
         print(f"[DIPS] Skipping first swing (mount detected at t={swings[0][1]:.2f}s)",
@@ -561,6 +556,7 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
 
     raw_rep_events = []  # (b_idx, t_idx, b_frame, t_frame, b_t, t_t, amp)
     last_bottom_time = -999
+    first_rep_found = False
 
     for i in range(len(swings) - 1):
         if swings[i][3] == "bottom" and swings[i + 1][3] == "top":
@@ -573,8 +569,23 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
             amp = t_val - b_val
             duration = t_t - b_t
 
+            # Mount guard: the first bottom→top pair is likely the mount
+            # (person jumping onto bars and pushing up). Skip it.
+            # This catches BOTH cases:
+            # - first swing was bottom (already removed above, so this is 2nd)
+            # - first swing was top, then bottom→top = mount ascent
+            if not first_rep_found:
+                first_rep_found = True
+                # Check: was there a PRECEDING top→bottom→top cycle before this?
+                # If this is truly the first bottom→top in the video, it's the mount.
+                preceding_reps = sum(1 for j in range(i) 
+                                    if j+1 < len(swings) and swings[j][3] == "bottom" and swings[j+1][3] == "top")
+                if preceding_reps == 0:
+                    print(f"[DIPS] Skipping first rep as mount: t={b_t:.2f}-{t_t:.2f}s amp={amp:.3f}",
+                          file=sys.stderr, flush=True)
+                    continue
+
             # Dismount detection: check if body_spread drops after this top
-            # (person getting off bars). Check raw spread, not delayed on_dips.
             lookahead_end = min(t_idx + 20, len(signal_points))
             after_top_frames = signal_points[t_idx + 1:lookahead_end]
             if after_top_frames:
