@@ -564,7 +564,6 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
 
     raw_rep_events = []
     last_bottom_time = -999
-    first_rep_found = False
 
     for i in range(len(swings) - 1):
         if swings[i][3] == "bottom" and swings[i + 1][3] == "top":
@@ -577,20 +576,8 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
             amp = t_val - b_val
             duration = t_t - b_t
 
-            # Mount guard: skip the first bottom→top ONLY if the video
-            # started with the person off the bars (mounting sequence)
-            if not first_rep_found and starts_off_bars:
-                first_rep_found = True
-                preceding_reps = sum(1 for j in range(i)
-                                    if j+1 < len(swings) and swings[j][3] == "bottom" and swings[j+1][3] == "top")
-                if preceding_reps == 0:
-                    print(f"[DIPS] Skipping first rep as mount: t={b_t:.2f}-{t_t:.2f}s amp={amp:.3f}",
-                          file=sys.stderr, flush=True)
-                    continue
-            first_rep_found = True
-
-            # Dismount detection: two checks
-            # 1. Body spread drops after this top (person getting off bars)
+            # Dismount detection: body spread drops after this top
+            # (person getting off bars). Check raw spread, not delayed on_dips.
             lookahead_end = min(t_idx + 20, len(signal_points))
             after_top_frames = signal_points[t_idx + 1:lookahead_end]
             if after_top_frames:
@@ -598,18 +585,6 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
                 if min_spread_after < ON_DIPS_SPREAD_THR * 0.5:
                     print(f"[DIPS] Skipping dismount rep at t={b_t:.2f}-{t_t:.2f}s "
                           f"(spread_after={min_spread_after:.3f})",
-                          file=sys.stderr, flush=True)
-                    continue
-
-            # 2. Last rep ends within 2s of video end — likely dismount prep
-            video_end_time = signal_points[-1]["t"] if signal_points else 0
-            if (video_end_time - t_t) < 2.0:
-                # Check: is this the LAST bottom→top pair?
-                remaining_pairs = sum(1 for j in range(i+1, len(swings)-1)
-                                     if swings[j][3] == "bottom" and swings[j+1][3] == "top")
-                if remaining_pairs == 0:
-                    print(f"[DIPS] Skipping last rep near video end: t={b_t:.2f}-{t_t:.2f}s "
-                          f"(video ends at {video_end_time:.2f}s)",
                           file=sys.stderr, flush=True)
                     continue
 
