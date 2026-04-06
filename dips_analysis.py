@@ -288,7 +288,7 @@ EMA_ALPHA = 0.35
 
 # Rep counting (signal-based)
 MIN_SWING       = 0.18   # minimum combined-signal swing for a real rep
-MIN_REP_SEC     = 1.0    # minimum seconds between consecutive rep bottoms
+MIN_REP_SEC     = 0.7    # minimum seconds between consecutive rep bottoms
 MIN_REP_AMP     = 0.15   # minimum bottom->top amplitude for a valid rep
 MAX_REP_SEC     = 5.0    # maximum seconds for a single rep (reject slow drift)
 VIS_RATIO       = 1.5    # prefer one side if it's this much more visible
