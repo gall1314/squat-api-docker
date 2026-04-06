@@ -547,38 +547,13 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
     # With multiple filters to reject false positives
     # ============================================================
 
-    # Mount detection: if the very first swing is "bottom", it means the
-    # signal started mid-descent (person was jumping/mounting onto bars).
-    # Skip that first bottom — the first real rep should start from a
-    # bottom that was PRECEDED by a top (established position).
-    if swings and swings[0][3] == "bottom":
-        print(f"[DIPS] Skipping first swing (mount detected at t={swings[0][1]:.2f}s)",
-              file=sys.stderr, flush=True)
-        swings = swings[1:]
-
-    # Dismount detection: if the very last swing is "top" and body_spread
-    # drops significantly within the next ~20 frames, it's a dismount.
-    # We check raw body_spread instead of on_dips state (which has hysteresis delay).
-    if len(swings) >= 2 and swings[-1][3] == "top":
-        last_top_idx = swings[-1][0]
-        top_spread = signal_points[last_top_idx]["body_spread"]
-        # Look ahead: does body_spread drop below threshold?
-        lookahead_end = min(last_top_idx + 20, len(signal_points))
-        after_frames = signal_points[last_top_idx + 1:lookahead_end]
-        if after_frames:
-            min_spread_after = min(s["body_spread"] for s in after_frames)
-            # Also check: are there fewer than 10 frames left? (near end of video)
-            frames_left = len(signal_points) - last_top_idx
-            spread_dropped = min_spread_after < ON_DIPS_SPREAD_THR
-            near_end = frames_left < 25
-            if spread_dropped or near_end:
-                print(f"[DIPS] Skipping last swing (dismount: spread_drop={spread_dropped}, "
-                      f"near_end={near_end}, t={swings[-1][1]:.2f}s)",
-                      file=sys.stderr, flush=True)
-                swings = swings[:-1]
-
+    # ============================================================
+    # Count reps: bottom -> top = one complete rep (count on ascent)
+    # With multiple filters to reject false positives
+    # ============================================================
     raw_rep_events = []  # (b_idx, t_idx, b_frame, t_frame, b_t, t_t, amp)
     last_bottom_time = -999
+    is_first_rep = True
 
     for i in range(len(swings) - 1):
         if swings[i][3] == "bottom" and swings[i + 1][3] == "top":
@@ -590,6 +565,31 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
             t_val = swings[i + 1][2]
             amp = t_val - b_val
             duration = t_t - b_t
+
+            # Mount detection: if this is the first bottom→top AND
+            # no top preceded this bottom, it's a mount (jump onto bars)
+            if is_first_rep:
+                # Check: was there a top swing BEFORE this bottom?
+                has_prior_top = any(s[3] == "top" for s in swings[:i])
+                if not has_prior_top:
+                    print(f"[DIPS] Skipping mount rep at t={b_t:.2f}-{t_t:.2f}s",
+                          file=sys.stderr, flush=True)
+                    is_first_rep = False
+                    continue
+                is_first_rep = False
+
+            # Dismount detection: check if body_spread drops after this top
+            # (person getting off bars). Check raw spread, not delayed on_dips.
+            lookahead_end = min(t_idx + 20, len(signal_points))
+            after_top_frames = signal_points[t_idx + 1:lookahead_end]
+            if after_top_frames:
+                min_spread_after = min(s["body_spread"] for s in after_top_frames)
+                if min_spread_after < ON_DIPS_SPREAD_THR * 0.5:
+                    # Spread dropped to near-zero → definitely dismounted
+                    print(f"[DIPS] Skipping dismount rep at t={b_t:.2f}-{t_t:.2f}s "
+                          f"(spread_after={min_spread_after:.3f})",
+                          file=sys.stderr, flush=True)
+                    continue
 
             # Filter 1: minimum time since last rep bottom
             if (b_t - last_bottom_time) < MIN_REP_SEC:
