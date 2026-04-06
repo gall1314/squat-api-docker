@@ -546,6 +546,16 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
     # Count reps: bottom -> top = one complete rep (count on ascent)
     # With multiple filters to reject false positives
     # ============================================================
+
+    # Mount detection: if the very first swing is "bottom", it means the
+    # signal started mid-descent (person was jumping/mounting onto bars).
+    # Skip that first bottom — the first real rep should start from a
+    # bottom that was PRECEDED by a top (established position).
+    if swings and swings[0][3] == "bottom":
+        print(f"[DIPS] Skipping first swing (mount detected at t={swings[0][1]:.2f}s)",
+              file=sys.stderr, flush=True)
+        swings = swings[1:]
+
     raw_rep_events = []  # (b_idx, t_idx, b_frame, t_frame, b_t, t_t, amp)
     last_bottom_time = -999
 
