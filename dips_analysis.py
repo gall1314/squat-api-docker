@@ -547,18 +547,22 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
     # With multiple filters to reject false positives
     # ============================================================
 
-    # Mount detection: only applies if the person was NOT on dips bars
-    # at the start of the video (low body_spread in first few frames).
-    # If person is already on bars from the start, don't skip anything.
-    starts_off_bars = False
-    if len(signal_points) >= 3:
-        first_spreads = [s["body_spread"] for s in signal_points[:5]]
-        avg_first_spread = sum(first_spreads) / len(first_spreads)
-        starts_off_bars = avg_first_spread < ON_DIPS_SPREAD_THR
+    # Mount detection: a real dip rep starts with the person at lockout
+    # (top of dip, signal value high). If the video starts with the signal
+    # in the LOW range, the person hasn't reached lockout yet — they're
+    # still mounting/getting into position. The first bottom→top in this
+    # case is the mount ascent, not a real rep.
+    starts_at_top = False
+    if len(signal_points) >= 5:
+        first_combined = [s["combined"] for s in signal_points[:5]]
+        max_first = max(first_combined)
+        # A real dip top has combined > 0.6. If first frames don't reach
+        # even 0.5, the person isn't at lockout — they're mid-mount.
+        starts_at_top = max_first >= 0.5
 
-    if starts_off_bars and swings and swings[0][3] == "bottom":
+    if not starts_at_top and swings and swings[0][3] == "bottom":
         print(f"[DIPS] Skipping first swing (mount detected at t={swings[0][1]:.2f}s, "
-              f"avg_first_spread={avg_first_spread:.3f})",
+              f"max_first_combined={max_first:.3f})",
               file=sys.stderr, flush=True)
         swings = swings[1:]
 
