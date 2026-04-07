@@ -632,10 +632,12 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
             filtered_not_on_dips += 1
             continue
 
-        # Filter 6: noise detection — if too many frames have impossibly
-        # low elbow angles, the pose tracker is failing and these aren't
-        # real dips. Real dip bottoms: 60-100°. Values <50° are noise.
-        noise_frames = sum(1 for c in cycle if c["raw_elbow_min"] < 50.0)
+        # Filter 6: noise detection — if too many frames have BOTH elbows
+        # at impossibly low angles, the pose tracker is failing on both
+        # sides. If only ONE side fails (raw_elbow_min low but raw_elbow_max
+        # is normal), the other side still has real data and the smoothed
+        # elbow is reliable. Real dip bottoms: 60-100°.
+        noise_frames = sum(1 for c in cycle if c["raw_elbow_max"] < 50.0)
         noise_ratio = noise_frames / max(1, len(cycle))
         if noise_ratio > 0.30:
             filtered_noise += 1
