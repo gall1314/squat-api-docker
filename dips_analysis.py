@@ -580,15 +580,24 @@ def _analysis_pass(video_path, rotation, frame_skip, scale, fps_in, model_comple
             amp = t_val - b_val
             duration = t_t - b_t
 
-            # Dismount detection: body spread drops after this top
-            # (person getting off bars). Check raw spread, not delayed on_dips.
+            # Dismount detection: body spread drops AND stays low after this top
+            # (person getting off bars). Require SUSTAINED low spread, not just
+            # a single noisy frame, to avoid false positives from pose tracking
+            # glitches at the end of videos.
             lookahead_end = min(t_idx + 20, len(signal_points))
             after_top_frames = signal_points[t_idx + 1:lookahead_end]
             if after_top_frames:
-                min_spread_after = min(s["body_spread"] for s in after_top_frames)
-                if min_spread_after < ON_DIPS_SPREAD_THR * 0.5:
+                # Count frames where spread is below threshold
+                low_spread_count = sum(1 for s in after_top_frames
+                                       if s["body_spread"] < ON_DIPS_SPREAD_THR * 0.5)
+                # Require at least 5 frames OR 50% of the lookahead with low spread
+                # This prevents single-frame noise from triggering false dismount
+                threshold = max(5, len(after_top_frames) // 2)
+                if low_spread_count >= threshold:
+                    avg_spread = sum(s["body_spread"] for s in after_top_frames) / len(after_top_frames)
                     print(f"[DIPS] Skipping dismount rep at t={b_t:.2f}-{t_t:.2f}s "
-                          f"(spread_after={min_spread_after:.3f})",
+                          f"(low_frames={low_spread_count}/{len(after_top_frames)}, "
+                          f"avg_spread={avg_spread:.3f})",
                           file=sys.stderr, flush=True)
                     continue
 
